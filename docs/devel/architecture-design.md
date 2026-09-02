@@ -682,7 +682,7 @@ search: took=8.2ms bm25=1.4ms(vector=6.1ms parallel) candidates=187 fused=50 too
 | -------------- | ---------------------- | --------- | ------------------ | ---------------------------------------------------------------------- |
 | 语言             | Rust                   | **1.90+** / 2021 edition | —        | MSRV 由依赖决定（bincode 1.85 / clap 1.85 / smol_str 1.89），见 ADR-008           |
 | 向量索引           | `instant-distance`     | 0.6.1     | MIT OR Apache-2.0  | 纯 Rust HNSW、rayon 并行构建、`with-serde` 支持序列化。**P4 与 `hnsw_rs` A/B 复核**（见 7.5、ADR-002） |
-| 本地 embedding   | `fastembed`            | **6.0.2** | Apache-2.0         | 基于 ort(ONNX Runtime)、同步无 tokio 依赖。⚠️ ① 传递依赖 `ort =2.0.0-rc.13` 为预发布，`Cargo.lock` 必须入库；② **必须 `default-features = false`**，否则默认 feature 会带来 `image → rav1e → libfuzzer-sys`（NCSA 许可）；③ 实际下载的模型仓为 `Xenova/bge-small-zh-v1.5`（**HF 未声明 License**，见 thirdparty.md 5.2） |
+| 本地 embedding   | `fastembed`            | **6.0.2** | Apache-2.0         | 基于 ort(ONNX Runtime)、同步无 tokio 依赖。⚠️ ① 传递依赖 `ort =2.0.0-rc.13` 为预发布，`Cargo.lock` 必须入库；② **必须 `default-features = false`**，否则默认 feature 会带来 `image → rav1e → libfuzzer-sys`（NCSA 许可）；③ 实际下载的模型仓为 `Xenova/bge-small-zh-v1.5`（HF 未声明 License，**已决策接受**，沿用上游 MIT；残留风险见需求文档 8.3 P5） |
 | 中文分词           | `jieba-rs`             | 0.10.3    | MIT                | 生态成熟、词典可定制                                                             |
 | 中英分段           | `unicode-segmentation` | 1.13.3    | MIT OR Apache-2.0  | 不手写 Unicode 边界判断                                                       |
 | 文本归一化          | `unicode-normalization` | 0.1.25   | MIT OR Apache-2.0  | NFC 归一化，保证索引侧与查询侧一致                                                    |

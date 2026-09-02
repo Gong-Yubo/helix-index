@@ -33,12 +33,18 @@
 正确性/确定性 > 首条精确率 MRR > 延迟 P99 > 召回率 > 资源占用
 
 ## 环境
-Rust 工具链需先安装（rustup）。NFR 中的延迟/内存/构建耗时指标均为**目标值待实测**，P5 前不得作为对外承诺。
+- Rust **已安装**：stable 1.98.0；项目经 `rust-toolchain.toml` pin **1.90.0**（MSRV）。**注意：cargo 只在登录 shell 的 PATH 里**，非登录 shell 需先 `export PATH="$HOME/.cargo/bin:$PATH"`
+- 命令入口：`make fmt` / `make lint` / `make test` / `make deny` / `make all`
+- **P0 已完成**（提交 5850545）：单条 embedding 推理 **1.58ms（debug）**、模型下载 49s、fastembed+ort 编译 42.5s
+- NFR 中的延迟/内存/构建耗时指标均为**目标值待实测**，P5 前不得作为对外承诺
 
 ## 技术约束（2026-09-02 三方库调研后确定，见 docs/thirdparty.md）
 - **MSRV 1.90**（NFR-08，原 1.80 不可行）；项目 License `MIT OR Apache-2.0`；`Cargo.lock` 必须入库
 - 依赖 License 白名单由 `cargo-deny` 强制（NFR-09）
 - `tantivy` 仅作 dev 依赖做 BM25 正确性基线（ADR-007），不参与构建产物
 - 缓存用 `moka` 不用 `lru`（并发安全 + TTL）；中英分段用 `unicode-segmentation`，文本过 NFC
-- `fastembed` 6.0.2 精确锁定 `ort =2.0.0-rc.13`（预发布，5.x/6.x 相同）
+- `fastembed` 6.0.2 精确锁定 `ort =2.0.0-rc.13`（预发布，5.x/6.x 相同）；**必须 `default-features = false`**（否则引入 NCSA 的 image 链）；默认把模型下到项目根 `.fastembed_cache/`（已 gitignore）
+- 序列化用 **bincode 2.0.1**；**3.0.0 是玩笑发布**（源码仅 `compile_error!`）——**crates.io 的 max_version 不等于可用版本，调研依赖必须验证能编译**
+- 中文 embedding 枚举变体是 `EmbeddingModel::BGESmallZHV15`（非 `BGESmallZH`）；实际下载仓为 `Xenova/bge-small-zh-v1.5`（HF 未声明 License，**已决策接受**，沿用上游 MIT；P2 复核）
+- git 身份：全局 `GongYubo <gongyubo@gmail.com>`。⚠️ 家目录有 ACL `group:everyone deny delete`，`git config --global` 会失败，**改 ~/.gitconfig 必须直接编辑文件内容**（不能用 git config 写）
 - P4 先用 `hnsw_rs`（纯 Rust + 原生增量 insert）与「instant-distance + delta」A/B，达标则删掉 delta 区

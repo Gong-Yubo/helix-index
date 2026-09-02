@@ -4,7 +4,7 @@
 | ---- | --------------------------------------------------------------------------------- |
 | 版本   | **v2.0（已执行并回写）**                                                                  |
 | 日期   | 2026-09-02                                                                        |
-| 状态   | **已执行完成** —— P0 全部通过，首次提交 `5850545`。执行中的 4 处修正见**第 12 章**，实测基线见**附录 A**   |
+| 状态   | **已执行完成** —— P0 全部通过，提交 `dd7589c`（骨架）+ `eb03ccc`（文档回写）。执行中的 4 处修正见**第 12 章**，实测基线见**附录 A** |
 | 上游   | `docs/devel/plan.md` 第 5 章（P0，T0-01 ~ T0-07）                                      |
 | 关联   | `docs/devel/architecture-design.md` 第 4.1 节（目录结构）、第 9 章（选型）、ADR-008（MSRV/License） |
 | 环境实测 | 2026-09-02 在本机采集，见第 2 章                                                           |
@@ -664,7 +664,7 @@ fastembed = { version = "6.0.2", default-features = false, features = [
 
 **附带发现**：fastembed 默认把模型缓存在**项目根目录**的 `.fastembed_cache/`（96 MB），已加入 `.gitignore`。**P2（T2-02）实现 `LocalEmbedder` 时应显式调用 `.with_cache_dir()` 指到仓库外**，否则开发者极易误提交 96MB。
 
-### 12.5 ⚠️ 需你决策：模型实际来源是 `Xenova/bge-small-zh-v1.5`，且该仓未声明 License
+### 12.5 ✅ 已决策：模型来源为 `Xenova/bge-small-zh-v1.5`，License 未声明但**接受**（选项 A）
 
 - 设计文档依据模型卡推断为 `Qdrant/bge-small-zh-v1.5`（MIT）
 - **实际下载的是 `Xenova/bge-small-zh-v1.5`**（`onnx/model.onnx`，90 MB）
@@ -674,11 +674,19 @@ fastembed = { version = "6.0.2", default-features = false, features = [
 
 | 选项    | 做法                                                            | 代价                     |
 | ----- | ------------------------------------------------------------- | ---------------------- |
-| A（默认） | 接受现状。Xenova 转换仓普遍沿用上游 MIT，但**无正式声明**，存在理论风险                  | 零成本；合规审查时可能被问         |
+| **A（✅ 已选定）** | 接受现状。Xenova 转换仓普遍沿用上游 MIT，但**无正式声明**，存在理论风险         | 零成本；合规审查时可能被问         |
 | B     | 自己从 `BAAI`（MIT）导出 ONNX，用 `.with_cache_dir()` + 手工目录布局喂给 fastembed | 需转换工具链；布局属内部约定，脆弱 |
 | C     | 换用自带 ONNX 且**明确声明 MIT** 的中文模型，绕过 fastembed 内置的 HF 下载逻辑        | 要自己写下载逻辑，违背"先用成熟库"初衷  |
 
-**我倾向 A + 在 thirdparty.md 记录风险**，等 P2（T2-02）实现 `Embedder` 时再定。**若你要求严格合规，请告诉我，我按 B 或 C 调整。**
+**决策结果（2026-09-02，用户确认）：采用选项 A，接受 `Xenova/bge-small-zh-v1.5`。**
+
+**落实的动作**
+
+- 需求文档 8.3 新增项目风险 **P5**，记录"License 未声明"这一残留风险与复核时机
+- `thirdparty.md` 5.2 的模型许可表标注为"⚠️ HF 未声明，项目已决策接受（沿用上游 MIT）"
+- **复核时机：P2（T2-02）实现 `Embedder` 时**。届时若发现合规要求变严，回落路径为 B 或 C——因为 `Embedder` 是 trait，切换实现不影响上层
+
+**残留风险**：MIT 的判断是**推断**而非声明。若将来该项目要商用分发，建议在 P2 前向 Xenova 仓提 issue 确认，或直接走选项 B。
 
 ### 12.6 依赖 License 白名单的实际补充项
 
@@ -704,8 +712,9 @@ fastembed = { version = "6.0.2", default-features = false, features = [
 
 ### 12.8 其他执行细节
 
-- **git 身份**：仓库此前无 `user.name` / `user.email`（全局也没有），已设置**仓库级**身份 `index-demo <index-demo@localhost>`。**建议你改成自己的**（`git config user.name "..."`）。
-- **首次提交**：`5850545`，38 个文件，含 `Cargo.lock`（已确认未被 `.gitignore` 忽略）。
+- **git 身份**：已设置为**全局** `GongYubo <gongyubo@gmail.com>`，并移除仓库级覆盖；两个已有提交的作者/提交者均已改写为该身份（历史重写，仓库无远端，无风险）。
+  - ⚠️ 写入 `~/.gitconfig` 时踩到坑：家目录带 ACL `group:everyone deny delete`，`git config --global` 的「创建锁文件 → rename 覆盖」流程会被拒（`unable to unlink ... Operation not permitted`）。**解决办法：直接编辑 `~/.gitconfig` 文件内容**（不走 rename），并把残留的 `.gitconfig.lock` 手动移走。
+- **提交**：`dd7589c`（P0 骨架，38 个文件，含 `Cargo.lock`）+ `eb03ccc`（文档回写）。`Cargo.lock` 已确认未被 `.gitignore` 忽略。
 - **未触发的兜底方案**：镜像（D2）、`HF_ENDPOINT`（R-P0-4）、cmake（R-P0-3）**全部没用上**——直连与预编译二进制都正常。
 - **`.gitignore` 行尾注释**：初次写入时把注释放到了规则行尾（`.gitignore` 不支持行尾注释），已修正为独立行。
 

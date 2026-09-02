@@ -174,7 +174,9 @@ unicode-normalization = "0.1"
 
    这样既移除 NCSA 许可项，又保留 `TextEmbedding::try_new` 所需的 `hf-hub` feature，且依赖树明显变小。
 
-2. **实际下载的模型仓是 `Xenova/bge-small-zh-v1.5`，不是 `Qdrant/...`**（本节表格此前写的是 Qdrant）。实测缓存内容：`onnx/model.onnx`（90 MB）+ tokenizer 等，共 96 MB。**该仓在 HuggingFace 上 `license` 字段为空**——上游 `BAAI` 为 MIT，但转换仓未声明。这是我留给使用方决策的一点（选项 A/B/C，见 `p0-design.md` 12.5）。
+2. **实际下载的模型仓是 `Xenova/bge-small-zh-v1.5`，不是 `Qdrant/...`**（本节表格此前写的是 Qdrant）。实测缓存内容：`onnx/model.onnx`（90 MB）+ tokenizer 等，共 96 MB。**该仓在 HuggingFace 上 `license` 字段为空**——上游 `BAAI` 为 MIT，但转换仓未声明。
+
+**已决策（2026-09-02）：采用选项 A，接受。** 理由：① 上游原始模型为 MIT；② Xenova 是公开的模型格式转换仓，非再训练产物；③ 替换成本高而收益不确定。残留风险已记入需求文档 8.3 P5，P2 实现 `Embedder` 时复核（选项 B/C 为回落路径）。
 
 3. **默认缓存目录在项目根**：fastembed 默认把模型下到 `./.fastembed_cache/`（96 MB）。务必加 `.gitignore`；实现 `Embedder` 时应显式 `InitOptions::with_cache_dir()` 指到仓库外。
 
@@ -361,7 +363,7 @@ unicode-normalization = "0.1"
 | ------------------------- | ----------- | ------------------------------------------- |
 | ONNX Runtime 二进制（随 ort 下载） | **MIT**   | Microsoft；`ort/load-dynamic` 可改为链接系统库以规避二进制分发问题 |
 | `BAAI/bge-small-zh-v1.5`  | **MIT**     | 上游原始模型（PyTorch / safetensors，无 ONNX）         |
-| `Xenova/bge-small-zh-v1.5` | **⚠️ HF 未声明** | **fastembed 实际下载的就是这个**（ONNX 90MB）。沿用上游 MIT 属推断，非声明。见 `p0-design.md` 12.5 |
+| `Xenova/bge-small-zh-v1.5` | **⚠️ HF 未声明 → 已决策接受** | **fastembed 实际下载的就是这个**（ONNX 90MB）。上游 `BAAI` 为 MIT，转换仓未声明，按"沿用上游 MIT"接受（选项 A，2026-09-02 确认）。残留风险记录于需求文档 8.3 P5，P2 复核 |
 | `BAAI/bge-m3`             | **MIT**     | 备选模型                                        |
 | `BAAI/bge-reranker-v2-m3` | **Apache-2.0** | v2 Rerank 用（FR-18 尚未接入）                 |
 | jieba 默认词典                | MIT（随 jieba-rs） | 若替换自定义词典需注意词典本身的授权                    |
