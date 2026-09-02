@@ -38,6 +38,9 @@ pub enum Error {
 
     #[error("分词错误: {0}")]
     Analyze(String),
+
+    #[error("分片不存在: {0}")]
+    ChunkNotFound(u32),
 }
 
 /// 统一结果类型

@@ -5,10 +5,12 @@
 //! 本模块**不知道索引的存在**。`embed_query` 与 `embed_documents` **必须分开**——
 //! BGE 查询侧需要 instruction 前缀，入库侧不能加（风险 R2）。
 
+mod cached;
 #[cfg(feature = "local-embed")]
 mod local;
 mod remote;
 
+pub use cached::CachedEmbedder;
 #[cfg(feature = "local-embed")]
 pub use local::LocalEmbedder;
 #[cfg(feature = "remote-embed")]

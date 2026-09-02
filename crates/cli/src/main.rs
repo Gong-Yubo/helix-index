@@ -1,20 +1,19 @@
 //! idx —— index-demo 的命令行工具。
 //!
-//! P1 阶段：`build` + `search --mode bm25`。
-//! 快照落盘是 P4（T4-01），故 `search` 目前通过 `--input` 重新读取语料重建索引；
-//! `--index` 在 P4 快照落地后启用。
+//! 已实现：`build`、`search --mode {bm25|vector|hybrid}`、`compare`。
+//! 快照落盘是 P4（T4-01），故 `search` 目前通过 `--input` 重新读取语料重建索引。
 
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
-use index_core::analyze::{Analyzer, MixedAnalyzer};
+use index_core::analyze::MixedAnalyzer;
 use index_core::chunk::Chunker;
 use index_core::document::Document;
 use index_core::embed::{Embedder, LocalEmbedder};
 use index_core::index::Index;
-use index_core::retriever::{Bm25Retriever, Retriever, VectorRetriever};
+use index_core::query::{EmptyReason, Hit, SearchMode, SearchResponse, Searcher};
 use index_core::vector::{BruteForceIndex, NormalizedVector, VectorIndex};
 
 #[derive(Parser)]
@@ -26,11 +25,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// 建索引（P1：内存索引，快照在 P4）
+    /// 建索引（内存索引，快照在 P4）
     Build(BuildArgs),
-    /// 检索（P1 支持 --mode bm25；vector/hybrid 在 P2/P3）
+    /// 检索（--mode bm25 / vector / hybrid）
     Search(SearchArgs),
-    /// 三种模式对比（P3 实现）
+    /// 三种模式同屏对比（调试主入口）
     Compare(CompareArgs),
     /// 效果评测（P5 实现）
     Bench(BenchArgs),
@@ -57,6 +56,9 @@ struct SearchArgs {
     /// 返回条数
     #[arg(short, long, default_value_t = 10)]
     k: usize,
+    /// 打印 explain 详情（匹配词 + 两路 rank/score）
+    #[arg(long)]
+    explain: bool,
     /// 查询文本
     query: String,
 }
@@ -87,8 +89,17 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Build(args) => build(args),
         Command::Search(args) => search(args),
-        Command::Compare(_) => bail!("compare 在 P3 实现"),
+        Command::Compare(args) => compare(args),
         Command::Bench(_) => bail!("bench 在 P5 实现"),
+    }
+}
+
+fn parse_mode(s: &str) -> Result<SearchMode> {
+    match s {
+        "bm25" => Ok(SearchMode::Bm25),
+        "vector" => Ok(SearchMode::Vector),
+        "hybrid" => Ok(SearchMode::Hybrid),
+        other => bail!("不支持的 --mode {other:?}（支持 bm25 / vector / hybrid）"),
     }
 }
 
@@ -121,7 +132,7 @@ fn load_corpus(path: &PathBuf) -> Result<(Index, MixedAnalyzer)> {
         let metadata = v.get("metadata").cloned().unwrap_or(serde_json::json!({}));
 
         let doc = Document {
-            doc_id: 0, // 由 Index 分配
+            doc_id: 0,
             source,
             metadata,
             content_hash: 0, // 幂等去重是 P4（T4-04）
@@ -135,6 +146,22 @@ fn load_corpus(path: &PathBuf) -> Result<(Index, MixedAnalyzer)> {
         bail!("语料为空: {}", path.display());
     }
     Ok((index, analyzer))
+}
+
+/// 把每个分片文本 embed 后建暴力向量索引。
+fn build_vector_index(index: &Index, embedder: &LocalEmbedder) -> Result<BruteForceIndex> {
+    let entries: Vec<(u32, String)> = index
+        .live_chunks()
+        .map(|c| (c.chunk_id, c.text.clone()))
+        .collect();
+    let texts: Vec<String> = entries.iter().map(|(_, t)| t.clone()).collect();
+    let vecs = embedder.embed_documents(&texts)?;
+
+    let mut vindex = BruteForceIndex::new();
+    for ((chunk_id, _), v) in entries.iter().zip(vecs.into_iter()) {
+        vindex.add(*chunk_id, NormalizedVector::new(v))?;
+    }
+    Ok(vindex)
 }
 
 fn build(args: BuildArgs) -> Result<()> {
@@ -153,88 +180,99 @@ fn build(args: BuildArgs) -> Result<()> {
 }
 
 fn search(args: SearchArgs) -> Result<()> {
-    match args.mode.as_str() {
-        "bm25" => search_bm25(&args),
-        "vector" => search_vector(&args),
-        other => bail!("不支持的 --mode {other:?}（P2 支持 bm25 / vector）"),
-    }
-}
-
-fn search_bm25(args: &SearchArgs) -> Result<()> {
+    let mode = parse_mode(&args.mode)?;
     let (index, analyzer) = load_corpus(&args.input)?;
-    let retriever = Bm25Retriever::new(&index, &analyzer);
-    let hits = retriever.search(&args.query, args.k)?;
 
-    if hits.is_empty() {
-        println!("无结果");
-        return Ok(());
+    // 延迟初始化，让 embedder / vindex 的生命周期覆盖到 search
+    let embedder;
+    let vindex;
+    let mut searcher = Searcher::new(&index, &analyzer);
+    if mode != SearchMode::Bm25 {
+        embedder = LocalEmbedder::new()?;
+        vindex = build_vector_index(&index, &embedder)?;
+        searcher = searcher.with_vector(&embedder, &vindex);
     }
 
-    println!("查询: {}\n", args.query);
-    for (rank, h) in hits.iter().enumerate() {
-        let chunk = index.chunk(h.chunk_id).expect("命中分片应存活");
-        let doc = index.doc(chunk.doc_id).expect("命中文档应存活");
-        // 匹配词：query 分词中真正命中该分片的词
-        let q_tokens = analyzer.analyze_query(&args.query);
-        let mut matched: Vec<String> = q_tokens
-            .iter()
-            .filter(|t| {
-                index.doc_freq(t.term.as_str()) > 0
-                    && analyzer
-                        .analyze_doc(&chunk.text)
-                        .iter()
-                        .any(|c| c.term == t.term)
-            })
-            .map(|t| t.term.to_string())
-            .collect();
-        matched.sort();
-        matched.dedup();
-
-        let snippet: String = chunk.text.chars().take(60).collect();
-        println!("#{:<2} score={:.4}  [{}]", rank + 1, h.score, doc.source);
-        println!("    匹配词: {}", matched.join(", "));
-        println!("    {}", snippet);
-    }
+    let resp = searcher.search(&args.query, mode, args.k)?;
+    print_response(&resp, &args.query, args.explain);
     Ok(())
 }
 
-fn search_vector(args: &SearchArgs) -> Result<()> {
-    let (index, _) = load_corpus(&args.input)?;
-
-    // 建向量索引：把每个分片文本 embed 后存入暴力索引（P2 规模，见 p2-design.md D3）
+fn compare(args: CompareArgs) -> Result<()> {
+    let (index, analyzer) = load_corpus(&args.input)?;
     let embedder = LocalEmbedder::new()?;
-    let entries: Vec<(u32, String)> = index
-        .live_chunks()
-        .map(|c| (c.chunk_id, c.text.clone()))
-        .collect();
-    let texts: Vec<String> = entries.iter().map(|(_, t)| t.clone()).collect();
-    let vecs = embedder.embed_documents(&texts)?;
-
-    let mut vindex = BruteForceIndex::new();
-    for ((chunk_id, _), v) in entries.iter().zip(vecs.into_iter()) {
-        vindex.add(*chunk_id, NormalizedVector::new(v))?;
-    }
-
-    let retriever = VectorRetriever::new(&embedder, &vindex);
-    let hits = retriever.search(&args.query, args.k)?;
-
-    if hits.is_empty() {
-        println!("无结果");
-        return Ok(());
-    }
+    let vindex = build_vector_index(&index, &embedder)?;
+    let searcher = Searcher::new(&index, &analyzer).with_vector(&embedder, &vindex);
 
     println!("查询: {}\n", args.query);
-    for (rank, h) in hits.iter().enumerate() {
-        let chunk = index.chunk(h.chunk_id).expect("命中分片应存活");
-        let doc = index.doc(chunk.doc_id).expect("命中文档应存活");
-        let snippet: String = chunk.text.chars().take(60).collect();
-        println!(
-            "#{:<2} similarity={:.4}  [{}]",
-            rank + 1,
-            h.score,
-            doc.source
-        );
-        println!("    {}", snippet);
-    }
+    println!("=== BM25 ===");
+    print_hits(&searcher.search(&args.query, SearchMode::Bm25, args.k)?.hits);
+    println!("\n=== Vector ===");
+    print_hits(
+        &searcher
+            .search(&args.query, SearchMode::Vector, args.k)?
+            .hits,
+    );
+    println!("\n=== Hybrid (RRF) ===");
+    print_hits(
+        &searcher
+            .search(&args.query, SearchMode::Hybrid, args.k)?
+            .hits,
+    );
     Ok(())
+}
+
+fn print_response(resp: &SearchResponse, query: &str, explain: bool) {
+    println!("查询: {}\n", query);
+    if let Some(reason) = resp.empty_reason {
+        println!("无结果（{}）", empty_reason_text(reason));
+        return;
+    }
+    for (rank, hit) in resp.hits.iter().enumerate() {
+        print_hit(rank, hit, explain);
+    }
+}
+
+fn print_hits(hits: &[Hit]) {
+    for (rank, hit) in hits.iter().enumerate() {
+        print_hit(rank, hit, false);
+    }
+}
+
+fn print_hit(rank: usize, hit: &Hit, explain: bool) {
+    let snippet: String = hit.text.chars().take(60).collect();
+    println!("#{:<2} score={:.4}  [{}]", rank + 1, hit.score, hit.source);
+    println!("    {}", snippet);
+    if explain {
+        let e = &hit.explain;
+        println!(
+            "    └─ 匹配词: {} | bm25(rank={},score={}) vector(rank={},score={})",
+            if e.matched_terms.is_empty() {
+                "-".to_string()
+            } else {
+                e.matched_terms.join(",")
+            },
+            opt_fmt(e.bm25_rank),
+            opt_score(e.bm25_score),
+            opt_fmt(e.vector_rank),
+            opt_score(e.vector_score),
+        );
+    }
+}
+
+fn opt_fmt(v: Option<u32>) -> String {
+    v.map(|x| x.to_string()).unwrap_or_else(|| "-".to_string())
+}
+
+fn opt_score(v: Option<f32>) -> String {
+    v.map(|x| format!("{x:.4}"))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn empty_reason_text(r: EmptyReason) -> &'static str {
+    match r {
+        EmptyReason::NoDocuments => "索引为空",
+        EmptyReason::AllTermsUnmatched => "查询词全部未命中（可能含幻觉词）",
+        EmptyReason::FilteredOut => "候选被过滤条件全部排除",
+    }
 }
