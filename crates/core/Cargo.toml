@@ -1,0 +1,48 @@
+[package]
+name        = "index-core"
+description = "面向 Agent 场景的通用检索引擎内核"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+
+[features]
+default      = ["local-embed"]
+local-embed  = ["dep:fastembed"]
+remote-embed = []            # P2 引入 dep:reqwest
+positions    = []            # posting 存储位置信息
+
+[dependencies]
+# 工程基础
+serde.workspace      = true
+serde_json.workspace = true
+thiserror.workspace  = true
+rayon.workspace      = true
+tracing.workspace    = true
+smol_str.workspace   = true
+
+# 文本处理
+jieba-rs.workspace              = true
+unicode-segmentation.workspace  = true
+unicode-normalization.workspace = true
+
+# 检索内核
+instant-distance.workspace = true
+bincode.workspace          = true
+crc32fast.workspace        = true
+moka.workspace             = true
+
+# 可选：本地 embedding（P2 启用）
+fastembed = { workspace = true, optional = true }
+
+[dev-dependencies]
+# ADR-007：仅作为 BM25 正确性对照基线，不参与构建产物
+tantivy  = "0.26"
+criterion = "0.8"
+proptest  = "1"
+tempfile  = "3"
+anyhow.workspace = true
+
+[[example]]
+name = "embed_smoke"
+required-features = ["local-embed"]

@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/cli"]
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2021"
+rust-version = "1.90"
+license      = "MIT OR Apache-2.0"
+authors      = ["index-demo contributors"]
+
+[workspace.dependencies]
+# ---- 工程基础 ----
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+thiserror   = "2"
+anyhow      = "1"
+rayon       = "1"
+tracing     = "0.1"
+smol_str    = "0.3"
+
+# ---- 文本处理 ----
+jieba-rs               = "0.10"
+unicode-segmentation   = "1.13"
+unicode-normalization  = "0.1"
+
+# ---- 检索内核 ----
+instant-distance = { version = "0.6.1", features = ["with-serde"] }
+# ⚠️ 精确锁定传递依赖 ort =2.0.0-rc.13（预发布），Cargo.lock 必须入库
+# 关闭 default features 以移除 `image-models`（我们只用文本模型）：
+# 它带来的 image → ravif → rav1e → libfuzzer-sys 链是 NCSA 许可，且白白增加编译时间。
+# 仅保留 ONNX 运行时下载与 HF Hub 下载所需的两个 TLS feature。
+fastembed        = { version = "6.0.2", default-features = false, features = [
+    "ort-download-binaries-native-tls",
+    "hf-hub-native-tls",
+] }
+# ⚠️ 不要用 "3.0.0"：crates.io 上的 bincode 3.0.0 是占位/玩笑发布
+#    （源码仅一行 compile_error!("https://xkcd.com/2347/")），实际稳定线为 2.0.1
+bincode          = "2.0.1"
+crc32fast        = "1.5"
+# moka 必须显式启用 sync 或 future，否则编译期直接 compile_error!
+moka             = { version = "0.12", features = ["sync"] }
+
+# ---- CLI ----
+clap = { version = "4.6", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"

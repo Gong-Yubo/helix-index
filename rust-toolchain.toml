@@ -1,0 +1,6 @@
+[toolchain]
+# NFR-08：MSRV 1.90+。pin 死版本以保证任何人 checkout 后使用同一工具链。
+# 升级需同步修改需求文档 NFR-08 与架构文档 ADR-008。
+channel = "1.90.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

@@ -1,0 +1,31 @@
+# ---- Rust 构建产物 ----
+/target
+**/*.rs.bk
+*.pdb
+
+# ---- Cargo.lock 必须入库 ----
+# fastembed 精确锁定 ort =2.0.0-rc.13（预发布），
+# 不锁定则不同时间构建会拉到不同的依赖树（风险 R9）。
+# 下面这行**不要**取消注释：
+# Cargo.lock
+
+# ---- fastembed 模型缓存 ----
+# ⚠️ fastembed 默认把模型下到**项目根**的 .fastedge_cache（96MB），必须忽略。
+# P2（T2-02）应通过 InitOptions::with_cache_dir() 显式指定仓库外的目录。
+# 注意拼写：是 fastembed，不是 fastedge
+.fastembed_cache/
+
+# ---- 索引产物与运行数据 ----
+*.idx
+*.idx.tmp
+
+# ---- 语料与评测数据（大文件，P5 单独管理）----
+/data/*.jsonl
+/data/*.json
+!data/.gitkeep
+
+# ---- 编辑器与系统 ----
+.DS_Store
+.idea/
+.vscode/
+*.swp

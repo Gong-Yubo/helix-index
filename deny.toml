@@ -1,0 +1,49 @@
+# cargo-deny 配置 —— ADR-008 / NFR-09
+# 运行：make deny
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+ignore = []
+
+[licenses]
+version = 2
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "BSL-1.0",             # xxhash-rust 等
+  "CC0-1.0",
+  "Zlib",
+  # CDLA-Permissive-2.0 来自 webpki-roots（经 ureq → hf-hub / ort-sys）。
+  # 该许可为宽松许可（数据许可协议 permissive 版），不含 copyleft 义务。
+  "CDLA-Permissive-2.0",
+  # icu_* 系列（经 url / idna 引入）使用 Unicode 许可，均为宽松许可
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  # MPL-2.0 为**弱 copyleft（文件级）**：来自 option-ext ← dirs-sys ← dirs（fastembed 定位缓存目录用）。
+  # 仅作为依赖使用不会波及本项目；只有修改 MPL 文件本身才需公开该文件。
+  # 与 GPL/LGPL/AGPL（强 copyleft，NFR-09 一票否决）有本质区别，故允许，但在此明确记录。
+  "MPL-2.0",
+]
+confidence-threshold = 0.8
+exceptions = []
+# 白名单里保留若干"当前未命中"的宽松许可（CC0 / Unicode-DFS-2016 等），
+# 避免未来新增依赖时反复调配置；对未命中项不告警。
+unused-allowed-license = "allow"
+
+[bans]
+# 传递依赖难免出现同一 crate 的多个版本，先放行；大版本冲突另行处理
+multiple-versions = "allow"
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
