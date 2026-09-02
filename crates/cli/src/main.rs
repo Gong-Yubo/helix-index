@@ -12,8 +12,10 @@ use clap::{Parser, Subcommand};
 use index_core::analyze::{Analyzer, MixedAnalyzer};
 use index_core::chunk::Chunker;
 use index_core::document::Document;
+use index_core::embed::{Embedder, LocalEmbedder};
 use index_core::index::Index;
-use index_core::retriever::{Bm25Retriever, Retriever};
+use index_core::retriever::{Bm25Retriever, Retriever, VectorRetriever};
+use index_core::vector::{BruteForceIndex, NormalizedVector, VectorIndex};
 
 #[derive(Parser)]
 #[command(name = "idx", version, about = "index-demo 检索内核命令行工具")]
@@ -151,9 +153,14 @@ fn build(args: BuildArgs) -> Result<()> {
 }
 
 fn search(args: SearchArgs) -> Result<()> {
-    if args.mode != "bm25" {
-        bail!("P1 仅支持 --mode bm25（收到: {}）", args.mode);
+    match args.mode.as_str() {
+        "bm25" => search_bm25(&args),
+        "vector" => search_vector(&args),
+        other => bail!("不支持的 --mode {other:?}（P2 支持 bm25 / vector）"),
     }
+}
+
+fn search_bm25(args: &SearchArgs) -> Result<()> {
     let (index, analyzer) = load_corpus(&args.input)?;
     let retriever = Bm25Retriever::new(&index, &analyzer);
     let hits = retriever.search(&args.query, args.k)?;
@@ -186,6 +193,47 @@ fn search(args: SearchArgs) -> Result<()> {
         let snippet: String = chunk.text.chars().take(60).collect();
         println!("#{:<2} score={:.4}  [{}]", rank + 1, h.score, doc.source);
         println!("    匹配词: {}", matched.join(", "));
+        println!("    {}", snippet);
+    }
+    Ok(())
+}
+
+fn search_vector(args: &SearchArgs) -> Result<()> {
+    let (index, _) = load_corpus(&args.input)?;
+
+    // 建向量索引：把每个分片文本 embed 后存入暴力索引（P2 规模，见 p2-design.md D3）
+    let embedder = LocalEmbedder::new()?;
+    let entries: Vec<(u32, String)> = index
+        .live_chunks()
+        .map(|c| (c.chunk_id, c.text.clone()))
+        .collect();
+    let texts: Vec<String> = entries.iter().map(|(_, t)| t.clone()).collect();
+    let vecs = embedder.embed_documents(&texts)?;
+
+    let mut vindex = BruteForceIndex::new();
+    for ((chunk_id, _), v) in entries.iter().zip(vecs.into_iter()) {
+        vindex.add(*chunk_id, NormalizedVector::new(v))?;
+    }
+
+    let retriever = VectorRetriever::new(&embedder, &vindex);
+    let hits = retriever.search(&args.query, args.k)?;
+
+    if hits.is_empty() {
+        println!("无结果");
+        return Ok(());
+    }
+
+    println!("查询: {}\n", args.query);
+    for (rank, h) in hits.iter().enumerate() {
+        let chunk = index.chunk(h.chunk_id).expect("命中分片应存活");
+        let doc = index.doc(chunk.doc_id).expect("命中文档应存活");
+        let snippet: String = chunk.text.chars().take(60).collect();
+        println!(
+            "#{:<2} similarity={:.4}  [{}]",
+            rank + 1,
+            h.score,
+            doc.source
+        );
         println!("    {}", snippet);
     }
     Ok(())

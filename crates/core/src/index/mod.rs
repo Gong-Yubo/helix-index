@@ -41,7 +41,7 @@ impl Index {
         Self::default()
     }
 
-    /// 摄入一个文档及其分片。
+    /// 摄入一个文档及其分片，返回 `(doc_id, chunk_ids)`。
     ///
     /// - 幂等去重（content_hash）是 **P4 / T4-04** 的职责，此处不做
     /// - 每个分片独立分词、独立维护 postings 与统计量
@@ -50,8 +50,9 @@ impl Index {
         doc: Document,
         chunks: Vec<Chunk>,
         analyzer: &dyn Analyzer,
-    ) -> Result<()> {
+    ) -> Result<(DocId, Vec<ChunkId>)> {
         let doc_id = self.forward.insert_doc(doc);
+        let mut chunk_ids = Vec::with_capacity(chunks.len());
 
         for mut chunk in chunks {
             chunk.doc_id = doc_id;
@@ -76,9 +77,10 @@ impl Index {
             self.chunk_lens.push(tokens.len() as u32);
             self.stats.total_len += tokens.len() as u64;
             self.stats.num_chunks += 1;
+            chunk_ids.push(chunk_id);
         }
 
-        Ok(())
+        Ok((doc_id, chunk_ids))
     }
 
     /// 删除一个文档（及其全部分片），含统计量回滚。

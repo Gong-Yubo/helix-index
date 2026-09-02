@@ -9,7 +9,9 @@
 | 文档                                        | 内容                | 读者            |
 | ----------------------------------------- | ----------------- | ------------- |
 | [`devel/plan.md`](./devel/plan.md)（开发计划） | **P0~P6 任务级清单、阶段门槛、进度追踪** | 实现者（想直接开工先看这个） |
-| [`devel/p0-design.md`](./devel/p0-design.md)（P0 设计说明） | **P0 的详细设计**：本机环境实测、配置文件全文、风险兜底、验收命令、待确认决策点 | 实现者（执行 P0 前必读，当前**待确认**） |
+| [`devel/p0-design.md`](./devel/p0-design.md)（P0 设计说明） | **P0 详细设计**：本机环境实测、配置文件全文、风险兜底、执行记录 | 实现者（P0 已完成） |
+| [`devel/p1-design.md`](./devel/p1-design.md)（P1 设计说明） | **P1 详细设计**：tantivy 源码核对、BM25 手算值、执行记录 | 实现者（P1 已完成） |
+| [`devel/p2-design.md`](./devel/p2-design.md)（P2 设计说明） | **P2 详细设计**：fastembed / instant-distance 源码核对、BGE 前缀、距离换算、决策点 | 实现者（执行 P2 前必读，当前**待确认**） |
 | [`devel/requirements-spec.md`](./devel/requirements-spec.md)（需求分析说明书）     | 做什么 / 为什么 / 怎么验收  | 决策者、场景层接入方、实现者 |
 | [`devel/architecture-design.md`](./devel/architecture-design.md)（架构设计说明书） | 怎么做 / 为什么这么做      | 实现者、代码评审者     |
 | [`devel/thirdparty.md`](./devel/thirdparty.md)（第三方库调研） | 哪些能力用现成库、哪些自研，含 License 与 MSRV 核查 | 实现者、评审者     |

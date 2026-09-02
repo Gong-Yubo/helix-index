@@ -46,5 +46,8 @@
 - `fastembed` 6.0.2 精确锁定 `ort =2.0.0-rc.13`（预发布，5.x/6.x 相同）；**必须 `default-features = false`**（否则引入 NCSA 的 image 链）；默认把模型下到项目根 `.fastembed_cache/`（已 gitignore）
 - 序列化用 **bincode 2.0.1**；**3.0.0 是玩笑发布**（源码仅 `compile_error!`）——**crates.io 的 max_version 不等于可用版本，调研依赖必须验证能编译**
 - 中文 embedding 枚举变体是 `EmbeddingModel::BGESmallZHV15`（非 `BGESmallZH`）；实际下载仓为 `Xenova/bge-small-zh-v1.5`（HF 未声明 License，**已决策接受**，沿用上游 MIT；P2 复核）
+- **fastembed 6.0.2 不自动加 BGE 查询 instruction 前缀**（全库无 query_embed）→ `embed_query` 必须自己加 `为这个句子生成表示以用于检索相关文章：`，入库侧不加（R2 是真的）；`get_model_info` 是**关联函数**不是实例方法
+- **fastembed 输出已 L2 归一化**（`output.rs:49` `.map(normalize)`）；`NormalizedVector::new` 仍幂等再归一化（双保险）
+- instant-distance HNSW **无增量 insert**（主索引 + delta）；**debug 模式构建极慢**（2000 条 102s）→ 万条重合率测试必须 `--release` 且 `#[ignore]`；`Search::default()` 即可（search 内部自设 ef）；`ef_construction=300 / ef_search=200`（万条重合率 0.97）
 - git 身份：全局 `GongYubo <gongyubo@gmail.com>`。⚠️ 家目录有 ACL `group:everyone deny delete`，`git config --global` 会失败，**改 ~/.gitconfig 必须直接编辑文件内容**（不能用 git config 写）
 - P4 先用 `hnsw_rs`（纯 Rust + 原生增量 insert）与「instant-distance + delta」A/B，达标则删掉 delta 区

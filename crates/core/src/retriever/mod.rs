@@ -6,8 +6,10 @@
 //! 每路只依赖 `index` / `analyze`（BM25 路）或 `vector` / `embed`（向量路）。
 
 mod bm25;
+mod vector;
 
 pub use bm25::{Bm25Params, Bm25Retriever};
+pub use vector::VectorRetriever;
 
 use crate::error::Result;
 use crate::types::{ChunkId, Score};

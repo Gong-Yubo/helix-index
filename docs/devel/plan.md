@@ -167,6 +167,8 @@ cargo run -p idx -- search --index /tmp/index.idx --mode bm25 -k 5 "BM25 参数�
 
 ## 7. P2 向量链路
 
+> **详细设计见 `docs/devel/p2-design.md`**（含 fastembed / instant-distance 源码核对、BGE 前缀决策、距离换算、决策点）。本章只保留任务纲要。
+
 **目标**：打通 embedding → 归一化 → HNSW → 向量召回，使同义改写可被召回。
 
 **阶段门槛**：向量路能召回字面完全不匹配但语义相关的结果；`cos = 1 − d²/2` 换算误差 < 1e-5。
@@ -345,16 +347,16 @@ make fmt && make lint && make test
 | P1 | T1-13 Retriever 抽象      | ✅  |
 | P1 | T1-14 CLI 最小版 + 语料启动     | ✅  |
 | P1 | T1-15 **BM25 与 tantivy 对照测试** | ✅  |
-| P2 | T2-01 Embedder 抽象        | ⬜  |
-| P2 | T2-02 本地 Embedder        | ⬜  |
-| P2 | T2-03 Feature flags     | ⬜  |
-| P2 | T2-04 向量类型与距离对齐          | ⬜  |
-| P2 | T2-05 VectorIndex 抽象    | ⬜  |
-| P2 | T2-06 向量 Retriever      | ⬜  |
-| P2 | T2-07 批量摄入并行            | ⬜  |
-| P2 | T2-08 远程 Embedder        | ⬜  |
-| P2 | T2-09 CLI 向量模式           | ⬜  |
-| P2 | T2-10 两路隔离自查            | ⬜  |
+| P2 | T2-01 Embedder 抽象        | ✅  |
+| P2 | T2-02 本地 Embedder        | ✅  |
+| P2 | T2-03 Feature flags     | ✅  |
+| P2 | T2-04 向量类型与距离对齐          | ✅  |
+| P2 | T2-05 VectorIndex 抽象    | ✅  |
+| P2 | T2-06 向量 Retriever      | ✅  |
+| P2 | T2-07 批量摄入并行            | ✅  |
+| P2 | T2-08 远程 Embedder        | ✅  |
+| P2 | T2-09 CLI 向量模式           | ✅  |
+| P2 | T2-10 两路隔离自查            | ✅  |
 | P3 | T3-01 融合抽象与 RRF          | ⬜  |
 | P3 | T3-02 加权归一               | ⬜  |
 | P3 | T3-03 Searcher 编排        | ⬜  |
@@ -386,7 +388,7 @@ make fmt && make lint && make test
 | P5 | T5-08 数据诚信               | ⬜  |
 | P5 | T5-09 分词方案对照（charabia）  | ⬜  |
 
-**当前阶段**：**P1 已完成**（2026-09-02），下一步 P2（向量链路）
+**当前阶段**：**P2 已完成**（2026-09-02），下一步 P3（融合、编排与可解释性）
 
 **P0 实测基线**：工具链 1.90.0 / lockfile 414 包 / 轻依赖编译 7.3s / fastembed+ort 42.5s / 全量含 tantivy 24.2s / 模型下载 49.0s / **单条推理 1.58ms（debug）** —— 详见 `p0-design.md` 附录 A。
 
