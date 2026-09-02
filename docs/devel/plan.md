@@ -6,7 +6,7 @@
 | ----- | --------------------------------------------------------- |
 | 版本    | v1.1                                                      |
 | 创建日期  | 2026-09-02                                                |
-| 状态    | 待执行（P0 阻塞中：Rust 工具链未安装）                                   |
+| 状态    | **P0 已完成**（提交 `5850545`）；当前阶段 P1                          |
 | v1.1 变更 | 依据 `docs/devel/thirdparty.md` 调研结论回写：新增 T1-15（tantivy 对照）、T4-06a（向量索引 A/B）、T5-09（分词对照）；T0-03/T0-06 增加 MSRV 1.90 与 `cargo-deny`；T1-04 引入 `unicode-segmentation`/`unicode-normalization`；T3-07 缓存改 `moka`；T4-01 改 `bincode 3.0.0`；附录 B 依赖清单同步至实测版本 |
 | 上游文档  | `docs/devel/requirements-spec.md`（需求）、`docs/devel/architecture-design.md`（架构） |
 | 阶段划分  | P0 → P5 为第一版；P6 为 v2                                      |
@@ -31,9 +31,9 @@
 
 | 项          | 状态                                                | 阻塞      | 解决动作（P0 内） |
 | ---------- | ------------------------------------------------- | ------- | ---------- |
-| Rust 工具链   | ❌ 未安装（`rustc`/`cargo`/`rustup` 均不存在，`~/.cargo` 不存在） | **全部编码** | T0-01      |
+| Rust 工具链   | ✅ 已安装（stable 1.98.0；项目 pin 1.90.0）。原"未安装"为误判，见 `p0-design.md` 12.1 | 无 | T0-01      |
 | crates.io  | ⚠️ 国内访问可能慢                                        | P0      | T0-02 配镜像  |
-| ONNX 模型下载  | ⚠️ fastembed 首次运行从 HuggingFace 拉取，国内可能失败          | P2      | **T0-05 提前验证**（最大未知项，不能拖到 P2 才发现） |
+| ONNX 模型下载  | ✅ **P0 已验证通过**：`Xenova/bge-small-zh-v1.5` 96MB，直连 49s | 无      | T0-05 已完成。⚠️ 该仓 HF 未声明 License，见需求文档 8.3 P5 |
 | 示例中文语料     | ❌ 待准备                                             | P5      | T1-14 起并行准备 |
 | 评测集标注      | ❌ 待准备                                             | P5      | T5-02      |
 | 仓库         | ❌ 无 git                                           | —       | T0-03 顺带初始化 |
@@ -230,7 +230,7 @@ cargo run -p idx -- search --index /tmp/index.idx --mode hybrid --explain "..."
 
 | ID    | 任务           | 产出文件                        | 要点                                                                                                | 验收                       |
 | ----- | ------------ | --------------------------- | ------------------------------------------------------------------------------------------------- | ------------------------ |
-| T4-01 | 快照编解码         | `storage/codec.rs`          | Header：`magic "IDX1"` + `format_version: u32` + `crc32: u32`；正文用 **`bincode 3.0.0`**（原"对齐 instant-distance 内部 bincode"的说法有误，其 `with-serde` 只含 serde，版本无外部约束） | 手写字节流解析单测               |
+| T4-01 | 快照编解码         | `storage/codec.rs`          | Header：`magic "IDX1"` + `format_version: u32` + `crc32: u32`；正文用 **`bincode 2.0.1`**（原"对齐 instant-distance 内部 bincode"的说法有误，其 `with-serde` 只含 serde；且 **3.0.0 是玩笑发布**，不可用） | 手写字节流解析单测               |
 | T4-02 | Section 读写   | `storage/snapshot.rs`       | `term_dict / postings / forward / stats / vectors` 五个 section，vectors 可选                            | save/load 跑通             |
 | T4-03 | 版本与校验         | `storage/snapshot.rs`       | 版本不匹配 → `SnapshotVersionMismatch`；CRC 失败 → `SnapshotCorrupted`；**绝不静默读错**                         | 单测：造损坏文件触发两个错误          |
 | T4-04 | 幂等 upsert    | `index/mod.rs`              | 按 `content_hash` 去重（FR-15）；重复 upsert 不产生重复 chunk                                                   | 单测：upsert 两次 chunk 数不翻倍 |
@@ -384,7 +384,9 @@ make fmt && make lint && make test
 | P5 | T5-08 数据诚信               | ⬜  |
 | P5 | T5-09 分词方案对照（charabia）  | ⬜  |
 
-**当前阶段**：P0（阻塞：Rust 工具链未安装）
+**当前阶段**：**P0 已完成**（2026-09-02，提交 `5850545`），下一步 P1（BM25 链路）
+
+**P0 实测基线**：工具链 1.90.0 / lockfile 414 包 / 轻依赖编译 7.3s / fastembed+ort 42.5s / 全量含 tantivy 24.2s / 模型下载 49.0s / **单条推理 1.58ms（debug）** —— 详见 `p0-design.md` 附录 A。
 
 ---
 
@@ -426,18 +428,18 @@ cargo build --features positions
 | --------------------------- | -------- | ----------------- | ---------------------------------------------------- |
 | `instant-distance`          | 0.6.1    | HNSW 向量索引         | `with-serde`；**无增量插入 API**（R1）。**P4 与 `hnsw_rs` A/B** |
 | `hnsw_rs`                   | 0.3.4    | 向量索引 A/B 候选（T4-06a） | 纯 Rust、原生增量 `insert`、`search_filter`、`DistDot` 要求入库前归一化 |
-| `fastembed`                 | 6.0.2    | 本地 embedding      | Apache-2.0；⚠️ 传递依赖 `ort =2.0.0-rc.13`（预发布），`Cargo.lock` 必须入库 |
+| `fastembed`                 | 6.0.2    | 本地 embedding      | Apache-2.0；⚠️ ① 传递依赖 `ort =2.0.0-rc.13`（预发布），`Cargo.lock` 必须入库；② 必须 `default-features = false` + 两个 TLS feature，否则引入 NCSA 许可的图像处理链；③ 默认把模型下到项目根 `.fastembed_cache/`（已 gitignore，P2 应改 `with_cache_dir`） |
 | `jieba-rs`                  | 0.10.3   | 中文分词              | MIT                                                  |
 | `unicode-segmentation`      | 1.13.3   | 中英分段              | 不手写 Unicode 边界判断                                     |
 | `unicode-normalization`     | 0.1.25   | 文本 NFC 归一化        | 保证索引侧与查询侧一致                                          |
 | `rayon`                     | 1.12     | 并行                | 两路召回并行、批量摄入并行                                        |
-| `bincode`                   | 3.0.0    | 快照序列化             | 版本无外部约束；P4 末与 `rkyv` 实测对比                            |
+| `bincode`                   | **2.0.1** | 快照序列化             | ⚠️ **不可用 3.0.0**（玩笑发布，源码仅一行 `compile_error!`）；P4 末与 `rkyv` 实测对比 |
 | `serde` / `serde_json`      | 1.0      | 序列化 / 元数据         |                                                      |
 | `smol_str`                  | 0.3.6    | term 字符串          | MSRV 1.89                                            |
 | `thiserror` / `anyhow`      | 2.0 / 1.0 | 错误类型（库 / CLI）     |                                                      |
 | `clap`                      | 4.6      | CLI 解析            | MSRV 1.85                                            |
 | `tracing` + `tracing-subscriber` | 0.1 / 0.3 | 可观测性（NFR-07）  |                                                      |
-| **`moka`**                  | 0.12.16  | query embedding 缓存 | **替代 `lru`**：并发安全 + TTL，`lru` 需套 `Mutex` 会抵消并行收益     |
+| **`moka`**                  | 0.12.16  | query embedding 缓存 | **替代 `lru`**：并发安全 + TTL；必须启用 `sync` feature，否则 `compile_error!` |
 | `crc32fast`                 | 1.5.1    | 快照校验              |                                                      |
 | `tantivy`（dev）              | 0.26.1   | **BM25 正确性对照基线**  | 仅 dev，不参与构建产物（ADR-007）                               |
 | `criterion`（dev）            | 0.8.2    | 基准测试              |                                                      |

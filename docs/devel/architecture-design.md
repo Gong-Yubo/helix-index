@@ -682,14 +682,14 @@ search: took=8.2ms bm25=1.4ms(vector=6.1ms parallel) candidates=187 fused=50 too
 | -------------- | ---------------------- | --------- | ------------------ | ---------------------------------------------------------------------- |
 | 语言             | Rust                   | **1.90+** / 2021 edition | —        | MSRV 由依赖决定（bincode 1.85 / clap 1.85 / smol_str 1.89），见 ADR-008           |
 | 向量索引           | `instant-distance`     | 0.6.1     | MIT OR Apache-2.0  | 纯 Rust HNSW、rayon 并行构建、`with-serde` 支持序列化。**P4 与 `hnsw_rs` A/B 复核**（见 7.5、ADR-002） |
-| 本地 embedding   | `fastembed`            | **6.0.2** | Apache-2.0         | 基于 ort(ONNX Runtime)、同步无 tokio 依赖、原生支持 `bge-small-zh-v1.5`。⚠️ 传递依赖 `ort =2.0.0-rc.13` 为预发布，`Cargo.lock` 必须入库 |
+| 本地 embedding   | `fastembed`            | **6.0.2** | Apache-2.0         | 基于 ort(ONNX Runtime)、同步无 tokio 依赖。⚠️ ① 传递依赖 `ort =2.0.0-rc.13` 为预发布，`Cargo.lock` 必须入库；② **必须 `default-features = false`**，否则默认 feature 会带来 `image → rav1e → libfuzzer-sys`（NCSA 许可）；③ 实际下载的模型仓为 `Xenova/bge-small-zh-v1.5`（**HF 未声明 License**，见 thirdparty.md 5.2） |
 | 中文分词           | `jieba-rs`             | 0.10.3    | MIT                | 生态成熟、词典可定制                                                             |
 | 中英分段           | `unicode-segmentation` | 1.13.3    | MIT OR Apache-2.0  | 不手写 Unicode 边界判断                                                       |
 | 文本归一化          | `unicode-normalization` | 0.1.25   | MIT OR Apache-2.0  | NFC 归一化，保证索引侧与查询侧一致                                                    |
 | 并行             | `rayon`                | 1.12      | MIT OR Apache-2.0  | 两路召回并行、批量 embedding                                                    |
-| 序列化            | `bincode`              | **3.0.0** | MIT                | 主流、够快；**版本无外部约束**（初版"与 instant-distance 对齐"的说法有误，已修正）。P4 与 `rkyv` A/B |
+| 序列化            | `bincode`              | **2.0.1** | MIT                | 主流、够快。**⚠️ 不可用 3.0.0**：crates.io 上的 3.0.0 是玩笑发布（源码仅 `compile_error!("https://xkcd.com/2347/")`）。版本无外部约束（`instant-distance` 的 `with-serde` 只含 serde）。P4 与 `rkyv` A/B |
 | 小字符串           | `smol_str`             | 0.3.6     | MIT OR Apache-2.0  | Term 存储的 inline 优化，减少堆分配                                               |
-| 缓存             | **`moka`**             | 0.12.16   | (MIT OR Apache-2.0) AND Apache-2.0 | **并发安全 + TTL**；替代原计划的 `lru`（非并发安全，需套 `Mutex`，会抵消两路并行收益） |
+| 缓存             | **`moka`**             | 0.12.16   | (MIT OR Apache-2.0) AND Apache-2.0 | **并发安全 + TTL**；替代原计划的 `lru`（非并发安全，需套 `Mutex`，会抵消两路并行收益）。⚠️ 必须显式启用 `sync` 或 `future` feature，否则 `compile_error!` |
 | CLI            | `clap`                 | 4.6       | MIT OR Apache-2.0  | derive API                                                             |
 | 错误处理           | `thiserror` / `anyhow` | 2.0 / 1.0 | MIT OR Apache-2.0  | 库侧 / CLI 侧                                                             |
 | 日志             | `tracing`（+ subscriber） | 0.1 / 0.3 | MIT             | 可观测性（NFR-07）                                                           |
@@ -775,7 +775,7 @@ positions     = []                        # posting 存储位置信息
 - **背景**：需要快照 save/load（FR-16），且需求文档 8.1 明确不引入嵌入式 KV。
 - **决策**：平时全内存，save/load 到自定义二进制格式（magic + version + crc32 + 若干 bincode section）。
 - **理由**：① 秒级加载，满足 NFR-04；② 零额外依赖；③ bincode 版本无外部约束（`instant-distance` 的 `with-serde` 只含 serde，不含 bincode）。
-- **修正（2026-09-02）**：初版称"bincode 1.3 与 instant-distance 内部版本对齐"属事实错误，已改为 `bincode 3.0.0`。P4 末与 `rkyv` 实测对比后再定稿。
+- **修正（2026-09-02，P0 实测）**：① 初版称"bincode 1.3 与 instant-distance 内部版本对齐"属事实错误；② 中间曾改选 3.0.0，但 **3.0.0 是玩笑发布**（源码仅一行 `compile_error!`），最终定为 **`bincode 2.0.1`**。P4 末与 `rkyv` 实测对比后再定稿。
 - **代价**：不支持单条文档的持久化更新，必须整体重写快照（MVP 规模可接受）。
 - **相关需求**：FR-16
 
@@ -1025,4 +1025,5 @@ pub enum Error {
 | 版本   | 日期         | 变更                                                                     |
 | ---- | ---------- | ---------------------------------------------------------------------- |
 | v1.0 | 2026-09-02 | 由 `archive/requirements-and-design_v1.0.md` v1.0 拆分而来。承接第 5、6、7、8、9、10、11.1、11.2、12 章内容；新增「文档信息」「架构概述与关键决策」「质量属性设计」「ADR 决策记录」「实施计划与需求映射」五节 |
+| v1.2 | 2026-09-02 | **P0 执行后回写**（详见 `p0-design.md` 第 12 章）：① 序列化定为 **`bincode 2.0.1`**（3.0.0 为玩笑发布）；② `moka` 需显式启用 `sync` feature；③ `fastembed` 必须 `default-features = false` 以移除 NCSA 依赖链；④ 模型实际来源为 `Xenova/bge-small-zh-v1.5`（非 Qdrant）；⑤ 枚举变体确认为 `BGESmallZHV15`（非 `BGESmallZH`） |
 | v1.1 | 2026-09-02 | 依据 `thirdparty.md` 调研结论回写：① 新增 ADR-007（tantivy 作 dev 基线）、ADR-008（MSRV 1.90 + cargo-deny）；② 7.1 引入 `unicode-segmentation` / `unicode-normalization`，不再手写 Unicode 分段；③ 7.5 补充 `hnsw_rs` A/B 复核路径；④ 7.6 修正 bincode 选型理由（instant-distance 不含 bincode）并新增 `rkyv` A/B 取舍规则；⑤ 8.1 缓存由 `lru` 改为 `moka`；⑥ 9.1/9.2 版本与候选同步至实测值（fastembed 6.0.2、arroy 0.8.0、新增 hnsw_rs/usearch）；⑦ 12.1 新增 tantivy 对照测试；⑧ 13 更新 R1、新增 R9/R10 |

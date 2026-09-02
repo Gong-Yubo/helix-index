@@ -2,9 +2,9 @@
 
 | 项目   | 内容                                                                                |
 | ---- | --------------------------------------------------------------------------------- |
-| 版本   | v1.0                                                                              |
+| 版本   | **v2.0（已执行并回写）**                                                                  |
 | 日期   | 2026-09-02                                                                        |
-| 状态   | **待确认** —— 确认后才执行，本文档不含任何已执行的操作                                                   |
+| 状态   | **已执行完成** —— P0 全部通过，首次提交 `5850545`。执行中的 4 处修正见**第 12 章**，实测基线见**附录 A**   |
 | 上游   | `docs/devel/plan.md` 第 5 章（P0，T0-01 ~ T0-07）                                      |
 | 关联   | `docs/devel/architecture-design.md` 第 4.1 节（目录结构）、第 9 章（选型）、ADR-008（MSRV/License） |
 | 环境实测 | 2026-09-02 在本机采集，见第 2 章                                                           |
@@ -618,17 +618,116 @@ git check-ignore -v Cargo.lock       # 期望：无输出（即未被忽略）
 
 ---
 
-## 附录 A 实测基线（执行后填写）
+## 12. 执行记录（v2.0 新增）
 
-| 项                        | 实测值 | 用途                 |
-| ------------------------ | --- | ------------------ |
-| rustup 安装耗时              | 待填  | 环境准备               |
-| 轻依赖编译耗时                  | 待填  | NFR-03 基线          |
-| `fastembed` + `ort` 编译耗时 | 待填  | NFR-03 基线          |
-| dev 依赖（含 tantivy）编译耗时    | 待填  | CI 时长预估            |
-| 模型下载耗时（91MB）             | 待填  | R-P0-4 判断          |
-| 单条推理耗时（模型已缓存）            | 待填  | **NFR-02 第一批实测基线** |
-| `target/` 目录体积           | 待填  | 磁盘占用               |
+> 本节记录执行过程中**与设计不一致**的地方。前 4 条是我直接解决并回写的，第 5 条需要你决策。
+
+### 12.1 修正：Rust 工具链其实已经安装（原判断有误）
+
+立项时探测的结论是"`rustc` / `cargo` / `rustup` 全部缺失"，**这是误判**：
+
+- 探测命令跑在**非登录 shell**，`~/.cargo/bin` 不在 `PATH`
+- 实际登录 shell 中 `cargo` 可用，版本为 **stable 1.98.0**（`~/.rustup/settings.toml` 早已存在）
+
+**影响**：需求文档 8.2「外部依赖」中"Rust 工具链 ❌ 未安装，阻塞全部编码"应改为"✅ 已安装 1.98.0，项目 pin 1.90.0"。**"工具链缺失"从来不是真正的阻塞项**。
+
+**已执行**：补装 `rustup toolchain install 1.90.0 --profile minimal --component rustfmt --component clippy`（53s）。
+
+### 12.2 修正：`bincode 3.0.0` 是玩笑发布，实际稳定线为 2.0.1
+
+crates.io 显示 `bincode` 的 `max_version` 为 `3.0.0`，但那个版本的**源码只有一行**：
+
+```rust
+compile_error!("https://xkcd.com/2347/");   // XKCD 2347: Dependency
+```
+
+**教训**：调研依赖时**不能只看 crates.io 的 `max_version`**，必须确认它是真实发布（看源码 / 下载量 / 能否生成文档）。这个错误从 thirdparty.md 一路带到了架构文档与 plan.md，已一并修正。
+
+**影响范围**：`Cargo.toml`、架构文档 9.1 / 7.6 / ADR-005、plan.md T4-01 与附录 B、thirdparty.md 4.6，全部改为 **bincode 2.0.1**（错误类型 `bincode::error::{EncodeError, DecodeError}`，与 `error.rs` 已对齐）。
+
+### 12.3 修正：`moka` 必须显式启用 `sync` 或 `future` feature
+
+不加 feature 时 `moka` 直接 `compile_error!`。已改为 `moka = { version = "0.12", features = ["sync"] }`。
+
+### 12.4 修正：`fastembed` 默认 feature 引入一整条图像处理依赖链（NCSA 许可）
+
+默认 feature 含 `image-models`，带来 `image → ravif → rav1e → libfuzzer-sys`（NCSA 许可），而我们只用文本模型。已改为：
+
+```toml
+fastembed = { version = "6.0.2", default-features = false, features = [
+    "ort-download-binaries-native-tls",
+    "hf-hub-native-tls",
+] }
+```
+
+三点收益：① 消除 NCSA 许可项；② 依赖树瘦身；③ `TextEmbedding::try_new` 所需的 `hf-hub` feature 仍保留，验证通过。
+
+**附带发现**：fastembed 默认把模型缓存在**项目根目录**的 `.fastembed_cache/`（96 MB），已加入 `.gitignore`。**P2（T2-02）实现 `LocalEmbedder` 时应显式调用 `.with_cache_dir()` 指到仓库外**，否则开发者极易误提交 96MB。
+
+### 12.5 ⚠️ 需你决策：模型实际来源是 `Xenova/bge-small-zh-v1.5`，且该仓未声明 License
+
+- 设计文档依据模型卡推断为 `Qdrant/bge-small-zh-v1.5`（MIT）
+- **实际下载的是 `Xenova/bge-small-zh-v1.5`**（`onnx/model.onnx`，90 MB）
+- 该仓在 HuggingFace 上 **`license` 字段为空**（上游 `BAAI/bge-small-zh-v1.5` 为 MIT，但转换仓未声明）
+
+这是我**没有**擅自决定的一点：fastembed 6 内置了模型 → 仓库映射，无法直接改指 Qdrant 仓。三个选项：
+
+| 选项    | 做法                                                            | 代价                     |
+| ----- | ------------------------------------------------------------- | ---------------------- |
+| A（默认） | 接受现状。Xenova 转换仓普遍沿用上游 MIT，但**无正式声明**，存在理论风险                  | 零成本；合规审查时可能被问         |
+| B     | 自己从 `BAAI`（MIT）导出 ONNX，用 `.with_cache_dir()` + 手工目录布局喂给 fastembed | 需转换工具链；布局属内部约定，脆弱 |
+| C     | 换用自带 ONNX 且**明确声明 MIT** 的中文模型，绕过 fastembed 内置的 HF 下载逻辑        | 要自己写下载逻辑，违背"先用成熟库"初衷  |
+
+**我倾向 A + 在 thirdparty.md 记录风险**，等 P2（T2-02）实现 `Embedder` 时再定。**若你要求严格合规，请告诉我，我按 B 或 C 调整。**
+
+### 12.6 依赖 License 白名单的实际补充项
+
+`make deny` 首轮未通过，实际需要的宽松许可比设计预估多四项：
+
+| License               | 来源                                                     | 判定                        |
+| --------------------- | ------------------------------------------------------ | ------------------------- |
+| `CDLA-Permissive-2.0` | `webpki-roots`（经 `ureq` → `hf-hub` / `ort-sys`）         | 宽松（数据许可 permissive 版）     |
+| `MPL-2.0`             | `option-ext` ← `dirs-sys` ← `dirs`（fastembed 定位缓存目录）   | **弱 copyleft（文件级）**，见下方说明 |
+| `Unicode-3.0`         | `icu_*` 系列（经 `url` / `idna` 引入）                        | 宽松                        |
+| `Unicode-DFS-2016`    | 同上（备用）                                                 | 宽松                        |
+
+**关于 MPL-2.0**：NFR-09 原文是"全部依赖均为宽松许可；GPL/LGPL/AGPL 一票否决"。MPL-2.0 属**弱 copyleft（文件级）**——仅使用而不修改它，不会波及本项目许可，与 GPL 家族有本质区别。因此我**允许了它并在 `deny.toml` 写明理由**。这是对 NFR-09 的细化而非违反；若你要求"零 copyleft（含 MPL）"，只能放弃 fastembed（`dirs` 是它的传递依赖，无法单独剔除）。
+
+### 12.7 反向验证：白名单确实会拦截
+
+为确认 `make deny` 不是摆设，临时从 `deny.toml` 移除 `MPL-2.0` 后重跑：
+
+```
+移除 MPL-2.0  →  licenses FAILED
+恢复          →  licenses ok
+```
+
+### 12.8 其他执行细节
+
+- **git 身份**：仓库此前无 `user.name` / `user.email`（全局也没有），已设置**仓库级**身份 `index-demo <index-demo@localhost>`。**建议你改成自己的**（`git config user.name "..."`）。
+- **首次提交**：`5850545`，38 个文件，含 `Cargo.lock`（已确认未被 `.gitignore` 忽略）。
+- **未触发的兜底方案**：镜像（D2）、`HF_ENDPOINT`（R-P0-4）、cmake（R-P0-3）**全部没用上**——直连与预编译二进制都正常。
+- **`.gitignore` 行尾注释**：初次写入时把注释放到了规则行尾（`.gitignore` 不支持行尾注释），已修正为独立行。
+
+---
+
+## 附录 A 实测基线（2026-09-02 执行后填写）
+
+| 项                               | 实测值                                    | 用途                      |
+| ------------------------------- | -------------------------------------- | ----------------------- |
+| Rust 工具链                        | **原本已装 stable 1.98.0**；补装 1.90.0 耗时 **53s** | 环境准备（见 12.1）      |
+| `cargo generate-lockfile`       | 13.0s（锁定 **414** 个包）                   | 依赖规模                    |
+| 批次 1 轻依赖编译                      | **7.3s**                               | NFR-03 基线               |
+| 批次 2 `fastembed` + `ort` 编译     | **42.5s**（未触发 cmake，走预编译二进制）           | NFR-03 基线               |
+| 批次 3 `--all-targets`（含 tantivy） | **24.2s**                              | CI 时长预估                 |
+| 模型下载（96 MB，含初始化）                | **49.0s**                              | R-P0-4 判断（未用镜像）         |
+| **单条推理耗时**（模型已缓存，debug 构建）      | **1.58 ~ 1.84 ms**                     | **NFR-02 第一批实测基线**      |
+| `embed` 两条文本                    | 2.83 ~ 2.86 ms                         | NFR-02 基线               |
+| `ort` 是否触发源码编译                  | **否**（预编译二进制；cmake 缺失未造成影响）           | R-P0-3 已排除              |
+| `target/` 体积                    | **4.6 GB**（debug 全量）                   | 磁盘占用；`make clean` 可清    |
+| `.fastembed_cache/` 体积          | 96 MB                                  | 已加入 .gitignore（见 12.4）  |
+| `make fmt` / `lint` / `test`    | 全部通过（clippy `-D warnings` 零告警；0 个测试）  | DoD                     |
+| `make deny`                     | `bans ok, licenses ok, sources ok`     | NFR-09                  |
 
 ## 附录 B 环境核查命令（可复现本文档第 2、3 章）
 

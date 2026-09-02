@@ -4,7 +4,17 @@
 | ------- | ---------------------------------------------------------------------- |
 | 版本      | v1.0                                                                   |
 | 日期      | 2026-09-02                                                             |
-| 状态      | **已采纳并回写**（结论已同步至架构文档 v1.1、需求文档 v1.1、plan.md v1.1）                 |
+| 状态      | **已采纳并回写**；**P0 已执行验证**（2026-09-02），执行中发现的 5 处修正见第 4 章各节与 `p0-design.md` 第 12 章 |
+
+**P0 执行后的 5 处修正**
+
+| # | 修正                                                            | 影响文档                                  |
+| - | ------------------------------------------------------------- | ------------------------------------- |
+| 1 | `bincode 3.0.0` 为玩笑发布 → 改用 **2.0.1**                          | 本文档 4.6、架构文档 9.1/7.6/ADR-005、plan.md |
+| 2 | `moka` 必须启用 `sync` feature                                    | 本文档 4.9、架构文档 9.1、plan.md 附录 B        |
+| 3 | `fastembed` 必须 `default-features = false`（移除 NCSA 依赖链）        | 本文档 4.3、架构文档 9.1、plan.md 附录 B        |
+| 4 | 模型实际来源为 `Xenova` 而非 `Qdrant`，且**未声明 License**                 | 本文档 4.3/5.2、需求文档 8.3（新增 P5）、p0-design.md |
+| 5 | 依赖白名单需补充 `CDLA-Permissive-2.0` / `MPL-2.0` / `Unicode-3.0`   | `deny.toml`、p0-design.md 12.6         |
 | 上游文档    | `docs/devel/requirements-spec.md`、`docs/devel/architecture-design.md`、`docs/devel/plan.md`    |
 | 数据来源    | crates.io API、docs.rs、HuggingFace API 实测拉取（非记忆），见附录 A                |
 | 核查时点    | Rust stable 1.98.0（2026-08-20 发布）                                      |
@@ -66,7 +76,7 @@
 | 向量索引（备选）    | `usearch` 2.26.2                      | ⏳ P6          | 功能最全（add/remove/filtered_search），但要 C++（cxx） |
 | 向量索引（备选）    | `arroy` 0.8.0                         | ❌             | 增量 + 过滤都好，但耦合 LMDB，与"内存 + 快照"路线冲突          |
 | 距离计算加速      | `simsimd` 6.5.16                      | ⏳ 若保留 delta 区  | Apache-2.0，SIMD 版余弦/内积；MVP 用 rayon 暴力足够   |
-| 序列化         | `bincode` 3.0.0 / 2.0.1               | ✅             | MIT；⚠️ 架构文档关于 bincode 选型理由有误，见 7.1         |
+| 序列化         | **`bincode` 2.0.1**                   | ✅             | MIT；⚠️ **3.0.0 是玩笑发布不可用**（P0 实测，见 4.6）      |
 | 零拷贝加载       | `rkyv` 0.8.18                         | ⏳ P4 A/B      | MIT，接近 O(1) 加载，对 NFR-04（<2s）有吸引力；代价是数据结构要 derive |
 | 快照压缩        | `zstd` 0.13.3                         | ⏳ 可选 feature  | MIT，体积换加载时间，P5 实测后决定                     |
 | 内存映射        | `memmap2` 0.9.11                      | ⏳ 与 rkyv 绑定    | 只有走上 rkyv 零拷贝路线才需要                         |
@@ -151,6 +161,25 @@ unicode-normalization = "0.1"
 
 **结论：✅ 引入 fastembed 6.0.2**，理由不变（架构 ADR-003）。
 
+**P0 实测补充（2026-09-02）**
+
+1. **必须 `default-features = false`**。默认 feature 含 `image-models`，会引入 `image → ravif → rav1e → libfuzzer-sys`（NCSA 许可）。只需文本模型时改为：
+
+   ```toml
+   fastembed = { version = "6.0.2", default-features = false, features = [
+       "ort-download-binaries-native-tls",
+       "hf-hub-native-tls",
+   ] }
+   ```
+
+   这样既移除 NCSA 许可项，又保留 `TextEmbedding::try_new` 所需的 `hf-hub` feature，且依赖树明显变小。
+
+2. **实际下载的模型仓是 `Xenova/bge-small-zh-v1.5`，不是 `Qdrant/...`**（本节表格此前写的是 Qdrant）。实测缓存内容：`onnx/model.onnx`（90 MB）+ tokenizer 等，共 96 MB。**该仓在 HuggingFace 上 `license` 字段为空**——上游 `BAAI` 为 MIT，但转换仓未声明。这是我留给使用方决策的一点（选项 A/B/C，见 `p0-design.md` 12.5）。
+
+3. **默认缓存目录在项目根**：fastembed 默认把模型下到 `./.fastembed_cache/`（96 MB）。务必加 `.gitignore`；实现 `Embedder` 时应显式 `InitOptions::with_cache_dir()` 指到仓库外。
+
+4. 编译与下载实测：`ort` 走**预编译二进制**（未触发源码编译，因此**不缺 cmake**），fastembed + ort 编译 42.5s，模型下载 49.0s。
+
 **但要知悉 RC 依赖风险**：`ort =2.0.0-rc.13` 被**精确锁定**（`=` 而非 `^`），意味着：
 
 - 无法随 ort 2.0 的后续 rc 自动升级，需等 fastembed 发版
@@ -215,8 +244,11 @@ unicode-normalization = "0.1"
 
 | 候选                   | License         | MSRV  | 结论         | 理由                                                                                        |
 | -------------------- | --------------- | ----- | ---------- | ----------------------------------------------------------------------------------------- |
-| `bincode` 3.0.0      | MIT             | 1.85  | ✅          | 主流、够快。⚠️ 架构文档 7.6 说"与 instant-distance 的 with-serde 内部 bincode 保持一致"——**这是事实错误**，见 7.1 |
-| `bincode` 2.0.1      | MIT             | —     | ✅ 备选       | 若 3.0 的 MSRV（1.85）或 API 变动带来麻烦，2.0.1 是稳妥选择                                                |
+| **`bincode` 2.0.1**  | MIT             | —     | ✅ **采用**   | 当前真实稳定线                                                    |
+| ~~`bincode` 3.0.0~~  | MIT             | 1.85  | ❌ **不可用**  | **P0 实测：源码只有一行 `compile_error!("https://xkcd.com/2347/")`**，是玩笑/占位发布。教训见下方 |
+| `bincode` 1.3        | MIT             | —     | ❌          | 架构文档原选型，其理由（"与 instant-distance 内部对齐"）本身是**事实错误**，见 7.1      |
+
+> **教训（值得写进团队规范）**：crates.io 的 `max_version` **不等于**"可用的最新版本"。`bincode 3.0.0` 在 crates.io 上正常显示版本、License、依赖关系，看起来与真发布无异，实际是 XKCD 2347（Dependency）的玩笑。调研依赖时必须至少确认一点：该版本能真正编译（P0 的编译验证就是在这一步兜住的）。
 | `rkyv` 0.8.18        | MIT             | 1.81  | ⏳ P4 A/B   | **零反序列化**：mmap 后直接访问，加载接近 O(1)，对 NFR-04（冷启动 <2s）是最强手段。代价：所有落盘结构需 `derive(Archive)`，且格式升级要处理版本兼容 |
 | `zstd` 0.13.3        | MIT             | 1.64  | ⏳ 可选 feature | 快照体积可降 3~5 倍，代价是加载时的解压耗时；属于"体积换时间"，P5 实测后决定                                          |
 | `memmap2` 0.9.11     | MIT OR Apache-2.0 | 1.65 | ⏳ 与 rkyv 绑定 | 只有走上零拷贝路线才需要                                                                          |
@@ -252,7 +284,7 @@ unicode-normalization = "0.1"
 
 | 候选                    | License            | 结论    | 理由                                                        |
 | --------------------- | ------------------ | ----- | --------------------------------------------------------- |
-| **`moka` 0.12.16**    | (MIT OR Apache-2.0) AND Apache-2.0 | ✅ 推荐 | 并发安全、支持 TTL 与权重、无需外部锁；对 query embedding 缓存（FR-20）正合适 |
+| **`moka` 0.12.16**    | (MIT OR Apache-2.0) AND Apache-2.0 | ✅ 推荐 | 并发安全、支持 TTL 与权重、无需外部锁。⚠️ 必须启用 `sync`（或 `future`）feature，否则 `compile_error!` |
 | `quick_cache` 0.7.0   | MIT                | ✅ 备选  | 更轻更快，锁竞争更少；无 TTL                                          |
 | `lru` 0.18.3          | MIT                | ⏳     | 最轻，但**非并发安全**，需自行套 `Mutex`，容易成为并行检索的锁点                    |
 
@@ -328,7 +360,8 @@ unicode-normalization = "0.1"
 | 资产                        | License     | 说明                                          |
 | ------------------------- | ----------- | ------------------------------------------- |
 | ONNX Runtime 二进制（随 ort 下载） | **MIT**   | Microsoft；`ort/load-dynamic` 可改为链接系统库以规避二进制分发问题 |
-| `BAAI/bge-small-zh-v1.5`  | **MIT**     | 当前默认模型                                      |
+| `BAAI/bge-small-zh-v1.5`  | **MIT**     | 上游原始模型（PyTorch / safetensors，无 ONNX）         |
+| `Xenova/bge-small-zh-v1.5` | **⚠️ HF 未声明** | **fastembed 实际下载的就是这个**（ONNX 90MB）。沿用上游 MIT 属推断，非声明。见 `p0-design.md` 12.5 |
 | `BAAI/bge-m3`             | **MIT**     | 备选模型                                        |
 | `BAAI/bge-reranker-v2-m3` | **Apache-2.0** | v2 Rerank 用（FR-18 尚未接入）                 |
 | jieba 默认词典                | MIT（随 jieba-rs） | 若替换自定义词典需注意词典本身的授权                    |
