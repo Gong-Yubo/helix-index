@@ -10,7 +10,11 @@ use crate::types::{ChunkId, Score};
 
 use super::{FusionStrategy, LaneResults};
 
-/// RRF 融合。`k` 默认 60（论文推荐值），`weights` 默认各 1.0。
+/// RRF 融合。`k` 默认 60（论文推荐值）；
+/// `weights` 默认 (bm25, vector) = (1.0, 1.5)——P5 weights 诊断定稿
+/// （T2Ranking 320 query：等权 (1,1) NDCG=0.5119 → (1,1.5)=0.5221，
+/// Recall@10/MRR@10 三路最高；(1,2) 以上回落。BM25 为弱路，加权后融合
+/// 被 NDCG 主导的 vector 单路追平。详见 docs/devel/p5-design.md 8.5 与 eval-report）。
 #[derive(Debug, Clone)]
 pub struct RrfFusion {
     k: f32,
@@ -26,7 +30,7 @@ impl RrfFusion {
 
 impl Default for RrfFusion {
     fn default() -> Self {
-        Self::new(60.0, vec![1.0, 1.0])
+        Self::new(60.0, vec![1.0, 1.5])
     }
 }
 
@@ -66,11 +70,11 @@ mod tests {
 
     #[test]
     fn rrf手算值比对() {
-        // p3-design.md 附录 A：
+        // p3-design.md 附录 A（等权手算锚点——显式构造，不随 Default 定稿值漂移）：
         // bm25 路: A(1) B(2) C(3)；vector 路: B(1) D(2) A(3)
         let bm25: LaneResults = vec![(0, 10.0), (1, 8.0), (2, 5.0)]; // A=0, B=1, C=2
         let vec: LaneResults = vec![(1, 0.9), (3, 0.8), (0, 0.7)]; // B=1, D=3, A=0
-        let fusion = RrfFusion::default();
+        let fusion = RrfFusion::new(60.0, vec![1.0, 1.0]);
 
         let out = fusion.fuse(&[bm25, vec], 10);
         let ids: Vec<ChunkId> = out.iter().map(|(id, _)| *id).collect();
@@ -89,7 +93,7 @@ mod tests {
     fn 未命中不贡献() {
         // 单路：只有 chunk 5 命中 rank1
         let lane: LaneResults = vec![(5, 1.0)];
-        let fusion = RrfFusion::default();
+        let fusion = RrfFusion::new(60.0, vec![1.0]);
         let out = fusion.fuse(&[lane], 10);
         assert_eq!(out, vec![(5, 1.0 / 61.0)]);
     }

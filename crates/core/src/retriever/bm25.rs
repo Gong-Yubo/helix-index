@@ -14,7 +14,9 @@ use crate::types::ChunkId;
 
 use super::{Retriever, Scored};
 
-/// BM25 可调参数（默认 Lucene 值，作为起点；P5 网格搜索校准，风险 R6）
+/// BM25 可调参数（默认值经 P5 网格搜索定稿：T2Ranking 320 query × 12K 段落，
+/// 16 格 k1×b 网格 NDCG@10 选优 k1=1.5/b=0.75，Recall/MRR 相对 Lucene 起点
+/// 1.2/0.75 均不退化；详见 docs/devel/p5-design.md 8.x 与 eval-report，风险 R6）
 #[derive(Debug, Clone, Copy)]
 pub struct Bm25Params {
     pub k1: f32,
@@ -23,7 +25,7 @@ pub struct Bm25Params {
 
 impl Default for Bm25Params {
     fn default() -> Self {
-        Self { k1: 1.2, b: 0.75 }
+        Self { k1: 1.5, b: 0.75 }
     }
 }
 

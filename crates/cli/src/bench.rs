@@ -68,6 +68,9 @@ pub struct BenchArgs {
     /// 覆盖 RRF k
     #[arg(long, default_value_t = 60.0)]
     pub rrf_k: f32,
+    /// RRF 路权重（"w_bm25,w_vector"，如 "1.5,1"；8.5 weights 诊断）
+    #[arg(long, default_value = "1,1")]
+    pub rrf_weights: String,
     /// Recall/MRR 的相关性阈值（1 或 2；主表两列都输出）
     #[arg(long, default_value_t = 1)]
     pub rel_threshold: u8,
@@ -157,10 +160,26 @@ pub fn run(args: BenchArgs) -> Result<()> {
 
     let modes = parse_modes(&args.modes)?;
     let need_vector = modes.contains(&SearchMode::Vector) || modes.contains(&SearchMode::Hybrid);
-    let bm25_params = Bm25Params {
-        k1: args.k1.unwrap_or(1.2),
-        b: args.b.unwrap_or(0.75),
-    };
+    // 默认值来自 Bm25Params::default()（P5 定稿 k1=1.5/b=0.75），CLI 仅覆盖显式传入项
+    let mut bm25_params = Bm25Params::default();
+    if let Some(k1) = args.k1 {
+        bm25_params.k1 = k1;
+    }
+    if let Some(b) = args.b {
+        bm25_params.b = b;
+    }
+    let rrf_weights: Vec<f32> = args
+        .rrf_weights
+        .split(',')
+        .map(|s| s.trim().parse::<f32>())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("--rrf-weights 解析失败: {:?}", args.rrf_weights))?;
+    if rrf_weights.len() != 2 || rrf_weights.iter().any(|w| *w < 0.0) {
+        bail!(
+            "--rrf-weights 需为两个非负数（w_bm25,w_vector），收到 {:?}",
+            args.rrf_weights
+        );
+    }
 
     // ---- 1. 加载 ----
     let mut setup = load_setup(&args, need_vector)?;
@@ -168,13 +187,14 @@ pub fn run(args: BenchArgs) -> Result<()> {
         .with_context(|| format!("加载 judgments 失败: {}", args.queries.display()))?;
     bench::validate_sources(&judgments, &setup.index)?;
     println!(
-        "评测配置: {} queries × {} 段落，K={}，BM25(k1={}, b={})，RRF k={}，向量后端 {}{}",
+        "评测配置: {} queries × {} 段落，K={}，BM25(k1={}, b={})，RRF(k={}, w={:?})，向量后端 {}{}",
         judgments.len(),
         setup.index.num_chunks(),
         args.k,
         bm25_params.k1,
         bm25_params.b,
         args.rrf_k,
+        &rrf_weights,
         args.vector_index,
         args.ef_search
             .map(|e| format!("(ef_search={e})"))
@@ -196,6 +216,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
     // ---- 2. 阶段 A：效果（--runs 轮，每轮重建 HNSW 图模拟跨进程差异）----
     let runs = args.runs.max(1);
     let mut run_reports: Vec<serde_json::Value> = Vec::new();
+    let mut all_ndcg: Vec<HashMap<String, f64>> = Vec::new();
     let mut first_results: Option<HashMap<String, ModeResult>> = None;
 
     for run_i in 1..=runs {
@@ -209,24 +230,58 @@ pub fn run(args: BenchArgs) -> Result<()> {
         }
         let mut results: HashMap<String, ModeResult> = HashMap::new();
         for &mode in &modes {
-            let searcher = make_searcher(&setup, bm25_params, args.rrf_k, mode)?;
+            let searcher = make_searcher(&setup, bm25_params, args.rrf_k, &rrf_weights, mode)?;
             results.insert(
                 mode_name(mode).to_string(),
                 eval_effect(&searcher, &judgments, mode, args.k),
             );
         }
+        // 每轮 NDCG 记录（含第一轮；--runs > 1 时用于抖动区间披露）
+        let ndcg_by_mode: HashMap<String, f64> = results
+            .iter()
+            .map(|(name, r)| {
+                let ndcg = r.agg(|p| &p.thr1).ndcg;
+                (name.clone(), ndcg)
+            })
+            .collect();
+        run_reports.push(serde_json::json!({"run": run_i, "ndcg": ndcg_by_mode}));
+        all_ndcg.push(
+            results
+                .iter()
+                .map(|(name, r)| (name.clone(), r.agg(|p| &p.thr1).ndcg))
+                .collect(),
+        );
         if run_i == 1 {
             print_effect(&results, &judgments, args.k);
             first_results = Some(results);
         } else {
-            // 后续轮：只输出整体 NDCG（抖动观测）
-            let summary: serde_json::Value = serde_json::Map::from_iter(
-                results
-                    .iter()
-                    .map(|(name, r)| (name.clone(), serde_json::json!(r.agg(|p| &p.thr1).ndcg))),
-            )
-            .into();
-            run_reports.push(serde_json::json!({"run": run_i, "ndcg": summary}));
+            let line: Vec<String> = ndcg_by_mode
+                .iter()
+                .map(|(name, v)| format!("{name}={v:.4}"))
+                .collect();
+            println!("[run {run_i} 图已重建] NDCG@10(thr1): {}]", line.join(" "));
+        }
+    }
+
+    // 抖动区间披露（R-P5-13：同进程同图确定，跨进程图不同）
+    if runs > 1 {
+        println!("\n== 跨图抖动（--runs {runs}）==");
+        let mut names: Vec<&String> = all_ndcg[0].keys().collect();
+        names.sort();
+        for name in &names {
+            let vals: Vec<f64> = all_ndcg
+                .iter()
+                .filter_map(|m| m.get(*name))
+                .copied()
+                .collect();
+            let (min, max) = (
+                vals.iter().cloned().fold(f64::INFINITY, f64::min),
+                vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+            );
+            println!(
+                "  {name:<8}: NDCG@10 min~max = {min:.4} ~ {max:.4}（极差 {:.4}）",
+                max - min
+            );
         }
     }
 
@@ -269,7 +324,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
         );
         println!("{:<8} {:>10} {:>10}", "mode", "P50(ms)", "P99(ms)");
         for &mode in &modes {
-            let searcher = make_searcher(&setup, bm25_params, args.rrf_k, mode)?;
+            let searcher = make_searcher(&setup, bm25_params, args.rrf_k, &rrf_weights, mode)?;
             let lat = eval_latency(&searcher, &judgments, mode, args.k, args.warmup, args.reps);
             println!(
                 "{:<8} {:>10.2} {:>10.2}",
@@ -409,6 +464,7 @@ fn make_searcher<'a>(
     setup: &'a Setup,
     params: Bm25Params,
     rrf_k: f32,
+    rrf_weights: &[f32],
     mode: SearchMode,
 ) -> Result<Searcher<'a>> {
     let mut s = Searcher::new(&setup.index, &setup.analyzer).with_bm25_params(params);
@@ -421,10 +477,10 @@ fn make_searcher<'a>(
             .backend
             .as_ref()
             .context("vector/hybrid 模式需要向量后端")?;
-        // bench 一律覆盖 fusion（哪怕 hybrid 用默认 k）——保证 --rrf-k 生效
+        // bench 一律覆盖 fusion（哪怕 hybrid 用默认 k）——保证 --rrf-k/--rrf-weights 生效
         s = s
             .with_vector(e, vi.as_index())
-            .with_fusion(Box::new(RrfFusion::new(rrf_k, vec![1.0, 1.0])));
+            .with_fusion(Box::new(RrfFusion::new(rrf_k, rrf_weights.to_vec())));
     }
     Ok(s)
 }
@@ -581,7 +637,13 @@ fn eval_grid(setup: &Setup, judgments: &[Judgment], k: usize, rrf_k: f32) -> Res
     let mut cells = Vec::new();
     for k1 in [1.0f32, 1.2, 1.5, 2.0] {
         for b in [0.3f32, 0.5, 0.75, 0.9] {
-            let searcher = make_searcher(setup, Bm25Params { k1, b }, rrf_k, SearchMode::Bm25)?;
+            let searcher = make_searcher(
+                setup,
+                Bm25Params { k1, b },
+                rrf_k,
+                &[1.0, 1.0],
+                SearchMode::Bm25,
+            )?;
             let r = eval_effect(&searcher, judgments, SearchMode::Bm25, k);
             let a = r.agg(|p| &p.thr1);
             println!(
