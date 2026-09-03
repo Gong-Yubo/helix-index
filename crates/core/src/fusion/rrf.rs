@@ -26,6 +26,19 @@ impl RrfFusion {
         assert!(k > 0.0, "RRF 的 k 必须 > 0");
         Self { k, weights }
     }
+
+    /// RRF 的 k（默认 60，论文推荐值）。
+    pub fn k(&self) -> f32 {
+        self.k
+    }
+
+    /// 路权重（默认 (bm25, vector) = (1.0, 1.5)）。
+    ///
+    /// CLI 的 `--rrf-k` / `--rrf-weights` 默认值从此派生，避免"内核定稿值"与
+    /// "CLI 硬编码默认值"两处漂移（V1-14：修 bench 默认 `1,1` 与 search `1,1.5` 分裂）。
+    pub fn weights(&self) -> &[f32] {
+        &self.weights
+    }
 }
 
 impl Default for RrfFusion {

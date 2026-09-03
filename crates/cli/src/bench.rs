@@ -47,7 +47,7 @@ const EXPECTED_WINNER: &[(&str, &str)] = &[
 #[derive(Args)]
 pub struct BenchArgs {
     /// 快照文件（build --vectors 产出；与 --input 二选一）
-    #[arg(short, long)]
+    #[arg(long)]
     pub index: Option<PathBuf>,
     /// 语料 JSONL（重建模式；与 --index 二选一）
     #[arg(short, long)]
@@ -67,12 +67,14 @@ pub struct BenchArgs {
     /// 覆盖 BM25 b
     #[arg(long)]
     pub b: Option<f32>,
-    /// 覆盖 RRF k
-    #[arg(long, default_value_t = 60.0)]
-    pub rrf_k: f32,
-    /// RRF 路权重（"w_bm25,w_vector"，如 "1.5,1"；8.5 weights 诊断）
-    #[arg(long, default_value = "1,1")]
-    pub rrf_weights: String,
+    /// 覆盖 RRF k（默认取 RrfFusion::default() 的 60）
+    #[arg(long)]
+    pub rrf_k: Option<f32>,
+    /// RRF 路权重（"w_bm25,w_vector"，如 "1.5,1"；8.5 weights 诊断）。
+    /// 默认取 RrfFusion::default() 的 [1.0, 1.5]（P5 定稿）—— 从内核派生而非
+    /// CLI 硬编码，避免 bench 与 search 的"默认融合"语义分裂（V1-14）
+    #[arg(long)]
+    pub rrf_weights: Option<String>,
     /// Recall/MRR 的相关性阈值（1 或 2；主表两列都输出）
     #[arg(long, default_value_t = 1)]
     pub rel_threshold: u8,
@@ -173,16 +175,22 @@ pub fn run(args: BenchArgs) -> Result<()> {
     if let Some(b) = args.b {
         bm25_params.b = b;
     }
-    let rrf_weights: Vec<f32> = args
-        .rrf_weights
-        .split(',')
-        .map(|s| s.trim().parse::<f32>())
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .with_context(|| format!("--rrf-weights 解析失败: {:?}", args.rrf_weights))?;
+    // RRF 默认值统一从 RrfFusion::default() 派生（P5 定稿 k=60 / weights=[1.0, 1.5]），
+    // CLI 只覆盖显式传入项——保证 bench 与 `search --mode hybrid` 的默认融合必然一致。
+    let fusion_default = RrfFusion::default();
+    let rrf_k = args.rrf_k.unwrap_or_else(|| fusion_default.k());
+    let rrf_weights: Vec<f32> = match &args.rrf_weights {
+        Some(s) => s
+            .split(',')
+            .map(|part| part.trim().parse::<f32>())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .with_context(|| format!("--rrf-weights 解析失败: {s:?}"))?,
+        None => fusion_default.weights().to_vec(),
+    };
     if rrf_weights.len() != 2 || rrf_weights.iter().any(|w| *w < 0.0) {
         bail!(
             "--rrf-weights 需为两个非负数（w_bm25,w_vector），收到 {:?}",
-            args.rrf_weights
+            rrf_weights
         );
     }
 
@@ -198,7 +206,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
         args.k,
         bm25_params.k1,
         bm25_params.b,
-        args.rrf_k,
+        rrf_k,
         &rrf_weights,
         args.vector_index,
         args.ef_search
@@ -208,7 +216,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
 
     let mut json = serde_json::json!({
         "config": {
-            "k": args.k, "k1": bm25_params.k1, "b": bm25_params.b, "rrf_k": args.rrf_k,
+            "k": args.k, "k1": bm25_params.k1, "b": bm25_params.b, "rrf_k": rrf_k,
             "rel_threshold": args.rel_threshold, "vector_index": args.vector_index,
             "ef_search": args.ef_search, "modes": args.modes,
             "queries": args.queries.display().to_string(),
@@ -235,7 +243,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
         }
         let mut results: HashMap<String, ModeResult> = HashMap::new();
         for &mode in &modes {
-            let searcher = make_searcher(&setup, bm25_params, args.rrf_k, &rrf_weights, mode)?;
+            let searcher = make_searcher(&setup, bm25_params, rrf_k, &rrf_weights, mode)?;
             results.insert(
                 mode_name(mode).to_string(),
                 eval_effect(&searcher, &judgments, mode, args.k),
@@ -329,7 +337,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
         );
         println!("{:<8} {:>10} {:>10}", "mode", "P50(ms)", "P99(ms)");
         for &mode in &modes {
-            let searcher = make_searcher(&setup, bm25_params, args.rrf_k, &rrf_weights, mode)?;
+            let searcher = make_searcher(&setup, bm25_params, rrf_k, &rrf_weights, mode)?;
             let lat = eval_latency(&searcher, &judgments, mode, args.k, args.warmup, args.reps);
             println!(
                 "{:<8} {:>10.2} {:>10.2}",
@@ -347,7 +355,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
 
     // ---- 4. 阶段 C：网格 ----
     if args.grid {
-        let grid = eval_grid(&setup, &judgments, args.k, args.rrf_k)?;
+        let grid = eval_grid(&setup, &judgments, args.k, rrf_k)?;
         json["grid"] = serde_json::to_value(&grid).unwrap_or_default();
         if !run_reports.is_empty() {
             json["runs"] = run_reports.into();
