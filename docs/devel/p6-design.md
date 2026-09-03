@@ -6,6 +6,7 @@
 | 日期 | 2026-09-03 |
 | 状态 | ⬜ **待拍板**（决策点 D-I1 ~ D-I6 未决，未动代码） |
 | 来源 | [issue #1「融合索引接口重新设计」](https://github.com/Gong-Yubo/helix-index/issues/1) |
+| 评审 | [issue #1 评论（方案摘要 + D-I1~D-I7 待拍板）](https://github.com/Gong-Yubo/helix-index/issues/1#issuecomment-5526051968) |
 | 前提 | P0~P5 + v1 收尾全部完成（`v1-finish-design.md` V1-00~V1-16 已落地，CI 9/9 绿） |
 | 上游 | `requirements-spec.md`（FR/NFR 定义源）、`architecture-design.md`（模块边界 4.2、ADR-001~008）、`plan.md` |
 | 定位 | **不改算法、不改评测口径、不改 CLI 参数**，只重构库的**对外接口层**，让 `index.add(doc)` / `searcher.search(query, mode, top_n)` 成为默认路径 |
