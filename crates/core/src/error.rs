@@ -41,6 +41,9 @@ pub enum Error {
 
     #[error("分片不存在: {0}")]
     ChunkNotFound(u32),
+
+    #[error("非法输入: {0}")]
+    InvalidInput(String),
 }
 
 /// 统一结果类型

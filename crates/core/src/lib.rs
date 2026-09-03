@@ -22,6 +22,7 @@
 //! P0（当前）：工程骨架，无业务逻辑。
 
 pub mod analyze;
+pub mod bench;
 pub mod chunk;
 pub mod document;
 pub mod embed;

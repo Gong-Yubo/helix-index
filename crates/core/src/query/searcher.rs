@@ -14,7 +14,7 @@ use crate::error::{Error, Result};
 use crate::fusion::{FusionStrategy, LaneResults, RrfFusion};
 use crate::index::Index;
 use crate::rerank::{NoOpReranker, Reranker};
-use crate::retriever::{Bm25Retriever, Retriever, VectorRetriever};
+use crate::retriever::{Bm25Params, Bm25Retriever, Retriever, VectorRetriever};
 use crate::types::{ChunkId, Score};
 use crate::vector::VectorIndex;
 
@@ -38,6 +38,8 @@ pub struct Searcher<'a> {
     vector_index: Option<&'a dyn VectorIndex>,
     fusion: Box<dyn FusionStrategy>,
     reranker: Box<dyn Reranker>,
+    /// BM25 参数（P5 网格搜索从外部注入；默认 Bm25Params::default()）
+    bm25_params: Bm25Params,
 }
 
 impl<'a> Searcher<'a> {
@@ -50,7 +52,14 @@ impl<'a> Searcher<'a> {
             vector_index: None,
             fusion: Box::new(RrfFusion::default()),
             reranker: Box::new(NoOpReranker),
+            bm25_params: Bm25Params::default(),
         }
+    }
+
+    /// 覆盖 BM25 参数（T5-05 网格搜索注入口；现状内部用默认参数）。
+    pub fn with_bm25_params(mut self, params: Bm25Params) -> Self {
+        self.bm25_params = params;
+        self
     }
 
     pub fn with_vector(
@@ -108,7 +117,8 @@ impl<'a> Searcher<'a> {
         // 1. 两路召回（Hybrid 并行，单路只跑一路）
         let (bm25_lane, vector_lane) = match mode {
             SearchMode::Bm25 => {
-                let bm25 = Bm25Retriever::new(self.index, self.analyzer);
+                let bm25 =
+                    Bm25Retriever::new(self.index, self.analyzer).with_params(self.bm25_params);
                 (Some(to_lane(bm25.search(query, candidate_k)?)), None)
             }
             SearchMode::Vector => {
@@ -118,7 +128,8 @@ impl<'a> Searcher<'a> {
             }
             SearchMode::Hybrid => {
                 let (e, vi) = self.require_vector()?;
-                let bm25 = Bm25Retriever::new(self.index, self.analyzer);
+                let bm25 =
+                    Bm25Retriever::new(self.index, self.analyzer).with_params(self.bm25_params);
                 let vec = VectorRetriever::new(e, vi);
                 // 并行执行；返回 (bm25, vector)，融合前按固定 lane 顺序收集
                 let (r1, r2) = rayon::join(

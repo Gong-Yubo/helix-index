@@ -45,6 +45,8 @@ impl Distance<f32> for DistDotClamped {
 /// hnsw_rs 实现的向量索引：支持原生增量插入。
 pub struct HnswRsIndex {
     hnsw: Hnsw<'static, f32, DistDotClamped>,
+    /// 查询时动态候选列表宽度（P5 前硬编码 200 从未校准；8.6 最小校准注入口）
+    ef_search: usize,
 }
 
 impl HnswRsIndex {
@@ -57,7 +59,16 @@ impl HnswRsIndex {
             EF_CONSTRUCTION,
             DistDotClamped,
         );
-        Self { hnsw }
+        Self {
+            hnsw,
+            ef_search: EF_SEARCH,
+        }
+    }
+
+    /// 覆盖 ef_search（8.6 向量路诊断：ef_search ∈ {100, 200, 400} 最小校准）。
+    pub fn with_ef_search(mut self, ef_search: usize) -> Self {
+        self.ef_search = ef_search;
+        self
     }
 }
 
@@ -78,7 +89,7 @@ impl VectorIndex for HnswRsIndex {
         if k == 0 {
             return Ok(Vec::new());
         }
-        let neighbours = self.hnsw.search(query.as_slice(), k, EF_SEARCH);
+        let neighbours = self.hnsw.search(query.as_slice(), k, self.ef_search);
         let out: Vec<(ChunkId, f32)> = neighbours
             .into_iter()
             .map(|n| {
