@@ -22,6 +22,7 @@
 | [`devel/p3-design.md`](./devel/p3-design.md)（P3 设计说明） | **P3 详细设计**：RRF 融合手算值、Explain 语义、确定性、决策点 | 实现者（P3 已完成） |
 | [`devel/p4-design.md`](./devel/p4-design.md)（P4 设计说明） | **P4 详细设计**：hnsw_rs 调研、快照格式、向量 A/B 方案、决策点 | 实现者（P4 已完成） |
 | [`devel/p5-design.md`](./devel/p5-design.md)（P5 设计说明） | **P5 详细设计**：T2Ranking 数据集选型与转换管线、评测指标（分级 NDCG）、bench 设计、NFR 实测协议、决策点 | 实现者（P5 已完成） |
+| [`devel/p6-design.md`](./devel/p6-design.md)（P6 设计说明） | **接口重构**：issue #1 的业界做法调研、`SearchIndex` / `Searcher` 门面设计、写缓冲与 commit 语义、配置指纹、任务清单与决策点（**待评审**） | 实现者、评审者（P6 待拍板） |
 | [`devel/eval-report.md`](./devel/eval-report.md)（P5 评测报告） | **P5 评测结论**：三路对照、分桶与符号检验、tantivy 基线、网格/RRF 定稿、charabia 对照、NFR 实测、数据诚信声明 | 决策者、接入方 |
 | [`devel/v1-finish-design.md`](./devel/v1-finish-design.md)（v1 收尾设计） | **使用文档 / 评测脚本 / CI / 改名与发布 / 工程收尾**的任务清单、执行顺序与决策点（含外部评审修正记录） | 实现者（v1 收尾进行中） |
 | [`devel/requirements-spec.md`](./devel/requirements-spec.md)（需求分析说明书）     | 做什么 / 为什么 / 怎么验收  | 决策者、场景层接入方、实现者 |
