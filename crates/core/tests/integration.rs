@@ -13,7 +13,7 @@ use helix_core::index::Index;
 use helix_core::query::{SearchMode, Searcher};
 use helix_core::storage;
 use helix_core::types::ChunkId;
-use helix_core::vector::{HnswRsIndex, NormalizedVector, VectorIndex};
+use helix_core::vector::{BruteForceIndex, NormalizedVector};
 
 /// 确定性假 Embedder：文本 → FNV 哈希 → 16 维归一化向量。
 struct FakeEmbedder;
@@ -90,13 +90,19 @@ fn build_full_index() -> (Index, MixedAnalyzer) {
     (index, analyzer)
 }
 
-fn build_vector_index(index: &Index) -> HnswRsIndex {
-    let mut vi = HnswRsIndex::with_capacity(1024);
-    for chunk in index.live_chunks() {
-        let v = fake_vec(&chunk.text);
-        vi.add(chunk.chunk_id, NormalizedVector::new(v)).unwrap();
-    }
-    vi
+/// 构建向量索引。
+///
+/// **刻意用 `BruteForceIndex` 而非 `HnswRsIndex`**：本集成测试验证的是
+/// 「快照 save → load 后检索结果一致」这一 round-trip 正确性，
+/// 不应混入 ANN 图构建的随机性——`hnsw_rs` 用 OS 熵建图（R-P5-13），
+/// 同一份向量两次建图的结果可能不同，会让本测试 flaky
+/// （已在 CI Linux 上复现：vector 模式断言失败，bm25 模式始终通过）。
+fn build_vector_index(index: &Index) -> BruteForceIndex {
+    let entries: Vec<_> = index
+        .live_chunks()
+        .map(|c| (c.chunk_id, NormalizedVector::new(fake_vec(&c.text))))
+        .collect();
+    BruteForceIndex::from_entries(entries)
 }
 
 fn search_ids(searcher: &Searcher, query: &str, mode: SearchMode) -> Vec<(ChunkId, f32)> {
@@ -139,14 +145,13 @@ fn 快照加载后检索结果一致() {
     let (loaded, lv) = storage::load(&path).unwrap();
     assert_eq!(lv.len(), vectors.len(), "向量应随快照保存");
 
-    // 加载后：重建向量索引（D1：存原始数据，加载重建）
-    let vi2 = {
-        let mut vi = HnswRsIndex::with_capacity(lv.len().max(1024));
-        for (id, v) in &lv {
-            vi.add(*id, NormalizedVector::new(v.clone())).unwrap();
-        }
-        vi
-    };
+    // 加载后：重建向量索引（D1：存原始数据，加载重建）。
+    // 与 before 侧保持同一实现（BruteForceIndex），确保对比的是快照正确性本身。
+    let vi2 = BruteForceIndex::from_entries(
+        lv.iter()
+            .map(|(id, v)| (*id, NormalizedVector::new(v.clone())))
+            .collect(),
+    );
     let analyzer2 = MixedAnalyzer::new();
     let searcher2 = Searcher::new(&loaded, &analyzer2).with_vector(&e, &vi2);
 

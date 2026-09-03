@@ -29,6 +29,7 @@ fn tokenizer() -> &'static charabia::Tokenizer<'static> {
 }
 
 impl CharabiaAnalyzer {
+    /// 构造分词器（提前触发 jieba 词典加载，避免首次查询把加载时间计入延迟）。
     pub fn new() -> Self {
         // 提前触发词典加载，避免首次查询计入延迟
         let _ = tokenizer();
