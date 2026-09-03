@@ -4,7 +4,7 @@
 
 | 项目   | 内容                   |
 | ---- | -------------------- |
-| 文档版本 | v1.0                 |
+| 文档版本 | v1.3                 |
 | 创建日期 | 2026-09-02           |
 | 状态   | 待评审                  |
 | 技术栈  | Rust 1.90+ / 2021 edition |
@@ -175,7 +175,7 @@ index-demo/
 │   │       ├── storage/        # Snapshot 读写 / codec
 │   │       └── chunk/          # Chunker 分块策略
 │   └── cli/                   # idx（二进制）
-├── data/                      # 示例中文语料 + 评测集
+├── data/                      # 30 篇 demo 语料 + T2Ranking 评测集转换产物（t2-corpus / t2-queries，见需求文档 9.4）
 ├── examples/
 └── docs/
 ```
@@ -874,7 +874,7 @@ idx compare --index index.idx -k 10 "查询文本"
 idx search --index index.idx --mode hybrid --explain "查询文本"
 
 # 评测（P5）
-idx bench --index index.idx --queries data/queries.jsonl
+idx bench --index index.idx --queries data/t2-queries.jsonl
 ```
 
 ### 10.3 错误类型
@@ -923,7 +923,7 @@ pub enum Error {
 | **P2**     | `embed`（本地）+ `vector`（HNSW）+ `retriever/vector`                | CLI 向量路出结果；同义改写能被召回                                  | P1 |
 | **P3**     | `fusion`（RRF + 加权）+ `query/searcher` + `explain`               | `idx compare` 可对比三路；Explain 输出完整                     | P2 |
 | **P4**     | `storage` 快照 + 增量写入（**先 `hnsw_rs` A/B 再定案**）+ 元数据过滤                | save/load 后检索结果完全一致；增量写入后立即可查                        | P3 |
-| **P5**     | 示例语料 + 评测集 + `idx bench` + README                              | Recall@K / MRR@10 / 延迟有实测数据；BM25 参数网格搜索调参            | P4 |
+| **P5**     | T2Ranking 评测集装配 + `idx bench` + README                        | Recall@K / MRR@10 / 分级 NDCG@10 / 延迟有实测数据；BM25 参数网格搜索调参 | P4 |
 | **P6**（v2） | Reranker 接入（bge-reranker-v2-m3）、MMR 去重、token budget 裁剪、自研 HNSW | —                                                    | P5 |
 
 **关键路径**：P1 → P2 → P3。这三步完成即具备完整检索能力，P4/P5 是工程化与验证。
@@ -1027,3 +1027,4 @@ pub enum Error {
 | v1.0 | 2026-09-02 | 由 `archive/requirements-and-design_v1.0.md` v1.0 拆分而来。承接第 5、6、7、8、9、10、11.1、11.2、12 章内容；新增「文档信息」「架构概述与关键决策」「质量属性设计」「ADR 决策记录」「实施计划与需求映射」五节 |
 | v1.2 | 2026-09-02 | **P0 执行后回写**（详见 `p0-design.md` 第 12 章）：① 序列化定为 **`bincode 2.0.1`**（3.0.0 为玩笑发布）；② `moka` 需显式启用 `sync` feature；③ `fastembed` 必须 `default-features = false` 以移除 NCSA 依赖链；④ 模型实际来源为 `Xenova/bge-small-zh-v1.5`（非 Qdrant）；⑤ 枚举变体确认为 `BGESmallZHV15`（非 `BGESmallZH`） |
 | v1.1 | 2026-09-02 | 依据 `thirdparty.md` 调研结论回写：① 新增 ADR-007（tantivy 作 dev 基线）、ADR-008（MSRV 1.90 + cargo-deny）；② 7.1 引入 `unicode-segmentation` / `unicode-normalization`，不再手写 Unicode 分段；③ 7.5 补充 `hnsw_rs` A/B 复核路径；④ 7.6 修正 bincode 选型理由（instant-distance 不含 bincode）并新增 `rkyv` A/B 取舍规则；⑤ 8.1 缓存由 `lru` 改为 `moka`；⑥ 9.1/9.2 版本与候选同步至实测值（fastembed 6.0.2、arroy 0.8.0、新增 hnsw_rs/usearch）；⑦ 12.1 新增 tantivy 对照测试；⑧ 13 更新 R1、新增 R9/R10 |
+| v1.3 | 2026-09-03 | 依据 `p5-design.md` v1.2（评测数据源切换 T2Ranking）同步：① 4.x 目录树 data/ 注释更新；② 10.2 CLI 示例改 `data/t2-queries.jsonl`；③ 11 阶段门槛 P5 行更新（T2Ranking 装配 + 分级 NDCG）。评测数据集的**需求定义**见需求文档 9.4（v1.2），本文档不复制 |

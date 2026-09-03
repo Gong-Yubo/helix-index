@@ -4,9 +4,10 @@
 
 | 项目      | 内容                                                                                                                                                                                                                                               |
 | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 版本      | v1.1                                                                                                                                                                                                                                             |
+| 版本      | v1.2                                                                                                                                                                                                                                             |
 | 创建日期    | 2026-09-02                                                                                                                                                                                                                                       |
 | 状态      | **P0 已完成**（提交 `5850545`）；当前阶段 P1                                                                                                                                                                                                                 |
+| v1.2 变更 | 依据 `p5-design.md` v1.2（评测数据源切换为开源 T2Ranking）：T5-01/T5-02 由"人工撰写语料 + 自标注"改为**数据集转换管线**（`t2_prep.rs`，固定种子）；T5-03 指标改**分级 NDCG**（gain=2^g−1）；T5-04 补 tantivy 基线与 RRF k 敏感性；T5-06 规模口径对齐 12K 段落；现状表与并行工作流同步 |
 | v1.1 变更 | 依据 `docs/devel/thirdparty.md` 调研结论回写：新增 T1-15（tantivy 对照）、T4-06a（向量索引 A/B）、T5-09（分词对照）；T0-03/T0-06 增加 MSRV 1.90 与 `cargo-deny`；T1-04 引入 `unicode-segmentation`/`unicode-normalization`；T3-07 缓存改 `moka`；T4-01 改 `bincode 3.0.0`；附录 B 依赖清单同步至实测版本 |
 | 上游文档    | `docs/devel/requirements-spec.md`（需求）、`docs/devel/architecture-design.md`（架构）                                                                                                                                                                    |
 | 阶段划分    | P0 → P5 为第一版；P6 为 v2                                                                                                                                                                                                                             |
@@ -34,8 +35,8 @@
 | Rust 工具链  | ✅ 已安装（stable 1.98.0；项目 pin 1.90.0）。原"未安装"为误判，见 `p0-design.md` 12.1 | 无  | T0-01                                       |
 | crates.io | ⚠️ 国内访问可能慢                                                         | P0 | T0-02 配镜像                                   |
 | ONNX 模型下载 | ✅ **P0 已验证通过**：`Xenova/bge-small-zh-v1.5` 96MB，直连 49s              | 无  | T0-05 已完成。⚠️ 该仓 HF 未声明 License，见需求文档 8.3 P5 |
-| 示例中文语料    | ❌ 待准备                                                              | P5 | T1-14 起并行准备                                 |
-| 评测集标注     | ❌ 待准备                                                              | P5 | T5-02                                       |
+| 示例中文语料    | ✅ 已备 30 篇 demo（`data/corpus.jsonl`，FR-23 / README 演示用，不再扩展）        | 无  | —                                           |
+| 评测数据集     | ⬜ 待装配（**开源 T2Ranking 转换**，Apache-2.0，见 `p5-design.md` 第 3~5 章） | P5 | T5-01/T5-02（`t2_prep.rs` 转换管线，固定种子）      |
 | 仓库        | ❌ 无 git                                                            | —  | T0-03 顺带初始化                                 |
 
 > **T0-05 是本计划里最重要的一条前置验证。** fastembed 依赖 ONNX Runtime，Apple Silicon 上编译链（C++、CoreML）较重，且模型下载可能失败。这两件事在 P0 用 30 分钟验证掉，能避免 P2 阶段才发现路线不可行。
@@ -103,7 +104,7 @@
 ```
 P1 ─────────────────────────────────────────►
      语料采集与整理（T1-14 起）──────────────► P5
-     评测集标注（T5-02）──────────────────► P5
+     评测集装配（T5-02，T2Ranking 转换）────► P5
 ```
 
 ---
@@ -155,7 +156,7 @@ P1 ─────────────────────────�
 | T1-11 | BM25 打分                 | `retriever/bm25.rs`                                | `idf = ln(1 + (N − df + 0.5)/(df + 0.5))`；`k1=1.2, b=0.75`（起点，P5 调参）；**OR 语义**                                             | 单测：构造 5 篇文档，逐条比对**手算值**（最关键测试）          |
 | T1-12 | Top-K 与执行方式             | `retriever/bm25.rs`                                | TAAT（Term-At-A-Time）+ 二叉堆取 Top-K；**分相同的按 `chunk_id` 升序 tie-break**                                                         | 单测：Top-K 顺序稳定                           |
 | T1-13 | Retriever 抽象            | `retriever/mod.rs`                                 | `trait Retriever { fn search(&self, req) -> Result<Vec<Scored>> }`                                                         | BM25 路实现该 trait                         |
-| T1-14 | CLI 最小版（并启动语料准备）        | `crates/cli`、`data/corpus.jsonl`                   | `idx build --input data/corpus.jsonl --output index.idx`、`idx search --mode bm25 -k 10 "查询"`；同期启动示例语料采集（50~200 篇短文档）       | CLI 在语料上返回合理结果                          |
+| T1-14 | CLI 最小版（并启动语料准备）        | `crates/cli`、`data/corpus.jsonl`                   | `idx build --input data/corpus.jsonl --output index.idx`、`idx search --mode bm25 -k 10 "查询"`；30 篇手写语料已定稿为 demo 语料（评测数据 v1.2 起改走 T2Ranking，见 T5-01）       | CLI 在语料上返回合理结果                          |
 | T1-15 | **BM25 与 tantivy 对照测试** | `tests/bm25_vs_tantivy.rs`（dev-dep `tantivy 0.26`） | **ADR-007**：同语料下用工业实现当 oracle，逐条比对 Top-K **排序**（分值允许 `k1`/`b` 与平均长度口径差异）。必须覆盖边界：空 query、全停用词 query、超长 query、`df=0` 的 term  | 排序一致率 ≥ 95%；不一致的 case 逐条分析并给出解释         |
 
 **P1 出口 Demo**
@@ -260,21 +261,23 @@ cargo run -p idx -- search --index /tmp/index.idx --mode hybrid --explain "..."
 
 ## 10. P5 语料、评测与调参
 
+> **详细设计见 `docs/devel/p5-design.md`**（含评测方法论、标注偏差处理、charabia 核查、决策点）。本章只保留任务纲要。
+
 **目标**：用数据证明"混合检索确实比单路好"，并把所有 NFR 从目标值变成实测值。
 
 **阶段门槛**：三路对照实验有数据；BM25 参数经网格搜索定稿；NFR-02~05 全部替换为实测值。
 
 | ID    | 任务             | 产出                                         | 要点                                                                                                                  | 验收                                       |
 | ----- | -------------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- | ---------------------------------------- |
-| T5-01 | 示例语料补全         | `data/corpus.jsonl`（50~200 篇短文档）           | 建议用技术博客/文档/Rust 主题文章，保证与 embedding 模型域大致匹配（防 P3 风险：模型与语料域不匹配）                                                       | ≥ 50 篇，可被 CLI 构建                         |
-| T5-02 | 评测集标注          | `data/queries.jsonl`（30~50 条）              | **必须覆盖四类**：精确术语 / 同义改写 / 中英混合 / 长句自然语言问句；标注 query → 相关 chunk_id 列表；标注后交叉复核（防 P2 风险）                                 | 四类齐全，复核通过                                |
-| T5-03 | `idx bench` 实现 | `crates/cli` + `core/bench`                | 输出 Recall@10 / MRR@10 / NDCG@10 / P50 / P99 延迟                                                                      | 三种模式各跑一遍有完整输出                            |
-| T5-04 | **强制对照实验**     | `docs/devel/eval-report.md`                | BM25 only / Vector only / Hybrid(RRF) 三路对比，按查询类型分桶统计                                                                | 有表格与结论                                   |
-| T5-05 | BM25 参数网格搜索    | `docs/devel/eval-report.md`                | `k1 ∈ {1.0, 1.2, 1.5, 2.0}` × `b ∈ {0.3, 0.5, 0.75, 0.9}`，以 NDCG@10 选优。**不盲信英文经验值**（R6）                             | 参数定稿并写入默认值                               |
-| T5-06 | NFR 实测校准       | 更新 `docs/devel/requirements-spec.md` 第 6 章 | 把 NFR-02~05 的目标值替换为实测值，或标注"未达标 + 原因"                                                                                | 需求文档不再有"待实测"标注                           |
-| T5-07 | README 与示例     | `README.md`、`examples/`                    | 快速上手、架构速览、评测结论摘要                                                                                                    | 新人不看文档能跑通                                |
-| T5-08 | 数据诚信           | `docs/devel/eval-report.md`                | 若混合未优于最优单路，**如实记录并分析原因**（语料太小 / 标注质量 / 模型域不匹配），**不得粉饰**                                                             | 结论与实际数据一致                                |
-| T5-09 | 分词方案对照实验       | `analyze/charabia.rs`（feature 隔离）          | 用裁剪版 `charabia`（`default-features=false, features=["chinese"]`，MIT）实现第二个 `Analyzer`，与 `jieba-rs + 自研过滤链` 对比 NDCG@10 | 输出对比结论；若 charabia 明显更优则切换（切换成本 = 一个实现文件） |
+| T5-01 | 评测语料装配         | `data/t2-corpus.jsonl`（~12K 段落）           | **从开源 T2Ranking（Apache-2.0，SIGIR 2023）转换**：`t2_prep.rs`（固定种子）从 dev 集装配 qrels 段落全集 + 均匀负例；真实中文网页段落，词频自然分布（选型与管线详见 `p5-design.md` 第 3~5 章） | ~12K 段落，可被 CLI 构建；分布统计输出                     |
+| T5-02 | 评测集装配          | `data/t2-queries.jsonl`（~320 条）             | 同上转换器产出：**四类各 ~80 条**（精确术语 / 同义改写 / 中英混合 / 长句问句，启发式分桶，词汇重合度计算不依赖任何检索器输出）；相关性为 **4 级专业标注**（T2Ranking qrels，每对 ≥3 人多数票），**不再自标注**（标注者偏差整体消除） | 四类齐全，`t2_prep` 校验通过（qrels 缺失 pid 为 0）      |
+| T5-03 | `idx bench` 实现 | `crates/cli` + `core/bench`                | 输出 Recall@10 / MRR@10 / NDCG@10（**分级 gain=2^g−1**）/ P50 / P99 延迟；`--rel-threshold` 可调 Recall/MRR 阈值；含指标手算单测锚点（详见 `p5-design.md` 第 6~7 章）                                                                      | 三种模式各跑一遍有完整输出                            |
+| T5-04 | **强制对照实验**     | `docs/devel/eval-report.md`                | BM25 only / Vector only / Hybrid(RRF) 三路对比，按查询类型分桶统计；**tantivy 作第三路基线**（ADR-007：NDCG@10 相对差 ≤5%）；RRF k ∈ {20,60,100} 敏感性（R7）。**用 T5-05 定稿参数跑终版**（执行顺序：T5-05 先于 T5-04，见 p5-design.md 8.1）                | 有表格与结论                                   |
+| T5-05 | BM25 参数网格搜索    | `docs/devel/eval-report.md`                | `k1 ∈ {1.0, 1.2, 1.5, 2.0}` × `b ∈ {0.3, 0.5, 0.75, 0.9}`，以 NDCG@10 选优（并列取近默认值）。**不盲信英文经验值**（R6）——真实中文网页语料 + 真实查询正是该风险的设计场景                             | 参数定稿并写入默认值                               |
+| T5-06 | NFR 实测校准       | 更新 `docs/devel/requirements-spec.md` 第 6 章 | 用 `t2-corpus.jsonl`（~12K chunk，对齐"1 万 chunk"目标规模）实测 NFR-02~05，替换目标值或标注"未达标 + 原因"                                                                                | 需求文档不再有"待实测"标注                           |
+| T5-07 | README 与示例     | `README.md`、`examples/`                    | 快速上手（30 篇 demo 语料）、架构速览、评测结论摘要、**T2Ranking 数据来源与引用**；demo 语料补 metadata 支撑 `--filter` 演示                                                                              | 新人不看文档能跑通                                |
+| T5-08 | 数据诚信           | `docs/devel/eval-report.md`                | 若混合未优于最优单路，**如实记录并分析原因**（子集难度 / 模型域 / 人类查询代理偏差），**不得粉饰**；披露：随机负例潜在假负例、分桶启发式、与论文基线仅量级对照                                                                             | 结论与实际数据一致                                |
+| T5-09 | 分词方案对照实验       | `analyze/charabia.rs`（feature 隔离）          | 用裁剪版 `charabia`（`default-features=false, features=["chinese"]`，MIT）实现第二个 `Analyzer`，在 **T2Ranking 真实语料**上与 `jieba-rs + 自研过滤链` 对比 NDCG@10。**三步验证先行**（依赖树 / MSRV / License），失败则记录事实并跳过（见 p5-design.md 第 9 章） | 输出对比结论；若 charabia 明显更优则切换（切换成本 = 一个实现文件） |
 
 ---
 
@@ -390,8 +393,8 @@ make fmt && make lint && make test
 | P4 | T4-07 元数据过滤                                            | ✅  |
 | P4 | T4-08 单元测试补齐                                           | ✅  |
 | P4 | T4-09 集成测试                                             | ✅  |
-| P5 | T5-01 示例语料补全                                           | ⬜  |
-| P5 | T5-02 评测集标注                                            | ⬜  |
+| P5 | T5-01 评测语料装配（T2Ranking 转换）                                    | ⬜  |
+| P5 | T5-02 评测集装配（T2Ranking 转换）                                      | ⬜  |
 | P5 | T5-03 `idx bench` 实现                                   | ⬜  |
 | P5 | T5-04 强制对照实验                                           | ⬜  |
 | P5 | T5-05 BM25 参数网格搜索                                      | ⬜  |
@@ -428,7 +431,7 @@ cargo run -p idx -- search  --index /tmp/index.idx --mode bm25   -k 5 "查询"
 cargo run -p idx -- search  --index /tmp/index.idx --mode vector -k 5 "查询"
 cargo run -p idx -- compare --index /tmp/index.idx -k 5 "查询"
 cargo run -p idx -- search  --index /tmp/index.idx --mode hybrid --explain "查询"
-cargo run -p idx -- bench   --index /tmp/index.idx --queries data/queries.jsonl
+cargo run -p idx -- bench   --index /tmp/index.idx --queries data/t2-queries.jsonl
 
 # 依赖与 feature 组合验证
 cargo build --no-default-features

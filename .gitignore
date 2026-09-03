@@ -29,3 +29,6 @@
 .idea/
 .vscode/
 *.swp
+
+# ---- T2Ranking 原始数据（3.5GB，P5 评测用，不入库）----
+/data/t2ranking/

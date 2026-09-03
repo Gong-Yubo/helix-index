@@ -17,7 +17,7 @@
 2. 向量入库前 L2 归一化（`cos = 1 - d²/2`）
 3. 索引侧与查询侧必须共用同一 Analyzer
 4. BM25 用 OR 不用 AND
-5. `instant-distance` 无增量插入 → 主索引 + delta 暴力区
+5. ~~instant-distance 无增量插入 → 主索引 + delta 暴力区~~（P4 A/B 定案 hnsw_rs 胜出，生产路径已切原生增量；见第 54 条）
 
 ## 文档结构（全部开发文档在 `docs/devel/` 下，索引见 `docs/README.md`）
 - `docs/devel/plan.md`（开发计划）：P0~P6 任务级清单（T0-01~T5-09）+ 阶段门槛 Gate + 进度追踪表。**开工前先看这个**
@@ -52,5 +52,6 @@
 - git 身份：全局 `GongYubo <gongyubo@gmail.com>`。⚠️ 家目录有 ACL `group:everyone deny delete`，`git config --global` 会失败，**改 ~/.gitconfig 必须直接编辑文件内容**（不能用 git config 写）
 - P4 先用 `hnsw_rs`（纯 Rust + 原生增量 insert）与「instant-distance + delta」A/B，达标则删掉 delta 区
 - **A/B 已定案（2026-09-03）：hnsw_rs 胜出**——召回同为 0.970，原生增量 1.5ms/条 vs instant-distance 全量重建 31s/万条；生产路径已切 HnswRsIndex。⚠️ **hnsw_rs 的 DistDot 在 aarch64 有 assert!(dot<=1) 浮点断言会 panic**（自匹配 dot=1.0000002）→ 用自定义 DistDotClamped；**crate 名是 hnsw_rs（下划线）**
+- **P5 评测数据源（2026-09-03 定案，p5-design.md v1.2）：T2Ranking**（THUIR，SIGIR 2023，Apache-2.0，HF `THUIR/T2Ranking` 直下）。dev 24,832 query 带 4 级 TREC qrels；BM25 MRR@10=0.359 论文基线可做外部锚点。转换器 `t2_prep.rs` 固定种子装配 ~320 query + ~12K 段落。**检索方向调研教训：DuReader-retrieval 有注册墙且数据许可未明示；mMARCO-zh 是机翻；Multi-CPR 假负例严重**
 - **bincode 2 不支持 serde_json::Value**（serialize_any → AnyNotSupported）→ 快照对 metadata 用 DTO 存 JSON 字符串；且 bincode 2 需显式开 `serde` feature 才有 bincode::serde
 - 快照格式：magic "IDX1" + version + crc32(header 后正文)；term_dict 按 TermId 升序导出防漂移；content_hash 用 xxhash-rust xxh64
