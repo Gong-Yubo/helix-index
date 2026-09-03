@@ -219,7 +219,8 @@ fn main() -> anyhow::Result<()> {
                     ostar = ostar.max(overlap / q_terms.len() as f64);
                 }
             }
-            ostar_hist[(ostar * 10.0) as usize] += 1;
+            // o* 恰为 1.0 时 (1.0*10.0) as usize == 10 会越界，钳制到末格
+            ostar_hist[((ostar * 10.0) as usize).min(9)] += 1;
             ostar_all.push(ostar);
             if ostar >= OSTAR_THRESHOLD {
                 "exact"
@@ -274,6 +275,11 @@ fn main() -> anyhow::Result<()> {
         if corpus_pids.insert(pid.clone()) {
             grade_dist[0] += 1; // 未标注负例，记 0 级口径
         }
+    }
+    // 负例文本并入文本表（后续 chunk 断言与 corpus 输出使用；
+    // negatives 此后不再使用，直接 move）
+    for (pid, text) in negatives {
+        qrels_text.insert(pid, text);
     }
     println!(
         "\n语料装配: qrels 段落 {} + 负例 {} = {} 段落（目标 ~{}）",

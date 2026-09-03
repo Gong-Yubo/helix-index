@@ -24,6 +24,7 @@ use clap::Args;
 
 use index_core::analyze::MixedAnalyzer;
 use index_core::bench::{self, Judgment, QueryMetrics};
+use index_core::chunk::Chunker;
 use index_core::embed::LocalEmbedder;
 use index_core::fusion::RrfFusion;
 use index_core::index::Index;
@@ -317,11 +318,29 @@ fn load_setup(args: &BenchArgs, need_vector: bool) -> Result<Setup> {
             (index, vectors)
         }
         (None, Some(path)) => {
-            let (index, _) = crate::load_corpus(path)?;
+            // 每段落强制单 chunk（p5-design 5.2 步骤 8）：T2Ranking 标注在段落级，
+            // 多 chunk 段落会导致同一 passage 的多个 chunk 各占 Top-10 位次、双计相关性。
+            // 200K 字符 > 语料最长段落（76,895），保证恒单 chunk。
+            const SINGLE_CHUNK_CHARS: usize = 200_000;
+            let (index, _) = crate::load_corpus_with(path, &Chunker::new(SINGLE_CHUNK_CHARS, 0))?;
+            println!(
+                "[评测构建：每段落强制单 chunk 路径（chunk_chars={SINGLE_CHUNK_CHARS}，无重叠）]"
+            );
             (index, Vec::new())
         }
         _ => bail!("--index 与 --input 必须二选一"),
     };
+
+    // 快照口径校验：T2Ranking 标注在段落级，chunk:doc ≠ 1:1 时存在多 chunk
+    // 双计风险（--index 路径无法重切，建议改用 --input 强制单 chunk 路径）
+    if index.num_chunks() as usize != index.num_docs() {
+        println!(
+            "[⚠️ 快照 chunk:doc ≠ 1:1（{} chunks / {} docs）：段落级标注会被多 chunk 双计，\
+             建议 --input 走强制单 chunk 路径]",
+            index.num_chunks(),
+            index.num_docs()
+        );
+    }
 
     let mut vectors = vectors;
     let mut embedder = None;

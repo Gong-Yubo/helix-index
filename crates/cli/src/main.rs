@@ -128,13 +128,18 @@ fn parse_filters(specs: &[String]) -> Result<Option<Filter>> {
     Ok(Some(Filter::And(conditions)))
 }
 
-/// 从 JSONL 语料构建索引。
+/// 从 JSONL 语料构建索引（默认 Chunker 512/64）。
 pub(crate) fn load_corpus(path: &Path) -> Result<(Index, MixedAnalyzer)> {
+    load_corpus_with(path, &Chunker::default())
+}
+
+/// 从 JSONL 语料构建索引，指定 Chunker（bench 的"每段落强制单 chunk"
+/// 评测路径用——T2Ranking 段落级标注防多 chunk 双计，见 p5-design 5.2 步骤 8）。
+pub(crate) fn load_corpus_with(path: &Path, chunker: &Chunker) -> Result<(Index, MixedAnalyzer)> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("读取语料失败: {}", path.display()))?;
 
     let analyzer = MixedAnalyzer::new();
-    let chunker = Chunker::default();
     let mut index = Index::new();
 
     let mut count = 0usize;
