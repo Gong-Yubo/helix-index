@@ -27,6 +27,11 @@ cargo run -p helix -- bench --input data/t2-corpus.jsonl --queries data/t2-queri
 库使用端到端示例：`cargo run -p helix-core --example search_basic`
 （建索引 → hybrid 检索 → `to_context_block()` 拼 prompt 上下文块）。
 
+> **完整文档见 [`docs/user-guide.md`](docs/user-guide.md)**：
+> CLI 全参数参考、典型工作流（建库 / 过滤 / explain / 对比 / 评测）、
+> 六 trait 替换矩阵、feature 选用建议、性能预期与已知坑。
+> 本文件的"快速上手"只是最短路径。
+
 ## 架构速览
 
 ```
@@ -93,7 +98,11 @@ embed ──► vector（向量存储与近邻检索）────────�
 ## 开发
 
 ```bash
-make fmt && make lint && make test && make deny   # 阶段门槛
+make fmt && make lint && make test && make deny   # 阶段门槛（CI 同样跑这些）
+make eval-quality                                 # 效果评测
+make eval-perf                                    # NFR 性能实测
+make report CHECK=--check                         # 报告数字逐格对账
 ```
 
-开发文档索引见 [`docs/README.md`](docs/README.md)，开工前先读 `docs/devel/plan.md`。
+- 使用文档：[`docs/user-guide.md`](docs/user-guide.md)
+- 开发文档索引：[`docs/README.md`](docs/README.md)，开工前先读 `docs/devel/plan.md`

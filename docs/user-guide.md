@@ -1,0 +1,326 @@
+# HelixIndex 使用指南
+
+面向两类读者：**CLI 使用者**（运维 / 评测 / 不想写 Rust 的人）与
+**库接入方**（把 HelixIndex 嵌进自己服务的 Rust 开发者）。
+
+项目定位与评测结论见 [`README.md`](../README.md)；
+设计决策与实现细节见 [`devel/`](./devel) 下各文档。
+
+## 目录
+
+- [Part 1 — CLI 使用](#part-1--cli-使用)
+  - [1.1 命令总览](#11-命令总览)
+  - [1.2 build 参数](#12-build-参数)
+  - [1.3 search 参数](#13-search-参数)
+  - [1.4 compare 参数](#14-compare-参数)
+  - [1.5 bench 参数](#15-bench-参数)
+  - [1.6 典型工作流](#16-典型工作流)
+  - [1.7 数据格式约定](#17-数据格式约定)
+  - [1.8 已知坑与性能预期](#18-已知坑与性能预期)
+- [Part 2 — 库接入](#part-2--库接入)
+  - [2.1 最小闭环](#21-最小闭环)
+  - [2.2 六 trait 替换矩阵](#22-六-trait-替换矩阵)
+  - [2.3 feature flags 选用](#23-feature-flags-选用)
+  - [2.4 性能预期](#24-性能预期)
+
+---
+
+# Part 1 — CLI 使用
+
+## 1.1 命令总览
+
+| 命令 | 用途 | 典型场景 |
+| --- | --- | --- |
+| `build` | 摄入语料并落盘快照 | 建库（一次性 / 定期重建） |
+| `search` | 单次检索（`--input` 重建 或 `--index` 加载快照） | 日常使用、调试 |
+| `compare` | 三路同屏对比 | 调试"为什么某条没召回" |
+| `bench` | 效果与性能评测 | 调参、回归验证 |
+
+> **短参约定**：`-i` = `--input`（语料），`--index`（快照）**没有短参**。
+> 这是刻意的——两者都给 `-i` 会让 debug 构建直接 panic。
+> 若你写 `helix xxx -i foo.jsonl`，拿到的永远是"语料"语义。
+
+## 1.2 build 参数
+
+```
+helix build --input <语料> [--output <快照>] [--vectors] [--single-chunk]
+```
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `-i, --input` | （必填） | 语料 JSONL，每行 `{"source","text","metadata?"}` |
+| `-o, --output` | 无 | 快照输出路径。不指定则只在内存中构建（进程结束即弃） |
+| `--vectors` | 关 | 同时 embed 并保存向量，**vector/hybrid 检索必需**；首次运行会下载模型（约 91MB） |
+| `--single-chunk` | 关 | 每段落强制单 chunk。评测口径专用——段落级标注时会防"同一 passage 的多个 chunk 各占位次"的双计 |
+
+输出示例：
+
+```
+索引构建完成:
+  文档数   = 12000
+  分片数   = 12000
+  词项总数 = 3200042
+  平均分片 = 266.67
+  embed 12000 条 耗时 233.70s（NFR-03 口径 = embed + 落盘，不含 HNSW）
+  快照已写入 data/t2-index-sc.snapshot（含向量，52.3 MB）耗时 236.69s
+```
+
+## 1.3 search 参数
+
+```
+helix search [--input <语料> | --index <快照>] [-m bm25|vector|hybrid] [-k N] [--filter f=v]... [--explain] <查询>
+```
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `-i, --input` | — | 从语料现场构建（每次重建，适合小语料/调试） |
+| `--index` | — | 从快照加载（秒级，生产用法）。**与 `--input` 二选一** |
+| `-m, --mode` | `bm25` | `bm25` 关键词 / `vector` 语义 / `hybrid` 两路融合（**推荐**） |
+| `-k, --k` | 10 | 返回条数 |
+| `--filter` | 无 | 元数据等值过滤，`field=value`，**可重复**（多个条件为 AND） |
+| `--explain` | 关 | 打印命中词 + 两路 rank/score，用于排查召回质量 |
+| `<QUERY>` | （必填） | 查询文本（位置参数，放最后） |
+
+`--explain` 输出示例（Agent 自查检索质量用，FR-13）：
+
+```
+#1  score=0.0410  [hybrid-search.md]
+    bm25 rank=1 score=3.15 | vector rank=2 score=0.87 | matched: 检索, 融合
+```
+
+## 1.4 compare 参数
+
+```
+helix compare --input <语料> [-k N] <查询>
+```
+
+三路（bm25 / vector / hybrid）同屏对比，调试主入口。只接受 `--input`（每次重建），
+不支持快照。
+
+## 1.5 bench 参数
+
+```
+helix bench [--input <语料> | --index <快照>] [--queries <judgments>] [选项...]
+```
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `-q, --queries` | `data/t2-queries.jsonl` | judgments 文件（含 graded 标注） |
+| `--modes` | `bm25,vector,hybrid` | 参评模式，逗号分隔 |
+| `-k, --k` | 10 | 指标 @K |
+| `--k1` / `--b` | 定稿 1.5 / 0.75 | 覆盖 BM25 参数（网格搜索用） |
+| `--rrf-k` | 60 | 覆盖 RRF k（默认取 `RrfFusion::default()`） |
+| `--rrf-weights` | `1,1.5` | RRF 路权重 `w_bm25,w_vector`（默认取 `RrfFusion::default()`） |
+| `--rel-threshold` | 1 | Recall/MRR 的相关性阈值（1 或 2）；**主表两列都输出** |
+| `--grid` | 关 | BM25 k1×b 16 格网格搜索 |
+| `--reps` / `--warmup` | 20 / 3 | 延迟测量的重复与预热次数 |
+| `--analyzer` | `mixed` | 分词器；`charabia` 需以 `--features charabia` 编译 |
+| `--vector-index` | `hnsw` | `brute` 用于诊断：隔离 ANN 近似误差（p5-design 8.6） |
+| `--ef-search` | 200 | 覆盖 HNSW ef_search |
+| `--runs` | 1 | >1 时每轮重建 HNSW 图，输出 run-to-run 抖动 |
+| `--json` | 无 | 机器可读输出路径（含 per-query 明细） |
+| `--no-latency` | 关 | 跳过延迟测量（只跑效果） |
+
+> **重要**：`--rrf-k` / `--rrf-weights` 的默认值**从内核 `RrfFusion::default()` 派生**，
+> 不是 CLI 硬编码。因此 `helix bench` 与 `helix search --mode hybrid` 的"默认融合"必然一致。
+
+**日常评测请用脚本**（固化定稿参数，一键复现）：
+
+```bash
+make eval-quality                                   # 三路对照
+make eval-quality ARGS="--grid"                     # 网格搜索
+make eval-quality ARGS="--modes bm25 --analyzer charabia"
+make eval-perf                                      # NFR 实测
+make report CHECK=--check                           # 与 eval-report 逐格对账
+```
+
+## 1.6 典型工作流
+
+### 建库 → 秒级检索（推荐生产用法）
+
+```bash
+# 建库（含向量，首次会下载模型 ~91MB）
+helix build --input data/corpus.jsonl --output /tmp/demo.snapshot --vectors
+
+# 之后每次检索都是秒级加载，不再重建
+helix search --index /tmp/demo.snapshot --mode hybrid "如何加快检索速度"
+```
+
+### 元数据过滤
+
+```bash
+# demo 语料的每篇文档都带 metadata.topic
+helix search --input data/corpus.jsonl --mode bm25 --filter topic=vector "向量检索"
+
+# 多个 --filter 为 AND
+helix search --input data/corpus.jsonl --filter topic=vector --filter lang=zh "检索"
+```
+
+### 可解释性（Agent 自查检索质量）
+
+```bash
+helix search --index /tmp/demo.snapshot --mode hybrid --explain "向量检索与BM25融合"
+```
+
+`--explain` 给出两路各自的 rank/score 与命中词。对 Agent 场景特别有用：
+看到 `bm25_rank=None` 说明词面完全没命中（可能是 query 含幻觉词），
+看到两路排名差异大说明该条处于两路的判断分歧区。
+
+### 三路对比调试
+
+```bash
+helix compare --input data/corpus.jsonl -k 5 "为什么这条没召回"
+```
+
+### 效果评测
+
+```bash
+make eval-quality
+```
+
+## 1.7 数据格式约定
+
+**语料 JSONL**（每行一个文档）：
+
+```json
+{"source": "vector-search.md", "text": "向量检索把文本编码成高维向量……"}
+{"source": "hnsw.md", "text": "HNSW 是一种近似最近邻搜索的图结构算法……", "metadata": {"topic": "vector"}}
+```
+
+- `source`（必需）：出处，用于溯源与结果展示（FR-12）
+- `text`（必需）：正文
+- `metadata`（可选）：任意 JSON 对象，`--filter field=value` 可对顶层字段做等值过滤
+
+**judgments JSONL**（仅 `bench` 评测用）：
+
+```json
+{"qid":"10100","query":"农村地理水井是哪个部门安装的",
+ "relevance":[{"grade":3,"source":"380887"},{"grade":1,"source":"330036"}],
+ "type":"paraphrase"}
+```
+
+- `relevance[].grade`：0~3 的分级标注（0 = 已判定负例）
+- `type`：分桶标签（mixed / natural / exact / paraphrase），用于分桶统计
+
+## 1.8 已知坑与性能预期
+
+| 现象 | 原因 | 处理 |
+| --- | --- | --- |
+| `helix bench -i x.jsonl` 报"快照版本不兼容" | 你把语料传给了 `--input` 之外的位置；注意 `-i` 恒等于 `--input` | 语料用 `-i`，快照用 `--index` |
+| 建库极慢（12K 段落 ~237s） | ort CPU 推理吞吐约 50 条/秒，**NFR-03 未达标** | 见 [2.4 性能预期](#24-性能预期)；P6 会做并行/量化/增量 |
+| 加载快照后首次检索仍要等 ~11s | HNSW **图不持久化**，加载后需重建（D7） | 已知问题，P6 做图持久化 |
+| `vector`/`hybrid` 模式首次运行很久 | 首次下载 bge-small-zh-v1.5（约 91MB） | 缓存在 `~/.cache/helix-index/models`，仅首次 |
+| 同一 query 两次跑分数略有不同 | HNSW 图每次构建不同（R-P5-13） | NDCG 抖动约 0.002，不影响结论；用 `--runs` 观察 |
+
+---
+
+# Part 2 — 库接入
+
+## 2.1 最小闭环
+
+完整可运行示例见 [`crates/core/examples/search_basic.rs`](../crates/core/examples/search_basic.rs)：
+
+```bash
+cargo run -p helix-core --example search_basic
+```
+
+核心链路只有四步：
+
+```rust
+// 1. 建索引：分词器 + 分块器 + 倒排
+let analyzer = MixedAnalyzer::new();
+let chunker = Chunker::default();          // 512 字符 / 64 重叠
+let mut index = Index::new();
+index.add(doc, chunker.chunk(0, text), &analyzer)?;
+
+// 2. 向量侧：embed 所有分片 → HNSW 图（入库前强制 L2 归一化）
+let embedder = LocalEmbedder::new()?;
+let vecs = embedder.embed_documents(&texts)?;
+let mut hnsw = HnswRsIndex::with_capacity(n);
+hnsw.add(chunk_id, NormalizedVector::new(v))?;
+
+// 3. 检索：Searcher 编排（bm25 / vector / hybrid）
+let searcher = Searcher::new(&index, &analyzer)
+    .with_vector(&embedder, &hnsw);
+let resp = searcher.search("如何加快检索速度", SearchMode::Hybrid, 3)?;
+
+// 4. 拼进 prompt：带出处与命中词（FR-12）
+for hit in &resp.hits {
+    println!("{}", hit.to_context_block());
+}
+```
+
+`to_context_block()` 产出形如：
+
+```
+[来源: vector-search.md]
+向量检索把文本编码成高维向量……
+(命中词: 加快, 检索, 速度)
+```
+
+## 2.2 六 trait 替换矩阵
+
+内核的全部能力都抽象为 trait，可按需替换：
+
+| trait | 默认实现 | 替换场景 | 影响面 / 注意事项 |
+| --- | --- | --- | --- |
+| `Analyzer` | `MixedAnalyzer`（jieba + 自研过滤链） | 换分词方案 | ⚠️ **索引侧与查询侧必须同时换**（R4）。换分词后需重建索引 |
+| `Embedder` | `LocalEmbedder`（bge-small-zh-v1.5） | 接远程 embedding、换模型 | 向量维度须与已入库向量一致，否则 `DimensionMismatch` |
+| `VectorIndex` | `HnswRsIndex`（原生增量） | 换 ANN 实现 | 无。`BruteForceIndex` 已现成（诊断/小语料用） |
+| `Retriever` | `Bm25Retriever` / `VectorRetriever` | 加自定义召回路 | 需同步 `FusionStrategy` 的权重数组长度 |
+| `FusionStrategy` | `RrfFusion`（k=60 / weights 1:1.5） | 换融合算法 | 无 |
+| `Reranker` | `NoOpReranker` | 接 rerank 模型 | 无（P6 主题） |
+
+**关于 `Analyzer` 的"双实现"说明**：内核自带 `MixedAnalyzer`；
+`charabia` 实现以 feature 隔离提供（T5-09 验证性），但在真实中文语料上
+**全面落后自研链**（NDCG −5.9%），故保留自研链为默认。
+替换路径本身已定义且可跑，只是不建议换。
+
+## 2.3 feature flags 选用
+
+| feature | 默认 | 说明 |
+| --- | --- | --- |
+| `local-embed` | ✅ 开 | 本地 embedding（fastembed + ONNX）。**关闭可显著缩小依赖树** |
+| `remote-embed` | 关 | 远程 embedding（P2 预留） |
+| `positions` | 关 | posting 存储位置信息（短语查询/高亮预备） |
+| `charabia` | 关 | 分词对照实现，**验证性依赖，不要在生产开** |
+
+只用关键词检索（不需要向量）时：
+
+```toml
+helix-core = { version = "0.1.0", default-features = false }
+```
+
+可省掉 fastembed / ort / ONNX Runtime 一整条重依赖链（CI 有对应 job 守着这个能力）。
+
+## 2.4 性能预期
+
+全部为 **release + macOS aarch64 + 12K 段落**实测值
+（详见 [`devel/eval-report.md`](./devel/eval-report.md) 第 8 节，请勿凭直觉外推）：
+
+| 项 | 实测 | NFR 目标 | 状态 |
+| --- | --- | --- | --- |
+| BM25 延迟 | P50 1.13ms / P99 3.90ms | < 5ms | ✅ |
+| 向量延迟 | P50 4.26ms / P99 8.37ms | < 10ms | ✅ |
+| 混合延迟 | P50 4.41ms / P99 8.70ms | P99 < 20ms | ✅ |
+| 快照加载 | 53~107ms | < 2s | ✅ |
+| **HNSW 图重建** | **11.57s** | 秒级 | ⚠️ 图不持久化（D7） |
+| **构建含 embedding** | **236.7s（12K 段落）** | < 120s | ⚠️ 未达标 |
+| 峰值内存 | 383MB（整进程，含模型+ort） | — | 向量本身仅 24.6MB |
+
+**构建慢的成因与对策**：ort CPU 推理批量吞吐约 50 条/秒（非超线性），
+12K 段落即 ~234s。当前适用于**一次性冷建库**；若你的场景需要频繁重建，
+P6 规划了并行 embed / 量化模型 / 增量构建三条路径。
+
+## 2.5 检索模式怎么选
+
+| 场景 | 建议 |
+| --- | --- |
+| 术语精确匹配（代码符号、专有名词、ID） | `bm25` |
+| 同义改写、语义泛化（"怎么加速" ↔ "索引优化"） | `vector` |
+| 通用 / 不确定 | **`hybrid`** |
+
+依据（T2Ranking 320 query 实测）：hybrid 的 **MRR@10 = 0.6922** 与
+**Recall@10 = 0.6829** 均为三路最高——对 Agent 场景（无翻页、首条即决定）
+最关键的正是这两项。hybrid 的 NDCG 略低于 vector 单路（0.5183 vs 0.5249）
+但差异不显著（p=0.385）。

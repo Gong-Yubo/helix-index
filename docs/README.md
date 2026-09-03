@@ -2,9 +2,16 @@
 
 面向 Agent 场景的通用检索引擎内核（Rust，单机 MVP）。
 
-> 全部开发文档存放于 [`devel/`](./devel) 目录下，本文件仅作索引。
+> 使用文档见 [`user-guide.md`](./user-guide.md)；开发文档存放于 [`devel/`](./devel) 目录。
 
-## 文档清单
+## 使用文档（面向使用者与接入方）
+
+| 文档                              | 内容                                                             | 读者        |
+| ------------------------------- | -------------------------------------------------------------- | --------- |
+| [`user-guide.md`](./user-guide.md) | **CLI 全参数参考、典型工作流、六 trait 替换矩阵、feature 选用、性能预期与已知坑** | 使用者、场景层接入方 |
+| [`../README.md`](../README.md)  | 项目定位、最短上手路径、架构速览、评测结论摘要                                     | 所有人       |
+
+## 开发文档（面向实现者）
 
 | 文档                                        | 内容                | 读者            |
 | ----------------------------------------- | ----------------- | ------------- |
@@ -16,6 +23,7 @@
 | [`devel/p4-design.md`](./devel/p4-design.md)（P4 设计说明） | **P4 详细设计**：hnsw_rs 调研、快照格式、向量 A/B 方案、决策点 | 实现者（P4 已完成） |
 | [`devel/p5-design.md`](./devel/p5-design.md)（P5 设计说明） | **P5 详细设计**：T2Ranking 数据集选型与转换管线、评测指标（分级 NDCG）、bench 设计、NFR 实测协议、决策点 | 实现者（P5 已完成） |
 | [`devel/eval-report.md`](./devel/eval-report.md)（P5 评测报告） | **P5 评测结论**：三路对照、分桶与符号检验、tantivy 基线、网格/RRF 定稿、charabia 对照、NFR 实测、数据诚信声明 | 决策者、接入方 |
+| [`devel/v1-finish-design.md`](./devel/v1-finish-design.md)（v1 收尾设计） | **使用文档 / 评测脚本 / CI / 改名与发布 / 工程收尾**的任务清单、执行顺序与决策点（含外部评审修正记录） | 实现者（v1 收尾进行中） |
 | [`devel/requirements-spec.md`](./devel/requirements-spec.md)（需求分析说明书）     | 做什么 / 为什么 / 怎么验收  | 决策者、场景层接入方、实现者 |
 | [`devel/architecture-design.md`](./devel/architecture-design.md)（架构设计说明书） | 怎么做 / 为什么这么做      | 实现者、代码评审者     |
 | [`devel/thirdparty.md`](./devel/thirdparty.md)（第三方库调研） | 哪些能力用现成库、哪些自研，含 License 与 MSRV 核查 | 实现者、评审者     |
