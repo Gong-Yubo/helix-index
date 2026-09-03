@@ -1,0 +1,59 @@
+HelixIndex — 第三方资产声明
+============================
+
+HelixIndex 本身采用 **MIT OR Apache-2.0** 双许可（见 LICENSE-MIT / LICENSE-APACHE）。
+本文件列出本项目**使用或随附的第三方资产**及其许可与引用义务。
+
+Rust 依赖（crate）的许可由 `cargo-deny` 自动校验（NFR-09，配置见 `deny.toml`），
+本文件不重复罗列——运行 `make deny` 可查看完整清单。
+
+
+## 1. 数据集：T2Ranking（评测用）
+
+- **许可**：Apache-2.0
+- **来源**：清华 THUIR，HuggingFace `THUIR/T2Ranking`
+- **用途**：P5 效果评测数据源（320 query / 12K 段落子集，4 级专业标注）
+- **引用义务**（Apache-2.0 §4c 及项目要求）：使用转换产物时需附来源与论文引用。
+
+```
+Xiaohui Xie, Qian Dong, Bingning Wang, Feiyang Lv, Hongbo Deng, Zhifang Sui,
+Yan Zhang, Wenwen Li. T2Ranking: A Large-scale Chinese Benchmark for Passage
+Ranking. In Proceedings of SIGIR 2023.
+```
+
+- 说明：原始数据（`collection.tsv` 等，约 3.5GB）不随仓库分发；
+  仓库内 `data/t2-corpus.jsonl` / `data/t2-queries.jsonl` 是由 `t2_prep.rs`
+  从该数据集确定性装配的子集，随仓库分发以便评测可复现。
+
+
+## 2. 嵌入模型：bge-small-zh-v1.5
+
+- **上游原始模型** `BAAI/bge-small-zh-v1.5`：**MIT**
+- **实际下载仓** `Xenova/bge-small-zh-v1.5`（ONNX，约 91MB）：
+  HuggingFace 页面**未声明 License**。
+  项目于 2026-09-02 决策**接受**该风险，理由：ONNX 转换仓沿用上游 `BAAI` 的 MIT 授权，
+  且该模型仅在运行期下载使用、不随本仓库分发。
+- **用途**：默认 embedding 模型（512 维），查询侧加 BGE instruction 前缀。
+- 残留风险记录于 `docs/devel/requirements-spec.md` 8.3（P5）。
+
+
+## 3. ONNX Runtime（随 ort crate 下载）
+
+- **许可**：**MIT**（Copyright Microsoft Corporation）
+- **来源**：`ort/download-binaries` 在构建期自动下载预编译二进制
+- **用途**：本地 embedding 推理运行时
+- **说明**：CLI（`helix`）是二进制产物，故按 MIT 的"声明须随附"要求在此列出。
+  若需规避二进制分发问题，可改用 `ort/load-dynamic` 链接系统库。
+
+
+## 4. 分词词典
+
+- **jieba 默认词典**：MIT（随 `jieba-rs` crate 分发）
+- 若替换为自定义词典，需注意词典本身的授权。
+
+
+## 5. 其他
+
+- 中文停用词表为项目自维护，无第三方授权问题。
+- 本文件依据 `docs/devel/thirdparty.md` 第 5.2 / 5.3 节整理；
+  如有新增第三方资产，请同步更新两处。
