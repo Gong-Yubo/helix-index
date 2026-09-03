@@ -15,6 +15,12 @@ mod filter;
 mod segment;
 mod stopwords;
 
+#[cfg(feature = "charabia")]
+mod charabia;
+
+#[cfg(feature = "charabia")]
+pub use charabia::CharabiaAnalyzer;
+
 pub use filter::{filter_token, normalize};
 pub use segment::{segment, Segment, SegmentKind};
 pub use stopwords::is_stopword;

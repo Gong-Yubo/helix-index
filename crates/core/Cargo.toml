@@ -11,6 +11,7 @@ default      = ["local-embed"]
 local-embed  = ["dep:fastembed"]
 remote-embed = []            # P2 引入 dep:reqwest
 positions    = []            # posting 存储位置信息
+charabia     = ["dep:charabia"]  # T5-09 分词对照实验（feature 隔离）
 
 [dependencies]
 # 工程基础
@@ -35,6 +36,9 @@ xxhash-rust.workspace      = true
 
 # 向量索引 A/B 候选（T4-06a）；P4 结束后若未采用则移除
 hnsw_rs.workspace = true
+
+# 可选：charabia 分词对照（T5-09；验证性依赖，不进默认特性）
+charabia = { version = "0.10", default-features = false, features = ["chinese"], optional = true }
 
 # 可选：本地 embedding（P2 启用）
 fastembed = { workspace = true, optional = true }

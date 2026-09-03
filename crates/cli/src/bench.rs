@@ -22,7 +22,9 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use clap::Args;
 
-use index_core::analyze::MixedAnalyzer;
+#[cfg(feature = "charabia")]
+use index_core::analyze::CharabiaAnalyzer;
+use index_core::analyze::{Analyzer, MixedAnalyzer};
 use index_core::bench::{self, Judgment, QueryMetrics};
 use index_core::chunk::Chunker;
 use index_core::embed::LocalEmbedder;
@@ -83,6 +85,9 @@ pub struct BenchArgs {
     /// 延迟测量：每 query 预热次数
     #[arg(long, default_value_t = 3)]
     pub warmup: usize,
+    /// 分词器：mixed（默认，自研链）| charabia（T5-09 对照，需 --features charabia 编译）
+    #[arg(long, default_value = "mixed")]
+    pub analyzer: String,
     /// 向量索引后端：hnsw（默认）| brute（诊断：隔离 ANN 近似误差，8.6）
     #[arg(long, default_value = "hnsw")]
     pub vector_index: String,
@@ -103,7 +108,7 @@ pub struct BenchArgs {
 /// 评测环境：索引 + 分词器 + 可选向量后端。
 struct Setup {
     index: Index,
-    analyzer: MixedAnalyzer,
+    analyzer: Box<dyn Analyzer>,
     vectors: Vec<(ChunkId, Vec<f32>)>,
     embedder: Option<LocalEmbedder>,
     backend: Option<VectorBackend>,
@@ -363,25 +368,62 @@ pub fn run(args: BenchArgs) -> Result<()> {
 // 加载
 // ---------------------------------------------------------------------------
 
+/// 按 `--analyzer` 构建分词器（`Box<dyn Analyzer>`）。
+///
+/// charabia 是 feature 隔离的验证性依赖（T5-09）：未以 `--features charabia`
+/// 编译时，`--analyzer charabia` 直接报错并提示重编，而非静默回退（回退会
+/// 在索引/查询两侧用不同分词器，是 R4 正确性事故）。
+fn build_analyzer(args: &BenchArgs) -> Result<Box<dyn Analyzer>> {
+    match args.analyzer.as_str() {
+        "mixed" => Ok(Box::new(MixedAnalyzer::new())),
+        #[cfg(feature = "charabia")]
+        "charabia" => Ok(Box::new(CharabiaAnalyzer::new())),
+        #[cfg(not(feature = "charabia"))]
+        "charabia" => bail!(
+            "--analyzer charabia 需要以 `cargo build --features charabia` 编译 idx（T5-09 对照实验，feature 隔离）"
+        ),
+        other => bail!(
+            "不支持的 --analyzer {other:?}（支持 mixed{}）",
+            if cfg!(feature = "charabia") { " / charabia" } else { "" }
+        ),
+    }
+}
+
 fn load_setup(args: &BenchArgs, need_vector: bool) -> Result<Setup> {
-    let (index, vectors) = match (&args.index, &args.input) {
+    let (index, vectors, analyzer) = match (&args.index, &args.input) {
         (Some(path), None) => {
             let t = Instant::now();
             let (index, vectors) =
                 storage::load(path).with_context(|| format!("加载快照失败: {}", path.display()))?;
             println!("[快照加载 耗时 {:?}（NFR-04 口径之一）]", t.elapsed());
-            (index, vectors)
+            // 快照不携带 analyzer 信息，--index 路径只能用自研链；
+            // --analyzer charabia 须走 --input 重建（索引侧也要切换分词器，R4）。
+            if args.analyzer != "mixed" {
+                println!(
+                    "[⚠️ --index 快照路径忽略 --analyzer={}（快照不存分词器；\
+                     charabia 对照请用 --input 重建，保证索引/查询两侧一致）]",
+                    args.analyzer
+                );
+            }
+            let analyzer: Box<dyn Analyzer> = Box::new(MixedAnalyzer::new());
+            (index, vectors, analyzer)
         }
         (None, Some(path)) => {
             // 每段落强制单 chunk（p5-design 5.2 步骤 8）：T2Ranking 标注在段落级，
             // 多 chunk 段落会导致同一 passage 的多个 chunk 各占 Top-10 位次、双计相关性。
             // 200K 字符 > 语料最长段落（76,895），保证恒单 chunk。
             const SINGLE_CHUNK_CHARS: usize = 200_000;
-            let (index, _) = crate::load_corpus_with(path, &Chunker::new(SINGLE_CHUNK_CHARS, 0))?;
+            let analyzer = build_analyzer(args)?;
+            let index = crate::build_index(
+                path,
+                &Chunker::new(SINGLE_CHUNK_CHARS, 0),
+                analyzer.as_ref(),
+            )?;
             println!(
-                "[评测构建：每段落强制单 chunk 路径（chunk_chars={SINGLE_CHUNK_CHARS}，无重叠）]"
+                "[评测构建：每段落强制单 chunk 路径（chunk_chars={SINGLE_CHUNK_CHARS}，无重叠），analyzer={}]",
+                args.analyzer
             );
-            (index, Vec::new())
+            (index, Vec::new(), analyzer)
         }
         _ => bail!("--index 与 --input 必须二选一"),
     };
@@ -423,7 +465,7 @@ fn load_setup(args: &BenchArgs, need_vector: bool) -> Result<Setup> {
 
     Ok(Setup {
         index,
-        analyzer: MixedAnalyzer::new(),
+        analyzer,
         vectors,
         embedder,
         backend,
@@ -467,7 +509,7 @@ fn make_searcher<'a>(
     rrf_weights: &[f32],
     mode: SearchMode,
 ) -> Result<Searcher<'a>> {
-    let mut s = Searcher::new(&setup.index, &setup.analyzer).with_bm25_params(params);
+    let mut s = Searcher::new(&setup.index, setup.analyzer.as_ref()).with_bm25_params(params);
     if mode != SearchMode::Bm25 {
         let e = setup
             .embedder

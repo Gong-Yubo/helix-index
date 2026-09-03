@@ -6,6 +6,10 @@ edition.workspace      = true
 rust-version.workspace = true
 license.workspace      = true
 
+[features]
+default = []
+charabia = ["index-core/charabia"]  # T5-09 分词对照实验（--analyzer charabia）
+
 [dependencies]
 # 显式写 version 是为了让 cargo-deny 的 wildcards 检查通过（纯 path 依赖会被判为 wildcard）
 index-core = { path = "../core", version = "0.1.0" }

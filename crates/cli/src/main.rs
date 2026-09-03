@@ -136,10 +136,24 @@ pub(crate) fn load_corpus(path: &Path) -> Result<(Index, MixedAnalyzer)> {
 /// 从 JSONL 语料构建索引，指定 Chunker（bench 的"每段落强制单 chunk"
 /// 评测路径用——T2Ranking 段落级标注防多 chunk 双计，见 p5-design 5.2 步骤 8）。
 pub(crate) fn load_corpus_with(path: &Path, chunker: &Chunker) -> Result<(Index, MixedAnalyzer)> {
+    let analyzer = MixedAnalyzer::new();
+    let index = build_index(path, chunker, &analyzer)?;
+    Ok((index, analyzer))
+}
+
+/// 底层构建：用调用方提供的 analyzer 从 JSONL 构建索引。
+///
+/// 与 [`load_corpus_with`] 的区别仅在于 analyzer 由外部注入——
+/// 供 bench 的 `--analyzer charabia` 对照实验在**索引侧切换分词器**（R4：
+/// 索引/查询两侧必须用同一 Analyzer，因此 analyzer 由调用方持有并复用）。
+pub(crate) fn build_index(
+    path: &Path,
+    chunker: &Chunker,
+    analyzer: &dyn index_core::analyze::Analyzer,
+) -> Result<Index> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("读取语料失败: {}", path.display()))?;
 
-    let analyzer = MixedAnalyzer::new();
     let mut index = Index::new();
 
     let mut count = 0usize;
@@ -168,14 +182,14 @@ pub(crate) fn load_corpus_with(path: &Path, chunker: &Chunker) -> Result<(Index,
             content_hash: content_hash(text), // 幂等 upsert（FR-15）
         };
         let chunks = chunker.chunk(0, text);
-        index.add(doc, chunks, &analyzer)?;
+        index.add(doc, chunks, analyzer)?;
         count += 1;
     }
 
     if count == 0 {
         bail!("语料为空: {}", path.display());
     }
-    Ok((index, analyzer))
+    Ok(index)
 }
 
 /// embed 所有分片，返回 (chunk_id, 原始向量)。
