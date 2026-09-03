@@ -25,7 +25,6 @@ unicode-segmentation   = "1.13"
 unicode-normalization  = "0.1"
 
 # ---- 检索内核 ----
-instant-distance = { version = "0.6.1", features = ["with-serde"] }
 # ⚠️ 精确锁定传递依赖 ort =2.0.0-rc.13（预发布），Cargo.lock 必须入库
 # 关闭 default features 以移除 `image-models`（我们只用文本模型）：
 # 它带来的 image → ravif → rav1e → libfuzzer-sys 链是 NCSA 许可，且白白增加编译时间。

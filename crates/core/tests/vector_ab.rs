@@ -1,112 +1,145 @@
-//! T4-06a：向量索引 A/B —— `hnsw_rs`（原生增量）vs `instant-distance`（一次性构建）。
+//! D8：`HnswRsIndex` vs `BruteForceIndex` 召回对照（真实语料 + 评测 query）。
 //!
-//! 运行方式（debug 下两者都极慢，必须 release）：
+//! P4 的 0.970 重合率测于**随机向量**，不能代表真实场景——bge 真实 embedding
+//! 的相关文档常处边界位置，恰是最易翻转的区间。D8 决策：在 T2Ranking 真实
+//! embedding + 评测 query 上验证 HNSW 召回一致性（相对暴力全量扫描的 Top-K 重合率）。
+//!
+//! # 运行（#[ignore]：依赖评测数据 + 模型下载，必须 release）
 //!
 //! ```bash
-//! cargo test --release -p index-core --test vector_ab -- --ignored --nocapture
+//! cargo test -p index-core --release --test vector_ab -- --ignored --nocapture
 //! ```
 //!
-//! 对比项（p4-design.md 7.1）：
-//! 1. **增量写入延迟**：hnsw_rs 单条 insert 的 P50/P99；
-//!    instant-distance 无 insert，其"增量成本"= 定期全量重建，测 1 万条 build 耗时
-//! 2. **召回一致性**：两者与暴力 Top-10 的重合率（判据 ≥ 95%）
-//! 3. **结论输出**：达标则采用 hnsw_rs 原生增量、删除 delta 区设计
+//! 语料/查询路径可用环境变量 `IDX_T2_CORPUS` / `IDX_T2_QUERIES` 覆盖（默认
+//! `../../data/t2-corpus.jsonl` / `../../data/t2-queries.jsonl`，相对仓库根执行）。
 
+#![cfg(feature = "local-embed")]
 #![allow(non_snake_case)] // 中文测试名
 
+use std::path::PathBuf;
 use std::time::Instant;
 
-use index_core::vector::{BruteForceIndex, HnswIndex, HnswRsIndex, NormalizedVector, VectorIndex};
+use index_core::embed::{Embedder, LocalEmbedder};
+use index_core::vector::{BruteForceIndex, HnswRsIndex, NormalizedVector, VectorIndex};
 
-fn random_vec(seed: &mut u64) -> Vec<f32> {
-    let mut next = || {
-        *seed = seed
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        ((*seed >> 33) as u32 as f32 / u32::MAX as f32) * 2.0 - 1.0
-    };
-    let v: Vec<f32> = (0..512).map(|_| next()).collect();
-    // 归一化
-    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    v.into_iter().map(|x| x / norm).collect()
+/// 语料子集规模（embed 吞吐 ~50 条/s，2000 段约 40s，控制测试时长）。
+const N_CORPUS: usize = 2000;
+/// 评测 query 数量。
+const N_QUERY: usize = 100;
+const K: usize = 10;
+
+fn env_path(var: &str, default: &str) -> PathBuf {
+    std::env::var(var)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(default))
+}
+
+/// 读 t2-corpus.jsonl 前 `limit` 段 → (chunk_id, text)。
+fn load_corpus(path: &PathBuf, limit: usize) -> Vec<(u32, String)> {
+    let content = std::fs::read_to_string(path).unwrap_or_else(|e| {
+        panic!(
+            "读取语料失败 {}: {e}（先跑 t2_prep 或设 IDX_T2_CORPUS）",
+            path.display()
+        )
+    });
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .take(limit)
+        .enumerate()
+        .map(|(i, line)| {
+            let v: serde_json::Value = serde_json::from_str(line).expect("语料行非法 JSON");
+            let text = v["text"].as_str().expect("缺 text").to_string();
+            (i as u32, text)
+        })
+        .collect()
+}
+
+/// 读 t2-queries.jsonl 前 `limit` 条 query 文本。
+fn load_queries(path: &PathBuf, limit: usize) -> Vec<String> {
+    let content = std::fs::read_to_string(path).unwrap_or_else(|e| {
+        panic!(
+            "读取查询失败 {}: {e}（先跑 t2_prep 或设 IDX_T2_QUERIES）",
+            path.display()
+        )
+    });
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .take(limit)
+        .map(|line| {
+            let v: serde_json::Value = serde_json::from_str(line).expect("查询行非法 JSON");
+            v["query"].as_str().expect("缺 query").to_string()
+        })
+        .collect()
 }
 
 fn topk_overlap(
-    a: &dyn VectorIndex,
-    b: &dyn VectorIndex,
+    hnsw: &HnswRsIndex,
+    brute: &BruteForceIndex,
     queries: &[NormalizedVector],
     k: usize,
 ) -> f32 {
     let mut total = 0.0;
     for q in queries {
-        let av: Vec<u32> = a.search(q, k).unwrap().iter().map(|(i, _)| *i).collect();
-        let bv: Vec<u32> = b.search(q, k).unwrap().iter().map(|(i, _)| *i).collect();
-        let aset: std::collections::HashSet<u32> = av.iter().copied().collect();
-        total += bv.iter().filter(|x| aset.contains(x)).count() as f32 / k as f32;
+        let h: Vec<u32> = hnsw.search(q, k).unwrap().iter().map(|(i, _)| *i).collect();
+        let b: Vec<u32> = brute
+            .search(q, k)
+            .unwrap()
+            .iter()
+            .map(|(i, _)| *i)
+            .collect();
+        let hset: std::collections::HashSet<u32> = h.iter().copied().collect();
+        total += b.iter().filter(|x| hset.contains(x)).count() as f32 / k as f32;
     }
     total / queries.len() as f32
 }
 
 #[test]
 #[ignore]
-fn 向量索引AB对比() {
-    let n = 10_000usize;
-    let mut seed = 7u64;
-    let entries: Vec<(u32, NormalizedVector)> = (0..n)
-        .map(|i| (i as u32, NormalizedVector::new(random_vec(&mut seed))))
-        .collect();
-    let queries: Vec<NormalizedVector> = (0..10)
-        .map(|_| NormalizedVector::new(random_vec(&mut seed)))
-        .collect();
-    let brute = BruteForceIndex::from_entries(entries.clone());
+fn 真实语料召回对照() {
+    let corpus_path = env_path("IDX_T2_CORPUS", "../../data/t2-corpus.jsonl");
+    let queries_path = env_path("IDX_T2_QUERIES", "../../data/t2-queries.jsonl");
 
-    println!("\n========== 向量索引 A/B（{n} 条 × 512 维，release） ==========\n");
-
-    // ---- A：hnsw_rs（原生增量 insert）----
-    let mut h = HnswRsIndex::with_capacity(n);
-    let mut insert_times: Vec<u128> = Vec::with_capacity(n);
-    let t_all = Instant::now();
-    for (id, v) in &entries {
-        let t = Instant::now();
-        h.add(*id, v.clone()).unwrap();
-        insert_times.push(t.elapsed().as_micros());
-    }
-    let h_total_ms = t_all.elapsed().as_millis();
-    insert_times.sort_unstable();
-    let p50 = insert_times[n / 2];
-    let p99 = insert_times[(n as f32 * 0.99) as usize];
-    let h_overlap = topk_overlap(&h, &brute, &queries, 10);
-
-    println!("[A] hnsw_rs（原生增量）");
-    println!("    逐条插入总耗时 = {h_total_ms} ms（含 {n} 次 insert）");
-    println!("    单条 insert P50 = {p50} µs, P99 = {p99} µs");
-    println!("    Top-10 vs 暴力重合率 = {h_overlap:.3}");
-
-    // ---- B：instant-distance（一次性构建）----
-    let t = Instant::now();
-    let idist = HnswIndex::build(entries.clone());
-    let b_build_ms = t.elapsed().as_millis();
-    let b_overlap = topk_overlap(&idist, &brute, &queries, 10);
-
-    println!("\n[B] instant-distance（一次性构建，无增量 insert）");
-    println!("    全量 build 耗时 = {b_build_ms} ms（delta 方案的重建成本）");
-    println!("    Top-10 vs 暴力重合率 = {b_overlap:.3}");
-
-    // ---- 结论 ----
-    println!("\n---------- 对比结论 ----------");
-    println!("增量能力:  A 支持（P99 {p99}µs/条）；B 不支持（重建 {b_build_ms}ms/万条）");
-    println!("召回重合:  A = {h_overlap:.3}, B = {b_overlap:.3}（判据 ≥ 0.95）");
-    let a_ok = h_overlap >= 0.95;
+    let corpus = load_corpus(&corpus_path, N_CORPUS);
+    let query_texts = load_queries(&queries_path, N_QUERY);
     println!(
-        "判定:      {}",
-        if a_ok {
-            "A（hnsw_rs）达标 → 采用原生增量，删除 delta 区设计"
-        } else {
-            "A 未达标 → 回落「instant-distance 主索引 + delta 暴力区」"
-        }
+        "\n========== HNSW vs 暴力召回对照（真实语料 {N_CORPUS} 段 × {N_QUERY} query，release） ==========\n"
     );
-    println!();
 
-    // 断言判据（A 的召回必须达标才算 A/B 有结论）
-    assert!(h_overlap >= 0.95, "hnsw_rs 召回未达标: {h_overlap}");
+    // ---- embed：语料入库侧（无前缀）+ query 查询侧（BGE 前缀）----
+    let embedder = LocalEmbedder::new().expect("模型初始化失败");
+    let t = Instant::now();
+    let doc_texts: Vec<String> = corpus.iter().map(|(_, t)| t.clone()).collect();
+    let doc_vecs = embedder
+        .embed_documents(&doc_texts)
+        .expect("embed 语料失败");
+    println!("embed {N_CORPUS} 段 耗时 {:?}", t.elapsed());
+
+    let query_vecs: Vec<NormalizedVector> = query_texts
+        .iter()
+        .map(|q| NormalizedVector::new(embedder.embed_query(q).expect("embed query 失败")))
+        .collect();
+
+    // ---- 构建两侧索引 ----
+    let entries: Vec<(u32, NormalizedVector)> = corpus
+        .iter()
+        .zip(doc_vecs)
+        .map(|((id, _), v)| (*id, NormalizedVector::new(v)))
+        .collect();
+
+    let mut hnsw = HnswRsIndex::with_capacity(N_CORPUS.max(1024));
+    let t = Instant::now();
+    for (id, v) in &entries {
+        hnsw.add(*id, v.clone()).expect("HNSW insert 失败");
+    }
+    println!("HNSW 构建 {N_CORPUS} 条 耗时 {:?}", t.elapsed());
+
+    let brute = BruteForceIndex::from_entries(entries);
+
+    // ---- 重合率对照 ----
+    let overlap = topk_overlap(&hnsw, &brute, &query_vecs, K);
+    println!("\nTop-{K} vs 暴力重合率 = {overlap:.3}（判据 ≥ 0.95）\n");
+
+    assert!(overlap >= 0.95, "HNSW 召回重合率未达标: {overlap}");
 }

@@ -33,9 +33,6 @@ pub enum Error {
     #[error("未启用任何 Embedder 实现，请开启 local-embed 或 remote-embed feature")]
     NoEmbedder,
 
-    #[error("该向量索引不支持增量插入（HNSW 需一次性构建）")]
-    ImmutableIndex,
-
     #[error("分词错误: {0}")]
     Analyze(String),
 

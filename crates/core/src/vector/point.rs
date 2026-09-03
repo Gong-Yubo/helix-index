@@ -1,10 +1,10 @@
-//! 归一化向量：实现 `instant_distance::Point`，入库前强制 L2 归一化。
+//! 归一化向量：入库前强制 L2 归一化。
 //!
 //! # 距离约定（架构文档 7.3 / p2-design.md）
 //!
 //! 用**平方欧氏距离**（不开根号，单调性不变）：
 //! `d² = Σ(aᵢ−bᵢ)² = 2 − 2·cos`（当两向量均为单位向量时）。
-//! 因此 `cos = 1 − d²/2`，`instant_distance` 里 distance 越小越近。
+//! 因此 `cos = 1 − d²/2`，距离越小越近。
 
 /// 已 L2 归一化的向量（内部保证范数 = 1）。
 #[derive(Clone, Debug, PartialEq)]
@@ -47,13 +47,6 @@ impl NormalizedVector {
                 d * d
             })
             .sum()
-    }
-}
-
-impl instant_distance::Point for NormalizedVector {
-    /// 距离越小越近（平方欧氏）。
-    fn distance(&self, other: &Self) -> f32 {
-        self.distance_sq(other)
     }
 }
 

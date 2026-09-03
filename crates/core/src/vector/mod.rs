@@ -6,12 +6,10 @@
 //! `NormalizedVector` 的构造函数已强制归一化，因此这里不会再出现未归一化向量。
 
 mod brute;
-mod hnsw;
 mod hnsw_rs_index;
 mod point;
 
 pub use brute::BruteForceIndex;
-pub use hnsw::HnswIndex;
 pub use hnsw_rs_index::HnswRsIndex;
 pub use point::NormalizedVector;
 
@@ -20,7 +18,7 @@ use crate::types::ChunkId;
 
 /// 向量索引抽象。
 pub trait VectorIndex: Send + Sync {
-    /// 增量插入一条向量。**HNSW 不支持**（返回 `Error::ImmutableIndex`），暴力支持。
+    /// 增量插入一条向量。当前实现（`HnswRsIndex` / `BruteForceIndex`）均支持。
     fn add(&mut self, id: ChunkId, vec: NormalizedVector) -> Result<()>;
 
     /// 检索最近的 k 条，返回 `(chunk_id, distance)`，按距离**升序**。

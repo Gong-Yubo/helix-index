@@ -1,11 +1,4 @@
-//! `hnsw_rs` 向量索引（T4-06a 的 A/B 候选）。
-//!
-//! 与 `instant-distance` 的关键差异：
-//!
-//! | 维度 | instant-distance | hnsw_rs |
-//! | -- | ---------------- | ------- |
-//! | 增量 insert | ❌（一次性 build） | ✅ 原生 `insert(&self)` |
-//! | 距离 | 自定义 `Point`（平方欧氏） | `DistDot` = `1 − cos`（要求归一化） |
+//! `hnsw_rs` 向量索引（P4 A/B 定案：原生增量 insert 胜出，生产路径）。
 //!
 //! # 距离换算
 //!
@@ -21,7 +14,7 @@ use crate::types::ChunkId;
 
 use super::{NormalizedVector, VectorIndex};
 
-/// 对齐 `HnswIndex`（instant-distance）的参数（见 p2-design.md）。
+/// HNSW 图构建/检索参数（P4 定稿；P5 在真实语料上校准 ef_search，见 p5-design 8.6）。
 const MAX_NB_CONNECTION: usize = 32; // M
 const MAX_LAYER: usize = 16;
 const EF_CONSTRUCTION: usize = 300;

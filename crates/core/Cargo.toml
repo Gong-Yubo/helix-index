@@ -28,13 +28,12 @@ unicode-segmentation.workspace  = true
 unicode-normalization.workspace = true
 
 # 检索内核
-instant-distance.workspace = true
 bincode.workspace          = true
 crc32fast.workspace        = true
 moka.workspace             = true
 xxhash-rust.workspace      = true
 
-# 向量索引 A/B 候选（T4-06a）；P4 结束后若未采用则移除
+# 向量索引（P4 A/B 定案：hnsw_rs 原生增量 insert 胜出，instant-distance 已移除 D8）
 hnsw_rs.workspace = true
 
 # 可选：charabia 分词对照（T5-09；验证性依赖，不进默认特性）
