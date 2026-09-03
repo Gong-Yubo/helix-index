@@ -6,7 +6,7 @@
 
 use thiserror::Error;
 
-/// index-core 的统一错误类型
+/// helix-core 的统一错误类型
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("IO 错误: {0}")]

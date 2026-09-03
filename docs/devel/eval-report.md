@@ -15,7 +15,7 @@
 | 检索模型 | `Xenova/bge-small-zh-v1.5`（512 维，本地 fastembed + ort CPU 推理） |
 | 转换器种子 | `SEED_QID=0x5432_7465` / `SEED_NEG=0x6e65_6731` / `SEED_BUCKET=0x6275_636b`（`t2_prep.rs`，固定种子确定性装配） |
 | 测量环境 | macOS aarch64，`--release` 构建，单机本地 CPU 推理 |
-| 测量命令 | 见第 8 节 NFR 各协议；效果评测：`idx bench --input data/t2-corpus.jsonl --queries data/t2-queries.jsonl --modes bm25,vector,hybrid --rrf-weights "1,1.5" --runs 3` |
+| 测量命令 | 见第 8 节 NFR 各协议；效果评测：`helix bench --input data/t2-corpus.jsonl --queries data/t2-queries.jsonl --modes bm25,vector,hybrid --rrf-weights "1,1.5" --runs 3` |
 
 ## 2. 数据来源与装配
 
@@ -126,7 +126,7 @@
 
 ### 8.1 NFR-02 查询延迟
 
-`idx bench` 阶段 B（裸 LocalEmbedder，warmup 3 + reps 20 × 320 query = 6400 样本/模式）：
+`helix bench` 阶段 B（裸 LocalEmbedder，warmup 3 + reps 20 × 320 query = 6400 样本/模式）：
 
 | mode | P50(ms) | P99(ms) | 目标 |
 | --- | --- | --- | --- |
@@ -136,7 +136,7 @@
 
 ### 8.2 NFR-03 索引构建
 
-`idx build --vectors`（release），embed 单独计时：
+`helix build --vectors`（release），embed 单独计时：
 
 | 口径 | chunk 数 | 纯索引构建 | embed | 含落盘总耗时 | 目标 |
 | --- | --- | --- | --- | --- | --- |

@@ -4,16 +4,16 @@
 
 use std::sync::Arc;
 
-use index_core::analyze::MixedAnalyzer;
-use index_core::chunk::Chunker;
-use index_core::document::{content_hash, Document};
-use index_core::embed::Embedder;
-use index_core::error::Result;
-use index_core::index::Index;
-use index_core::query::{SearchMode, Searcher};
-use index_core::storage;
-use index_core::types::ChunkId;
-use index_core::vector::{HnswRsIndex, NormalizedVector, VectorIndex};
+use helix_core::analyze::MixedAnalyzer;
+use helix_core::chunk::Chunker;
+use helix_core::document::{content_hash, Document};
+use helix_core::embed::Embedder;
+use helix_core::error::Result;
+use helix_core::index::Index;
+use helix_core::query::{SearchMode, Searcher};
+use helix_core::storage;
+use helix_core::types::ChunkId;
+use helix_core::vector::{HnswRsIndex, NormalizedVector, VectorIndex};
 
 /// 确定性假 Embedder：文本 → FNV 哈希 → 16 维归一化向量。
 struct FakeEmbedder;

@@ -1,4 +1,4 @@
-//! idx —— index-demo 的命令行工具。
+//! helix —— HelixIndex 的命令行工具。
 //!
 //! 已实现：
 //! - `build`：摄入语料并**落盘快照**（`--vectors` 同时保存向量）
@@ -14,19 +14,19 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
-use index_core::analyze::MixedAnalyzer;
-use index_core::chunk::Chunker;
-use index_core::document::{content_hash, Document};
-use index_core::embed::{Embedder, LocalEmbedder};
-use index_core::index::Index;
-use index_core::query::{EmptyReason, Hit, SearchMode, SearchResponse, Searcher};
-use index_core::schema::Filter;
-use index_core::storage;
-use index_core::types::ChunkId;
-use index_core::vector::{HnswRsIndex, NormalizedVector, VectorIndex};
+use helix_core::analyze::MixedAnalyzer;
+use helix_core::chunk::Chunker;
+use helix_core::document::{content_hash, Document};
+use helix_core::embed::{Embedder, LocalEmbedder};
+use helix_core::index::Index;
+use helix_core::query::{EmptyReason, Hit, SearchMode, SearchResponse, Searcher};
+use helix_core::schema::Filter;
+use helix_core::storage;
+use helix_core::types::ChunkId;
+use helix_core::vector::{HnswRsIndex, NormalizedVector, VectorIndex};
 
 #[derive(Parser)]
-#[command(name = "idx", version, about = "index-demo 检索内核命令行工具")]
+#[command(name = "helix", version, about = "HelixIndex 检索内核命令行工具")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -152,7 +152,7 @@ pub(crate) fn load_corpus_with(path: &Path, chunker: &Chunker) -> Result<(Index,
 pub(crate) fn build_index(
     path: &Path,
     chunker: &Chunker,
-    analyzer: &dyn index_core::analyze::Analyzer,
+    analyzer: &dyn helix_core::analyze::Analyzer,
 ) -> Result<Index> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("读取语料失败: {}", path.display()))?;

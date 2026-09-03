@@ -1,8 +1,8 @@
 //! T0-05：ONNX 模型下载 + 推理验证（P0 最高风险项）。
 //!
 //! 运行：
-//!   cargo run -p index-core --example embed_smoke
-//!   HF_ENDPOINT=https://hf-mirror.com cargo run -p index-core --example embed_smoke
+//!   cargo run -p helix-core --example embed_smoke
+//!   HF_ENDPOINT=https://hf-mirror.com cargo run -p helix-core --example embed_smoke
 //!
 //! 验证内容：
 //!   1. 模型能下载（Qdrant/bge-small-zh-v1.5，约 91 MB）

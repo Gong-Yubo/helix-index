@@ -7,7 +7,7 @@
 //! # 运行（#[ignore]：依赖评测数据 + 模型下载，必须 release）
 //!
 //! ```bash
-//! cargo test -p index-core --release --test vector_ab -- --ignored --nocapture
+//! cargo test -p helix-core --release --test vector_ab -- --ignored --nocapture
 //! ```
 //!
 //! 语料/查询路径可用环境变量 `IDX_T2_CORPUS` / `IDX_T2_QUERIES` 覆盖（默认
@@ -19,8 +19,8 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use index_core::embed::{Embedder, LocalEmbedder};
-use index_core::vector::{BruteForceIndex, HnswRsIndex, NormalizedVector, VectorIndex};
+use helix_core::embed::{Embedder, LocalEmbedder};
+use helix_core::vector::{BruteForceIndex, HnswRsIndex, NormalizedVector, VectorIndex};
 
 /// 语料子集规模（embed 吞吐 ~50 条/s，2000 段约 40s，控制测试时长）。
 const N_CORPUS: usize = 2000;

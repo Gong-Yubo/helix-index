@@ -1,6 +1,8 @@
-//! # index-core
+//! # helix-core
 //!
-//! 面向 Agent 场景的**通用检索引擎内核**。
+//! **HelixIndex** —— 面向 Agent 场景的**通用检索引擎内核**。
+//!
+//! crate 名 `helix-core`，CLI 二进制为 `helix`。
 //!
 //! ## 模块边界（硬性约束，见架构文档 4.2）
 //!
@@ -19,7 +21,11 @@
 //!
 //! ## 阶段进度
 //!
-//! P0（当前）：工程骨架，无业务逻辑。
+//! **P0~P5 全部完成**（2026-09-03），当前版本 `0.1.0`。
+//! 下一阶段 P6（v2：Rerank / MMR / 自研索引）不在当前版本范围。
+//!
+//! 效果与性能实测结论见 `docs/devel/eval-report.md`；
+//! 任务清单与进度见 `docs/devel/plan.md`。
 
 pub mod analyze;
 pub mod bench;

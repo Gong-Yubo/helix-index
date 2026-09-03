@@ -1,4 +1,4 @@
-# index-demo 文档索引
+# HelixIndex 文档索引
 
 面向 Agent 场景的通用检索引擎内核（Rust，单机 MVP）。
 

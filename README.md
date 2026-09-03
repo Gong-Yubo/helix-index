@@ -1,4 +1,4 @@
-# index-demo
+# HelixIndex
 
 面向 **Agent 场景**的通用检索引擎内核（Rust，单机 MVP）。
 
@@ -11,20 +11,20 @@ Agent 自己零散写入。本项目把这些差异翻译为**接口与质量属
 
 ```bash
 # 用 30 篇 demo 语料建索引并检索（BM25，纯 CPU 秒级）
-cargo run -p idx -- build --input data/corpus.jsonl --output /tmp/demo.snapshot
-cargo run -p idx -- search --index /tmp/demo.snapshot --mode bm25 "如何加快检索速度"
+cargo run -p helix -- build --input data/corpus.jsonl --output /tmp/demo.snapshot
+cargo run -p helix -- search --index /tmp/demo.snapshot --mode bm25 "如何加快检索速度"
 
 # 元数据过滤（demo 语料带 topic 字段）
-cargo run -p idx -- search --input data/corpus.jsonl --mode bm25 --filter topic=vector "向量检索"
+cargo run -p helix -- search --input data/corpus.jsonl --mode bm25 --filter topic=vector "向量检索"
 
 # 三路对比（hybrid 需先下载 bge-small-zh-v1.5，约 91MB）
-cargo run -p idx -- search --input data/corpus.jsonl --mode hybrid "向量检索与BM25融合"
+cargo run -p helix -- search --input data/corpus.jsonl --mode hybrid "向量检索与BM25融合"
 
 # 效果评测（P5，需 T2Ranking 评测语料，见下）
-cargo run -p idx -- bench --input data/t2-corpus.jsonl --queries data/t2-queries.jsonl
+cargo run -p helix -- bench --input data/t2-corpus.jsonl --queries data/t2-queries.jsonl
 ```
 
-库使用端到端示例：`cargo run -p index-core --example search_basic`
+库使用端到端示例：`cargo run -p helix-core --example search_basic`
 （建索引 → hybrid 检索 → `to_context_block()` 拼 prompt 上下文块）。
 
 ## 架构速览

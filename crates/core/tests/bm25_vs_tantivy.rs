@@ -17,9 +17,9 @@
 //! 主指标：Top-10 集合重叠率。允许因 fieldnorm 量化造成的个别排序交换，
 //! 但重叠率应接近 1.0（本测试用 ≥ 0.9 兜底）；差异 case 全部打印并归因。
 
-use index_core::analyze::{Analyzer, MixedAnalyzer};
-use index_core::index::Index;
-use index_core::retriever::{Bm25Retriever, Retriever};
+use helix_core::analyze::{Analyzer, MixedAnalyzer};
+use helix_core::index::Index;
+use helix_core::retriever::{Bm25Retriever, Retriever};
 
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
@@ -67,13 +67,13 @@ fn bm25_排序对照_tantivy() {
     // ---- 我们这边：建索引 ----
     let mut ours = Index::new();
     for (i, text) in CORPUS.iter().enumerate() {
-        let doc = index_core::document::Document {
+        let doc = helix_core::document::Document {
             doc_id: 0,
             source: format!("doc-{i}"),
             metadata: serde_json::json!({}),
             content_hash: 0,
         };
-        let chunks = index_core::chunk::Chunker::default().chunk(0, text);
+        let chunks = helix_core::chunk::Chunker::default().chunk(0, text);
         ours.add(doc, chunks, &analyzer).unwrap();
     }
 

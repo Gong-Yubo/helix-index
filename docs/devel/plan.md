@@ -1,4 +1,4 @@
-# index-demo 开发计划
+# HelixIndex 开发计划
 
 > 面向 Agent 场景的通用检索引擎内核（Rust，单机 MVP）
 
@@ -91,9 +91,9 @@
 | 阶段         | 主题                     | 任务数 | 依赖 | 关键产出                         | 关键路径 |
 | ---------- | ---------------------- | --- | -- | ---------------------------- | ---- |
 | **P0**     | 工程骨架 + 依赖验证            | 7   | —  | 空工程可编译，三个关键依赖可拉取             | ✅    |
-| **P1**     | BM25 链路（analyze→index） | 15  | P0 | `idx search --mode bm25` 出结果 | ✅    |
+| **P1**     | BM25 链路（analyze→index） | 15  | P0 | `helix search --mode bm25` 出结果 | ✅    |
 | **P2**     | 向量链路（embed→HNSW）       | 10  | P1 | 向量路出结果，同义改写可召回               | ✅    |
-| **P3**     | 融合 + 编排 + 可解释          | 11  | P2 | `idx compare` 三路对比           | ✅    |
+| **P3**     | 融合 + 编排 + 可解释          | 11  | P2 | `helix compare` 三路对比           | ✅    |
 | **P4**     | 持久化 + 增量 + 过滤          | 10  | P3 | save/load 结果一致，增量立即可查        | ✅    |
 | **P5**     | 语料 + 评测 + 调参           | 9   | P4 | 实测指标 + BM25 参数定稿             | ✅    |
 | **P6**（v2） | Rerank / MMR / 自研索引    | 5   | P5 | —                            |      |
@@ -140,7 +140,7 @@ P1 ─────────────────────────�
 
 **目标**：从零手写出一条完整可用的关键词检索链路，并用 CLI 在示例语料上跑出结果。
 
-**阶段门槛**：BM25 分值与**手算值**一致；**与 `tantivy` 的排序对照通过（T1-15）**；索引侧与查询侧分词一致；`idx search --mode bm25` 有合理排序。
+**阶段门槛**：BM25 分值与**手算值**一致；**与 `tantivy` 的排序对照通过（T1-15）**；索引侧与查询侧分词一致；`helix search --mode bm25` 有合理排序。
 
 | ID    | 任务                      | 产出文件                                               | 要点                                                                                                                         | 验收                                      |
 | ----- | ----------------------- | -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- | --------------------------------------- |
@@ -157,14 +157,14 @@ P1 ─────────────────────────�
 | T1-11 | BM25 打分                 | `retriever/bm25.rs`                                | `idf = ln(1 + (N − df + 0.5)/(df + 0.5))`；`k1=1.2, b=0.75`（起点，P5 调参）；**OR 语义**                                             | 单测：构造 5 篇文档，逐条比对**手算值**（最关键测试）          |
 | T1-12 | Top-K 与执行方式             | `retriever/bm25.rs`                                | TAAT（Term-At-A-Time）+ 二叉堆取 Top-K；**分相同的按 `chunk_id` 升序 tie-break**                                                         | 单测：Top-K 顺序稳定                           |
 | T1-13 | Retriever 抽象            | `retriever/mod.rs`                                 | `trait Retriever { fn search(&self, req) -> Result<Vec<Scored>> }`                                                         | BM25 路实现该 trait                         |
-| T1-14 | CLI 最小版（并启动语料准备）        | `crates/cli`、`data/corpus.jsonl`                   | `idx build --input data/corpus.jsonl --output index.idx`、`idx search --mode bm25 -k 10 "查询"`；30 篇手写语料已定稿为 demo 语料（评测数据 v1.2 起改走 T2Ranking，见 T5-01）       | CLI 在语料上返回合理结果                          |
+| T1-14 | CLI 最小版（并启动语料准备）        | `crates/cli`、`data/corpus.jsonl`                   | `helix build --input data/corpus.jsonl --output index.helix`、`helix search --mode bm25 -k 10 "查询"`；30 篇手写语料已定稿为 demo 语料（评测数据 v1.2 起改走 T2Ranking，见 T5-01）       | CLI 在语料上返回合理结果                          |
 | T1-15 | **BM25 与 tantivy 对照测试** | `tests/bm25_vs_tantivy.rs`（dev-dep `tantivy 0.26`） | **ADR-007**：同语料下用工业实现当 oracle，逐条比对 Top-K **排序**（分值允许 `k1`/`b` 与平均长度口径差异）。必须覆盖边界：空 query、全停用词 query、超长 query、`df=0` 的 term  | 排序一致率 ≥ 95%；不一致的 case 逐条分析并给出解释         |
 
 **P1 出口 Demo**
 
 ```bash
-cargo run -p idx -- build --input data/corpus.jsonl --output /tmp/index.idx
-cargo run -p idx -- search --index /tmp/index.idx --mode bm25 -k 5 "BM25 参数怎么调"
+cargo run -p helix -- build --input data/corpus.jsonl --output /tmp/index.helix
+cargo run -p helix -- search --index /tmp/index.helix --mode bm25 -k 5 "BM25 参数怎么调"
 # 期望：5 条结果，带 source 与匹配词，分数递减
 ```
 
@@ -189,13 +189,13 @@ cargo run -p idx -- search --index /tmp/index.idx --mode bm25 -k 5 "BM25 参数�
 | T2-06 | 向量 Retriever        | `retriever/vector.rs`                | query 向量化 → 检索 → 距离转相似度 → Top-K                                                                   | 单测：Top-K 按相似度降序                          |
 | T2-07 | 批量摄入并行              | `index/mod.rs`                       | rayon 并行分词与 embedding（FR-19）                                                                      | 1 万 chunk 构建耗时记录（NFR-03 校准数据）            |
 | T2-08 | 远程 Embedder（Should） | `embed/remote.rs`                    | HTTP API 实现，feature 隔离                                                                            | 无 Key 时报错清晰                              |
-| T2-09 | CLI 向量模式            | `crates/cli`                         | `idx search --mode vector -k 10`                                                                  | 同义改写查询能召回正确文档                            |
+| T2-09 | CLI 向量模式            | `crates/cli`                         | `helix search --mode vector -k 10`                                                                  | 同义改写查询能召回正确文档                            |
 | T2-10 | 两路隔离自查              | —                                    | 确认 `retriever/bm25.rs` 与 `retriever/vector.rs` **无相互引用**（架构文档 4.3 硬约束）                            | 评审通过                                     |
 
 **P2 出口 Demo**
 
 ```bash
-cargo run -p idx -- search --index /tmp/index.idx --mode vector -k 5 "怎样让检索支持中文分词"
+cargo run -p helix -- search --index /tmp/index.helix --mode vector -k 5 "怎样让检索支持中文分词"
 # 期望：能召回标题里没有"中文分词"但讲同一件事的文档
 ```
 
@@ -208,7 +208,7 @@ cargo run -p idx -- search --index /tmp/index.idx --mode vector -k 5 "怎样让�
 
 **目标**：把两路结果合成一路，并让 Agent 能理解"为什么召回这条 / 为什么没结果"。
 
-**阶段门槛**：`idx compare` 可同屏对比三路；`--explain` 输出完整；同一 query 连续 100 次结果顺序完全一致。
+**阶段门槛**：`helix compare` 可同屏对比三路；`--explain` 输出完整；同一 query 连续 100 次结果顺序完全一致。
 
 | ID    | 任务                    | 产出文件                             | 要点                                                                                                         | 验收                        |
 | ----- | --------------------- | -------------------------------- | ---------------------------------------------------------------------------------------------------------- | ------------------------- |
@@ -221,15 +221,15 @@ cargo run -p idx -- search --index /tmp/index.idx --mode vector -k 5 "怎样让�
 | T3-07 | query embedding 缓存    | `embed/cached.rs`                | **用 `moka`**（并发安全 + TTL），**不用 `lru`**（非并发安全，需套 `Mutex`，会抵消两路并行收益）。Agent 多轮循环中大量 query 重复（FR-20）            | 单测：重复 query 命中缓存；并发命中无死锁  |
 | T3-08 | 确定性（NFR-06）           | 全局                               | HNSW 固定 seed；所有排序路径先收集再按 `chunk_id` 排序，不依赖 HashMap 迭代序                                                     | 单测：**连续 100 次结果完全一致**     |
 | T3-09 | 可观测性（NFR-07）          | `query/metrics.rs`               | tracing 输出 `took / bm25 / vector / candidates / fused`                                                     | 检索日志样例可复现                 |
-| T3-10 | CLI compare / explain | `crates/cli`                     | `idx compare`（三路同屏对比，调试最常用）、`--explain`                                                                    | 输出可读                      |
+| T3-10 | CLI compare / explain | `crates/cli`                     | `helix compare`（三路同屏对比，调试最常用）、`--explain`                                                                    | 输出可读                      |
 | T3-11 | 模块边界复查                | —                                | 按第 3 节边界表逐项检查；重点：`fusion` 不回捞正文                                                                            | 评审通过                      |
 
 **P3 出口 Demo**
 
 ```bash
-cargo run -p idx -- compare --index /tmp/index.idx -k 5 "Rust 里怎么做中文 BM25"
+cargo run -p helix -- compare --index /tmp/index.helix -k 5 "Rust 里怎么做中文 BM25"
 # 期望：三列结果对比，hybrid 综合两路优点
-cargo run -p idx -- search --index /tmp/index.idx --mode hybrid --explain "..."
+cargo run -p helix -- search --index /tmp/index.helix --mode hybrid --explain "..."
 # 期望：每条带 matched_terms 与两路 rank
 ```
 
@@ -272,7 +272,7 @@ cargo run -p idx -- search --index /tmp/index.idx --mode hybrid --explain "..."
 | ----- | -------------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- | ---------------------------------------- |
 | T5-01 | 评测语料装配         | `data/t2-corpus.jsonl`（~12K 段落）           | **从开源 T2Ranking（Apache-2.0，SIGIR 2023）转换**：`t2_prep.rs`（固定种子）从 dev 集装配 qrels 段落全集 + 均匀负例；真实中文网页段落，词频自然分布（选型与管线详见 `p5-design.md` 第 3~5 章） | ~12K 段落，可被 CLI 构建；分布统计输出                     |
 | T5-02 | 评测集装配          | `data/t2-queries.jsonl`（~320 条）             | 同上转换器产出：**四类各 ~80 条**（精确术语 / 同义改写 / 中英混合 / 长句问句，启发式分桶，词汇重合度计算不依赖任何检索器输出）；相关性为 **4 级专业标注**（T2Ranking qrels，每对 ≥3 人多数票），**不再自标注**（标注者偏差整体消除） | 四类齐全，`t2_prep` 校验通过（qrels 缺失 pid 为 0）      |
-| T5-03 | `idx bench` 实现 | `crates/cli` + `core/bench`                | 输出 Recall@10 / MRR@10 / NDCG@10（**分级 gain=2^g−1**）/ P50 / P99 延迟；`--rel-threshold` 可调 Recall/MRR 阈值；含指标手算单测锚点（详见 `p5-design.md` 第 6~7 章）                                                                      | 三种模式各跑一遍有完整输出                            |
+| T5-03 | `helix bench` 实现 | `crates/cli` + `core/bench`                | 输出 Recall@10 / MRR@10 / NDCG@10（**分级 gain=2^g−1**）/ P50 / P99 延迟；`--rel-threshold` 可调 Recall/MRR 阈值；含指标手算单测锚点（详见 `p5-design.md` 第 6~7 章）                                                                      | 三种模式各跑一遍有完整输出                            |
 | T5-04 | **强制对照实验**     | `docs/devel/eval-report.md`                | BM25 only / Vector only / Hybrid(RRF) 三路对比，按查询类型分桶统计；**tantivy 作第三路基线**（ADR-007：NDCG@10 相对差 ≤5%）；RRF k ∈ {20,60,100} 敏感性（R7）。**用 T5-05 定稿参数跑终版**（执行顺序：T5-05 先于 T5-04，见 p5-design.md 8.1）                | 有表格与结论                                   |
 | T5-05 | BM25 参数网格搜索    | `docs/devel/eval-report.md`                | `k1 ∈ {1.0, 1.2, 1.5, 2.0}` × `b ∈ {0.3, 0.5, 0.75, 0.9}`，以 NDCG@10 选优（并列取近默认值）。**不盲信英文经验值**（R6）——真实中文网页语料 + 真实查询正是该风险的设计场景                             | 参数定稿并写入默认值                               |
 | T5-06 | NFR 实测校准       | 更新 `docs/devel/requirements-spec.md` 第 6 章 | 用 `t2-corpus.jsonl`（~12K chunk，对齐"1 万 chunk"目标规模）实测 NFR-02~05，替换目标值或标注"未达标 + 原因"                                                                                | 需求文档不再有"待实测"标注                           |
@@ -326,9 +326,9 @@ make fmt && make lint && make test
 | 门槛    | 条件                                                             |
 | ----- | -------------------------------------------------------------- |
 | P0→P1 | Rust 工具链可用；三个关键依赖可编译；**ONNX 模型下载 + 单句推理验证成功**；workspace 骨架就绪   |
-| P1→P2 | BM25 分值与手算一致；两侧分词一致；`idx search --mode bm25` 出合理结果；语料采集已启动     |
+| P1→P2 | BM25 分值与手算一致；两侧分词一致；`helix search --mode bm25` 出合理结果；语料采集已启动     |
 | P2→P3 | 向量路能召回同义改写；相似度对齐误差 < 1e-5；两路无相互引用                              |
-| P3→P4 | `idx compare` 三路可对比；`--explain` 完整；**连续 100 次结果完全一致**；融合层不回捞正文 |
+| P3→P4 | `helix compare` 三路可对比；`--explain` 完整；**连续 100 次结果完全一致**；融合层不回捞正文 |
 | P4→P5 | save/load 结果完全一致；增量写入立即可查；删除后统计量与全量重建一致；集成测试全绿 ✅ |
 | P5→完结 | 三路对照实验有数据；BM25 参数定稿；NFR-02~05 全部为实测值；评测报告含诚信声明 ✅（`eval-report.md`） |
 
@@ -396,7 +396,7 @@ make fmt && make lint && make test
 | P4 | T4-09 集成测试                                             | ✅  |
 | P5 | T5-01 评测语料装配（T2Ranking 转换）                                    | ✅  |
 | P5 | T5-02 评测集装配（T2Ranking 转换）                                      | ✅  |
-| P5 | T5-03 `idx bench` 实现                                   | ✅  |
+| P5 | T5-03 `helix bench` 实现                                   | ✅  |
 | P5 | T5-04 强制对照实验                                           | ✅  |
 | P5 | T5-05 BM25 参数网格搜索                                      | ✅  |
 | P5 | T5-06 NFR 实测校准                                         | ✅  |
@@ -427,12 +427,12 @@ make deny       # cargo-deny：依赖 License 白名单校验（NFR-09 / ADR-008
 make all        # 以上四条
 
 # 分阶段验证
-cargo run -p idx -- build   --input data/corpus.jsonl --output /tmp/index.idx
-cargo run -p idx -- search  --index /tmp/index.idx --mode bm25   -k 5 "查询"
-cargo run -p idx -- search  --index /tmp/index.idx --mode vector -k 5 "查询"
-cargo run -p idx -- compare --index /tmp/index.idx -k 5 "查询"
-cargo run -p idx -- search  --index /tmp/index.idx --mode hybrid --explain "查询"
-cargo run -p idx -- bench   --index /tmp/index.idx --queries data/t2-queries.jsonl
+cargo run -p helix -- build   --input data/corpus.jsonl --output /tmp/index.helix
+cargo run -p helix -- search  --index /tmp/index.helix --mode bm25   -k 5 "查询"
+cargo run -p helix -- search  --index /tmp/index.helix --mode vector -k 5 "查询"
+cargo run -p helix -- compare --index /tmp/index.helix -k 5 "查询"
+cargo run -p helix -- search  --index /tmp/index.helix --mode hybrid --explain "查询"
+cargo run -p helix -- bench   --index /tmp/index.helix --queries data/t2-queries.jsonl
 
 # 依赖与 feature 组合验证
 cargo build --no-default-features

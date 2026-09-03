@@ -17,7 +17,10 @@ pub const BGE_ZH_QUERY_PREFIX: &str = "为这个句子生成表示以用于检�
 
 /// 默认缓存目录（仓库外）。
 fn default_cache_dir() -> std::path::PathBuf {
-    dirs_home().join(".cache").join("index-demo").join("models")
+    dirs_home()
+        .join(".cache")
+        .join("helix-index")
+        .join("models")
 }
 
 /// 解析用户主目录（无 `dirs` 依赖，读环境变量兜底）。

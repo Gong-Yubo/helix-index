@@ -1,20 +1,20 @@
 //! 库使用端到端示例：建索引 → hybrid 检索 → 拼上下文块。
 //!
 //! 运行（需 local-embed feature，首次会下载 bge-small-zh-v1.5 约 91MB）：
-//!   cargo run -p index-core --example search_basic
+//!   cargo run -p helix-core --example search_basic
 //!
 //! 演示内核对外的最小闭环：`Index` + `Analyzer` + `Chunker` 建索引，
 //! `LocalEmbedder` + `HnswRsIndex` 建向量侧，`Searcher` 编排 hybrid 检索，
 //! 最终用 `Hit::to_context_block()` 产出可直接拼进 prompt 的上下文块。
 
-use index_core::analyze::MixedAnalyzer;
-use index_core::chunk::Chunker;
-use index_core::document::{content_hash, Document};
-use index_core::embed::{Embedder, LocalEmbedder};
-use index_core::fusion::RrfFusion;
-use index_core::index::Index;
-use index_core::query::{SearchMode, Searcher};
-use index_core::vector::{HnswRsIndex, NormalizedVector, VectorIndex};
+use helix_core::analyze::MixedAnalyzer;
+use helix_core::chunk::Chunker;
+use helix_core::document::{content_hash, Document};
+use helix_core::embed::{Embedder, LocalEmbedder};
+use helix_core::fusion::RrfFusion;
+use helix_core::index::Index;
+use helix_core::query::{SearchMode, Searcher};
+use helix_core::vector::{HnswRsIndex, NormalizedVector, VectorIndex};
 
 fn main() -> anyhow::Result<()> {
     // ---- 1. 建索引：MixedAnalyzer（中英混合分词）+ 默认 Chunker（512/64）----

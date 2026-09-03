@@ -1,6 +1,6 @@
 [package]
-name        = "idx"
-description = "index-demo 的命令行工具（建索引 / 检索 / 评测）"
+name        = "helix"
+description = "HelixIndex 的命令行工具（建索引 / 检索 / 评测）"
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
@@ -8,11 +8,11 @@ license.workspace      = true
 
 [features]
 default = []
-charabia = ["index-core/charabia"]  # T5-09 分词对照实验（--analyzer charabia）
+charabia = ["helix-core/charabia"]  # T5-09 分词对照实验（--analyzer charabia）
 
 [dependencies]
 # 显式写 version 是为了让 cargo-deny 的 wildcards 检查通过（纯 path 依赖会被判为 wildcard）
-index-core = { path = "../core", version = "0.1.0" }
+helix-core = { path = "../core", version = "0.1.0" }
 anyhow.workspace = true
 clap.workspace   = true
 serde.workspace     = true

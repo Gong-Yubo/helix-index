@@ -1,5 +1,5 @@
 [package]
-name        = "index-core"
+name        = "helix-core"
 description = "面向 Agent 场景的通用检索引擎内核"
 version.workspace      = true
 edition.workspace      = true

@@ -1226,6 +1226,47 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "helix"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "helix-core",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "helix-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bincode 2.0.1",
+ "charabia",
+ "clap",
+ "crc32fast",
+ "criterion",
+ "fastembed",
+ "hnsw_rs",
+ "jieba-rs",
+ "moka",
+ "proptest",
+ "rayon",
+ "serde",
+ "serde_json",
+ "smol_str",
+ "tantivy",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tracing",
+ "unicode-normalization",
+ "unicode-segmentation",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "hermit-abi"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1516,19 +1557,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "idx"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "index-core",
- "serde",
- "serde_json",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "include-flate"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1559,34 +1587,6 @@ checksum = "44fbb9c5ccb9a5b67b4afa2974c27e5507ea1bf6d22828cef418e4dfaeca51dd"
 dependencies = [
  "libflate",
  "zstd",
-]
-
-[[package]]
-name = "index-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bincode 2.0.1",
- "charabia",
- "clap",
- "crc32fast",
- "criterion",
- "fastembed",
- "hnsw_rs",
- "jieba-rs",
- "moka",
- "proptest",
- "rayon",
- "serde",
- "serde_json",
- "smol_str",
- "tantivy",
- "tempfile",
- "thiserror 2.0.20",
- "tracing",
- "unicode-normalization",
- "unicode-segmentation",
- "xxhash-rust",
 ]
 
 [[package]]

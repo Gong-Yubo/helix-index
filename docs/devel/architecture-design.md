@@ -1,4 +1,4 @@
-# index-demo 架构设计说明书
+# HelixIndex 架构设计说明书
 
 ### —— 面向 Agent 场景的通用检索引擎内核
 
@@ -48,7 +48,7 @@
 
 ### 2.1 文档目的与范围
 
-本文档定义 index-demo 检索内核的模块结构、核心抽象、数据结构、关键算法与技术选型。
+本文档定义 HelixIndex 检索内核的模块结构、核心抽象、数据结构、关键算法与技术选型。
 
 **覆盖的需求**：FR-01 ~ FR-23、NFR-01 ~ NFR-09。FR-24（结果去重）、FR-25（token budget 裁剪）为 v2 需求，本版不做设计。
 
@@ -91,7 +91,7 @@
 └───────────────┬────────────────────────────┘
                 │  SearchRequest / SearchResponse
 ┌───────────────▼────────────────────────────┐
-│  index-core（本内核）                          │
+│  helix-core（本内核）                          │
 │  摄入 → 分析 → 索引 → 召回 → 融合 → 精排(留位) → 输出  │
 └────────────────────────────────────────────┘
 ```
@@ -154,10 +154,10 @@ Query(raw text)
 ### 4.1 Cargo workspace 目录结构
 
 ```
-index-demo/
+HelixIndex/
 ├── Cargo.toml                 # workspace
 ├── crates/
-│   ├── core/                  # index-core（库，对外交付主体）
+│   ├── core/                  # helix-core（库，对外交付主体）
 │   │   └── src/
 │   │       ├── lib.rs          # 顶层 API：Index / Searcher 组装
 │   │       ├── error.rs        # Error / Result
@@ -174,7 +174,7 @@ index-demo/
 │   │       ├── query/          # Searcher / parse / explain
 │   │       ├── storage/        # Snapshot 读写 / codec
 │   │       └── chunk/          # Chunker 分块策略
-│   └── cli/                   # idx（二进制）
+│   └── cli/                   # helix（二进制）
 ├── data/                      # 30 篇 demo 语料 + T2Ranking 评测集转换产物（t2-corpus / t2-queries，见需求文档 9.4）
 ├── examples/
 └── docs/
@@ -831,8 +831,8 @@ for doc in documents {
 index.commit()?;          // 合并 delta，构建 HNSW（FR-17）
 
 // ---- 持久化 ----
-index.save_to_path("index.idx")?;
-let index = Index::load_from_path("index.idx")?;   // 秒级加载（FR-16）
+index.save_to_path("index.helix")?;
+let index = Index::load_from_path("index.helix")?;   // 秒级加载（FR-16）
 
 // ---- 检索 ----
 let searcher = Searcher::new(index)
@@ -860,21 +860,21 @@ if let Some(reason) = &resp.empty_reason {
 
 ```bash
 # 建索引
-idx build --input data/corpus.jsonl --output index.idx
+helix build --input data/corpus.jsonl --output index.helix
 
 # 检索（三种模式）
-idx search --index index.idx --mode hybrid -k 10 "查询文本"
-idx search --index index.idx --mode bm25   -k 10 "查询文本"
-idx search --index index.idx --mode vector -k 10 "查询文本"
+helix search --index index.helix --mode hybrid -k 10 "查询文本"
+helix search --index index.helix --mode bm25   -k 10 "查询文本"
+helix search --index index.helix --mode vector -k 10 "查询文本"
 
 # 对比三种模式的效果（调试用，最常用）
-idx compare --index index.idx -k 10 "查询文本"
+helix compare --index index.helix -k 10 "查询文本"
 
 # 可解释性输出（FR-13）
-idx search --index index.idx --mode hybrid --explain "查询文本"
+helix search --index index.helix --mode hybrid --explain "查询文本"
 
 # 评测（P5）
-idx bench --index index.idx --queries data/t2-queries.jsonl
+helix bench --index index.helix --queries data/t2-queries.jsonl
 ```
 
 ### 10.3 错误类型
@@ -919,11 +919,11 @@ pub enum Error {
 | 阶段         | 内容                                                             | 验收标准                                                 | 依赖 |
 | ---------- | -------------------------------------------------------------- | ---------------------------------------------------- | -- |
 | **P0**     | 工程骨架 + 安装 Rust 工具链 + 验证依赖可获取性                                  | `cargo build` 通过空工程；`instant-distance` / `fastembed` / `jieba-rs` 均可拉取编译 | —  |
-| **P1**     | `analyze` + `index` + `retriever/bm25` + 单测                    | CLI `idx search --mode bm25` 在示例语料上出结果；BM25 分值与手算值一致 | P0 |
+| **P1**     | `analyze` + `index` + `retriever/bm25` + 单测                    | CLI `helix search --mode bm25` 在示例语料上出结果；BM25 分值与手算值一致 | P0 |
 | **P2**     | `embed`（本地）+ `vector`（HNSW）+ `retriever/vector`                | CLI 向量路出结果；同义改写能被召回                                  | P1 |
-| **P3**     | `fusion`（RRF + 加权）+ `query/searcher` + `explain`               | `idx compare` 可对比三路；Explain 输出完整                     | P2 |
+| **P3**     | `fusion`（RRF + 加权）+ `query/searcher` + `explain`               | `helix compare` 可对比三路；Explain 输出完整                     | P2 |
 | **P4**     | `storage` 快照 + 增量写入（**先 `hnsw_rs` A/B 再定案**）+ 元数据过滤                | save/load 后检索结果完全一致；增量写入后立即可查                        | P3 |
-| **P5**     | T2Ranking 评测集装配 + `idx bench` + README                        | Recall@K / MRR@10 / 分级 NDCG@10 / 延迟有实测数据；BM25 参数网格搜索调参 | P4 |
+| **P5**     | T2Ranking 评测集装配 + `helix bench` + README                        | Recall@K / MRR@10 / 分级 NDCG@10 / 延迟有实测数据；BM25 参数网格搜索调参 | P4 |
 | **P6**（v2） | Reranker 接入（bge-reranker-v2-m3）、MMR 去重、token budget 裁剪、自研 HNSW | —                                                    | P5 |
 
 **关键路径**：P1 → P2 → P3。这三步完成即具备完整检索能力，P4/P5 是工程化与验证。

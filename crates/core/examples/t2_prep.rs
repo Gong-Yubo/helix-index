@@ -2,7 +2,7 @@
 //!
 //! 运行（需先下载三文件到 data/t2ranking/）：
 //! ```bash
-//! cargo run --release -p index-core --example t2_prep -- \
+//! cargo run --release -p helix-core --example t2_prep -- \
 //!     --t2ranking data/t2ranking --out data
 //! ```
 //!
@@ -39,8 +39,8 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser;
 
-use index_core::analyze::{Analyzer, MixedAnalyzer};
-use index_core::chunk::Chunker;
+use helix_core::analyze::{Analyzer, MixedAnalyzer};
+use helix_core::chunk::Chunker;
 
 // ---- 固定种子（改动 = 评测集变更，须在报告中记录）----
 const SEED_QID: u64 = 0x5432_7465; // 候选池排序

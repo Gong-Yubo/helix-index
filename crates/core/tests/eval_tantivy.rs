@@ -16,7 +16,7 @@
 //! # 运行（#[ignore]：依赖本地评测数据 + tantivy 是 dev 依赖）
 //!
 //! ```bash
-//! cargo test -p index-core --release --test eval_tantivy -- --ignored --nocapture
+//! cargo test -p helix-core --release --test eval_tantivy -- --ignored --nocapture
 //! ```
 //!
 //! 语料路径可用环境变量 `IDX_T2_CORPUS` / `IDX_T2_QUERIES` 覆盖（默认
@@ -25,12 +25,12 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use index_core::analyze::{Analyzer, MixedAnalyzer};
-use index_core::bench::{self, Judgment};
-use index_core::chunk::Chunker;
-use index_core::document::Document;
-use index_core::index::Index;
-use index_core::retriever::{Bm25Params, Bm25Retriever, Retriever};
+use helix_core::analyze::{Analyzer, MixedAnalyzer};
+use helix_core::bench::{self, Judgment};
+use helix_core::chunk::Chunker;
+use helix_core::document::Document;
+use helix_core::index::Index;
+use helix_core::retriever::{Bm25Params, Bm25Retriever, Retriever};
 
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;

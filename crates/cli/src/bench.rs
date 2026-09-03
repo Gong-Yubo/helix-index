@@ -1,4 +1,4 @@
-//! `idx bench` —— 效果与性能评测（P5 / T5-03b，p5-design.md 第 7 章）。
+//! `helix bench` —— 效果与性能评测（P5 / T5-03b，p5-design.md 第 7 章）。
 //!
 //! # 执行流程（7.4）
 //!
@@ -23,18 +23,18 @@ use anyhow::{bail, Context, Result};
 use clap::Args;
 
 #[cfg(feature = "charabia")]
-use index_core::analyze::CharabiaAnalyzer;
-use index_core::analyze::{Analyzer, MixedAnalyzer};
-use index_core::bench::{self, Judgment, QueryMetrics};
-use index_core::chunk::Chunker;
-use index_core::embed::LocalEmbedder;
-use index_core::fusion::RrfFusion;
-use index_core::index::Index;
-use index_core::query::{SearchMode, Searcher};
-use index_core::retriever::Bm25Params;
-use index_core::storage;
-use index_core::types::ChunkId;
-use index_core::vector::{BruteForceIndex, HnswRsIndex, NormalizedVector, VectorIndex};
+use helix_core::analyze::CharabiaAnalyzer;
+use helix_core::analyze::{Analyzer, MixedAnalyzer};
+use helix_core::bench::{self, Judgment, QueryMetrics};
+use helix_core::chunk::Chunker;
+use helix_core::embed::LocalEmbedder;
+use helix_core::fusion::RrfFusion;
+use helix_core::index::Index;
+use helix_core::query::{SearchMode, Searcher};
+use helix_core::retriever::Bm25Params;
+use helix_core::storage;
+use helix_core::types::ChunkId;
+use helix_core::vector::{BruteForceIndex, HnswRsIndex, NormalizedVector, VectorIndex};
 
 /// 预期占优（分桶假设，9.4）：检验"哪路占优"，非自我实现预言
 const EXPECTED_WINNER: &[(&str, &str)] = &[
@@ -388,7 +388,7 @@ fn build_analyzer(args: &BenchArgs) -> Result<Box<dyn Analyzer>> {
         "charabia" => Ok(Box::new(CharabiaAnalyzer::new())),
         #[cfg(not(feature = "charabia"))]
         "charabia" => bail!(
-            "--analyzer charabia 需要以 `cargo build --features charabia` 编译 idx（T5-09 对照实验，feature 隔离）"
+            "--analyzer charabia 需要以 `cargo build --features charabia` 编译 helix（T5-09 对照实验，feature 隔离）"
         ),
         other => bail!(
             "不支持的 --analyzer {other:?}（支持 mixed{}）",
