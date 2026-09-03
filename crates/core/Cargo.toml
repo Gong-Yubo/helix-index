@@ -55,3 +55,7 @@ clap.workspace = true
 [[example]]
 name = "embed_smoke"
 required-features = ["local-embed"]
+
+[[example]]
+name = "search_basic"
+required-features = ["local-embed"]

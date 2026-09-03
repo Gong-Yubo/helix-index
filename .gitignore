@@ -20,9 +20,19 @@
 *.idx.tmp
 
 # ---- 语料与评测数据（大文件，P5 单独管理）----
+# 默认忽略 data/ 下的 jsonl/json；但以下三份**必须入库**：
+#   corpus.jsonl     —— demo 语料（README 快速上手依赖）
+#   t2-queries.jsonl —— 评测标注（320 query + qrels，180KB，复现评测的输入）
+#   t2-corpus.jsonl  —— 评测语料（12K 段落，21.7MB，避免下游重下 3.5GB 原始数据 + 跑 t2_prep）
 /data/*.jsonl
 /data/*.json
 !data/.gitkeep
+!data/corpus.jsonl
+!data/t2-queries.jsonl
+!data/t2-corpus.jsonl
+
+# 运行产物（由 build 生成，可重建）
+/data/*.snapshot
 
 # ---- 编辑器与系统 ----
 .DS_Store
