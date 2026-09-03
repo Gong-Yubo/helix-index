@@ -1477,6 +1477,7 @@ dependencies = [
  "anyhow",
  "clap",
  "index-core",
+ "serde",
  "serde_json",
  "tracing",
  "tracing-subscriber",
@@ -1521,6 +1522,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bincode 2.0.1",
+ "clap",
  "crc32fast",
  "criterion",
  "fastembed",

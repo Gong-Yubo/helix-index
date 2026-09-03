@@ -7,6 +7,8 @@
 //!
 //! 向量索引用 `HnswRsIndex`（P4 A/B 结论：原生增量 insert，见 p4-design.md）。
 
+mod bench;
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -39,7 +41,7 @@ enum Command {
     /// 三种模式同屏对比（调试主入口）
     Compare(CompareArgs),
     /// 效果评测（P5 实现）
-    Bench(BenchArgs),
+    Bench(bench::BenchArgs),
 }
 
 #[derive(clap::Args)]
@@ -88,14 +90,6 @@ struct CompareArgs {
     query: String,
 }
 
-#[derive(clap::Args)]
-struct BenchArgs {
-    #[arg(short, long)]
-    index: PathBuf,
-    #[arg(short, long)]
-    queries: PathBuf,
-}
-
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -106,7 +100,7 @@ fn main() -> Result<()> {
         Command::Build(args) => build(args),
         Command::Search(args) => search(args),
         Command::Compare(args) => compare(args),
-        Command::Bench(_) => bail!("bench 在 P5 实现"),
+        Command::Bench(args) => bench::run(args),
     }
 }
 
@@ -135,7 +129,7 @@ fn parse_filters(specs: &[String]) -> Result<Option<Filter>> {
 }
 
 /// 从 JSONL 语料构建索引。
-fn load_corpus(path: &Path) -> Result<(Index, MixedAnalyzer)> {
+pub(crate) fn load_corpus(path: &Path) -> Result<(Index, MixedAnalyzer)> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("读取语料失败: {}", path.display()))?;
 
@@ -180,7 +174,10 @@ fn load_corpus(path: &Path) -> Result<(Index, MixedAnalyzer)> {
 }
 
 /// embed 所有分片，返回 (chunk_id, 原始向量)。
-fn embed_chunks(index: &Index, embedder: &LocalEmbedder) -> Result<Vec<(ChunkId, Vec<f32>)>> {
+pub(crate) fn embed_chunks(
+    index: &Index,
+    embedder: &LocalEmbedder,
+) -> Result<Vec<(ChunkId, Vec<f32>)>> {
     let entries: Vec<(ChunkId, String)> = index
         .live_chunks()
         .map(|c| (c.chunk_id, c.text.clone()))
