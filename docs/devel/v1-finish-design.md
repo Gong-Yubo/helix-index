@@ -2,9 +2,9 @@
 
 | 项目    | 内容 |
 | ----- | --- |
-| 版本    | **v1.2（决策已定，待开工）** |
+| 版本    | **v1.3（已实施完成）** |
 | 日期    | 2026-09-03 |
-| 状态    | **待确认，未开工** |
+| 状态    | ✅ **已完成**（2026-09-03）：V1-00 ~ V1-16 全部落地，远端 CI 9/9 全绿 |
 | 前提    | P0~P5 全部完成（提交 `9d5179a`）；**P6（v2：Rerank / MMR / 自研索引）不在本轮范围** |
 | 上游    | `docs/devel/plan.md`、`docs/devel/eval-report.md`、`docs/devel/thirdparty.md` |
 | 定位    | 把"能跑通的研究原型"变成"别人能接手、能复现、能持续集成的工程制品"，并正式定名发布 |
@@ -210,6 +210,38 @@ README 指向 `docs/user-guide.md`；`docs/README.md` 增设"使用文档"分区
 效果评测需 12K 段落 embed（~230s）；性能评测是毫秒级 P99 口径，
 共享 runner 上的数字**不具备可引用性，反而会污染 `eval-report`**。
 CI 只保留 `build-release` + 冒烟（见 V1-08）。
+
+### action 版本（v1.3 追加）
+
+初版用 `actions/*@v4`，CI 运行报 Node.js 20 弃用警告
+（runner 强制以 Node 24 运行）。已升级至 `checkout@v7` /
+`upload-artifact@v7` / `download-artifact@v8`，警告消除。
+
+---
+
+## 5.1 实施记录：CI 抓到的两个本地未暴露问题（v1.3）
+
+本地 `rust-toolchain.toml` pin 1.90，CI 用最新 stable——**环境差异让 CI 抓到了
+两个本地全绿时没发现的问题**，这本身证明了自动化守门的价值。
+
+**① `charabia` feature 下缺文档（feature isolation job 失败）**
+
+V1-02 加 `#![deny(missing_docs)]` 时只验证了默认 feature；
+`CharabiaAnalyzer::new()` 在 charabia 分支下漏了文档注释。
+→ **教训：加 deny 类 lint 后必须逐 feature 验证，隔离分支最容易漏。**
+
+**② `integration`「快照加载后检索结果一致」是 flaky 测试（test job 失败）**
+
+- 现象：Linux 上失败、macOS 通过；失败点在第 155 行 **vector** 断言
+  （bm25 断言始终通过）
+- 根因：该测试**两次构建 HNSW 图**（落盘前 + 加载后重建），
+  而 `hnsw_rs` 用 OS 熵建图（**R-P5-13**）——两图不同 → vector 结果可能不同
+- 修法：两侧改用**确定性的 `BruteForceIndex`**。本测试验证的是
+  「快照 save/load round-trip 正确性」，**不该混入 ANN 图构建的随机性**；
+  用 ANN 是当初写测试时的设计失误
+- → **教训：凡是与"If 两次建图结果不同就会挂"相关的断言，都要先自问
+  「这个测试到底要验证什么」，把无关变量（此处是 ANN 随机性）隔离掉。**
+
 
 ### V1-16 建立远端并推送（v1.1 新增，CI 前置）
 
