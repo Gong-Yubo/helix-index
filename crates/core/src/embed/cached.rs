@@ -25,6 +25,7 @@ impl CachedEmbedder {
         Self { inner, cache }
     }
 
+    /// 拆出底层 embedder（丢弃缓存）。
     pub fn into_inner(self) -> Box<dyn Embedder> {
         self.inner
     }

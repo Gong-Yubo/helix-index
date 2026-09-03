@@ -16,8 +16,11 @@ use crate::types::{ChunkId, Score};
 
 /// 一条召回结果
 #[derive(Debug, Clone, Copy, PartialEq)]
+/// 单路召回的一条结果（不含正文，回捞由上层负责）。
 pub struct Scored {
+    /// 命中的分片 ID
     pub chunk_id: ChunkId,
+    /// 该路的原始分数（BM25 无上界 / 向量为余弦相似度）
     pub score: Score,
 }
 
@@ -25,5 +28,6 @@ pub struct Scored {
 ///
 /// 输入原始查询文本，输出按分数降序的结果（不含正文，回捞由上层负责）。
 pub trait Retriever: Send + Sync {
+    /// 单路召回 Top-K，按分数降序。**不得与其他 lane 交互**。
     fn search(&self, query: &str, k: usize) -> Result<Vec<Scored>>;
 }

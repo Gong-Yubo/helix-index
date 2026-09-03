@@ -15,10 +15,12 @@ pub struct BruteForceIndex {
 }
 
 impl BruteForceIndex {
+    /// 创建空索引。
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// 由既有向量批量构造（诊断/基线对照用，见 p5-design 8.6）。
     pub fn from_entries(entries: Vec<(ChunkId, NormalizedVector)>) -> Self {
         Self { entries }
     }

@@ -19,7 +19,9 @@ use super::{Retriever, Scored};
 /// 1.2/0.75 均不退化；详见 docs/devel/p5-design.md 8.x 与 eval-report，风险 R6）
 #[derive(Debug, Clone, Copy)]
 pub struct Bm25Params {
+    /// 词频饱和参数（P5 实测定稿 1.5，非 Lucene 默认 1.2）
     pub k1: f32,
+    /// 长度归一化强度（0~1，定稿 0.75）
     pub b: f32,
 }
 
@@ -37,6 +39,7 @@ pub struct Bm25Retriever<'a> {
 }
 
 impl<'a> Bm25Retriever<'a> {
+    /// 构造 BM25 检索器（用 `Bm25Params::default()`，即 P5 定稿值）。
     pub fn new(index: &'a Index, analyzer: &'a dyn Analyzer) -> Self {
         Self {
             index,
@@ -45,6 +48,7 @@ impl<'a> Bm25Retriever<'a> {
         }
     }
 
+    /// 覆盖 BM25 参数（网格搜索/调参用）。
     pub fn with_params(mut self, params: Bm25Params) -> Self {
         self.params = params;
         self

@@ -6,6 +6,7 @@
 use crate::document::{Chunk, Document};
 use crate::types::{ChunkId, DocId};
 
+/// 正排存储：chunk_id / doc_id → 内容与元数据（`None` 表示墓碑位）。
 #[derive(Debug, Default)]
 pub struct ForwardStore {
     chunks: Vec<Option<Chunk>>,
@@ -13,10 +14,12 @@ pub struct ForwardStore {
 }
 
 impl ForwardStore {
+    /// 创建空正排存储。
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// 插入文档并返回分配的 DocId。
     pub fn insert_doc(&mut self, mut doc: Document) -> DocId {
         let id = self.docs.len() as DocId;
         doc.doc_id = id;
@@ -24,6 +27,7 @@ impl ForwardStore {
         id
     }
 
+    /// 插入分片并返回分配的 ChunkId。
     pub fn insert_chunk(&mut self, mut chunk: Chunk) -> ChunkId {
         let id = self.chunks.len() as ChunkId;
         chunk.chunk_id = id;
@@ -31,10 +35,12 @@ impl ForwardStore {
         id
     }
 
+    /// 取分片（墓碑位返回 `None`）。
     pub fn chunk(&self, id: ChunkId) -> Option<&Chunk> {
         self.chunks.get(id as usize).and_then(|o| o.as_ref())
     }
 
+    /// 取文档（墓碑位返回 `None`）。
     pub fn doc(&self, id: DocId) -> Option<&Document> {
         self.docs.get(id as usize).and_then(|o| o.as_ref())
     }
@@ -71,6 +77,7 @@ impl ForwardStore {
         self.chunks.iter().filter(|c| c.is_some()).count()
     }
 
+    /// 存活文档数（不含墓碑位）。
     pub fn live_docs(&self) -> usize {
         self.docs.iter().filter(|d| d.is_some()).count()
     }

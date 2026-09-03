@@ -20,6 +20,7 @@ pub struct WeightedFusion {
 }
 
 impl WeightedFusion {
+    /// 按给定路权重构造（权重与 lane 顺序一一对应）。
     pub fn new(weights: Vec<f32>) -> Self {
         Self { weights }
     }

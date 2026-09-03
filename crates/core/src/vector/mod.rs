@@ -23,10 +23,14 @@ pub trait VectorIndex: Send + Sync {
 
     /// 检索最近的 k 条，返回 `(chunk_id, distance)`，按距离**升序**。
     /// `distance` 是平方欧氏距离，越小越近；转相似度由调用方负责。
+    /// 检索最近的 k 条，返回 `(chunk_id, distance)`，按距离**升序**。
+    /// `distance` 是平方欧氏距离，越小越近；转相似度由上层负责。
     fn search(&self, query: &NormalizedVector, k: usize) -> Result<Vec<(ChunkId, f32)>>;
 
+    /// 已入库向量条数。
     fn len(&self) -> usize;
 
+    /// 是否为空索引。
     fn is_empty(&self) -> bool {
         self.len() == 0
     }

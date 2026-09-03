@@ -8,9 +8,21 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Filter {
     /// tag 等值匹配
-    Eq { field: String, value: String },
+    Eq {
+        /// 元数据字段名
+        field: String,
+        /// 期望的值（字符串等值比较）
+        value: String,
+    },
     /// 数值范围 [gte, lte)
-    Range { field: String, gte: f64, lte: f64 },
+    Range {
+        /// 元数据字段名
+        field: String,
+        /// 下界（含）
+        gte: f64,
+        /// 上界（不含）
+        lte: f64,
+    },
     /// 与
     And(Vec<Filter>),
     /// 或

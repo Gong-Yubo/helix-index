@@ -9,13 +9,19 @@ use crate::types::{ChunkId, DocId, Score};
 /// 一条最终命中结果（已回捞正文与元数据）。
 #[derive(Debug, Clone)]
 pub struct Hit {
+    /// 命中的分片 ID（检索的最小单位）
     pub chunk_id: ChunkId,
+    /// 所属文档 ID（一个文档可能含多个分片）
     pub doc_id: DocId,
     /// 融合后分数（Hybrid）/ 单路分数（单路模式）
     pub score: Score,
+    /// 分片正文
     pub text: String,
+    /// 出处：文件路径 / URL / 标题——溯源用（FR-12）
     pub source: String,
+    /// 业务自定义元数据（过滤用，FR-14）
     pub metadata: serde_json::Value,
+    /// 命中解释：为什么召回这条（FR-13）
     pub explain: Explain,
 }
 
@@ -40,22 +46,28 @@ impl Hit {
 pub struct Explain {
     /// 查询分词中真正命中该分片的词（BM25 才有意义，向量路为空）
     pub matched_terms: Vec<String>,
-    /// `None` = 该 lane 未召回此文档（诊断信号，勿用 0 或 usize::MAX）
+    /// BM25 路分数；`None` = 该 lane 未召回此文档（诊断信号，勿用 0 或 usize::MAX）
     pub bm25_score: Option<Score>,
+    /// BM25 路排名（从 1 起）；`None` 同 `bm25_score`
     pub bm25_rank: Option<u32>,
+    /// 向量路余弦相似度；`None` = 未召回
     pub vector_score: Option<Score>,
+    /// 向量路排名（从 1 起）；`None` 同 `vector_score`
     pub vector_rank: Option<u32>,
+    /// 融合后的最终分数
     pub fused_score: Score,
 }
 
 /// 检索响应。
 #[derive(Debug, Clone)]
 pub struct SearchResponse {
+    /// 最终命中列表（按分数降序）
     pub hits: Vec<Hit>,
     /// 融合阶段看到的候选总数（bm25 候选 + vector 候选去重后）
     pub total_candidates: usize,
     /// 空结果时说明原因，供 Agent 决策（FR-13）
     pub empty_reason: Option<EmptyReason>,
+    /// 本次检索耗时（可观测性，NFR-07）
     pub took: Duration,
 }
 

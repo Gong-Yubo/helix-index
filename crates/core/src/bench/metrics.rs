@@ -17,18 +17,27 @@ use std::collections::HashMap;
 
 /// 单 query 的指标值。
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
+/// 单 query 的评测指标（P5：Recall / MRR / graded NDCG）。
 pub struct QueryMetrics {
+    /// 召回率（阈值化：相关度 >= rel_threshold 才算相关）
     pub recall: f64,
+    /// 首条命中相关文档的排名倒数（未命中为 0）
     pub mrr: f64,
+    /// 分级 NDCG（gain = 2^grade - 1）
     pub ndcg: f64,
 }
 
 /// 宏平均聚合。
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
+/// 宏平均聚合。
 pub struct Aggregate {
+    /// 参与聚合的 query 数
     pub n: usize,
+    /// 召回率宏平均
     pub recall: f64,
+    /// MRR 宏平均
     pub mrr: f64,
+    /// NDCG 宏平均
     pub ndcg: f64,
 }
 

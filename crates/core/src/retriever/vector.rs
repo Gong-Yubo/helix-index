@@ -21,6 +21,7 @@ pub struct VectorRetriever<'a> {
 }
 
 impl<'a> VectorRetriever<'a> {
+    /// 构造向量检索器：embedder 做查询侧向量化，index 做近邻检索。
     pub fn new(embedder: &'a dyn Embedder, index: &'a dyn VectorIndex) -> Self {
         Self { embedder, index }
     }

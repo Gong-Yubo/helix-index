@@ -27,7 +27,9 @@ use crate::index::Index;
 /// 一条评测查询及其 graded 标注。
 #[derive(Debug, Clone, Deserialize)]
 pub struct Judgment {
+    /// 查询唯一 ID
     pub qid: String,
+    /// 查询文本
     pub query: String,
     /// 分桶：mixed / natural / exact / paraphrase
     #[serde(rename = "type")]
@@ -36,9 +38,12 @@ pub struct Judgment {
     pub relevance: Vec<RelEntry>,
 }
 
+/// 一条相关性标注：某个 source（段落）对该 query 的等级。
 #[derive(Debug, Clone, Deserialize)]
 pub struct RelEntry {
+    /// 段落出处（对应语料的 source 字段）
     pub source: String,
+    /// 相关性等级 0~3（0 = 已判定负例）
     pub grade: u8,
 }
 

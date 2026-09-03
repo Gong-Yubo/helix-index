@@ -17,7 +17,9 @@ pub enum SegmentKind {
 /// 一个同构片段
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Segment {
+    /// 片段原文
     pub text: String,
+    /// 片段类型（CJK / Latin）
     pub kind: SegmentKind,
 }
 

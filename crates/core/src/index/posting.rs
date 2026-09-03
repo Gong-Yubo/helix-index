@@ -17,6 +17,7 @@ pub struct Posting {
 }
 
 impl Posting {
+    /// 构造一条 posting（chunk_id + 词频）。
     pub fn new(chunk_id: ChunkId, tf: u32) -> Self {
         Self {
             chunk_id,

@@ -25,8 +25,11 @@ use super::response::{Explain, Hit, SearchResponse};
 /// 检索模式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchMode {
+    /// 仅关键词路（BM25）
     Bm25,
+    /// 仅语义路（向量近邻检索）
     Vector,
+    /// 两路召回后融合（RRF，推荐默认）
     Hybrid,
 }
 
@@ -62,6 +65,7 @@ impl<'a> Searcher<'a> {
         self
     }
 
+    /// 接入向量路：embedder 负责查询侧向量化，vector_index 负责近邻检索。
     pub fn with_vector(
         mut self,
         embedder: &'a dyn Embedder,
@@ -72,16 +76,19 @@ impl<'a> Searcher<'a> {
         self
     }
 
+    /// 覆盖融合策略（默认 `RrfFusion`）。
     pub fn with_fusion(mut self, fusion: Box<dyn FusionStrategy>) -> Self {
         self.fusion = fusion;
         self
     }
 
+    /// 覆盖重排策略（默认 `NoOpReranker`，P6 再接真实 rerank）。
     pub fn with_reranker(mut self, reranker: Box<dyn Reranker>) -> Self {
         self.reranker = reranker;
         self
     }
 
+    /// 执行一次检索，返回结构化响应（含 hits / explain / took）。
     pub fn search(&self, query: &str, mode: SearchMode, k: usize) -> Result<SearchResponse> {
         self.search_filtered(query, mode, k, None)
     }

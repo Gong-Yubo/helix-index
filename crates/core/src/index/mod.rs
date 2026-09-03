@@ -52,21 +52,32 @@ pub struct Index {
 /// 把 metadata 存成 JSON 字符串，导入时再解析回来。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotSections {
+    /// 词项 → TermId 映射（导出时按 TermId 升序，防跨进程漂移）
     pub term_dict: Vec<(String, TermId)>,
+    /// 每个 TermId 对应的倒排链
     pub postings: Vec<Vec<Posting>>,
+    /// 正排文档表（`None` = 已删除的墓碑位）
     pub docs: Vec<Option<DocumentDto>>,
+    /// 正排分片表（`None` = 已删除的墓碑位）
     pub chunks: Vec<Option<Chunk>>,
+    /// 每个分片的分词数，供 avgdl 与 BM25 长度归一化
     pub chunk_lens: Vec<u32>,
+    /// 语料级统计量（文档数、分片数、词项总数、avgdl）
     pub stats: Stats,
+    /// content_hash → DocId（幂等 upsert 用，FR-15；按 hash 升序导出）
     pub content_hashes: Vec<(u64, DocId)>,
 }
 
 /// 快照专用的文档 DTO（metadata 序列化为 JSON 字符串）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentDto {
+    /// 文档 ID
     pub doc_id: DocId,
+    /// 出处（溯源用，FR-12）
     pub source: String,
+    /// 业务元数据的 JSON 文本（`serde_json::Value` 无法直接进 bincode 2）
     pub metadata_json: String,
+    /// 内容哈希（幂等 upsert，FR-15）
     pub content_hash: u64,
 }
 
@@ -93,6 +104,7 @@ impl From<DocumentDto> for Document {
 }
 
 impl Index {
+    /// 创建空索引。
     pub fn new() -> Self {
         Self::default()
     }
@@ -201,26 +213,32 @@ impl Index {
 
     // ---- 查询接口（供 Retriever / 测试）----
 
+    /// 存活分片数（检索的最小单位数量）。
     pub fn num_chunks(&self) -> u32 {
         self.stats.num_chunks
     }
 
+    /// 全语料词项总数（所有分片的分词数之和）。
     pub fn total_len(&self) -> u64 {
         self.stats.total_len
     }
 
+    /// 平均分片长度（BM25 长度归一化用）。
     pub fn avgdl(&self) -> f32 {
         self.stats.avgdl()
     }
 
+    /// 词项的文档频率 df（BM25 的 IDF 计算用）。
     pub fn doc_freq(&self, term: &str) -> u32 {
         self.inverted.doc_freq(term)
     }
 
+    /// 词项对应的内部 TermId；未收录则该词。
     pub fn term_id(&self, term: &str) -> Option<crate::types::TermId> {
         self.inverted.term_id(term)
     }
 
+    /// 取某 TermId 的倒排链（供 retriever 遍历）。
     pub fn postings_by_id(&self, id: crate::types::TermId) -> &[Posting] {
         self.inverted.postings_by_id(id)
     }
@@ -230,10 +248,12 @@ impl Index {
         self.forward.chunk(chunk_id).is_some()
     }
 
+    /// 取分片内容（墓碑位返回 `None`）。
     pub fn chunk(&self, chunk_id: ChunkId) -> Option<&Chunk> {
         self.forward.chunk(chunk_id)
     }
 
+    /// 取文档（墓碑位返回 `None`）。
     pub fn doc(&self, doc_id: DocId) -> Option<&Document> {
         self.forward.doc(doc_id)
     }
@@ -243,7 +263,7 @@ impl Index {
         self.chunk_lens.get(chunk_id as usize).copied().unwrap_or(0)
     }
 
-    /// 迭代所有活分片（确定性顺序，用于"全量重建"对照测试）。
+    /// 迭代所有活分片（确定性顺序，用于"全量重建"对照测试与向量化）。
     pub fn live_chunks(&self) -> impl Iterator<Item = &Chunk> {
         self.forward.iter_live_chunks()
     }
@@ -255,6 +275,7 @@ impl Index {
 
     // ---- 快照导出 / 导入（T4-02，供 storage 模块序列化）----
 
+    /// 导出为快照所需的结构化分区（供 storage 序列化）。
     pub fn export(&self) -> SnapshotSections {
         let (term_dict, postings) = self.inverted.export();
         let (docs, chunks) = self.forward.export();

@@ -22,6 +22,8 @@ pub struct RrfFusion {
 }
 
 impl RrfFusion {
+    /// 构造 RRF 融合。默认请直接用 `RrfFusion::default()`
+    /// （k=60、weights=[1.0, 1.5]，均为 P5 实测定稿值）。
     pub fn new(k: f32, weights: Vec<f32>) -> Self {
         assert!(k > 0.0, "RRF 的 k 必须 > 0");
         Self { k, weights }

@@ -58,6 +58,7 @@ pub struct MixedAnalyzer {
 }
 
 impl MixedAnalyzer {
+    /// 构造分词器（会加载 jieba 词典，建议复用同一实例）。
     pub fn new() -> Self {
         Self {
             jieba: jieba_rs::Jieba::new(),

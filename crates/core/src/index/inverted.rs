@@ -13,6 +13,7 @@ use crate::types::{ChunkId, TermId};
 
 use super::posting::Posting;
 
+/// 倒排索引：词项 → 倒排链（chunk_id 升序，服务于确定性 NFR-06）。
 #[derive(Debug, Default)]
 pub struct InvertedIndex {
     /// term → TermId
@@ -22,6 +23,7 @@ pub struct InvertedIndex {
 }
 
 impl InvertedIndex {
+    /// 创建空倒排索引。
     pub fn new() -> Self {
         Self::default()
     }

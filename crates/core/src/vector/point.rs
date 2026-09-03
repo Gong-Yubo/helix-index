@@ -28,6 +28,7 @@ impl NormalizedVector {
         self.0.len()
     }
 
+    /// 底层切片（用于喂给 ANN 索引与距离计算）。
     pub fn as_slice(&self) -> &[f32] {
         &self.0
     }

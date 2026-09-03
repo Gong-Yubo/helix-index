@@ -11,7 +11,9 @@ pub use noop::NoOpReranker;
 use crate::error::Result;
 use crate::query::response::Hit;
 
-/// 精排抽象：在粗召回 + 融合之后，对少量候选重新排序。
+/// 重排抽象：在粗召回 + 融合之后，对少量候选重新排序。
+/// P6 才接真实 rerank 模型，当前默认 `NoOpReranker`。
 pub trait Reranker: Send + Sync {
+    /// 对候选重排，返回前 `top_n` 条。
     fn rerank(&self, query: &str, hits: Vec<Hit>, top_n: usize) -> Result<Vec<Hit>>;
 }

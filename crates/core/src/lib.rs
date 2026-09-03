@@ -24,8 +24,14 @@
 //! **P0~P5 全部完成**（2026-09-03），当前版本 `0.1.0`。
 //! 下一阶段 P6（v2：Rerank / MMR / 自研索引）不在当前版本范围。
 //!
-//! 效果与性能实测结论见 `docs/devel/eval-report.md`；
+//! 评测结论见 `docs/devel/eval-report.md`；
 //! 任务清单与进度见 `docs/devel/plan.md`。
+
+// rustdoc 守门（V1-02）：公有 API 必须有文档注释。
+// 用 `deny` 而非 `warn`——`warn` 不打断构建，不构成守门。
+// 注意：只加在 **库** crate；CLI（crates/cli）是二进制 crate、无 pub API，
+// 加它是 no-op（评审意见 v1.1 第 4 条）。
+#![deny(missing_docs)]
 
 pub mod analyze;
 pub mod bench;
