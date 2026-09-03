@@ -55,6 +55,9 @@ struct BuildArgs {
     /// 同时嵌入并保存向量（vector/hybrid 检索需要；首次会下载模型）
     #[arg(long)]
     vectors: bool,
+    /// 每段落强制单 chunk（评测口径：段落级标注防多 chunk 双计，NFR-03 对齐"1 万 chunk"）
+    #[arg(long)]
+    single_chunk: bool,
 }
 
 #[derive(clap::Args)]
@@ -221,7 +224,12 @@ fn rebuild_vector_index(vectors: &[(ChunkId, Vec<f32>)]) -> Result<HnswRsIndex> 
 
 fn build(args: BuildArgs) -> Result<()> {
     let started = std::time::Instant::now();
-    let (index, _) = load_corpus(&args.input)?;
+    let (index, _) = if args.single_chunk {
+        // 评测口径：每段落强制单 chunk（对齐 NFR-01/03 的"1 万 chunk"目标规模）
+        load_corpus_with(&args.input, &Chunker::new(200_000, 0))?
+    } else {
+        load_corpus(&args.input)?
+    };
     println!("索引构建完成:");
     println!("  文档数   = {}", index.num_docs());
     println!("  分片数   = {}", index.num_chunks());
@@ -236,7 +244,14 @@ fn build(args: BuildArgs) -> Result<()> {
     // 可选：嵌入并保存向量
     let vectors = if args.vectors {
         let embedder = LocalEmbedder::new()?;
-        embed_chunks(&index, &embedder)?
+        let t = std::time::Instant::now();
+        let v = embed_chunks(&index, &embedder)?;
+        println!(
+            "  embed {} 条 耗时 {:?}（NFR-03 口径 = embed + 落盘，不含 HNSW）",
+            v.len(),
+            t.elapsed()
+        );
+        v
     } else {
         Vec::new()
     };
