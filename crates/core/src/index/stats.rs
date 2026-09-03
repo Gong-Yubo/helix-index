@@ -5,8 +5,10 @@
 //! 注意 `df` 不在此维护——它由 `postings.len()` 直接推导（见 `inverted.rs`），
 //! 不存在第二份需要同步的状态。
 
+use serde::{Deserialize, Serialize};
+
 /// 索引级统计量
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stats {
     /// 所有活分片的 term 总数（Σ dl）
     pub total_len: u64,

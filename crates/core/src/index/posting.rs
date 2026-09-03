@@ -1,9 +1,11 @@
 //! posting 列表项：某个词项在某个分片中的出现记录。
 
+use serde::{Deserialize, Serialize};
+
 use crate::types::ChunkId;
 
 /// 倒排表项
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Posting {
     /// 命中该词项的分片 ID
     pub chunk_id: ChunkId,

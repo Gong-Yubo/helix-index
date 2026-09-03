@@ -74,6 +74,20 @@ impl<'a> Searcher<'a> {
     }
 
     pub fn search(&self, query: &str, mode: SearchMode, k: usize) -> Result<SearchResponse> {
+        self.search_filtered(query, mode, k, None)
+    }
+
+    /// 带元数据过滤的检索（FR-14 / T4-07）。
+    ///
+    /// 过滤在**融合前**对 lane 结果做（chunk_id 位图），查询路径零 IO。
+    /// 有候选但被过滤条件全部排除时，`empty_reason = FilteredOut`。
+    pub fn search_filtered(
+        &self,
+        query: &str,
+        mode: SearchMode,
+        k: usize,
+        filter: Option<&crate::schema::Filter>,
+    ) -> Result<SearchResponse> {
         let started = Instant::now();
         let mut metrics = Metrics::default();
 
@@ -118,6 +132,21 @@ impl<'a> Searcher<'a> {
         metrics.bm25 = bm25_lane.as_ref().map_or(0, |l| l.len());
         metrics.vector = vector_lane.as_ref().map_or(0, |l| l.len());
 
+        // 1.5 融合前位图过滤（FR-14 / NFR-02：查询路径零 IO）
+        let pre_filter_candidates = metrics.bm25 + metrics.vector;
+        let mut bm25_lane = bm25_lane;
+        let mut vector_lane = vector_lane;
+        if let Some(f) = filter {
+            let allowed = super::filter::allowed_chunks(f, self.index);
+            let retain = |lane: &mut Option<LaneResults>| {
+                if let Some(l) = lane.as_mut() {
+                    l.retain(|(id, _)| allowed.contains(id));
+                }
+            };
+            retain(&mut bm25_lane);
+            retain(&mut vector_lane);
+        }
+
         // 2. 融合（或单路直通）
         let mut lanes: Vec<LaneResults> = Vec::new();
         if let Some(l) = &bm25_lane {
@@ -137,7 +166,12 @@ impl<'a> Searcher<'a> {
         metrics.candidates = fused.len();
 
         if fused.is_empty() {
-            let reason = determine_empty_reason(false, query_is_empty, 0);
+            // 有候选但被过滤光 → FilteredOut；否则按"无召回/空 query"判定
+            let reason = if pre_filter_candidates > 0 && filter.is_some() {
+                Some(super::response::EmptyReason::FilteredOut)
+            } else {
+                determine_empty_reason(false, query_is_empty, 0)
+            };
             return Ok(empty_response(reason, started));
         }
 
@@ -355,6 +389,36 @@ mod tests {
             resp.empty_reason,
             Some(crate::query::response::EmptyReason::AllTermsUnmatched)
         );
+    }
+
+    #[test]
+    fn 过滤后是子集且全过滤触发FilteredOut() {
+        use crate::schema::Filter;
+        let (index, analyzer) = build_index(&[
+            "BM25 是经典检索算法",
+            "向量检索计算余弦相似度",
+            "混合检索融合两路",
+        ]);
+        let searcher = Searcher::new(&index, &analyzer);
+
+        // 不过滤：应召回多条
+        let all = searcher.search("检索", SearchMode::Bm25, 10).unwrap();
+        assert!(all.hits.len() >= 2);
+
+        // 过滤：构造一个只匹配部分文档的 metadata 条件——本测试语料无 metadata，
+        // 因此用"永不匹配"的条件验证 FilteredOut
+        let impossible = Filter::eq("__no_such_field__", "__no_such_value__");
+        let filtered = searcher
+            .search_filtered("检索", SearchMode::Bm25, 10, Some(&impossible))
+            .unwrap();
+        assert!(filtered.hits.is_empty());
+        assert_eq!(
+            filtered.empty_reason,
+            Some(crate::query::response::EmptyReason::FilteredOut)
+        );
+
+        // 不过滤时有结果 → 证明 FilteredOut 不是因为无召回
+        assert!(!all.hits.is_empty());
     }
 
     #[test]

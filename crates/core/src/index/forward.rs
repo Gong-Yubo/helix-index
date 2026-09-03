@@ -79,4 +79,14 @@ impl ForwardStore {
     pub fn iter_live_chunks(&self) -> impl Iterator<Item = &Chunk> {
         self.chunks.iter().filter_map(|c| c.as_ref())
     }
+
+    /// 导出快照用的 (docs, chunks)。`Option::None` 即墓碑，原样保留。
+    pub fn export(&self) -> (&[Option<Document>], &[Option<Chunk>]) {
+        (&self.docs, &self.chunks)
+    }
+
+    /// 从快照恢复。
+    pub fn import(docs: Vec<Option<Document>>, chunks: Vec<Option<Chunk>>) -> Self {
+        Self { chunks, docs }
+    }
 }

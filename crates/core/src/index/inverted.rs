@@ -98,6 +98,35 @@ impl InvertedIndex {
     pub fn postings_by_id(&self, id: TermId) -> &[Posting] {
         &self.postings[id as usize]
     }
+
+    /// 导出快照用的 (term_dict, postings)。
+    ///
+    /// term_dict **按 TermId 升序**导出：HashMap 本身无序，若按哈希序导出，
+    /// round-trip 后 TermId 仍然由 postings 下标决定、不会漂移——但按 id 排序
+    /// 能保证快照字节流的确定性（NFR-06）。
+    pub fn export(&self) -> (Vec<(String, TermId)>, Vec<Vec<Posting>>) {
+        let mut dict: Vec<(String, TermId)> = self
+            .terms
+            .iter()
+            .map(|(k, &v)| (k.to_string(), v))
+            .collect();
+        dict.sort_unstable_by_key(|(_, id)| *id);
+        (dict, self.postings.clone())
+    }
+
+    /// 从快照恢复。
+    pub fn import(term_dict: Vec<(String, TermId)>, postings: Vec<Vec<Posting>>) -> Self {
+        let terms: HashMap<SmolStr, TermId> = term_dict
+            .into_iter()
+            .map(|(k, v)| (SmolStr::new(k), v))
+            .collect();
+        debug_assert_eq!(
+            terms.len(),
+            postings.len(),
+            "term_dict 与 postings 数量应一致"
+        );
+        Self { terms, postings }
+    }
 }
 
 #[cfg(test)]

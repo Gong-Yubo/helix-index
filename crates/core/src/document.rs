@@ -21,6 +21,14 @@ pub struct Document {
     pub content_hash: u64,
 }
 
+/// 计算文档内容的哈希（幂等 upsert 用，FR-15）。
+///
+/// 用 xxh64：64-bit 稳定哈希，无随机种子，同内容跨进程结果一致。
+/// 相比 crc32（32-bit）碰撞概率低一个量级。
+pub fn content_hash(text: &str) -> u64 {
+    xxhash_rust::xxh64::xxh64(text.as_bytes(), 0)
+}
+
 /// 检索的最小单位
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Chunk {

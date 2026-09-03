@@ -31,6 +31,10 @@ instant-distance.workspace = true
 bincode.workspace          = true
 crc32fast.workspace        = true
 moka.workspace             = true
+xxhash-rust.workspace      = true
+
+# 向量索引 A/B 候选（T4-06a）；P4 结束后若未采用则移除
+hnsw_rs.workspace = true
 
 # 可选：本地 embedding（P2 启用）
 fastembed = { workspace = true, optional = true }

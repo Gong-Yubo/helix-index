@@ -51,3 +51,6 @@
 - instant-distance HNSW **无增量 insert**（主索引 + delta）；**debug 模式构建极慢**（2000 条 102s）→ 万条重合率测试必须 `--release` 且 `#[ignore]`；`Search::default()` 即可（search 内部自设 ef）；`ef_construction=300 / ef_search=200`（万条重合率 0.97）
 - git 身份：全局 `GongYubo <gongyubo@gmail.com>`。⚠️ 家目录有 ACL `group:everyone deny delete`，`git config --global` 会失败，**改 ~/.gitconfig 必须直接编辑文件内容**（不能用 git config 写）
 - P4 先用 `hnsw_rs`（纯 Rust + 原生增量 insert）与「instant-distance + delta」A/B，达标则删掉 delta 区
+- **A/B 已定案（2026-09-03）：hnsw_rs 胜出**——召回同为 0.970，原生增量 1.5ms/条 vs instant-distance 全量重建 31s/万条；生产路径已切 HnswRsIndex。⚠️ **hnsw_rs 的 DistDot 在 aarch64 有 assert!(dot<=1) 浮点断言会 panic**（自匹配 dot=1.0000002）→ 用自定义 DistDotClamped；**crate 名是 hnsw_rs（下划线）**
+- **bincode 2 不支持 serde_json::Value**（serialize_any → AnyNotSupported）→ 快照对 metadata 用 DTO 存 JSON 字符串；且 bincode 2 需显式开 `serde` feature 才有 bincode::serde
+- 快照格式：magic "IDX1" + version + crc32(header 后正文)；term_dict 按 TermId 升序导出防漂移；content_hash 用 xxhash-rust xxh64

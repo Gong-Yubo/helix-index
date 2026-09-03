@@ -7,10 +7,12 @@
 
 mod brute;
 mod hnsw;
+mod hnsw_rs_index;
 mod point;
 
 pub use brute::BruteForceIndex;
 pub use hnsw::HnswIndex;
+pub use hnsw_rs_index::HnswRsIndex;
 pub use point::NormalizedVector;
 
 use crate::error::Result;

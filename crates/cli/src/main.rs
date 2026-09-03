@@ -1,20 +1,27 @@
 //! idx —— index-demo 的命令行工具。
 //!
-//! 已实现：`build`、`search --mode {bm25|vector|hybrid}`、`compare`。
-//! 快照落盘是 P4（T4-01），故 `search` 目前通过 `--input` 重新读取语料重建索引。
+//! 已实现：
+//! - `build`：摄入语料并**落盘快照**（`--vectors` 同时保存向量）
+//! - `search --mode {bm25|vector|hybrid}`：`--input` 重建 或 `--index` 从快照加载
+//! - `compare`：三路同屏对比
+//!
+//! 向量索引用 `HnswRsIndex`（P4 A/B 结论：原生增量 insert，见 p4-design.md）。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
 use index_core::analyze::MixedAnalyzer;
 use index_core::chunk::Chunker;
-use index_core::document::Document;
+use index_core::document::{content_hash, Document};
 use index_core::embed::{Embedder, LocalEmbedder};
 use index_core::index::Index;
 use index_core::query::{EmptyReason, Hit, SearchMode, SearchResponse, Searcher};
-use index_core::vector::{BruteForceIndex, NormalizedVector, VectorIndex};
+use index_core::schema::Filter;
+use index_core::storage;
+use index_core::types::ChunkId;
+use index_core::vector::{HnswRsIndex, NormalizedVector, VectorIndex};
 
 #[derive(Parser)]
 #[command(name = "idx", version, about = "index-demo 检索内核命令行工具")]
@@ -25,9 +32,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// 建索引（内存索引，快照在 P4）
+    /// 建索引并落盘快照
     Build(BuildArgs),
-    /// 检索（--mode bm25 / vector / hybrid）
+    /// 检索（--mode bm25 / vector / hybrid；--input 重建 或 --index 快照）
     Search(SearchArgs),
     /// 三种模式同屏对比（调试主入口）
     Compare(CompareArgs),
@@ -40,22 +47,31 @@ struct BuildArgs {
     /// 语料文件（JSONL：每行 {"source": "...", "text": "..."}）
     #[arg(short, long)]
     input: PathBuf,
-    /// 输出快照路径（P4 启用；当前仅打印）
+    /// 输出快照路径（P4 起真正落盘）
     #[arg(short, long)]
     output: Option<PathBuf>,
+    /// 同时嵌入并保存向量（vector/hybrid 检索需要；首次会下载模型）
+    #[arg(long)]
+    vectors: bool,
 }
 
 #[derive(clap::Args)]
 struct SearchArgs {
-    /// 语料文件（P4 快照落地后改用 --index）
+    /// 语料文件（与 --index 二选一，每次重建索引）
     #[arg(short, long)]
-    input: PathBuf,
+    input: Option<PathBuf>,
+    /// 快照文件（与 --input 二选一，秒级加载）
+    #[arg(long)]
+    index: Option<PathBuf>,
     /// 检索模式
     #[arg(short, long, default_value = "bm25")]
     mode: String,
     /// 返回条数
     #[arg(short, long, default_value_t = 10)]
     k: usize,
+    /// 元数据过滤（field=value，等值匹配，可多次出现）
+    #[arg(long)]
+    filter: Vec<String>,
     /// 打印 explain 详情（匹配词 + 两路 rank/score）
     #[arg(long)]
     explain: bool,
@@ -103,8 +119,23 @@ fn parse_mode(s: &str) -> Result<SearchMode> {
     }
 }
 
+/// 解析 `field=value` 形式的过滤条件（等值匹配）。
+fn parse_filters(specs: &[String]) -> Result<Option<Filter>> {
+    if specs.is_empty() {
+        return Ok(None);
+    }
+    let mut conditions = Vec::with_capacity(specs.len());
+    for s in specs {
+        match s.split_once('=') {
+            Some((f, v)) => conditions.push(Filter::eq(f, v)),
+            None => bail!("过滤条件格式应为 field=value，收到 {s:?}"),
+        }
+    }
+    Ok(Some(Filter::And(conditions)))
+}
+
 /// 从 JSONL 语料构建索引。
-fn load_corpus(path: &PathBuf) -> Result<(Index, MixedAnalyzer)> {
+fn load_corpus(path: &Path) -> Result<(Index, MixedAnalyzer)> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("读取语料失败: {}", path.display()))?;
 
@@ -135,7 +166,7 @@ fn load_corpus(path: &PathBuf) -> Result<(Index, MixedAnalyzer)> {
             doc_id: 0,
             source,
             metadata,
-            content_hash: 0, // 幂等去重是 P4（T4-04）
+            content_hash: content_hash(text), // 幂等 upsert（FR-15）
         };
         let chunks = chunker.chunk(0, text);
         index.add(doc, chunks, &analyzer)?;
@@ -148,52 +179,120 @@ fn load_corpus(path: &PathBuf) -> Result<(Index, MixedAnalyzer)> {
     Ok((index, analyzer))
 }
 
-/// 把每个分片文本 embed 后建暴力向量索引。
-fn build_vector_index(index: &Index, embedder: &LocalEmbedder) -> Result<BruteForceIndex> {
-    let entries: Vec<(u32, String)> = index
+/// embed 所有分片，返回 (chunk_id, 原始向量)。
+fn embed_chunks(index: &Index, embedder: &LocalEmbedder) -> Result<Vec<(ChunkId, Vec<f32>)>> {
+    let entries: Vec<(ChunkId, String)> = index
         .live_chunks()
         .map(|c| (c.chunk_id, c.text.clone()))
         .collect();
     let texts: Vec<String> = entries.iter().map(|(_, t)| t.clone()).collect();
     let vecs = embedder.embed_documents(&texts)?;
+    Ok(entries
+        .into_iter()
+        .zip(vecs)
+        .map(|((id, _), v)| (id, v))
+        .collect())
+}
 
-    let mut vindex = BruteForceIndex::new();
-    for ((chunk_id, _), v) in entries.iter().zip(vecs.into_iter()) {
-        vindex.add(*chunk_id, NormalizedVector::new(v))?;
+/// 从原始向量重建向量索引（HnswRsIndex，A/B 结论：原生增量）。
+fn rebuild_vector_index(vectors: &[(ChunkId, Vec<f32>)]) -> Result<HnswRsIndex> {
+    let mut vi = HnswRsIndex::with_capacity(vectors.len().max(1024));
+    for (id, v) in vectors {
+        vi.add(*id, NormalizedVector::new(v.clone()))?;
     }
-    Ok(vindex)
+    Ok(vi)
 }
 
 fn build(args: BuildArgs) -> Result<()> {
+    let started = std::time::Instant::now();
     let (index, _) = load_corpus(&args.input)?;
     println!("索引构建完成:");
+    println!("  文档数   = {}", index.num_docs());
     println!("  分片数   = {}", index.num_chunks());
     println!("  词项总数 = {}", index.total_len());
     println!("  平均分片 = {:.2}", index.avgdl());
-    if let Some(out) = &args.output {
-        println!(
-            "  ⚠️  快照落盘在 P4 实现，当前忽略 --output {}（索引仅存在于本次进程）",
-            out.display()
-        );
-    }
+
+    let Some(out) = args.output else {
+        println!("  （未指定 --output，索引仅存在于本次进程）");
+        return Ok(());
+    };
+
+    // 可选：嵌入并保存向量
+    let vectors = if args.vectors {
+        let embedder = LocalEmbedder::new()?;
+        embed_chunks(&index, &embedder)?
+    } else {
+        Vec::new()
+    };
+
+    storage::save(&out, &index, &vectors)?;
+    println!(
+        "  快照已写入 {}（{}，{}）耗时 {:?}",
+        out.display(),
+        if vectors.is_empty() {
+            "纯文本"
+        } else {
+            "含向量"
+        },
+        humansize(&out),
+        started.elapsed()
+    );
     Ok(())
+}
+
+fn humansize(p: &Path) -> String {
+    match std::fs::metadata(p) {
+        Ok(m) => {
+            let b = m.len();
+            if b > 1024 * 1024 {
+                format!("{:.1} MB", b as f64 / (1024.0 * 1024.0))
+            } else if b > 1024 {
+                format!("{:.1} KB", b as f64 / 1024.0)
+            } else {
+                format!("{b} B")
+            }
+        }
+        Err(_) => "未知大小".to_string(),
+    }
 }
 
 fn search(args: SearchArgs) -> Result<()> {
     let mode = parse_mode(&args.mode)?;
-    let (index, analyzer) = load_corpus(&args.input)?;
+    let filter = parse_filters(&args.filter)?;
 
-    // 延迟初始化，让 embedder / vindex 的生命周期覆盖到 search
+    // --index 与 --input 二选一
+    let (index, analyzer, snapshot_vectors) = match (&args.index, &args.input) {
+        (Some(idx_path), None) => {
+            let t = std::time::Instant::now();
+            let (index, vectors) = storage::load(idx_path)
+                .with_context(|| format!("加载快照失败: {}", idx_path.display()))?;
+            eprintln!("[快照加载 {} 耗时 {:?}]", idx_path.display(), t.elapsed());
+            (index, MixedAnalyzer::new(), vectors)
+        }
+        (None, Some(input)) => {
+            let (index, analyzer) = load_corpus(input)?;
+            (index, analyzer, Vec::new())
+        }
+        _ => bail!("--index 与 --input 必须二选一"),
+    };
+
+    // 向量模式：查询侧向量化必须要 LocalEmbedder；
+    // 文档向量优先用快照里的（build 时已 embed），--input 时现场 embed。
     let embedder;
-    let vindex;
+    let vi;
     let mut searcher = Searcher::new(&index, &analyzer);
     if mode != SearchMode::Bm25 {
         embedder = LocalEmbedder::new()?;
-        vindex = build_vector_index(&index, &embedder)?;
-        searcher = searcher.with_vector(&embedder, &vindex);
+        let vectors = if !snapshot_vectors.is_empty() {
+            snapshot_vectors
+        } else {
+            embed_chunks(&index, &embedder)?
+        };
+        vi = rebuild_vector_index(&vectors)?;
+        searcher = searcher.with_vector(&embedder, &vi);
     }
 
-    let resp = searcher.search(&args.query, mode, args.k)?;
+    let resp = searcher.search_filtered(&args.query, mode, args.k, filter.as_ref())?;
     print_response(&resp, &args.query, args.explain);
     Ok(())
 }
@@ -201,8 +300,9 @@ fn search(args: SearchArgs) -> Result<()> {
 fn compare(args: CompareArgs) -> Result<()> {
     let (index, analyzer) = load_corpus(&args.input)?;
     let embedder = LocalEmbedder::new()?;
-    let vindex = build_vector_index(&index, &embedder)?;
-    let searcher = Searcher::new(&index, &analyzer).with_vector(&embedder, &vindex);
+    let vectors = embed_chunks(&index, &embedder)?;
+    let vi = rebuild_vector_index(&vectors)?;
+    let searcher = Searcher::new(&index, &analyzer).with_vector(&embedder, &vi);
 
     println!("查询: {}\n", args.query);
     println!("=== BM25 ===");

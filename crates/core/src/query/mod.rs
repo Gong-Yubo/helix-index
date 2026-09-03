@@ -5,6 +5,7 @@
 //! 本模块**不自己实现算法**，只调用 `retriever` / `fusion` / `rerank`。
 
 pub mod explain;
+pub mod filter;
 pub mod metrics;
 pub mod response;
 pub mod searcher;

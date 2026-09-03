@@ -36,10 +36,16 @@ fastembed        = { version = "6.0.2", default-features = false, features = [
 ] }
 # ⚠️ 不要用 "3.0.0"：crates.io 上的 bincode 3.0.0 是占位/玩笑发布
 #    （源码仅一行 compile_error!("https://xkcd.com/2347/")），实际稳定线为 2.0.1
-bincode          = "2.0.1"
+#    serde feature 用于 serde 结构体的 encode/decode（storage 快照）
+bincode          = { version = "2.0.1", features = ["serde"] }
 crc32fast        = "1.5"
 # moka 必须显式启用 sync 或 future，否则编译期直接 compile_error!
 moka             = { version = "0.12", features = ["sync"] }
+# content_hash 用 xxh64（64-bit 稳定哈希，幂等 upsert 去重，比 crc32 少一个量级碰撞风险）
+xxhash-rust      = { version = "0.8", features = ["xxh64"] }
+# 向量索引 A/B 候选（T4-06a）：纯 Rust、原生增量 insert、内建 search_filter、DistDot 要求归一化
+# ⚠️ 包名用下划线：hnsw_rs（crates.io 上没有 hnsw-rs）
+hnsw_rs          = "0.3.4"
 
 # ---- CLI ----
 clap = { version = "4.6", features = ["derive"] }
