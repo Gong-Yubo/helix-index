@@ -28,6 +28,7 @@ impl Posting {
     }
 
     #[cfg(feature = "positions")]
+    /// 构造一条带位置信息的 posting（`positions` feature 下使用）。
     pub fn with_positions(chunk_id: ChunkId, tf: u32, positions: Vec<u32>) -> Self {
         Self {
             chunk_id,
