@@ -86,6 +86,8 @@ Agent 作为调用方与人类搜索有五个根本差异（query 含 LLM 噪声
 - **macOS BSD grep 不支持 `\|`**（ripgrep 才支持）：Bash 里 `grep "a\|b"` 静默不匹配并返回 exit 1，
   极易误判「代码里没有某符号」。**一律用 Grep 工具**
 - **并行 Edit 同一文件会互相覆盖**：同一条消息对同一文件发两次 Edit，后一次基于旧快照写入，前一次丢失（工具仍报 success）。同文件多次编辑必须串行
+- **`gh issue/pr create --body "..."` 不能用**：zsh 下 body 里的反引号被当**命令替换**执行（报 `command not found: Xxx.yyy`），
+  含 `()` 还会 `parse error in command substitution`。**含 Markdown 反引号的 body 一律先写文件，再用 `--body-file`**
 
 ## P6 门面层坑（详见 p6-design.md §9.1）
 - **`crate::error::Result<T>` 是单泛型别名**，写 `Result<SearchMode, String>` 会撞别名（E0107）→ 用 `std::result::Result` 完整路径
