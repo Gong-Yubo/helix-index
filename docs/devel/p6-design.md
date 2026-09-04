@@ -2,18 +2,17 @@
 
 | 项目 | 内容 |
 | --- | --- |
-| 版本 | **v1.1（已按评审修订）** |
+| 版本 | **v2.0（已拍板定稿）** |
 | 日期 | 2026-09-04 |
-| 状态 | ⬜ **待拍板**（决策点 D-I1 ~ D-I8 未决，未动代码；已消化评审 P1~P11 + `search` 接口改为仅 query 必选） |
+| 状态 | ✅ **已拍板**（决策点 D-I1~D-I8 全部定案，结论见第 10.2 节；未动代码，待实施 I-01） |
 | 来源 | [issue #1「融合索引接口重新设计」](https://github.com/Gong-Yubo/helix-index/issues/1) |
-| 评审 | [issue #1 评论（方案摘要 + D-I1~D-I7 待拍板）](https://github.com/Gong-Yubo/helix-index/issues/1#issuecomment-5526051968) |
+| 评审 | [issue #1 评论（方案摘要 + 决策点待拍板）](https://github.com/Gong-Yubo/helix-index/issues/1#issuecomment-5526051968)、[回应评审 P1~P11](https://github.com/Gong-Yubo/helix-index/issues/1#issuecomment-5534925042) |
 | 前提 | P0~P5 + v1 收尾全部完成（`v1-finish-design.md` V1-00~V1-16 已落地，CI 9/9 绿） |
 | 上游 | `requirements-spec.md`（FR/NFR 定义源）、`architecture-design.md`（模块边界 4.2、ADR-001~008）、`plan.md` |
 | 定位 | **不改算法、不改评测口径、不改 CLI 参数**，只重构库的**对外接口层**，让 `index.add(doc)` / `searcher.search(query)` 成为默认路径 |
 
 > 命名说明：本文件按 `p0~p5-design.md` 的既有约定命名，编号 P6。
-> 但 `plan.md` 当前已把 **P6 定义为「v2：Rerank / MMR / 自研索引」**。
-> 本文档建议**把「接口重构」提为 P6、原 v2 顺延 P7**，理由见第 10 节 D-I1。
+> 「接口重构提为 P6、原 v2 顺延 P7」已拍板（D-I1），`plan.md` 已同步更新。
 
 ---
 
@@ -608,18 +607,18 @@ LanceDB 有 `EmbeddingRegistry` 可以按配置自动重建 embedding 函数。
 - [ ] B3：`Document` 含 `text`，`content_hash` 由库内计算
 - [ ] **P1（positions）**：`--features positions` 建的快照与默认快照**互拒**（`SnapshotVersionMismatch`），不得靠 CRC 兜底
 
-### 10.2 决策点（待拍板）
+### 10.2 决策点（已拍板，2026-09-04）
 
-| 编号 | 决策 | 建议 |
+| 编号 | 决策 | 结论 |
 | --- | --- | --- |
-| **D-I1** | 阶段编号：接口重构提为 **P6**，原「v2：Rerank / MMR / 自研索引」顺延 **P7**？ | **是**。接口是 breaking change，越晚做代价越大（P7 每加一个特性就多一处要改）；而 Rerank / MMR 是纯增量，晚做零损失 |
-| **D-I2** | 旧 `Searcher<'a>` 改名为 `QueryExecutor<'a>`，把 `Searcher` 让给新的 owned reader？ | **是**。issue 明确要 `searcher.search(...)`；旧类型是"编排器"而非"检索器"，改名更准确。备选：新类型叫 `Reader`、旧名字不动 |
-| **D-I3** | 可见性语义：显式 `commit()`（对齐 Lucene），还是写完立即可见？ | **显式 `commit()`** + `SearchIndex::search()` 便利法兜底。理由见 6.3 |
-| **D-I4** | `Document` 改造为输入 DTO（breaking，实测 16 个文件引用）？ | **是**。不改则 `index.add(doc)` 无法实现——现状 `Document` 根本没有 `text` 字段 |
-| **D-I5** | 快照升 `FORMAT_VERSION` 2 存配置指纹（旧 `.idx` 全部需重建）？ | **是**。B1 是静默错误，代价高；旧快照只有 2 个（`data/*.snapshot`），重建成本可控 |
-| **D-I6** | 旧 API（`QueryExecutor` / `Index::add`）是否标 `#[deprecated]`？ | **本轮不加**。内部 bench / 测试仍在用，`#[deprecated]` 会因 `-D warnings` 打断 CI；等 P7 完成再评估 |
-| **D-I7** | `batch_size` 默认值？ | **不预设，实测校准**（32 / 64 / 128 / 256 四档，T2Ranking 12K 语料） |
-| **D-I8** | `search` 默认值：`top_n=10`、`mode` 按装配自动推断（有向量→Hybrid，无→Lexical）？ | **是**。top_n=10 是单轮 prompt 的合理长度（LanceDB 默认 10）；mode 自动推断是"零配置可用"的应有之义，任何时候可用 builder 覆盖 |
+| **D-I1** | 阶段编号：接口重构提为 **P6**，原「v2：Rerank / MMR / 自研索引」顺延 **P7**？ | ✅ **是**。已同步 `plan.md`：P6 = 接口重构（14 任务），P7 = 原 v2 |
+| **D-I2** | 旧 `Searcher<'a>` 改名为 `QueryExecutor<'a>`，把 `Searcher` 让给新的 owned reader？ | ✅ **是**。旧类型是"编排器"而非"检索器"，改名更准确 |
+| **D-I3** | 可见性语义：显式 `commit()`（对齐 Lucene），还是写完立即可见？ | ✅ **显式 `commit()`** + `SearchIndex::search(&mut self)` 便利法兜底（理由见 6.3） |
+| **D-I4** | `Document` 改造为输入 DTO（breaking，16 文件引用）？ | ✅ **是**。不改则 `index.add(doc)` 无法实现 |
+| **D-I5** | 快照升 `FORMAT_VERSION` 2 存配置指纹（旧 `.idx` 需重建）？ | ✅ **是**。B1 是静默错误代价高；旧快照仅 2 个，重建可控 |
+| **D-I6** | 旧 API 是否标 `#[deprecated]`？ | ✅ **本轮不加**（内部 bench/测试仍在用，会因 `-D warnings` 打断 CI）；P7 后评估 |
+| **D-I7** | `batch_size` 默认值？ | ✅ **实测校准**（32 / 64 / 128 / 256 四档，T2Ranking 12K 语料），不预设 |
+| **D-I8** | `search` 默认值：`top_n=10`、`mode` 按装配自动推断（有向量→Hybrid，无→Lexical）？ | ✅ **是**。top_n=10 是单轮 prompt 的合理长度；mode 自动推断是"零配置可用"的应有之义 |
 
 ---
 
