@@ -171,9 +171,12 @@ pub fn search_parts(
 
     metrics.bm25 = bm25_lane.as_ref().map_or(0, |l| l.len());
     metrics.vector = vector_lane.as_ref().map_or(0, |l| l.len());
-    metrics.vector_shortfall = vector_lane
-        .as_ref()
-        .map_or(0, |l| candidate_k.saturating_sub(l.len()));
+    // 缺口必须相对「本该拿到的条数」，而不是 `candidate_k`——候选池本身就不足
+    // `candidate_k` 时（小语料 / 高选择度过滤）`candidate_k - len` 恒为正，指标会被
+    // 噪声淹没，而它的用途是判断 filtered-ANN 是否**真的**降级了（V2.1 prefilter 判据）。
+    metrics.vector_shortfall = vector_lane.as_ref().map_or(0, |l| {
+        candidate_k.min(metrics.allowed).saturating_sub(l.len())
+    });
 
     // 3. 融合（或单路直通）。**过滤已在召回期下推**，这里不再做 retain（原 1.5 节已删）
     let mut lanes: Vec<LaneResults> = Vec::new();
@@ -277,6 +280,19 @@ pub fn search_parts(
 /// 摘除，因此"有非空 postings"即"存在活候选"。
 ///
 /// 成本 O(|query 词数|) 次哈希查找，相对两路召回可忽略。
+///
+/// # ⚠️ 适用边界：这是一个 **BM25 词典探针**，不是通用"有没有候选"探针
+///
+/// 它只看倒排链，因此**只在 BM25 / Hybrid 模式下代表"有没有候选"**。
+/// `SearchMode::Vector` 下向量路的召回与该探针无关，于是：
+///
+/// - 向量索引为空、或 query 的分词结果与入库侧不一致时，即使向量路本该有候选，
+///   本函数也返回 `false` → 空结果会被报成 `AllTermsUnmatched`（"你的词是幻觉词"），
+///   而真实原因可能在向量侧。
+/// - 该行为**不是 V2 Step 1 引入的**（改动前后一致），且已被 T16 钉成契约。
+///
+/// 若要真正区分，需要向量路自己的探针（例如"向量索引非空且最近邻距离在阈值内"），
+/// 属 V2.1 议题。在那之前，读这个指标/原因时要记住它只覆盖 BM25 侧。
 fn query_has_hits(index: &Index, analyzer: &dyn Analyzer, query: &str) -> bool {
     let mut seen = std::collections::HashSet::new();
     analyzer
