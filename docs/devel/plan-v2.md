@@ -92,12 +92,18 @@
 | # | 决策点 | 说明 | 归属步骤 |
 | --- | --- | --- | --- |
 | **H1** | 图持久化格式 + **多文件原子性** | hnsw_rs 图落盘是**双文件**（`hnsw.graph` + `hnsw.data`，`HnswIo`/`DumpInit`）。图持久化进入 `save()` 后，「快照」不再是单文件，「临时文件 + rename」无法保证跨文件一致（图新、快照旧版本错配）。**必须二选一**：① 图并入快照 blob（`FORMAT_VERSION` 升版）；② sidecar + manifest/generation 目录级原子替换。Step 2 与 Step 3 **不是无依赖**，需先合出这份 ADR（记为 **ADR-A**）。 | Step 2 + Step 3 |
-| **H2** | 向量删除的真实语义 | hnsw_rs 0.3.4 **无 remove/delete API**（架构 7.5 早记录「物理删除需 usearch，引入 C++」）。T7-07 实际语义只能是**向量墓碑 + `search_filter` 存活位图**；Q-C1 的「图膨胀」只能**缓解**，真正回收靠 T7-12 重建图。Step 5 的「体积不无界增长」验收**必须显式覆盖向量图 + `raw_vectors` + 快照文件**。 | Step 1 + Step 5 |
+| **H2** | 向量删除的真实语义 | hnsw_rs 0.3.4 **无 remove/delete API**（架构 7.5 早记录「物理删除需 usearch，引入 C++」）。T7-07 实际语义只能是**向量墓碑 + `search_filter` 存活位图**；Q-C1 的「图膨胀」只能**缓解**，真正回收靠 T7-12 重建图。Step 5 的「体积不无界增长」验收**必须显式覆盖向量图 + `raw_vectors` + 快照文件**。**→ 已由 `v2-step1-design.md` §4.3 / §6 D-S1-01 回答**：存活状态只住 `Index.forward`（单一真源），以位图谓词传给向量路，`VectorIndex` 不加 `tombstone`。 | Step 1 + Step 5 |
 | **H3** | 精排候选窗口 | 当前编排 `search_parts` 融合后先 `take(k)` 再进 reranker（`query/searcher.rs:196`），精排只能重排 k 条。要拿像样的 MRR 提升必须放开窗口到 `candidate_k`（3k）或可配 R，这直接决定延迟预算。需**新增精排延迟 NFR**（NFR-12），并在 T7-01 内设计窗口参数。 | Step 6 |
 
 ### V2.0 —— 质量与性能夯实 + 精排
 
 #### Step 1 · 正确性修复（地基，最先做）
+
+> **详细设计**：`docs/devel/v2-step1-design.md`（**v0.2**，2026-09-04，已吸收外部评审，待确认后实施）。
+> v0.2 关键修订：`hnsw_rs::search_filter` 的停止条件**原判断有误**——带 filter 时**从不 fast return**，且堆未满时距离剪枝全程关闭 ⇒ `allowed < ef` 时必然整图遍历（结构性，tuning 治不了）。
+> 由此新增：**无过滤热路径走普通 `search()` + 按存活比例过采样**（保住 fast-return 与 `EF_SEARCH=200`），**有过滤才走 `search_filter`**。另新增字段索引全类型覆盖、惰性谓词（消除 O(N) 展开）、`query_has_hits` 探针。
+> 已回答 H2（向量软删除的真实语义）并核实 `hnsw_rs::search_filter` 的真实行为；
+> 实施任务拆分为 S1-01~S1-11，建议顺序：先修幽灵候选（含跨快照），再做过滤下推。
 
 | 任务 | 解决 |
 | --- | --- |

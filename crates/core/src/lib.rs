@@ -35,12 +35,14 @@
 
 pub mod analyze;
 pub mod bench;
+pub mod bitmap;
 pub mod chunk;
 pub mod document;
 pub mod embed;
 pub mod error;
 pub mod fusion;
 pub mod index;
+pub mod predicate;
 pub mod query;
 pub mod rerank;
 pub mod retriever;

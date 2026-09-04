@@ -106,27 +106,64 @@ pub fn search_parts(
     // 候选预算：融合时多看几倍，给精排留余地
     let candidate_k = k.saturating_mul(3).max(10);
 
-    // 1. 两路召回（Hybrid 并行，单路只跑一路）
+    // 1. 过滤求值 → 候选谓词（**下推的数据源**，只求值一次；空集直接短路）
+    let t0 = Instant::now();
+    let predicate = match super::filter::try_build_predicate(parts.index, filter) {
+        Some(p) => Some(p),
+        None => {
+            // 过滤条件排空了所有文档：不必进两路召回（省掉一次完整检索）。
+            //
+            // 空原因与下方 `fused.is_empty()` 分支**同口径**（§5.8.1：query 侧信号优先）：
+            // query 本身就无命中时，报"你的过滤太窄"是误导——Agent 会去调过滤条件，
+            // 而真正的问题在 query。故此处也跑一次词典探针（O(query 词数)，
+            // 相比省下的一次完整检索可忽略）。
+            let reason = if query_is_empty || !query_has_hits(parts.index, parts.analyzer, query) {
+                determine_empty_reason(false, query_is_empty, 0)
+            } else {
+                Some(super::response::EmptyReason::FilteredOut)
+            };
+            metrics.filter_eval = t0.elapsed();
+            metrics.log(query);
+            return Ok(empty_response(reason, started));
+        }
+    };
+    metrics.filter_eval = t0.elapsed();
+    metrics.allowed = predicate.as_ref().map_or(0, |p| p.allowed_count());
+
+    // 2. 两路召回（Hybrid 并行，单路只跑一路）
+    //
+    // ⚠️ BM25 路在**无用户过滤**时传 `None`（P1-4）：`Index::remove` 已在删除时
+    // 物理摘除 postings，活 postings 里不可能有死 chunk。传 `None` 省掉热路径上
+    // 每 posting 一次 `dyn contains()` 虚调用——这是所有无过滤查询的必经之路。
+    // 向量路**必须**始终传谓词：hnsw_rs 无法从图中摘除已删向量（Q-C1）。
+    let pred = predicate.as_deref();
+    // BM25：无用户过滤时传 None（postings 已物理摘除死 chunk，无需再判活）
+    let bm25_f = if filter.is_some() { pred } else { None };
+    // 向量：恒传谓词（hnsw_rs 无法摘除已删向量，Q-C1）
+    let vec_f = pred;
+
     let (bm25_lane, vector_lane) = match mode {
         SearchMode::Bm25 => {
             let bm25 =
                 Bm25Retriever::new(parts.index, parts.analyzer).with_params(parts.bm25_params);
-            (Some(to_lane(bm25.search(query, candidate_k)?)), None)
+            let lane = to_lane(bm25.search_filtered(query, candidate_k, bm25_f)?);
+            (Some(lane), None)
         }
         SearchMode::Vector => {
             let (e, vi) = require_vector(parts.embedder, parts.vector_index)?;
             let vec = VectorRetriever::new(e, vi);
-            (None, Some(to_lane(vec.search(query, candidate_k)?)))
+            let lane = to_lane(vec.search_filtered(query, candidate_k, vec_f)?);
+            (None, Some(lane))
         }
         SearchMode::Hybrid => {
             let (e, vi) = require_vector(parts.embedder, parts.vector_index)?;
             let bm25 =
                 Bm25Retriever::new(parts.index, parts.analyzer).with_params(parts.bm25_params);
             let vec = VectorRetriever::new(e, vi);
-            // 并行执行；返回 (bm25, vector)，融合前按固定 lane 顺序收集
+            // 并行执行；谓词是 Send + Sync，可安全跨 rayon 线程共享
             let (r1, r2) = rayon::join(
-                || bm25.search(query, candidate_k),
-                || vec.search(query, candidate_k),
+                || bm25.search_filtered(query, candidate_k, bm25_f),
+                || vec.search_filtered(query, candidate_k, vec_f),
             );
             (Some(to_lane(r1?)), Some(to_lane(r2?)))
         }
@@ -134,23 +171,11 @@ pub fn search_parts(
 
     metrics.bm25 = bm25_lane.as_ref().map_or(0, |l| l.len());
     metrics.vector = vector_lane.as_ref().map_or(0, |l| l.len());
+    metrics.vector_shortfall = vector_lane
+        .as_ref()
+        .map_or(0, |l| candidate_k.saturating_sub(l.len()));
 
-    // 1.5 融合前位图过滤（FR-14 / NFR-02：查询路径零 IO）
-    let pre_filter_candidates = metrics.bm25 + metrics.vector;
-    let mut bm25_lane = bm25_lane;
-    let mut vector_lane = vector_lane;
-    if let Some(f) = filter {
-        let allowed = super::filter::allowed_chunks(f, parts.index);
-        let retain = |lane: &mut Option<LaneResults>| {
-            if let Some(l) = lane.as_mut() {
-                l.retain(|(id, _)| allowed.contains(id));
-            }
-        };
-        retain(&mut bm25_lane);
-        retain(&mut vector_lane);
-    }
-
-    // 2. 融合（或单路直通）
+    // 3. 融合（或单路直通）。**过滤已在召回期下推**，这里不再做 retain（原 1.5 节已删）
     let mut lanes: Vec<LaneResults> = Vec::new();
     if let Some(l) = &bm25_lane {
         lanes.push(l.clone());
@@ -169,12 +194,20 @@ pub fn search_parts(
     metrics.candidates = fused.len();
 
     if fused.is_empty() {
-        // 有候选但被过滤光 → FilteredOut；否则按"无召回/空 query"判定
-        let reason = if pre_filter_candidates > 0 && filter.is_some() {
+        // 语义（§5.8.1）：**query 侧信号优先**——对 Agent 更可操作，
+        // 「你的词是幻觉词」（AllTermsUnmatched）比「你的过滤太窄」（FilteredOut）更有指导性。
+        //
+        // 下推后 lane 结果已是过滤后的，"本来有候选但被过滤光"这个信号丢失了，
+        // 因此用 `query_has_hits` 词典探针还原它（O(query 词数)，成本可忽略）。
+        let reason = if query_is_empty || !query_has_hits(parts.index, parts.analyzer, query) {
+            determine_empty_reason(false, query_is_empty, 0)
+        } else if filter.is_some() {
             Some(super::response::EmptyReason::FilteredOut)
         } else {
             determine_empty_reason(false, query_is_empty, 0)
         };
+        metrics.took = started.elapsed();
+        metrics.log(query);
         return Ok(empty_response(reason, started));
     }
 
@@ -235,6 +268,23 @@ pub fn search_parts(
         empty_reason: None,
         took: metrics.took,
     })
+}
+
+/// query 是否在词典里**有任何命中**（§5.8.1 的词典探针）。
+///
+/// 过滤下推后 lane 结果已是过滤后的产物，"query 本来有没有命中"这个信号丢失了，
+/// 本函数用 `Index::term_id` + `postings_by_id` 还原它——postings 在删除时已物理
+/// 摘除，因此"有非空 postings"即"存在活候选"。
+///
+/// 成本 O(|query 词数|) 次哈希查找，相对两路召回可忽略。
+fn query_has_hits(index: &Index, analyzer: &dyn Analyzer, query: &str) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    analyzer
+        .analyze_query(query)
+        .iter()
+        .filter(|t| seen.insert(t.term.as_str()))
+        .filter_map(|t| index.term_id(t.term.as_str()))
+        .any(|id| !index.postings_by_id(id).is_empty())
 }
 
 /// 向量路依赖检查：embedder 与 vector_index 必须成对出现。
@@ -559,6 +609,83 @@ mod tests {
                 .map(|h| h.chunk_id)
                 .collect();
             assert_eq!(first, cur, "第 N 次结果与首次不一致");
+        }
+    }
+
+    /// T16（V2 Step 1 / P1-5）：空结果原因矩阵 2×3。
+    ///
+    /// 过滤下推后，lane 结果已经是「过滤后」的产物，编排层看不到
+    /// 「query 本来有没有命中」这个信号，而它决定了该报
+    /// `AllTermsUnmatched`（你的词是幻觉词）还是 `FilteredOut`（你的过滤太窄）。
+    /// 设计 §5.8.1 定案用 `query_has_hits` 词典探针还原该信号，语义为
+    /// **query 侧信号优先**——对 Agent 而言前者比后者更有指导性。
+    #[test]
+    fn T16_空结果原因矩阵() {
+        use crate::query::response::EmptyReason;
+        use crate::schema::Filter;
+
+        let analyzer = MixedAnalyzer::new();
+        let chunker = Chunker::default();
+        let mut index = Index::new();
+        for (i, text) in ["BM25 是经典检索算法", "向量检索计算余弦相似度"]
+            .iter()
+            .enumerate()
+        {
+            let doc = DocRecord {
+                doc_id: 0,
+                source: format!("doc-{i}"),
+                metadata: serde_json::json!({"tag": "kept"}),
+                content_hash: 0,
+            };
+            index.add(doc, chunker.chunk(0, text), &analyzer).unwrap();
+        }
+        let searcher = QueryExecutor::new(&index, &analyzer);
+
+        let hit_q = "检索"; // 词典里有
+        let miss_q = "zzz"; // 词典里没有，且不是停用词（分词后非空）
+        let matching = Filter::eq("tag", "kept");
+        let impossible = Filter::eq("tag", "nope");
+
+        // ── query 有命中 ──────────────────────────────────────────────
+        let r = searcher.search(hit_q, SearchMode::Bm25, 10).unwrap();
+        assert!(!r.hits.is_empty(), "有命中 / 无过滤 → 应有结果");
+        assert_eq!(r.empty_reason, None, "有命中 / 无过滤 → 无空原因");
+
+        let r = searcher
+            .search_filtered(hit_q, SearchMode::Bm25, 10, Some(&matching))
+            .unwrap();
+        assert!(!r.hits.is_empty(), "有命中 / 过滤有匹配 → 应有结果");
+        assert_eq!(r.empty_reason, None, "有命中 / 过滤有匹配 → 无空原因");
+
+        let r = searcher
+            .search_filtered(hit_q, SearchMode::Bm25, 10, Some(&impossible))
+            .unwrap();
+        assert!(r.hits.is_empty(), "有命中 / 过滤排空 → 应无结果");
+        assert_eq!(
+            r.empty_reason,
+            Some(EmptyReason::FilteredOut),
+            "有命中 / 过滤排空 → FilteredOut"
+        );
+
+        // ── query 无命中：query 侧信号优先，三种过滤情况下都报 AllTermsUnmatched ──
+        let cases: [(Option<&Filter>, &str); 3] = [
+            (None, "无过滤"),
+            (Some(&matching), "过滤有匹配"),
+            (Some(&impossible), "过滤无匹配"),
+        ];
+        for (f, label) in cases {
+            let r = match f {
+                Some(f) => searcher
+                    .search_filtered(miss_q, SearchMode::Bm25, 10, Some(f))
+                    .unwrap(),
+                None => searcher.search(miss_q, SearchMode::Bm25, 10).unwrap(),
+            };
+            assert!(r.hits.is_empty(), "无命中 / {label} → 应无结果");
+            assert_eq!(
+                r.empty_reason,
+                Some(EmptyReason::AllTermsUnmatched),
+                "无命中 / {label} → AllTermsUnmatched（query 侧信号优先于 filter）"
+            );
         }
     }
 }

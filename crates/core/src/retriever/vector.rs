@@ -10,6 +10,7 @@ use std::cmp::Ordering;
 
 use crate::embed::Embedder;
 use crate::error::Result;
+use crate::predicate::CandidateFilter;
 use crate::vector::{NormalizedVector, VectorIndex};
 
 use super::{Retriever, Scored};
@@ -28,13 +29,24 @@ impl<'a> VectorRetriever<'a> {
 }
 
 impl Retriever for VectorRetriever<'_> {
-    fn search(&self, query: &str, k: usize) -> Result<Vec<Scored>> {
+    /// 向量召回：谓词**直接下推**到 `VectorIndex`（而非召回后再过滤）。
+    ///
+    /// 下推是必须的：已软删除的 chunk 其向量仍留在 HNSW 图里（hnsw_rs 无 remove API），
+    /// 后置过滤会浪费 Top-K 名额、且低选择度下几乎召不回东西。
+    ///
+    /// ⚠️ `filter = None` 语义同 [`Retriever::search_filtered`]：不过滤，**含已软删除条目**。
+    fn search_filtered(
+        &self,
+        query: &str,
+        k: usize,
+        filter: Option<&dyn CandidateFilter>,
+    ) -> Result<Vec<Scored>> {
         if k == 0 || query.trim().is_empty() || self.index.is_empty() {
             return Ok(Vec::new());
         }
 
         let q = NormalizedVector::new(self.embedder.embed_query(query)?);
-        let raw = self.index.search(&q, k)?;
+        let raw = self.index.search_filtered(&q, k, filter)?;
 
         // distance（平方欧氏）→ 相似度 score = 1 - d²/2 = cos（单位向量）
         let mut out: Vec<Scored> = raw

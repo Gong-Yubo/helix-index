@@ -207,7 +207,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
         bm25_params.k1,
         bm25_params.b,
         rrf_k,
-        &rrf_weights,
+        rrf_weights,
         args.vector_index,
         args.ef_search
             .map(|e| format!("(ef_search={e})"))
