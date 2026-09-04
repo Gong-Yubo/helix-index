@@ -224,31 +224,39 @@ make eval-quality
 cargo run -p helix-core --example search_basic
 ```
 
-核心链路只有四步：
+核心链路（P6 门面层）：
 
 ```rust
-// 1. 建索引：分词器 + 分块器 + 倒排
-let analyzer = MixedAnalyzer::new();
-let chunker = Chunker::default();          // 512 字符 / 64 重叠
-let mut index = Index::new();
-index.add(doc, chunker.chunk(0, text), &analyzer)?;
+use helix_core::prelude::*;
+use helix_core::search::SearchIndex;
 
-// 2. 向量侧：embed 所有分片 → HNSW 图（入库前强制 L2 归一化）
-let embedder = LocalEmbedder::new()?;
-let vecs = embedder.embed_documents(&texts)?;
-let mut hnsw = HnswRsIndex::with_capacity(n);
-hnsw.add(chunk_id, NormalizedVector::new(v))?;
+// 1. 零配置装配：MixedAnalyzer + bge-small-zh + HNSW + RRF(60, 1:1.5)
+let mut index = SearchIndex::builder().build();
 
-// 3. 检索：Searcher 编排（bm25 / vector / hybrid）
-let searcher = Searcher::new(&index, &analyzer)
-    .with_vector(&embedder, &hnsw);
-let resp = searcher.search("如何加快检索速度", SearchMode::Hybrid, 3)?;
+// 2. 摄入（分块 / 倒排 / 向量化 / 幂等去重全在 add 背后）
+index.add(
+    Document::new(text)
+        .with_source(source)
+        .with_metadata(metadata),
+)?;
+
+// 3. 检索（只有 query 必选；默认 Hybrid + top_n=10）
+let searcher = index.into_searcher()?;         // 'static + Clone + Send + Sync
+let resp = searcher.search("如何加快检索速度")?;
+// 需要定制时走 builder：
+//   searcher.search_with(q).mode(SearchMode::Hybrid).top_n(3)
+//       .filter(&Filter::eq("topic", "vector")).exec()?
 
 // 4. 拼进 prompt：带出处与命中词（FR-12）
 for hit in &resp.hits {
     println!("{}", hit.to_context_block());
 }
 ```
+
+对比 P6 之前：同一闭环过去要 79 行、手接 8 个对象、7 步，其中三步是
+**静默正确性陷阱**（漏算 content_hash → 幂等失效；漏归一化 → 余弦分全错；
+analyzer 没活到最后 → 分词器不一致）。现在这些全部由库保证，用户代码里
+不再出现 `content_hash` / `NormalizedVector` / `&analyzer` / `Chunker`。
 
 `to_context_block()` 产出形如：
 
@@ -260,16 +268,20 @@ for hit in &resp.hits {
 
 ## 2.2 六 trait 替换矩阵
 
-内核的全部能力都抽象为 trait，可按需替换：
+内核的全部能力都抽象为 trait，通过 `SearchIndex::builder()` 按需替换：
 
-| trait | 默认实现 | 替换场景 | 影响面 / 注意事项 |
+| trait | 默认实现 | 注入点（builder 方法） | 替换场景 / 注意事项 |
 | --- | --- | --- | --- |
-| `Analyzer` | `MixedAnalyzer`（jieba + 自研过滤链） | 换分词方案 | ⚠️ **索引侧与查询侧必须同时换**（R4）。换分词后需重建索引 |
-| `Embedder` | `LocalEmbedder`（bge-small-zh-v1.5） | 接远程 embedding、换模型 | 向量维度须与已入库向量一致，否则 `DimensionMismatch` |
-| `VectorIndex` | `HnswRsIndex`（原生增量） | 换 ANN 实现 | 无。`BruteForceIndex` 已现成（诊断/小语料用） |
-| `Retriever` | `Bm25Retriever` / `VectorRetriever` | 加自定义召回路 | 需同步 `FusionStrategy` 的权重数组长度 |
-| `FusionStrategy` | `RrfFusion`（k=60 / weights 1:1.5） | 换融合算法 | 无 |
-| `Reranker` | `NoOpReranker` | 接 rerank 模型 | 无（P6 主题） |
+| `Analyzer` | `MixedAnalyzer`（jieba + 自研过滤链） | `.analyzer(Arc::new(..))` | ⚠️ **索引侧与查询侧必须同款**（R4）。换分词后需重建索引；快照会记录分词器指纹，load 时校验 |
+| `Embedder` | `LocalEmbedder`（bge-small-zh-v1.5） | `.embedder(Some(Arc::new(..)))` / `.embedder(None)` | 换模型 / 纯 BM25。向量维度由库校验，不一致报 `DimensionMismatch` |
+| `VectorIndex` | `HnswRsIndex`（原生增量） | `.vector_backend(VectorBackend::Brute)` | 诊断/小语料用 brute；`ef_search` 由 `HnswRsIndex` 默认（200） |
+| `FusionStrategy` | `RrfFusion`（k=60 / weights 1:1.5） | `.fusion(Arc::new(..))` | 换融合算法 |
+| `Reranker` | `NoOpReranker` | `.reranker(Arc::new(..))` | 接 rerank 模型（P7） |
+| `BM25 参数` | `Bm25Params`（k1=1.5 / b=0.75） | `.bm25_params(..)` | 网格搜索 |
+
+**底层永远可达（逃生舱）**：需要逐 lane 自定义组装时，借用型
+`QueryExecutor<'a>`（原 `Searcher`）与六个 trait 原样可用——
+门面只是"默认装配"，不是"唯一路径"。
 
 **关于 `Analyzer` 的"双实现"说明**：内核自带 `MixedAnalyzer`；
 `charabia` 实现以 feature 隔离提供（T5-09 验证性），但在真实中文语料上
