@@ -213,6 +213,76 @@ impl SearchIndex {
             inner: Arc::new(self.inner),
         })
     }
+
+    /// 删除一个文档（及其全部分片），含统计量回滚（复用 `Index::remove`）。
+    ///
+    /// 注意：墓碑删除只影响倒排/正排；向量索引里的向量条目随 chunk_id 失效
+    /// （检索时回捞会跳过墓碑 chunk，见 `search_parts`）。若之后 `save`，
+    /// `raw_vectors` 中对应的旧向量条目会被下次 flush/重建丢弃。
+    pub fn remove(&mut self, doc_id: DocId) -> Result<()> {
+        self.inner
+            .index
+            .remove(doc_id, self.cfg.analyzer.as_ref())
+    }
+
+    /// 落盘快照（**隐含 commit**，p6-design 6.2：不允许带未刷缓冲落盘）。
+    pub fn save(&mut self, path: &std::path::Path) -> Result<()> {
+        self.commit()?;
+        let vectors: Vec<(ChunkId, Vec<f32>)> = self
+            .inner
+            .raw_vectors
+            .as_deref()
+            .unwrap_or(&[])
+            .to_vec();
+        crate::storage::save(path, &self.inner.index, &vectors)
+    }
+
+    /// 从快照加载（默认装配）。
+    ///
+    /// - 快照存**原始数据 + 原始向量**（D1），加载后重建倒排 + 向量索引
+    /// - 配置指纹校验（I-08）尚未接入：加载时用当前 builder 装配重建
+    /// - 若快照含向量但当前装配无 embedder，向量不重建（纯 BM25）
+    pub fn load(path: &std::path::Path) -> Result<Self> {
+        let cfg = SearchIndexBuilder::default().build_config();
+        let backend = SearchIndexBuilder::default().backend();
+        Self::load_with(cfg, backend, path)
+    }
+
+    /// 按给定装配从快照加载（`load` 的实现主体）。
+    fn load_with(cfg: Config, backend: VectorBackend, path: &std::path::Path) -> Result<Self> {
+        let (index, raw_vectors) = crate::storage::load(path)?;
+
+        // 重建向量索引（D1：不序列化 HNSW 图，用原始向量重建）
+        let vector_index = match (cfg.embedder.as_ref(), raw_vectors.is_empty()) {
+            (Some(_), false) => Some(match backend {
+                VectorBackend::Brute => {
+                    let entries: Vec<(ChunkId, NormalizedVector)> = raw_vectors
+                        .iter()
+                        .map(|(id, v)| (*id, NormalizedVector::new(v.clone())))
+                        .collect();
+                    Box::new(BruteForceIndex::from_entries(entries)) as Box<dyn VectorIndex>
+                }
+                VectorBackend::Hnsw => {
+                    let mut vi = HnswRsIndex::with_capacity(raw_vectors.len().max(1024));
+                    for (id, v) in &raw_vectors {
+                        vi.add(*id, NormalizedVector::new(v.clone()))?;
+                    }
+                    Box::new(vi) as Box<dyn VectorIndex>
+                }
+            }),
+            _ => None,
+        };
+
+        Ok(Self {
+            cfg: Arc::new(cfg),
+            inner: Inner {
+                index,
+                vector_index,
+                raw_vectors: Some(raw_vectors),
+            },
+            pending: Vec::new(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -283,5 +353,34 @@ mod tests {
         idx.add(String::from("字符串")).unwrap();
         idx.add("字符串字面量").unwrap();
         assert_eq!(idx.num_chunks(), 2);
+    }
+
+    #[test]
+    fn save后load快照roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("search.idx");
+
+        let mut idx = bm25_index();
+        idx.add("BM25 是经典关键词检索算法").unwrap();
+        idx.add("向量检索计算余弦相似度").unwrap();
+        idx.save(&path).unwrap();
+
+        let loaded = SearchIndex::load(&path).unwrap();
+        assert_eq!(loaded.num_chunks(), idx.num_chunks());
+
+        // 检索能力保留：doc_freq 一致
+        assert_eq!(
+            loaded.inner.index.doc_freq("检索"),
+            idx.inner.index.doc_freq("检索")
+        );
+    }
+
+    #[test]
+    fn remove删除文档并回滚统计量() {
+        let mut idx = bm25_index();
+        let out = idx.add("BM25 检索算法").unwrap();
+        assert_eq!(idx.num_chunks(), 1);
+        idx.remove(out.doc_id).unwrap();
+        assert_eq!(idx.num_chunks(), 0);
     }
 }
