@@ -1,6 +1,6 @@
 # HelixIndex 项目长期记忆
 
-> 项目于 2026-09-03 正式定名 **HelixIndex**（版本 0.1.0）。
+> 项目于 2026-09-03 正式定名 **HelixIndex**（版本 0.1.0 → **0.2.0（2026-09-04，P6 接口重构）**）。
 > 原名 index-demo；库 crate `index-core` → **`helix-core`**，CLI 二进制 `idx` → **`helix`**。
 > 远端：`https://github.com/Gong-Yubo/helix-index`（private，默认分支 main）。
 > **本地工作目录仍是 `index-demo`**（决策 D-E3，未改名）。
@@ -43,6 +43,14 @@
 - 命令入口：`make fmt` / `make lint` / `make test` / `make deny` / `make all`
 - **P0 已完成**（提交 5850545）：单条 embedding 推理 **1.58ms（debug）**、模型下载 49s、fastembed+ort 编译 42.5s
 - **P0~P5 全部完成（2026-09-03）**。NFR 已实测（见 `eval-report.md` 第 8 节）：NFR-02 延迟达标、NFR-03 构建未达标、NFR-04 快照加载达标但图重建 11.57s、NFR-05 向量 24.6MB 吻合理论
+- **P6 接口重构全部完成（2026-09-04）**：门面层 `SearchIndex`/`Searcher`（`search` 模块），
+  见 `p6-design.md` 9.1 实施记录。关键新增约定与坑：
+  - **`crate::error::Result<T>` 是单泛型别名**，写 `Result<SearchMode, String>` 会撞别名（E0107），用 `std::result::Result` 完整路径
+  - **门面层 SearchIndex 不实现 Debug**（含 `Box<dyn VectorIndex>` 无法派生），测试里 `unwrap_err()` 需 `T: Debug` → 改用 `match` 判错误
+  - 所有权切换用 **`Arc::try_unwrap`**（非设计的 make_mut）：`Box<dyn VectorIndex>` 不可 Clone
+  - 指纹校验 embedder 维度**仅快照含向量时才严格**（纯 BM25 快照装配有无 embedder 均正确）
+  - `SearchIndex::embed_elapsed()` 累计真实 embed 耗时；**不能在 commit 处计时**（add_documents 已分批 flush）
+  - batch_size 实测 32~256 差异 <20% 且小 batch 略快 → 维持 64
 
 ## 技术约束（2026-09-02 三方库调研后确定，见 docs/thirdparty.md）
 - **MSRV 1.90**（NFR-08，原 1.80 不可行）；项目 License `MIT OR Apache-2.0`；`Cargo.lock` 必须入库
