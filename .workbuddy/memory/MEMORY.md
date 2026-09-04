@@ -139,6 +139,11 @@
 - **stable clippy 1.98 新 lint 会误伤旧代码**：`map_or` → `is_some_and`/`is_none_or`、`% 2 == 0`
   → `is_multiple_of`、`println!(&x)` → 去 `&`。修法对 MSRV 1.90 安全（`is_some_and` 1.70 /
   `is_none_or` 1.82 / `is_multiple_of` 1.87）
+- **⚠️ `hnsw_rs::search` 有固有近似误差：即使 `knbn == len`、`ef=200` 也可能返回不足 `len` 条**
+  （20 点图采样 200 次：191 次满、8 次少 1、1 次少 2 ≈ 4.5% 缺口）。这是库层行为，
+  **不是过采样参数的 bug**，path A / path B 都受影响。
+  ⇒ 写断言时：① 对"返回条数"的严格断言要留余量 ② **验收配比让存活数 ≥ 2×K**
+  （曾因 K=5/存活 5 在 CI Linux 假红、本地 30 次挂 2 次；改 30 篇删 20 留 10 后 50 次 0 失败）
 - **macOS BSD grep 不支持 `\|`**（ripgrep 才支持）：Bash 里用 `grep "a\|b"` 会静默不匹配并返回 exit 1，
   极易误判「代码里没有某符号」。**一律用 Grep 工具**，别在 Bash 里写 `\|`
 - **并行 Edit 同一文件会互相覆盖**：同一条消息里对同一文件发两次 Edit，后一次基于旧快照写入，

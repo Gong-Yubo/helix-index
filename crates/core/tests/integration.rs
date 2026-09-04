@@ -211,9 +211,13 @@ fn 并发检索安全且确定() {
 
 // ------------------------------------------------- V2 Step 1：幽灵候选（Q-C1）
 
-/// 20 篇短文档（确定性生成）：幽灵候选测试需要「大量已删向量」来制造名额压力。
+/// 30 篇短文档（确定性生成）：幽灵候选测试需要「大量已删向量」来制造名额压力。
+///
+/// 配比刻意选 **30 篇删 20 留 10 / K=5**：存活数是 K 的 2 倍，
+/// 这样即便 ANN 少枚举 1~2 个节点（`hnsw_rs` 的固有近似误差，见 T1 注释），
+/// 存活候选仍足够填满 K，测试才不会 flaky。
 fn ghost_corpus() -> Vec<(String, String)> {
-    (0..20)
+    (0..30)
         .map(|i| {
             (
                 format!("note{i:02}.md"),
@@ -253,13 +257,25 @@ fn build_ghost_facade(backend: VectorBackend) -> (SearchIndex, Vec<(DocId, Vec<C
 ///
 /// hnsw_rs 没有 remove API（设计 §2.1 / H2），已删向量物理上仍在图里，
 /// 只能靠存活位图谓词在检索期挡掉，故两种后端都要覆盖。
+///
+/// # 关于 Hnsw 后端的 flakiness（实测，勿回退本配置）
+///
+/// `hnsw_rs` 的 `search` **即使 `knbn == len`、`ef=200`，也可能返回不足 `len` 条**：
+/// 在 20 点图上采样 200 次，191 次返回 20 条、8 次 19 条、1 次 18 条（约 4.5% 缺口）。
+/// 这是 HNSW 的固有近似误差，与存活过滤无关。
+///
+/// ⇒ 若配比取「存活数 == K」（初版就是 20 篇删 15 留 5 / K=5），
+/// 少枚举 1 个节点就必然少 1 条存活结果，测试约 5% 概率假红
+/// （CI Linux 已复现，本地 30 次挂 2 次）。
+/// 现配比 **存活数 = 2×K**，少枚举 1~2 条也不会凑不满 K。
 #[test]
 fn T1_已删向量不霸占TopK名额() {
     for backend in [VectorBackend::Brute, VectorBackend::Hnsw] {
         let (idx, per_doc) = build_ghost_facade(backend);
         let keep = 5;
+        let survive = keep * 2; // 存活文档数刻意取 K 的 2 倍，理由见函数文档
         let total = per_doc.len();
-        assert!(total > keep * 2, "语料需足够大才能制造名额压力");
+        assert!(total >= survive * 2, "语料需足够大才能制造名额压力");
 
         // 删除前：top_n = keep 应该被填满（基线）
         let searcher = idx.into_searcher().unwrap();
@@ -273,11 +289,11 @@ fn T1_已删向量不霸占TopK名额() {
 
         let mut idx = searcher.into_index().unwrap();
 
-        // 删掉大部分文档，只留 keep 篇 ⇒ 向量索引里 75% 是幽灵
+        // 只留 survive 篇，其余删掉 ⇒ 向量索引里 2/3 是幽灵
         let (victims, kept): (Vec<_>, Vec<_>) = per_doc
             .into_iter()
             .enumerate()
-            .partition(|(i, _)| *i < total - keep);
+            .partition(|(i, _)| *i < total - survive);
         let victim_chunks: Vec<ChunkId> = victims
             .iter()
             .flat_map(|(_, (_, chunks))| chunks.clone())
@@ -341,6 +357,7 @@ fn T1_已删向量不霸占TopK名额() {
 #[test]
 fn T2_幽灵候选不跨快照永续() {
     let keep = 5;
+    let survive = keep * 2; // 同 T1：存活数取 K 的 2 倍，规避 HNSW 近似误差
     let analyzer = MixedAnalyzer::new();
     let chunker = Chunker::default();
     let mut index = Index::new();
@@ -366,7 +383,7 @@ fn T2_幽灵候选不跨快照永续() {
     let (victims, _kept): (Vec<_>, Vec<_>) = per_doc
         .into_iter()
         .enumerate()
-        .partition(|(i, _)| *i < total - keep);
+        .partition(|(i, _)| *i < total - survive);
     let victim_chunks: Vec<ChunkId> = victims
         .iter()
         .flat_map(|(_, (_, chunks))| chunks.clone())
