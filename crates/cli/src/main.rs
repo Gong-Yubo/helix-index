@@ -230,14 +230,14 @@ fn build(args: BuildArgs) -> Result<()> {
         return Ok(());
     };
 
-    // 向量嵌入：--vectors 时 commit 触发批量 embed
+    // 向量嵌入：--vectors 时 commit 冲刷残余缓冲；embed 实际分散在 add_documents
+    // 的自动 flush 里，故耗时取门面层累计值（而非此处 commit 计时，否则只测到最后一批）
     if args.vectors {
-        let t = std::time::Instant::now();
         index.commit()?;
         println!(
-            "  embed {} 条 耗时 {:?}（NFR-03 口径 = embed + 落盘，不含 HNSW）",
+            "  embed {} 条 耗时 {:?}（NFR-03 口径 = embed，不含 HNSW / 落盘）",
             index.num_chunks(),
-            t.elapsed()
+            index.embed_elapsed()
         );
     }
 

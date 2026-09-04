@@ -4,9 +4,10 @@
 
 | 项目      | 内容                                                                                                                                                                                                                                               |
 | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 版本      | v1.4                                                                                                                                                                                                                                             |
+| 版本      | v1.5                                                                                                                                                                                                                                             |
 | 创建日期    | 2026-09-02                                                                                                                                                                                                                                       |
-| 状态      | **P0~P5 全部完成**；当前阶段 **P6（接口重构）**，设计已定稿（`p6-design.md` v2.0，D-I1~D-I8 已拍板），待实施 I-01                                                                                                                                                                                                     |
+| 状态      | **P0~P6 全部完成**（P6 接口重构 2026-09-04 落地，回归对账通过）；下一步 P7（v2）                                                                                                                                                                                                     |
+| v1.5 变更 | P6 完成：I-01~I-14 全部落地（门面层 SearchIndex/Searcher、写缓冲+批量 embed、配置指纹校验、CLI/示例/文档迁移、bench 回归对账 brute 逐位一致）。batch_size 实测 32~256 差异 <20% 维持 64；NFR 重测见 eval-report 8.x |
 | v1.4 变更 | 依据 issue #1 与 `p6-design.md`：**P6 重新定义为「融合索引接口重构」**（原 v2 顺延 P7）。新增任务 I-01~I-14；接口目标 `index.add(doc)` / `searcher.search(query)`（仅 query 必选）。详见 `p6-design.md` |
 | v1.3 变更 | P5 完成：三路对照 + 参数定稿（BM25 k1=1.5/b=0.75、RRF weights 1:1.5）、tantivy 基线相对差 0.31%、charabia 保留自研链、NFR 实测（延迟达标/构建未达标）、README、D8 移除 instant-distance。详见 `eval-report.md` |
 | v1.2 变更 | 依据 `p5-design.md` v1.2（评测数据源切换为开源 T2Ranking）：T5-01/T5-02 由"人工撰写语料 + 自标注"改为**数据集转换管线**（`t2_prep.rs`，固定种子）；T5-03 指标改**分级 NDCG**（gain=2^g−1）；T5-04 补 tantivy 基线与 RRF k 敏感性；T5-06 规模口径对齐 12K 段落；现状表与并行工作流同步 |
@@ -433,22 +434,22 @@ make fmt && make lint && make test
 | P5 | T5-07 README 与示例                                       | ✅  |
 | P5 | T5-08 数据诚信                                             | ✅  |
 | P5 | T5-09 分词方案对照（charabia）                                 | ✅  |
-| P6 | I-01 抽 search_parts；Searcher→QueryExecutor              | ⬜  |
-| P6 | I-02 Document 改输入 DTO + DocRecord                     | ⬜  |
-| P6 | I-03 Config + Inner + SearchIndexBuilder                | ⬜  |
-| P6 | I-04 SearchIndex::add / 写缓冲 / commit                  | ⬜  |
-| P6 | I-05 owned Searcher + SearchRequest builder              | ⬜  |
-| P6 | I-06 mode 走 builder + 字符串接受                          | ⬜  |
-| P6 | I-07 remove / save / load 接入门面                        | ⬜  |
-| P6 | I-08 ConfigFingerprint + ConfigMismatch                 | ⬜  |
-| P6 | I-09 effective_version()（base2/positions3）              | ⬜  |
-| P6 | I-10 CLI 切新 API                                       | ⬜  |
-| P6 | I-11 search_basic 重写 + user-guide                       | ⬜  |
-| P6 | I-12 bench 迁移 + 回归对账                                 | ⬜  |
-| P6 | I-13 plan.md 更新 + 状态回写                               | ⬜  |
-| P6 | I-14 旧 API deprecated 评估                              | ⬜  |
+| P6 | I-01 抽 search_parts；Searcher→QueryExecutor              | ✅  |
+| P6 | I-02 Document 改输入 DTO + DocRecord                     | ✅  |
+| P6 | I-03 Config + Inner + SearchIndexBuilder                | ✅  |
+| P6 | I-04 SearchIndex::add / 写缓冲 / commit                  | ✅  |
+| P6 | I-05 owned Searcher + SearchRequest builder              | ✅  |
+| P6 | I-06 mode 走 builder + 字符串接受                          | ✅  |
+| P6 | I-07 remove / save / load 接入门面                        | ✅  |
+| P6 | I-08 ConfigFingerprint + ConfigMismatch                 | ✅  |
+| P6 | I-09 effective_version()（base2/positions3）              | ✅  |
+| P6 | I-10 CLI 切新 API                                       | ✅  |
+| P6 | I-11 search_basic 重写 + user-guide                       | ✅  |
+| P6 | I-12 bench 迁移 + 回归对账                                 | ✅  |
+| P6 | I-13 plan.md 更新 + 状态回写                               | ✅  |
+| P6 | I-14 旧 API deprecated 评估                              | ✅（D-I6 决议：本轮不加 `#[deprecated]`，P7 后评估） |
 
-**当前阶段**：**P0~P5 全部完成**（2026-09-03）；当前 **P6（接口重构）**，设计定稿（`p6-design.md` v2.0，D-I1~D-I8 已拍板），待实施 I-01
+**当前阶段**：**P0~P6 全部完成**（2026-09-04）。P6 接口重构落地：门面层 `SearchIndex`/`Searcher`、写缓冲 + 批量 embed、配置指纹校验（修 B1/B2）、CLI/示例/文档全迁移，brute 后端新旧逐位一致（回归对账通过）。下一步 P7（v2：Rerank / MMR / delta 分段）。
 
 **P0 实测基线**：工具链 1.90.0 / lockfile 414 包 / 轻依赖编译 7.3s / fastembed+ort 42.5s / 全量含 tantivy 24.2s / 模型下载 49.0s / **单条推理 1.58ms（debug）** —— 详见 `p0-design.md` 附录 A。
 

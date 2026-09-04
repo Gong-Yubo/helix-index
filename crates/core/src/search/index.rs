@@ -61,6 +61,9 @@ pub struct SearchIndex {
     pub(crate) cfg: Arc<Config>,
     pub(crate) inner: Inner,
     pub(crate) pending: Vec<PendingChunk>,
+    /// 累计 embed 推理耗时（`flush` 中累加，供 NFR-03 构建耗时口径观测）。
+    /// 只计 `embed_documents` 推理本身，不含归一化 / 灌向量索引。
+    pub(crate) embed_elapsed: std::time::Duration,
 }
 
 impl SearchIndex {
@@ -89,6 +92,7 @@ impl SearchIndex {
             cfg: Arc::new(cfg),
             inner,
             pending: Vec::new(),
+            embed_elapsed: std::time::Duration::ZERO,
         }
     }
 
@@ -173,7 +177,9 @@ impl SearchIndex {
         };
 
         let texts: Vec<String> = self.pending.iter().map(|p| p.text.clone()).collect();
+        let t = std::time::Instant::now();
         let vecs = embedder.embed_documents(&texts)?;
+        self.embed_elapsed += t.elapsed();
         debug_assert_eq!(vecs.len(), texts.len(), "embed 输出条数应与输入一致");
 
         // 归一化 + 灌向量索引 + 记录原始向量（快照用）
@@ -215,6 +221,16 @@ impl SearchIndex {
     /// 平均分片长度（BM25 长度归一化用）。
     pub fn avgdl(&self) -> f32 {
         self.inner.index.avgdl()
+    }
+
+    /// 累计 embed 推理耗时（NFR-03 构建耗时口径观测）。
+    ///
+    /// 只计 `embed_documents` 推理本身，不含归一化 / 灌向量索引。
+    /// `add_documents` 会按 `batch_size` 分批自动 flush，因此 build 命令
+    /// 不能在 `commit()` 处计时（那时大部分 embed 已在 add 阶段分批完成）——
+    /// 应取这个累计值。
+    pub fn embed_elapsed(&self) -> std::time::Duration {
+        self.embed_elapsed
     }
 
     /// 交出所有权，产出只读 `Searcher`（`'static + Clone + Send + Sync`）。
@@ -325,6 +341,7 @@ impl SearchIndex {
                 raw_vectors: Some(raw_vectors),
             },
             pending: Vec::new(),
+            embed_elapsed: std::time::Duration::ZERO,
         })
     }
 }

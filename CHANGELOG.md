@@ -7,6 +7,41 @@
 > P0~P5 的条目为**逆向补写**（2026-09-03），依据各阶段设计文档与 git 历史整理；
 > 此后每次变更即时追加。
 
+## [0.2.0] — 2026-09-04（P6 接口重构）
+
+依据 issue #1「融合索引接口重新设计」重构库的对外接口层，引入门面层。
+设计文档 `docs/devel/p6-design.md`（v2.1），架构文档新增「对外接口设计」章。
+
+### 门面层（新增）
+
+- `SearchIndex`（写端）：`builder().build()` 零配置装配（MixedAnalyzer + bge-small-zh + HNSW + RRF）
+- `SearchIndex::add(doc)`：分块 → 倒排 → 写缓冲 → 批量 embed，幂等去重（`dedup_key`）由库保证
+- `SearchIndex::commit()` / `flush()`：显式可见性（对齐 Lucene）；写缓冲 `batch_size=64`（实测 32~256 差异 <20%）
+- `Searcher`（读端，`'static + Clone + Send + Sync`）：`search(query)` 仅 query 必选
+- `SearchRequest` builder：`.mode()`（enum 或 `"hybrid"` 字符串）/ `.top_n()` / `.filter()`
+- 消除三个静默正确性陷阱：content_hash、L2 归一化、analyzer 生命周期全部内聚进库
+
+### 接口重构（breaking）
+
+- `Document` 重定义为输入 DTO（含 `text`）；新增 `DocRecord` 承接存储记录
+- 旧 `Searcher<'a>` → `QueryExecutor<'a>`（签名不变，底层逃生舱仍可用）
+- 所有权切换用 `Arc::try_unwrap`（refcount>1 明确报错，非静默深拷贝）
+
+### 配置指纹（修 B1/B2）
+
+- `Analyzer::id()` / `Embedder::id()` 身份标识；快照写入 `ConfigFingerprint`
+- load 时校验装配，不一致报 `Error::ConfigMismatch { expected, actual }`
+- `FORMAT_VERSION` 1→2；`effective_version()` 把 positions +1 从注释约定落成实现
+
+### 迁移与回归
+
+- CLI build/search/compare 切门面层（`--help` 逐字不变）；bench 删 `--analyzer` 警告回退
+- `examples/search_basic.rs` 79→33 行；`docs/user-guide.md` 库接入章节更新
+- **回归对账**：brute 后端新旧逐位一致（bm25 0.4491 / vector 0.5279 / hybrid 0.5213）
+
+> ⚠️ **迁移提示**：`Document` 语义变化（`doc_id`/`content_hash` 字段移除，改由库内计算）；
+> 快照 `FORMAT_VERSION` 1→2，**旧 `.idx` 快照需重建**（`helix build` 重新生成）。
+
 ## [0.1.0] — 2026-09-03
 
 第一版：面向 Agent 场景的通用检索引擎内核，P0~P5 全部完成。

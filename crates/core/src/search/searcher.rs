@@ -96,6 +96,7 @@ impl Searcher {
                 cfg: self.cfg,
                 inner,
                 pending: Vec::new(),
+                embed_elapsed: std::time::Duration::ZERO,
             }),
             Err(_) => Err(Error::InvalidInput(
                 "Searcher 仍有 clone 残留，无法换回写端（先 drop 其他 reader）".to_string(),

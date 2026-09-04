@@ -2,9 +2,9 @@
 
 | 项目 | 内容 |
 | --- | --- |
-| 版本 | **v2.0（已拍板定稿）** |
+| 版本 | **v2.1（已实施完成）** |
 | 日期 | 2026-09-04 |
-| 状态 | ✅ **已拍板**（决策点 D-I1~D-I8 全部定案，结论见第 10.2 节；未动代码，待实施 I-01） |
+| 状态 | ✅ **已实施**（决策点 D-I1~D-I8 定案，I-01~I-14 全部落地；详见第 9.1 节实施记录） |
 | 来源 | [issue #1「融合索引接口重新设计」](https://github.com/Gong-Yubo/helix-index/issues/1) |
 | 评审 | [issue #1 评论（方案摘要 + 决策点待拍板）](https://github.com/Gong-Yubo/helix-index/issues/1#issuecomment-5526051968)、[回应评审 P1~P11](https://github.com/Gong-Yubo/helix-index/issues/1#issuecomment-5534925042) |
 | 前提 | P0~P5 + v1 收尾全部完成（`v1-finish-design.md` V1-00~V1-16 已落地，CI 9/9 绿） |
@@ -574,6 +574,20 @@ LanceDB 有 `EmbeddingRegistry` 可以按配置自动重建 embedding 函数。
 > **为什么 bench 放最后**：bench 是评测可复现性的唯一保障（V1-04/05/06 的全部意义），
 > 且它用到了最多的逃生舱（brute 后端、BM25 网格、RRF 网格、--runs 重建图、裸 embedder）。
 > **在所有逃生舱都被验证过之前动 bench，等于拿评测数字冒险。**
+
+### 9.1 实施记录（2026-09-04，I-01~I-14 全部落地）
+
+| # | 与设计的偏离 / 关键实测 | 结论 |
+| --- | --- | --- |
+| **实施偏离 1** | 设计 6.4 假设 `into_searcher` 用 `Arc::make_mut` 静默深拷贝；但 `Box<dyn VectorIndex>` 不可 `Clone`，该路径无法编译 | 改用 `Arc::try_unwrap`：refcount==1 零拷贝取出，clone 残留时**明确报错**（更符合 error.rs「配置错误最早暴露」原则）。见 `index.rs` 结构注释 |
+| **实施偏离 2** | 指纹校验对 embedder 严格（全字段）会导致「纯 BM25 快照 + 默认装配（含 embedder）load」误报 ConfigMismatch | 改为：analyzer/chunker 严格；embedder 仅在**快照含向量**时严格（id+dim）。纯 BM25 快照无向量可重建，装配有无 embedder 均正确 |
+| **实测** | `batch_size` 32/64/128/256 四档：吞吐 62.6 / 59.1 / 54.4 / 51.6 条/s | 差异 <20% 且**小 batch 略快**（ort 推理不受 batch 规模瓶颈）。维持默认 64（D-I7 落定） |
+| **实测** | brute 后端 P5(5b82085) vs P6 逐位一致：bm25 0.4491 / vector 0.5279 / hybrid 0.5213 | 重构零回归（10.1 验收「brute 逐位一致」达标） |
+| **实测** | NFR-03 构建：embed 209.9s（口径修正为累计值，非 commit 计时）、总 225.5s | 仍不达标（<120s）；batch_size 略改善吞吐但未改结论。NFR-05 峰值 372MB，raw_vectors 翻倍被模型+ort 主导项稀释 |
+| **修复 bug** | build 命令原「embed 耗时」在 `commit()` 处计时，只测到最后一批（581ms），误导 | `SearchIndex::embed_elapsed()` 累计真实 embed 推理耗时（209.9s） |
+
+> 提交：I-01 `aeec34d`、I-02 `30af5d8`、I-03~I-06 `38e3bf6`、I-07 `79c1a71`、
+> I-08 `71ee890`、I-09 `617fdff`、I-10 `da96e38`、I-11 `e377bb4`、I-12 `2fc0677`、I-13 收尾。
 
 ---
 
