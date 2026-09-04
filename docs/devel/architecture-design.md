@@ -4,9 +4,9 @@
 
 | 项目   | 内容                   |
 | ---- | -------------------- |
-| 文档版本 | v1.3                 |
+| 文档版本 | v1.4                 |
 | 创建日期 | 2026-09-02           |
-| 状态   | 待评审                  |
+| 状态   | P6 接口重构设计已并入（对外接口门面层，见第 10 章） |
 | 技术栈  | Rust 1.90+ / 2021 edition |
 | 文件名   | `architecture-design.md` |
 | 配套文档 | `requirements-spec.md`（需求分析说明书） |
@@ -40,7 +40,7 @@
 
 ### 1.4 修订记录
 
-见文末「14.2 变更记录」。
+见文末「15.2 变更记录」。
 
 ---
 
@@ -52,7 +52,7 @@
 
 **覆盖的需求**：FR-01 ~ FR-23、NFR-01 ~ NFR-09。FR-24（结果去重）、FR-25（token budget 裁剪）为 v2 需求，本版不做设计。
 
-**需求覆盖矩阵**见第 11.2 节。
+**需求覆盖矩阵**见第 12.2 节。
 
 ### 2.2 架构目标与约束
 
@@ -76,6 +76,7 @@
 | ADR-006 | BM25 检索用 **TAAT** 而非 DAAT/WAND        | 万级规模下实现简单、缓存友好，天然支持 OR 语义          | FR-04  |
 | ADR-007 | **`tantivy` 仅作 dev 依赖的 BM25 正确性基线** | 不用它实现功能，**用它证明自己写得对**；自研最大风险是"写错了看不出来" | FR-03、FR-04 |
 | ADR-008 | **MSRV 提到 1.90 并用 `cargo-deny` 强制 License 白名单** | NFR-08 的 1.80 已被主流依赖突破；License 友好是硬要求，人工审查不可靠 | NFR-08 |
+| ADR-009 | **对外接口采用「门面层 + 共用编排内核」**（`SearchIndex` 写端 / owned `Searcher` 读端） | 复用同一编排实现避免逻辑漂移；重构是"加法"，bench/测试零改动，逃生舱保证能力不丢 | issue #1 |
 
 ---
 
@@ -159,10 +160,10 @@ HelixIndex/
 ├── crates/
 │   ├── core/                  # helix-core（库，对外交付主体）
 │   │   └── src/
-│   │       ├── lib.rs          # 顶层 API：Index / Searcher 组装
+│   │       ├── lib.rs          # 顶层 API：SearchIndex / Searcher 门面 + prelude
 │   │       ├── error.rs        # Error / Result
 │   │       ├── types.rs        # DocId / ChunkId / TermId / Score
-│   │       ├── document.rs     # Document / Chunk
+│   │       ├── document.rs     # Document（输入 DTO）/ DocRecord（存储记录）/ Chunk
 │   │       ├── schema.rs       # 字段定义、权重、Filter
 │   │       ├── analyze/        # Analyzer trait / 中英混合分词 / 过滤器 / 停用词
 │   │       ├── index/          # Index / inverted / posting / forward / stats
@@ -171,7 +172,7 @@ HelixIndex/
 │   │       ├── embed/          # Embedder trait / local / remote / cached
 │   │       ├── fusion/         # FusionStrategy trait / rrf / weighted
 │   │       ├── rerank/         # Reranker trait / noop
-│   │       ├── query/          # Searcher / parse / explain
+│   │       ├── query/          # SearchIndex / Searcher 门面 + search_parts 编排 + parse / explain
 │   │       ├── storage/        # Snapshot 读写 / codec
 │   │       └── chunk/          # Chunker 分块策略
 │   └── cli/                   # helix（二进制）
@@ -190,9 +191,11 @@ HelixIndex/
 | `embed`     | 文本 → 向量       | 不知道索引的存在            |
 | `retriever` | 单路召回          | 不与其他 lane 交互        |
 | `fusion`    | 多路合并          | 不回捞正文               |
-| `query`     | 编排以上全部        | 不自己实现算法             |
+| `query`     | 编排以上全部；门面层（`SearchIndex` 写端 / `Searcher` 读端）只做装配与生命周期管理 | 不自己实现算法             |
 
 > 这些「禁止」是**代码评审的硬性检查项**。违反边界不会导致编译失败，但会让 trait 抽象失去意义——一旦 `fusion` 开始回捞正文，换融合策略就再也不能独立测试。
+
+> **门面层边界（P6 新增）**：`SearchIndex` / `Searcher` 是 `query` 模块上的门面，只做装配与生命周期管理，**不实现任何算法**——`add` 内部依次调 `Chunker::chunk` → `Index::add` → `Embedder::embed_documents` → `VectorIndex::add`，不碰 postings / BM25 公式 / HNSW 图。底层 `QueryExecutor<'a>`（旧 `Searcher`）原样保留作逃生舱，见第 10 章。
 
 ### 4.3 依赖规则
 
@@ -220,11 +223,18 @@ pub type ChunkId = u32;
 pub type TermId  = u32;
 pub type Score   = f32;
 
-pub struct Document {
-    pub doc_id: DocId,
+pub struct Document {                // 输入 DTO（对外门面 add 的参数，P6 起才含 text）
+    pub text: String,                // 原始文本，由门面层分块
     pub source: String,              // 文件路径 / URL / 标题 —— 溯源用（FR-12）
     pub metadata: serde_json::Value, // 业务自定义 —— 过滤用（FR-14）
-    pub content_hash: u64,           // 幂等 upsert 用（FR-15）
+    pub dedup_key: Option<String>,   // 幂等 upsert 键（FR-15）；缺省用 xxh64(text)
+}
+
+pub struct DocRecord {               // 存储记录（内部），由 Document 派生
+    pub doc_id: DocId,
+    pub source: String,
+    pub metadata: serde_json::Value,
+    pub content_hash: u64,           // xxh64(dedup_key.unwrap_or(text))
 }
 
 pub struct Chunk {
@@ -660,7 +670,7 @@ fn should_rebuild(&self) -> bool {
 | HashMap 遍历序 | 凡是进入排序的路径，必须先收集再按 `chunk_id` 排序，不直接依赖 HashMap 迭代顺序 |
 | 并行执行       | 两路并行不影响各自结果；融合前按 lane 名固定顺序收集               |
 
-验收：同一 query 连续检索 100 次，结果顺序完全一致（见 12.1 单测清单）。
+验收：同一 query 连续检索 100 次，结果顺序完全一致（见 13.1 单测清单）。
 
 ### 8.3 可观测性（NFR-07）
 
@@ -729,7 +739,7 @@ remote-embed  = ["dep:reqwest", "dep:tokio"]  # 远程 HTTP API
 positions     = []                        # posting 存储位置信息
 ```
 
-`local-embed` 与 `remote-embed` 可同时开启，运行时通过配置选择；都不开启时 `Embedder` 无可用实现，编译期即暴露（见 10.3 `NoEmbedder`）。
+`local-embed` 与 `remote-embed` 可同时开启，运行时通过配置选择；都不开启时 `Embedder` 无可用实现，编译期即暴露（见 11.3 `NoEmbedder`）。
 
 ### 9.4 决策记录
 
@@ -807,14 +817,109 @@ positions     = []                        # posting 存储位置信息
 - **代价**：要求使用者的工具链 ≥ 1.90。
 - **相关需求**：NFR-08；对应 plan.md T0-03、T0-06
 
+#### ADR-009：对外接口采用「门面层 + 共用编排内核」，而非重写检索路径
+
+- **状态**：已接受（2026-09-04 新增，依据 `p6-design.md` v2.0 决策点 D-I1~D-I8）
+- **背景**：issue #1 要求把接口重构为 `index.add(doc)` / `searcher.search(query)`。现状 `Searcher<'a>` 借 4 个外部引用无法存 struct，最小闭环 79 行含 3 个静默陷阱；但它的编排逻辑（两路召回→融合→回捞→精排）已稳定并被评测验证，**不应重写**。
+- **决策**：新增 `SearchIndex`（写端）+ owned `Searcher`（读端，`'static + Clone + Send + Sync`）门面；把原 `Searcher<'a>` 的编排抽成自由函数 `search_parts`，旧类型改名 `QueryExecutor<'a>`（签名不变）作底层逃生舱。门面只做装配与生命周期管理，不实现算法。
+- **理由**：① 新旧共用同一 `search_parts`，避免两份编排逻辑漂移；② 重构是"加法"，bench / 集成测试 / 单测零改动，评测可复现性不受威胁；③ 逃生舱保证现有可调能力（brute 后端、BM25/RRF 网格、charabia、裸 embedder）一个不丢。
+- **代价**：`Document` 拆为输入 DTO + `DocRecord`（breaking）；快照升 `FORMAT_VERSION` 2 存配置指纹（旧 `.idx` 需重建）；`raw_vectors` 使向量内存翻倍（NFR-05 重测）。
+- **相关需求**：FR-12 / FR-14 / FR-15 / FR-17 / NFR-03 / NFR-05；对应 plan.md P6（I-01~I-14）
+
 ---
 
-## 10. 接口设计
+## 10. 对外接口设计（门面层）
 
-### 10.1 Rust API
+> 架构级概要。任务级拆分见 `plan.md` 第 11 章；完整设计（业界调研、Before/After、决策点 D-I1~D-I8）见 `p6-design.md`（v2.0 已拍板）。
+
+### 10.1 设计动机
+
+对外接口重构的三个动因（均实测，见 `p6-design.md` 第 1 章）：
+
+1. **静默正确性陷阱**：现状最小闭环 79 行、手接 8 对象、7 步，其中 3 步写错不报错只变差——分词器不一致（R4）、忘算 `content_hash`（FR-15 幂等失效）、忘 `NormalizedVector`（余弦分全错）。这与 11.3 节「配置错误尽早暴露」的原则直接矛盾。
+2. **生命周期逼用户当库作者**：`Searcher<'a>` 借 4 个外部引用，无法存 struct / 无法跨线程；仓库自己的 CLI 与 bench 都手搓了「引擎对象」。
+3. **批量 embed 不可见**：向量化是批接口，逐条 `add` 会打穿 NFR-03。
+
+门面层的修复方式：把易错步骤移进库「只做对一次」，把生命周期收进 owned 对象，把批量 embed 收进写缓冲。
+
+### 10.2 目标 API 形态
 
 ```rust
-use index_core::prelude::*;
+use helix_core::prelude::*;
+
+let mut index = SearchIndex::builder().build()?;   // 零配置可用
+index.add(Document::new("文本").with_source("src").with_metadata(json!({})))?;
+index.add("纯文本")?;                               // impl Into<Document> for &str
+index.commit()?;                                    // 刷写缓冲，此后可见
+
+let searcher = index.into_searcher();               // 'static + Clone + Send + Sync
+let resp = searcher.search("查询")?;                // 只有 query 必选；mode=Hybrid(自动)、top_n=10
+let resp = searcher.search_with("查询")
+    .mode(SearchMode::Hybrid)   // 也接受 .mode("hybrid")
+    .top_n(10)
+    .filter(&Filter::eq("lang", "zh"))              // FR-14
+    .explain(true)                                  // FR-13
+    .exec()?;
+```
+
+### 10.3 写端 `SearchIndex`
+
+| 方法 | 说明 |
+| --- | --- |
+| `SearchIndex::builder()` → `SearchIndexBuilder` | 全部配置点（analyzer / chunker / embedder / fusion / reranker / bm25 / batch_size）；**不调即用默认值** |
+| `add(doc) -> Result<AddOutcome>` | 分块 → 倒排 → 写缓冲；返回 `{ doc_id, chunk_ids, deduped }` |
+| `add_documents(iter)` | 批量路径（吞吐最优，`helix build` 走这条） |
+| `remove(doc_id)` | 墓碑删除 + 统计量回滚 |
+| `commit()` | 刷写缓冲（批量 embed + 灌向量索引），此后数据可见（对齐 Lucene） |
+| `into_searcher()` | 交出所有权，产出 owned `Searcher`（隐含 flush） |
+| `search(&mut self, q)` | 便利法：内部 `commit()` 后立即检索 |
+| `save(path)` / `load(path)` | 落盘 / 加载（含配置指纹校验，见 10.6） |
+
+**写缓冲与批量 embed**：`Embedder::embed_documents` 是批接口，`add` 逐条 embed 会打穿 NFR-03。因此 `add` 只把 chunk 文本 push 进 `pending`，满 `batch_size`（默认 64，**实测校准** 32/64/128/256）时同步 flush。L2 归一化由 flush 路径内部保证。
+
+**可见性语义**：`add` 后必须 `commit()` 才对检索可见（对齐 Lucene/tantivy），为 P7 的 delta 分段留出语义空间。
+
+**所有权切换**：`into_searcher()` / `into_index()` 只移动 `Arc<Inner>`，零拷贝零锁。⚠️ 若 `Searcher` 被 `clone()` 后再 `into_index().add()`，`Arc::make_mut` 会静默深拷贝整个 `Inner`（快照隔离语义正确，但非零拷贝）——`add` 内加 `debug_assert!(Arc::strong_count == 1)` 提示。
+
+### 10.4 读端 `Searcher`
+
+| 方法 | 说明 |
+| --- | --- |
+| `search(query)` | 主形态：**只有 query 必选**；`top_n=10`，`mode` 按装配自动推断（有向量→Hybrid、无→Lexical） |
+| `search_with(query)` → `SearchRequest` | builder：`.mode(m)` `.top_n(n)` `.filter(&f)` `.explain(b)` `.exec()` |
+| `into_index()` | 换回写端继续增量写入 |
+| `config_report()` | 打印 analyzer / chunker / embedder 实际取值（可观测性，对应风险 R7） |
+
+`Searcher: 'static + Clone + Send + Sync`（六 trait 均已 `Send + Sync`），可直接放进 axum 的 `AppState`、`Arc<Searcher>` 分发、`move` 进 rayon。`SearchIndex` 本身是 `!Sync`（含可变 `pending`），可 `Send` 不可共享。
+
+### 10.5 Document 输入 DTO 与数据模型
+
+`Document`（对外输入）与 `DocRecord`（内部存储）拆分，见 5.1。要点：
+
+- `content_hash = xxh64(dedup_key.unwrap_or(text))`——`dedup_key` 存在时以它为准，是**替代**非并存
+- `dedup_key` 持久化进 `DocRecord`，remove→re-add 幂等判定不变
+- 同一逻辑文档应始终用同一 `dedup_key`（时有时无判为不同文档，是调用方责任）
+
+### 10.6 持久化与配置指纹
+
+`SearchIndex::load(path)` 校验快照中的 `ConfigFingerprint { analyzer_id, embedder_id, dim, chunker }` 与当前装配是否一致，不一致 → `Error::ConfigMismatch { expected, actual }`（**双面打印**，绝不静默）。这修掉了 `helix search --index` 写死 `MixedAnalyzer` 导致的静默换分词器（R4）隐患。
+
+快照 `FORMAT_VERSION` 升 2；`positions` feature 通过 `effective_version()` 对 base +1（base 2 / positions 3）——**这是把 `codec.rs` 里「从未实现的注释约定」落成实现**。
+
+### 10.7 逃生舱：底层永远可达
+
+门面是**默认装配，不是唯一路径**。底层 `QueryExecutor<'a>`（旧 `Searcher`）原样保留，需要完全自定义 lane 组装（brute 后端、BM25/RRF 网格、裸 embedder、`--runs` 重建图）时直接用它。完整逃生舱映射见 `p6-design.md` 7.3。
+
+---
+
+## 11. 内部接口与 CLI
+
+### 11.1 底层 API（trait 与逃生舱）
+
+> 门面层（第 10 章）是默认路径；以下底层 trait 装配 API 保留作逃生舱（换 brute 后端、BM25/RRF 网格、charabia 对照等，完整映射见 `p6-design.md` 7.3）。底层 `Searcher<'a>` 已改名 `QueryExecutor<'a>`。
+
+```rust
+use helix_core::prelude::*;
 
 // ---- 构建索引 ----
 let analyzer = MixedAnalyzer::new()?;
@@ -856,7 +961,7 @@ if let Some(reason) = &resp.empty_reason {
 }
 ```
 
-### 10.2 CLI
+### 11.2 CLI
 
 ```bash
 # 建索引
@@ -877,7 +982,7 @@ helix search --index index.helix --mode hybrid --explain "查询文本"
 helix bench --index index.helix --queries data/t2-queries.jsonl
 ```
 
-### 10.3 错误类型
+### 11.3 错误类型
 
 ```rust
 #[derive(Debug, thiserror::Error)]
@@ -890,6 +995,9 @@ pub enum Error {
 
     #[error("快照版本不兼容: 文件版本 {found}, 支持版本 {expected}")]
     SnapshotVersionMismatch { found: u32, expected: u32 },
+
+    #[error("配置不匹配: 快照指纹 {expected}, 当前装配 {actual}")]
+    ConfigMismatch { expected: String, actual: String },   // P6 新增：load 时校验配置指纹（10.6）
 
     #[error("快照校验失败，文件可能损坏")]
     SnapshotCorrupted,
@@ -912,9 +1020,9 @@ pub enum Error {
 
 ---
 
-## 11. 实施计划与需求映射
+## 12. 实施计划与需求映射
 
-### 11.1 阶段划分
+### 12.1 阶段划分
 
 | 阶段         | 内容                                                             | 验收标准                                                 | 依赖 |
 | ---------- | -------------------------------------------------------------- | ---------------------------------------------------- | -- |
@@ -924,11 +1032,12 @@ pub enum Error {
 | **P3**     | `fusion`（RRF + 加权）+ `query/searcher` + `explain`               | `helix compare` 可对比三路；Explain 输出完整                     | P2 |
 | **P4**     | `storage` 快照 + 增量写入（**先 `hnsw_rs` A/B 再定案**）+ 元数据过滤                | save/load 后检索结果完全一致；增量写入后立即可查                        | P3 |
 | **P5**     | T2Ranking 评测集装配 + `helix bench` + README                        | Recall@K / MRR@10 / 分级 NDCG@10 / 延迟有实测数据；BM25 参数网格搜索调参 | P4 |
-| **P6**（v2） | Reranker 接入（bge-reranker-v2-m3）、MMR 去重、token budget 裁剪、自研 HNSW | —                                                    | P5 |
+| **P6**     | **接口重构**：`SearchIndex` / `Searcher` 门面 + 写缓冲 commit + 配置指纹（issue #1，见第 10 章） | 最小闭环 ≤15 行；brute 后端新旧逐位一致；CLI 参数输出一字不改 | P5 |
+| **P7**（v2） | Reranker 接入（bge-reranker-v2-m3）、MMR 去重、token budget 裁剪、自研 HNSW、delta 分段（FR-17 完整版） | —                                                    | P6 |
 
 **关键路径**：P1 → P2 → P3。这三步完成即具备完整检索能力，P4/P5 是工程化与验证。
 
-### 11.2 阶段 → 需求覆盖矩阵
+### 12.2 阶段 → 需求覆盖矩阵
 
 | 需求    | 阶段           | 需求    | 阶段          |
 | ----- | ------------ | ----- | ----------- |
@@ -939,11 +1048,11 @@ pub enum Error {
 | FR-05 | P2           | FR-18 | P3          |
 | FR-06 | P2           | FR-19 | P2          |
 | FR-07 | P2（可选 feature） | FR-20 | P3       |
-| FR-08 | P2           | FR-21 | v2（P6）      |
+| FR-08 | P2           | FR-21 | v2（P7）      |
 | FR-09 | P2           | FR-22 | P1，随阶段演进   |
 | FR-10 | P3           | FR-23 | P1，P5 完善   |
-| FR-11 | P3           | FR-24 | v2（P6）      |
-| FR-12 | P3           | FR-25 | v2（P6）      |
+| FR-11 | P3           | FR-24 | v2（P7）      |
+| FR-12 | P3           | FR-25 | v2（P7）      |
 | FR-13 | P3           | —     | —           |
 
 | NFR     | 验证阶段 |
@@ -962,9 +1071,9 @@ pub enum Error {
 
 ---
 
-## 12. 测试策略
+## 13. 测试策略
 
-### 12.1 单元测试（必须有）
+### 13.1 单元测试（必须有）
 
 | 测试               | 断言                                                        |
 | ---------------- | --------------------------------------------------------- |
@@ -983,7 +1092,7 @@ pub enum Error {
 >
 > **tantivy 对照测试是前三者的补强**：手算只能验证 5 个样本，对照测试能覆盖整份语料与边界情况。三者叠加才敢说"BM25 是对的"。
 
-### 12.2 集成测试
+### 13.2 集成测试
 
 - 端到端：摄入 → 提交 → 快照 → 加载 → 检索，结果一致
 - 并发：多线程并发检索（验证 `Send + Sync` 与 `Search` 对象复用安全）
@@ -992,7 +1101,7 @@ pub enum Error {
 
 ---
 
-## 13. 技术风险与应对
+## 14. 技术风险与应对
 
 | #  | 风险                                          | 影响                                 | 应对措施                                                                  |
 | -- | ------------------------------------------- | ---------------------------------- | --------------------------------------------------------------------- |
@@ -1011,20 +1120,21 @@ pub enum Error {
 
 ---
 
-## 14. 附录
+## 15. 附录
 
-### 14.1 参考资料
+### 15.1 参考资料
 
 - Robertson & Zaragoza, *The Probabilistic Relevance Framework: BM25 and Beyond*, 2009 — BM25 理论基础
 - Malkov & Yashunin, *Efficient and Robust Approximate Nearest Neighbor Search Using HNSW*, 2016 — HNSW 原论文
 - Cormack, Clarke & Büttcher, *Reciprocal Rank Fusion Outperforms Condorcet and Individual Rank Learning Methods*, SIGIR 2009 — RRF 与 k=60 的出处
 - BAAI/bge-small-zh-v1.5 模型卡 — 查询侧 instruction 前缀的权威说明
 
-### 14.2 变更记录
+### 15.2 变更记录
 
 | 版本   | 日期         | 变更                                                                     |
 | ---- | ---------- | ---------------------------------------------------------------------- |
 | v1.0 | 2026-09-02 | 由 `archive/requirements-and-design_v1.0.md` v1.0 拆分而来。承接第 5、6、7、8、9、10、11.1、11.2、12 章内容；新增「文档信息」「架构概述与关键决策」「质量属性设计」「ADR 决策记录」「实施计划与需求映射」五节 |
 | v1.2 | 2026-09-02 | **P0 执行后回写**（详见 `p0-design.md` 第 12 章）：① 序列化定为 **`bincode 2.0.1`**（3.0.0 为玩笑发布）；② `moka` 需显式启用 `sync` feature；③ `fastembed` 必须 `default-features = false` 以移除 NCSA 依赖链；④ 模型实际来源为 `Xenova/bge-small-zh-v1.5`（非 Qdrant）；⑤ 枚举变体确认为 `BGESmallZHV15`（非 `BGESmallZH`） |
 | v1.1 | 2026-09-02 | 依据 `thirdparty.md` 调研结论回写：① 新增 ADR-007（tantivy 作 dev 基线）、ADR-008（MSRV 1.90 + cargo-deny）；② 7.1 引入 `unicode-segmentation` / `unicode-normalization`，不再手写 Unicode 分段；③ 7.5 补充 `hnsw_rs` A/B 复核路径；④ 7.6 修正 bincode 选型理由（instant-distance 不含 bincode）并新增 `rkyv` A/B 取舍规则；⑤ 8.1 缓存由 `lru` 改为 `moka`；⑥ 9.1/9.2 版本与候选同步至实测值（fastembed 6.0.2、arroy 0.8.0、新增 hnsw_rs/usearch）；⑦ 12.1 新增 tantivy 对照测试；⑧ 13 更新 R1、新增 R9/R10 |
+| v1.4 | 2026-09-04 | 依据 `p6-design.md` v2.0（issue #1 接口重构，决策点 D-I1~D-I8 已拍板）：① 新增**第 10 章「对外接口设计（门面层）」**，原 10~14 章顺延为 11~15；② 新增 ADR-009（门面层 + 共用编排内核）；③ 5.1 `Document` 拆为输入 DTO + `DocRecord`；④ 4.2 补门面层边界；⑤ 11.3 错误类型新增 `ConfigMismatch`；⑥ 阶段表 P6 重定义为接口重构、原 v2 顺延 P7。详细设计见 `p6-design.md`，任务级见 `plan.md` |
 | v1.3 | 2026-09-03 | 依据 `p5-design.md` v1.2（评测数据源切换 T2Ranking）同步：① 4.x 目录树 data/ 注释更新；② 10.2 CLI 示例改 `data/t2-queries.jsonl`；③ 11 阶段门槛 P5 行更新（T2Ranking 装配 + 分级 NDCG）。评测数据集的**需求定义**见需求文档 9.4（v1.2），本文档不复制 |
