@@ -1,18 +1,25 @@
 //! T4-09 集成测试：端到端快照 + 并发检索。
 //!
 //! 用确定性假 Embedder（FNV 哈希向量），**不依赖模型下载**。
+//!
+//! 另含 V2 Step 1 的两条核心验收（T1 / T2，对应 `plan-v2.md` Step 1 与设计文档 §9）：
+//! 软删除的向量不再以「幽灵候选」形式被召回，包括跨快照的场景。
+
+// 测试名保留 T1_/T2_ 前缀以便与设计文档的任务编号对账
+#![allow(non_snake_case)]
 
 use std::sync::Arc;
 
 use helix_core::analyze::MixedAnalyzer;
 use helix_core::chunk::Chunker;
-use helix_core::document::{content_hash, DocRecord};
+use helix_core::document::{content_hash, DocRecord, Document};
 use helix_core::embed::Embedder;
 use helix_core::error::Result;
 use helix_core::index::Index;
 use helix_core::query::{QueryExecutor, SearchMode};
+use helix_core::search::{SearchIndex, VectorBackend};
 use helix_core::storage;
-use helix_core::types::ChunkId;
+use helix_core::types::{ChunkId, DocId};
 use helix_core::vector::{BruteForceIndex, NormalizedVector};
 
 /// 确定性假 Embedder：文本 → FNV 哈希 → 16 维归一化向量。
@@ -73,6 +80,9 @@ const CORPUS: &[(&str, &str)] = &[
         "倒数排名融合 RRF 只用排名不用分数，免疫两路量纲差异",
     ),
 ];
+
+/// 覆盖面广的查询：命中多篇文档，使"名额是否被占"具备鉴别力。
+const QUERY: &str = "检索";
 
 fn build_full_index() -> (Index, MixedAnalyzer) {
     let analyzer = MixedAnalyzer::new();
@@ -197,4 +207,221 @@ fn 并发检索安全且确定() {
             });
         }
     });
+}
+
+// ------------------------------------------------- V2 Step 1：幽灵候选（Q-C1）
+
+/// 20 篇短文档（确定性生成）：幽灵候选测试需要「大量已删向量」来制造名额压力。
+fn ghost_corpus() -> Vec<(String, String)> {
+    (0..20)
+        .map(|i| {
+            (
+                format!("note{i:02}.md"),
+                format!("第 {i:02} 篇笔记：检索系统里的向量召回与倒排索引"),
+            )
+        })
+        .collect()
+}
+
+/// 返回（索引, [(doc_id, 该文档的分片)]），顺序与 [`ghost_corpus`] 一致。
+fn build_ghost_facade(backend: VectorBackend) -> (SearchIndex, Vec<(DocId, Vec<ChunkId>)>) {
+    let mut idx = SearchIndex::builder()
+        .embedder(Some(Arc::new(FakeEmbedder)))
+        .vector_backend(backend)
+        .build();
+    let mut per_doc = Vec::new();
+    for (source, text) in ghost_corpus() {
+        let out = idx.add(Document::new(text).with_source(source)).unwrap();
+        per_doc.push((out.doc_id, out.chunk_ids));
+    }
+    idx.commit().unwrap();
+    (idx, per_doc)
+}
+
+/// T1（V2 Step 1）：已删除的向量不再霸占 Top-K 名额。
+///
+/// # Q-C1 的真实危害（重要）
+///
+/// 幽灵候选**从来就进不了最终结果**——`search_parts` 回捞时用
+/// `Index::chunk(id)` 取正文，墓碑位返回 `None` 直接跳过。所以「删除后还能
+/// 搜到已删内容」并不是本 bug 的表现形式。
+///
+/// 真正的危害是**名额被占**：Top-K 的 K 个位置里混进了幽灵，回捞时才被丢弃，
+/// 于是用户要 5 条实际只拿到 1~2 条，有效召回静默下降——而调用方（Agent）
+/// 无法区分「库里只有 2 条」和「有 5 条但 3 个位置被幽灵占了」。
+/// 因此本测试断言的是 **`hits.len() == k`**，而不是"不含幽灵 chunk_id"。
+///
+/// hnsw_rs 没有 remove API（设计 §2.1 / H2），已删向量物理上仍在图里，
+/// 只能靠存活位图谓词在检索期挡掉，故两种后端都要覆盖。
+#[test]
+fn T1_已删向量不霸占TopK名额() {
+    for backend in [VectorBackend::Brute, VectorBackend::Hnsw] {
+        let (idx, per_doc) = build_ghost_facade(backend);
+        let keep = 5;
+        let total = per_doc.len();
+        assert!(total > keep * 2, "语料需足够大才能制造名额压力");
+
+        // 删除前：top_n = keep 应该被填满（基线）
+        let searcher = idx.into_searcher().unwrap();
+        let before = searcher
+            .search_with(QUERY)
+            .mode("vector")
+            .top_n(keep)
+            .exec()
+            .unwrap();
+        assert_eq!(before.hits.len(), keep, "{backend:?}：删除前基线应填满 K");
+
+        let mut idx = searcher.into_index().unwrap();
+
+        // 删掉大部分文档，只留 keep 篇 ⇒ 向量索引里 75% 是幽灵
+        let (victims, kept): (Vec<_>, Vec<_>) = per_doc
+            .into_iter()
+            .enumerate()
+            .partition(|(i, _)| *i < total - keep);
+        let victim_chunks: Vec<ChunkId> = victims
+            .iter()
+            .flat_map(|(_, (_, chunks))| chunks.clone())
+            .collect();
+        let kept_chunks: Vec<ChunkId> = kept
+            .iter()
+            .flat_map(|(_, (_, chunks))| chunks.clone())
+            .collect();
+        for (_, (doc_id, _)) in &victims {
+            idx.remove(*doc_id).unwrap();
+        }
+
+        let searcher = idx.into_searcher().unwrap();
+
+        // 向量路：名额必须被存活文档填满
+        let hits = searcher
+            .search_with(QUERY)
+            .mode("vector")
+            .top_n(keep)
+            .exec()
+            .unwrap();
+        assert_eq!(
+            hits.hits.len(),
+            keep,
+            "{backend:?}/vector：存活 {kept_chunks:?} 共 {} 条，\
+             应全部填满 K={keep}；实际只返回 {} 条 —— 名额被幽灵占了",
+            kept_chunks.len(),
+            hits.hits.len()
+        );
+
+        // 三模式 soundness：结果里都不该出现幽灵
+        for mode in ["bm25", "vector", "hybrid"] {
+            let hits = searcher
+                .search_with(QUERY)
+                .mode(mode)
+                .top_n(keep)
+                .exec()
+                .unwrap();
+            let ghosts: Vec<ChunkId> = hits
+                .hits
+                .iter()
+                .map(|h| h.chunk_id)
+                .filter(|id| victim_chunks.contains(id))
+                .collect();
+            assert!(ghosts.is_empty(), "{backend:?}/{mode}：出现幽灵 {ghosts:?}");
+        }
+    }
+}
+
+/// T2（V2 Step 1）：幽灵候选**不跨快照永续**（覆盖设计 §2.2）。
+///
+/// 构造一个「已删除、但快照里仍带着幽灵向量」的快照——这正是旧实现的真实行为：
+/// `raw_vectors` 没有移除路径，`save` 原样导出、`load` 全量重灌，
+/// 于是被删文档一旦落盘，下次加载后幽灵就会回来继续占名额。
+///
+/// 现在有两道防线：① `SearchIndex::remove` 主动摘除 `raw_vectors`；
+/// ② 即便快照里仍有幽灵向量（旧快照 / 其他写入路径），存活位图也会在检索期挡掉。
+/// 本测试走 storage 层直接落盘，**刻意绕过防线 ①**，专门验证防线 ②。
+///
+/// 断言口径同 T1：看 `hits.len() == k`（名额未被幽灵占用），而非"结果不含幽灵"。
+#[test]
+fn T2_幽灵候选不跨快照永续() {
+    let keep = 5;
+    let analyzer = MixedAnalyzer::new();
+    let chunker = Chunker::default();
+    let mut index = Index::new();
+    let mut per_doc: Vec<(DocId, Vec<ChunkId>)> = Vec::new();
+    let mut all_vectors: Vec<(ChunkId, Vec<f32>)> = Vec::new();
+
+    for (source, text) in ghost_corpus() {
+        let doc = DocRecord {
+            doc_id: 0,
+            source,
+            metadata: serde_json::json!({}),
+            content_hash: content_hash(&text),
+        };
+        let (doc_id, chunk_ids) = index.add(doc, chunker.chunk(0, &text), &analyzer).unwrap();
+        for id in &chunk_ids {
+            all_vectors.push((*id, fake_vec(&text)));
+        }
+        per_doc.push((doc_id, chunk_ids));
+    }
+
+    // 删掉大部分，**但向量列表刻意原样保留**（复现旧行为：无移除路径）
+    let total = per_doc.len();
+    let (victims, _kept): (Vec<_>, Vec<_>) = per_doc
+        .into_iter()
+        .enumerate()
+        .partition(|(i, _)| *i < total - keep);
+    let victim_chunks: Vec<ChunkId> = victims
+        .iter()
+        .flat_map(|(_, (_, chunks))| chunks.clone())
+        .collect();
+    for (_, (doc_id, _)) in &victims {
+        index.remove(*doc_id, &analyzer).unwrap();
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ghost.idx");
+    let fingerprint = storage::ConfigFingerprint {
+        analyzer_id: "mixed".to_string(),
+        embedder_id: "fake".to_string(),
+        dim: 16,
+        chunker: (512, 64),
+    };
+    storage::save(&path, &index, &all_vectors, &fingerprint).unwrap();
+
+    // 加载：raw_vectors 全量重灌，幽灵向量重新进入向量索引
+    let (loaded, loaded_vectors, _fp) = storage::load(&path).unwrap();
+    assert!(
+        loaded_vectors
+            .iter()
+            .any(|(id, _)| victim_chunks.contains(id)),
+        "前置条件失败：快照里必须带着幽灵向量，否则本测试失去鉴别力"
+    );
+
+    let vi = BruteForceIndex::from_entries(
+        loaded_vectors
+            .iter()
+            .map(|(id, v)| (*id, NormalizedVector::new(v.clone())))
+            .collect(),
+    );
+    let e = FakeEmbedder;
+    let searcher = QueryExecutor::new(&loaded, &analyzer).with_vector(&e, &vi);
+
+    let hits = searcher.search(QUERY, SearchMode::Vector, keep).unwrap();
+    assert_eq!(
+        hits.hits.len(),
+        keep,
+        "跨快照后 K={keep} 个名额应被存活文档填满，实际只返回 {} 条",
+        hits.hits.len()
+    );
+
+    for mode in [SearchMode::Bm25, SearchMode::Vector, SearchMode::Hybrid] {
+        let hits = searcher.search(QUERY, mode, keep).unwrap();
+        let ghosts: Vec<ChunkId> = hits
+            .hits
+            .iter()
+            .map(|h| h.chunk_id)
+            .filter(|id| victim_chunks.contains(id))
+            .collect();
+        assert!(
+            ghosts.is_empty(),
+            "{mode:?}：幽灵候选跨快照复活了 {ghosts:?}"
+        );
+    }
 }

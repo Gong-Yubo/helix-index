@@ -82,3 +82,64 @@
 - **P5 评测数据源（2026-09-03 定案，p5-design.md v1.2）：T2Ranking**（THUIR，SIGIR 2023，Apache-2.0，HF `THUIR/T2Ranking` 直下）。dev 24,832 query 带 4 级 TREC qrels；BM25 MRR@10=0.359 论文基线可做外部锚点。转换器 `t2_prep.rs` 固定种子装配 ~320 query + ~12K 段落。**检索方向调研教训：DuReader-retrieval 有注册墙且数据许可未明示；mMARCO-zh 是机翻；Multi-CPR 假负例严重**
 - **bincode 2 不支持 serde_json::Value**（serialize_any → AnyNotSupported）→ 快照对 metadata 用 DTO 存 JSON 字符串；且 bincode 2 需显式开 `serde` feature 才有 bincode::serde
 - 快照格式：magic "IDX1" + version + crc32(header 后正文)；term_dict 按 TermId 升序导出防漂移；content_hash 用 xxhash-rust xxh64
+
+## V2 约定与坑（2026-09-04 起）
+- **V2 设计文档命名 `docs/devel/v2-stepN-design.md`**（不用 pX-design，P 前缀已被阶段号占用，评审 M2 同源问题）；
+  `plan.md` = V1 计划（冻结），`plan-v2.md` = V2 计划
+- **⚠️⚠️ hnsw_rs `search_filter` 是"半残的下推"（源码逐行核实 0.3.4，2026-09-04 修正过一次，别用旧结论）**：
+  `DataId = usize`（hnsw.rs:50，即 insert 传的 chunk_id）；被过滤节点**仍进 candidate_points**
+  （hnsw.rs:1026-1027 push 在 1032 的 filter 判断前）→ 连通性不破，能穿过被过滤区域 ✅；
+  但不进 return_points 堆（1028-1041），堆上限 ef（1042-1044）。
+
+  三个反直觉的真实机制（v0.1 曾把第 1 条误读为"凑够 ef 才返回"，已被评审推翻）：
+  1. **带 filter 时从不 fast return**：983 分支——无 filter 才 `return`（984）；
+     有 filter 只 `retain` 剔除未通过过滤的入口点（986-991）后 **fall-through 继续循环**。
+     唯一正常终止 = candidate_points 耗尽（while 在 960）。
+  2. **堆未满时距离剪枝全程关闭**：1019 `if e_dist_to_p < f_dist_to_p || return_points.len() < ef`
+     ⇒ 通过点数 < ef 时**任何邻居都进候选**，候选持续膨胀 ⇒ **整图遍历**。
+     ⇒ 判据：**只要 `allowed < ef`，堆恒填不满 ⇒ 剪枝永不开启 ⇒ 必然整图遍历**。
+     **这是库层结构性行为，调参治不了**（ef 只能决定"是否进入整图遍历"，不能降低成本）。
+  3. **`ef = ef_arg.max(knbn)`**（1519）⇒ 输出上限恒为 `min(knbn,ef) = knbn`。
+     **`knbn` 才是输出条数旋钮，`ef` 只是搜索宽度**——想多返回要调 knbn，调 ef 无效。
+
+  ⇒ **定案（v2-step1-design §5.7 双路径）**：
+  - 无用户过滤（热路径）→ **走普通 `search()` 保住 fast-return**，`ef` 仍 200，
+    `knbn = min(len, ceil(k/alive_ratio)+k).min(1024)` 按删除比例过采样，返回后 `retain(alive)` + 稳定排序 + truncate。
+    （用 `search_filter` 跑 AliveOnly 会禁用 fast-return，改变热路径成本结构——这是 P99 敏感路径）
+  - 有用户过滤 → `search_filter`，`ef = min(max(4k,k), 256)` **纯宽度**。
+    ⚠️ **不要用 `ef.min(allowed)` 夹逼——无效**：allowed<ef 时堆恒不满、剪枝本就关闭；
+    allowed≥4k 时该 min 又不生效。低选择度宁可召回不足，用 `Metrics::vector_shortfall` 暴露。
+- **软删除的单一真源在 `Index.forward`**（V2 Step 1 D-S1-01）：存活位图与 chunks 的 Some/None 同入口维护，
+  检索时以**位图谓词**传给向量路；**`VectorIndex` 不加 `tombstone`**（双写必漂移；且 load 时 raw_vectors
+  全量重灌，向量侧状态无法从快照恢复）。位图自研 `Vec<u64>` 不引 roaring（ID 稠密、内存小、
+  `count_ones()` O(1) 供 ef 策略与空集短路决策）。
+  ⚠️ **别再写"现状 HashSet 破坏 NFR-06"——那是伪证**：`allowed` 只用于 `lane.retain(...)`（保 Vec 序），
+  lane 顺序由 sort(score→chunk_id) 决定，与 HashSet 迭代序无关（评审 P2-1 已驳倒）
+- **过滤谓词用惰性判定，不要 O(N) 展开**（D-S1-09）：
+  `contains(chunk_id) = alive(chunk_id) && doc_bits[doc_of(chunk_id)]`，两次 O(1)。
+  字段索引只建 **doc 级**位图；`allowed_count` 靠 `ForwardStore::doc_chunk_count: Vec<u32>` 对匹配文档求和（O(|匹配|)）。
+  v0.1 的 `expand_to_chunks`（doc 位图 → chunk 位图）**每 query 一次 O(N) 全扫**，只把 O(N) 次 JSON 求值
+  换成 O(N) 次位运算，**O(N) 没消掉**——而 Q-I1 的病根正是 O(N)。惰性判定使每 query 成本与语料规模解耦
+- **`search/index.rs` 旧注释「已删向量会被丢弃」是错的**：`raw_vectors` 无移除路径 → save 原样导出 →
+  load 全量重灌 ⇒ 幽灵候选**跨快照永续**。修法靠存活位图在检索期过滤（V2 Step 1）
+- **`ForwardStore::chunk_ids_of_doc` 是 O(N) 全扫**，而 `Index::remove` 每次删除都调它 ⇒ 删除是 O(N)。
+  已记录，未修（V2 后续优化点）
+- `FilterT` 需 `Send + Sync`（Hybrid 两路在 `rayon::join` 共享谓词引用）
+
+## V2 Step 1 实施期结论（2026-09-04，S1-01~S1-09 完成）
+- **⚠️ Q-C1 的真实危害是「名额被占」，不是「召回脏数据」**：幽灵候选**进不了最终 hits**——
+  `search_parts` 回捞时 `Index::chunk(id)` 对墓碑返回 `None` 直接 `continue`（`query/searcher.rs:222-225`）。
+  真正可观测危害：Top-K 的 K 个位置混进幽灵、回捞时才被丢弃 ⇒ **要 5 条只给 2 条**，
+  而 Agent 无法区分「库里只有 2 条」与「有 5 条但 3 个位置被幽灵占了」。
+  ⇒ **验收必须断言 `hits.len() == k`；断言"结果不含幽灵 chunk_id"是修复前后都为真的假测试**
+  （T1/T2 初版踩过：把谓词摘掉后测试仍全绿，做「临时摘掉修复→确认测试变红」的反向验证才暴露）
+- **空结果原因两条分支必须同口径跑 `query_has_hits` 探针**：空集短路分支（filter 排空）与
+  `fused.is_empty()` 分支都要遵循「query 侧信号优先」，否则「query 无命中 + 过滤排空」会误报
+  `FilteredOut`（Agent 会去调过滤条件，而问题在 query 词）。由 T16 抓出
+- **stable clippy 1.98 新 lint 会误伤旧代码**：`map_or` → `is_some_and`/`is_none_or`、`% 2 == 0`
+  → `is_multiple_of`、`println!(&x)` → 去 `&`。修法对 MSRV 1.90 安全（`is_some_and` 1.70 /
+  `is_none_or` 1.82 / `is_multiple_of` 1.87）
+- **macOS BSD grep 不支持 `\|`**（ripgrep 才支持）：Bash 里用 `grep "a\|b"` 会静默不匹配并返回 exit 1，
+  极易误判「代码里没有某符号」。**一律用 Grep 工具**，别在 Bash 里写 `\|`
+- **并行 Edit 同一文件会互相覆盖**：同一条消息里对同一文件发两次 Edit，后一次基于旧快照写入，
+  前一次修改丢失（工具仍报 success）。同文件多次编辑必须串行

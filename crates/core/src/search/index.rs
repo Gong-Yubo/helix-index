@@ -247,11 +247,33 @@ impl SearchIndex {
 
     /// 删除一个文档（及其全部分片），含统计量回滚（复用 `Index::remove`）。
     ///
-    /// 注意：墓碑删除只影响倒排/正排；向量索引里的向量条目随 chunk_id 失效
-    /// （检索时回捞会跳过墓碑 chunk，见 `search_parts`）。若之后 `save`，
-    /// `raw_vectors` 中对应的旧向量条目会被下次 flush/重建丢弃。
+    /// # 删除的三层语义（V2 Step 1 / D-S1-01）
+    ///
+    /// | 层             | 是否物理摘除                       | 失效方式                    |
+    /// | ------------- | ---------------------------- | ----------------------- |
+    /// | 倒排 postings   | ✅ `Index::remove` 时物理摘除          | ——                      |
+    /// | 正排 chunk      | ✅ 置 `None`（墓碑位）                | `alive` 位图（O(1)）        |
+    /// | 向量（HNSW 图）    | ❌ hnsw_rs 无 remove API           | 检索期用存活位图谓词挡掉（Q-C1 的修复点） |
+    /// | `raw_vectors` | ✅ 本方法顺带摘除                      | 防止幽灵候选**跨快照永续**        |
+    ///
+    /// > ⚠️ 旧注释曾写「`raw_vectors` 中的旧向量会在下次 flush/重建时被丢弃」——
+    /// > **这是错的**：`raw_vectors` 没有任何移除路径，`save` 原样导出、`load` 全量重灌，
+    /// > 幽灵候选因此会跨快照永续。现在 `remove` 主动摘除，另由存活位图在检索期兜底。
     pub fn remove(&mut self, doc_id: DocId) -> Result<()> {
-        self.inner.index.remove(doc_id, self.cfg.analyzer.as_ref())
+        self.inner
+            .index
+            .remove(doc_id, self.cfg.analyzer.as_ref())?;
+
+        // 顺带摘除原始向量（O(len)，与 `Index::remove` 的 O(N) 同量级）：
+        // 这既缩小快照体积，也断掉「删除 → save → load → 幽灵候选复活」的路径。
+        // 内存中的 HNSW 图仍需靠存活位图过滤（物理回收归 V2.0 Step 5 的 compaction）。
+        let Inner {
+            index, raw_vectors, ..
+        } = &mut self.inner;
+        if let Some(raw) = raw_vectors.as_mut() {
+            raw.retain(|(id, _)| index.is_live_chunk(*id));
+        }
+        Ok(())
     }
 
     /// 落盘快照（**隐含 commit**，p6-design 6.2：不允许带未刷缓冲落盘）。

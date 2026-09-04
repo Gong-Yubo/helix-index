@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use crate::analyze::Analyzer;
 use crate::error::Result;
 use crate::index::Index;
+use crate::predicate::CandidateFilter;
 use crate::types::ChunkId;
 
 use super::{Retriever, Scored};
@@ -63,7 +64,21 @@ impl<'a> Bm25Retriever<'a> {
 }
 
 impl Retriever for Bm25Retriever<'_> {
-    fn search(&self, query: &str, k: usize) -> Result<Vec<Scored>> {
+    /// BM25 召回（TAAT 累加 + 末端 truncate）。
+    ///
+    /// # 过滤下推（§5.6）
+    ///
+    /// 判定加在 TAAT 累加循环内：被跳过的候选**不参与累加**，其余候选的分数不受影响。
+    /// 因此这是**真下推**——召回不损失，且累加顺序不变（NFR-06 确定性保持）。
+    ///
+    /// 与 `allowed_chunks` 的融合前 post-filter 相比，下推后的 top-k 取自
+    /// 「allowed 内的 top-k」而非「全局 top-k ∩ allowed」，是后者的**超集**（评审 P1-3）。
+    fn search_filtered(
+        &self,
+        query: &str,
+        k: usize,
+        filter: Option<&dyn CandidateFilter>,
+    ) -> Result<Vec<Scored>> {
         if k == 0 {
             return Ok(Vec::new());
         }
@@ -92,6 +107,12 @@ impl Retriever for Bm25Retriever<'_> {
             let idf = self.idf(df);
 
             for posting in self.index.postings_by_id(term_id) {
+                // 下推：评分期就跳过不通过的候选（其余候选分数不受影响）
+                if let Some(f) = filter {
+                    if !f.contains(posting.chunk_id) {
+                        continue;
+                    }
+                }
                 let dl = self.index.chunk_len(posting.chunk_id) as f32;
                 let tf = posting.tf as f32;
                 let norm = k1 * (1.0 - b + b * dl / avgdl);

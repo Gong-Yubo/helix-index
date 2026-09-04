@@ -11,11 +11,13 @@
 //!   传入 `&dyn Analyzer`，分词策略与索引解耦。
 //! - `df` 不单独存，由 `postings.len()` 推导（见 `inverted.rs`），杜绝漂移。
 
+mod field_index;
 mod forward;
 mod inverted;
 mod posting;
 mod stats;
 
+pub use field_index::{json_to_string, FieldIndex, DEFAULT_MAX_VALUES_PER_FIELD};
 pub use forward::ForwardStore;
 pub use inverted::InvertedIndex;
 pub use posting::Posting;
@@ -40,6 +42,10 @@ pub struct Index {
     chunk_lens: Vec<u32>,
     /// content_hash → doc_id，幂等 upsert 去重用（FR-15）
     content_hashes: HashMap<u64, DocId>,
+    /// 字段索引：field → value → doc 位图（过滤下推，FR-27）
+    ///
+    /// **不入快照**：可由 `docs` 的 metadata 全量重建，因此 `FORMAT_VERSION` 无需升版。
+    field_index: FieldIndex,
 }
 
 /// 快照的索引部分（storage 序列化的数据源）。
@@ -135,6 +141,10 @@ impl Index {
         if content_hash != 0 {
             self.content_hashes.insert(content_hash, doc_id);
         }
+        // 字段索引同步点 1/3：摄入（必须在拿到 doc_id 之后、任何删除动作之前）
+        if let Some(d) = self.forward.doc(doc_id) {
+            self.field_index.insert(doc_id, &d.metadata);
+        }
         let mut chunk_ids = Vec::with_capacity(chunks.len());
 
         for mut chunk in chunks {
@@ -180,6 +190,9 @@ impl Index {
                 self.content_hashes.remove(&doc.content_hash);
             }
         }
+        // 字段索引同步点 2/3：删除。metadata 必须**在 tombstone_doc 之前**取走副本——
+        // 墓碑化后 `forward.doc()` 返回 None，字段索引就再也摘不干净了（T15 钉死）。
+        let metadata = self.forward.doc(doc_id).map(|d| d.metadata.clone());
 
         for chunk_id in chunk_ids {
             if let Some(chunk) = self.forward.chunk(chunk_id) {
@@ -207,6 +220,9 @@ impl Index {
             self.forward.tombstone_chunk(chunk_id);
         }
 
+        if let Some(metadata) = metadata {
+            self.field_index.remove(doc_id, &metadata);
+        }
         self.forward.tombstone_doc(doc_id);
         Ok(())
     }
@@ -244,8 +260,38 @@ impl Index {
     }
 
     /// 某分片是否存活（未被墓碑化）。
+    ///
+    /// 转发到正排的存活位图（O(1) 位测试，与 `chunks` 的 `Some`/`None` 同源）。
     pub fn is_live_chunk(&self, chunk_id: ChunkId) -> bool {
-        self.forward.chunk(chunk_id).is_some()
+        self.forward.alive_chunks().contains(chunk_id)
+    }
+
+    /// 存活分片位图（过滤下推的谓词数据源）。
+    ///
+    /// 这是 **Q-C1（删除后向量残留）修复的基础**：已删 chunk 的向量仍留在 HNSW 图里，
+    /// 检索期必须用这张位图把幽灵候选挡掉。
+    pub fn alive_chunks(&self) -> &crate::bitmap::ChunkBits {
+        self.forward.alive_chunks()
+    }
+
+    /// 存活分片总数（O(1)）。
+    pub fn alive_count(&self) -> usize {
+        self.forward.alive_count()
+    }
+
+    /// 分片所属文档的 ID（O(1)；墓碑位返回 `None`）。
+    pub fn doc_of(&self, chunk_id: ChunkId) -> Option<DocId> {
+        self.forward.doc_of(chunk_id)
+    }
+
+    /// 字段索引（过滤下推的求值数据源，FR-27）。
+    pub fn field_index(&self) -> &FieldIndex {
+        &self.field_index
+    }
+
+    /// 某文档的存活分片数（O(1)）。
+    pub fn chunk_count_of_doc(&self, doc_id: DocId) -> u32 {
+        self.forward.chunk_count_of_doc(doc_id)
     }
 
     /// 取分片内容（墓碑位返回 `None`）。
@@ -280,6 +326,13 @@ impl Index {
         self.forward.iter_live_chunks()
     }
 
+    /// 迭代所有存活文档 `(doc_id, record)`（确定性顺序）。
+    ///
+    /// 过滤的全扫兜底（`doc_bits_scan`）以 doc 为遍历单位，与 doc 级字段索引同粒度。
+    pub fn iter_live_docs(&self) -> impl Iterator<Item = (DocId, &DocRecord)> {
+        self.forward.iter_live_docs()
+    }
+
     /// 活文档数。
     pub fn num_docs(&self) -> usize {
         self.forward.live_docs()
@@ -309,6 +362,10 @@ impl Index {
     }
 
     /// 从快照恢复。**不重建向量索引**——向量由 storage 层按原始向量重建（D1）。
+    ///
+    /// `ForwardStore::import` 会顺带重建存活位图与每文档分片计数（O(N)），
+    /// 因此**跨快照的墓碑状态得到保留**：已删 chunk 在加载后依然是死的，
+    /// 这正是 Q-C1「幽灵候选跨快照永续」的修复基础。
     pub fn import(sections: SnapshotSections) -> Self {
         let inverted = InvertedIndex::import(sections.term_dict, sections.postings);
         let docs: Vec<Option<DocRecord>> = sections
@@ -316,6 +373,10 @@ impl Index {
             .into_iter()
             .map(|d| d.map(DocRecord::from))
             .collect();
+        // 字段索引同步点 3/3：全量重建（不入快照，故每次导入重建，O(N)）
+        let mut field_index = FieldIndex::new();
+        field_index.rebuild(&docs);
+
         let forward = ForwardStore::import(docs, sections.chunks);
         let content_hashes: HashMap<u64, DocId> = sections.content_hashes.into_iter().collect();
         Self {
@@ -324,6 +385,7 @@ impl Index {
             stats: sections.stats,
             chunk_lens: sections.chunk_lens,
             content_hashes,
+            field_index,
         }
     }
 }
@@ -444,6 +506,111 @@ mod tests {
                 rebuilt.doc_freq(term),
                 "term={term} 的 df 不一致"
             );
+        }
+    }
+
+    // ---- 字段索引的三个同步点（add / remove / import）----
+
+    fn make_doc_meta(source: &str, text: &str, meta: serde_json::Value) -> DocRecord {
+        DocRecord {
+            doc_id: 0,
+            source: source.to_string(),
+            metadata: meta,
+            content_hash: content_hash(text),
+        }
+    }
+
+    fn meta_index() -> Index {
+        let analyzer = MixedAnalyzer::new();
+        let mut index = Index::new();
+        for (i, (tag, year)) in [("rust", 2021.0), ("python", 2022.0), ("rust", 2023.0)]
+            .iter()
+            .enumerate()
+        {
+            let text = format!("第 {i} 篇关于 {tag} 的检索文档");
+            let meta = serde_json::json!({"tag": tag, "year": year});
+            index
+                .add(
+                    make_doc_meta(&format!("s{i}"), &text, meta),
+                    Chunker::default().chunk(0, &text),
+                    &analyzer,
+                )
+                .unwrap();
+        }
+        index
+    }
+
+    #[test]
+    fn add时字段索引同步登记() {
+        let index = meta_index();
+        let fi = index.field_index();
+        let rust = fi.eq_bits("tag", "rust").expect("未降级");
+        assert_eq!(rust.count_ones(), 2, "tag=rust 有两个文档");
+        assert!(rust.contains(0) && rust.contains(2));
+        assert_eq!(
+            fi.range_bits("year", 2022.0, 2024.0).unwrap().count_ones(),
+            2
+        );
+    }
+
+    /// T15：字段索引必须在 `tombstone_doc` **之前**清理——
+    /// 墓碑化后 metadata 不可读，索引就再也摘不干净。
+    #[test]
+    fn remove时字段索引同步摘除() {
+        let analyzer = MixedAnalyzer::new();
+        let mut index = meta_index();
+
+        // 删掉 doc 0（tag=rust, year=2021）
+        index.remove(0, &analyzer).unwrap();
+
+        let fi = index.field_index();
+        let rust = fi.eq_bits("tag", "rust").expect("未降级");
+        assert!(!rust.contains(0), "已删文档的 doc 位必须被清掉");
+        assert!(rust.contains(2));
+        assert_eq!(rust.count_ones(), 1);
+        assert_eq!(
+            fi.range_bits("year", 0.0, 2022.0).unwrap().count_ones(),
+            0,
+            "year=2021 的文档已删，区间内应为空"
+        );
+        // 删除不应把 value_count 扣成负数（否则高基数字段会被永久误判降级）
+        assert!(!fi.is_degraded("tag"));
+        assert!(!fi.is_degraded("year"));
+    }
+
+    /// T7（Index 层）：增量维护 ≡ 全量重建 ≡ 快照往返后重建。
+    #[test]
+    fn 字段索引的增量维护与全量重建一致() {
+        let analyzer = MixedAnalyzer::new();
+        let mut incremental = meta_index();
+        incremental.remove(1, &analyzer).unwrap(); // 删掉 tag=python 那个
+
+        // 全量重建：只加 doc 0 与 doc 2
+        let mut rebuilt = Index::new();
+        for (i, (tag, year)) in [("rust", 2021.0), ("rust", 2023.0)].iter().enumerate() {
+            let text = format!("第 {i} 篇关于 {tag} 的检索文档");
+            let meta = serde_json::json!({"tag": tag, "year": year});
+            rebuilt
+                .add(
+                    make_doc_meta(&format!("s{i}"), &text, meta),
+                    Chunker::default().chunk(0, &text),
+                    &analyzer,
+                )
+                .unwrap();
+        }
+
+        // 快照往返：export → import 走 rebuild 路径
+        let roundtrip = Index::import(incremental.export());
+
+        for idx in [&incremental, &rebuilt, &roundtrip] {
+            let fi = idx.field_index();
+            assert_eq!(
+                fi.eq_bits("tag", "rust").unwrap().count_ones(),
+                2,
+                "三个路径下 tag=rust 都应命中 2 个文档"
+            );
+            assert!(fi.eq_bits("tag", "python").unwrap().is_empty());
+            assert_eq!(fi.range_bits("year", 0.0, 3000.0).unwrap().count_ones(), 2);
         }
     }
 }
