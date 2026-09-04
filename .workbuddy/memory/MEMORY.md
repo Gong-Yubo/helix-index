@@ -88,6 +88,8 @@ Agent 作为调用方与人类搜索有五个根本差异（query 含 LLM 噪声
 - **并行 Edit 同一文件会互相覆盖**：同一条消息对同一文件发两次 Edit，后一次基于旧快照写入，前一次丢失（工具仍报 success）。同文件多次编辑必须串行
 - **`gh issue/pr create --body "..."` 不能用**：zsh 下 body 里的反引号被当**命令替换**执行（报 `command not found: Xxx.yyy`），
   含 `()` 还会 `parse error in command substitution`。**含 Markdown 反引号的 body 一律先写文件，再用 `--body-file`**
+- **`cargo clippy --workspace --all-targets -D warnings` 会报 `unexpected argument '-D'`**：`-D warnings` 前必须有 `--`。
+  Makefile 的 lint 目标写对了，手敲容易漏
 
 ## P6 门面层坑（详见 p6-design.md §9.1）
 - **`crate::error::Result<T>` 是单泛型别名**，写 `Result<SearchMode, String>` 会撞别名（E0107）→ 用 `std::result::Result` 完整路径
@@ -123,7 +125,12 @@ Agent 作为调用方与人类搜索有五个根本差异（query 含 LLM 噪声
 - **`search/index.rs` 旧注释「已删向量会被丢弃」是错的**：`raw_vectors` 无移除路径 → save 原样导出 → load 全量重灌
   ⇒ 幽灵候选**跨快照永续**。防线①：存活位图检索期过滤；防线②：`SearchIndex::remove` 摘 `raw_vectors`
 - `FilterT` 需 `Send + Sync`（Hybrid 两路在 `rayon::join` 共享谓词引用）
-- 已知未修优化点：`ForwardStore::chunk_ids_of_doc` 是 O(N) 全扫，而 `Index::remove` 每次删除都调它 ⇒ 删除 O(N)
+- ⚠️ **`query::Metrics` 目前不可观测、也不可测**：只在 `search_parts` 内聚合并经 `tracing::info!` 输出，
+  **既不在 `SearchResponse` 里，也不进 `bench::QueryMetrics`** ⇒ ① 必须挂 tracing subscriber 才看得到
+  ② 无法做单测 ③ **无法被 bench 聚合**。而 `vector_shortfall` 的定位正是「V2.1 是否引入 prefilter 的判据」——
+  **在 Metrics 被暴露出来之前，它实际承担不了决策依据的角色**（记在 issue #7，待排期）
+- 已知未修优化点：`ForwardStore::chunk_ids_of_doc` 是 O(N) 全扫，而 `Index::remove` 每次删除都调它 ⇒ 删除 O(N)；
+  `SearchIndex::remove` 每次全量 `raw_vectors.retain`，批量删 N 篇是 O(N·M)（计划随 Step 5 compaction 加 `remove_many`）
 - **字段索引高基数降级是已知取舍**：单字段 >1024 个不同值即永久降级 → 该字段所有过滤退回 O(N) 全扫
   （毫秒时间戳类 Range 过滤最常见的真实场景正是受害者）。`degraded` **粘滞是有意设计**——降级窗口内被跳过的值
   不在索引里，复位会产生假阴性。**别"好心修掉"**（注：save/load 后 rebuild 会复位，存在细微前后差异）
