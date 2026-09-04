@@ -202,6 +202,21 @@ impl SearchIndex {
         self.inner.index.num_chunks()
     }
 
+    /// 当前已提交的文档数（不含墓碑）。
+    pub fn num_docs(&self) -> usize {
+        self.inner.index.num_docs()
+    }
+
+    /// 全语料词项总数（所有分片的分词数之和）。
+    pub fn total_len(&self) -> u64 {
+        self.inner.index.total_len()
+    }
+
+    /// 平均分片长度（BM25 长度归一化用）。
+    pub fn avgdl(&self) -> f32 {
+        self.inner.index.avgdl()
+    }
+
     /// 交出所有权，产出只读 `Searcher`（`'static + Clone + Send + Sync`）。
     ///
     /// **隐含 flush**（p6-design 6.4 评审 P2）：把 `pending` 刷进 `Inner` 后再移交，
@@ -263,9 +278,18 @@ impl SearchIndex {
     ) -> Result<Self> {
         let (index, raw_vectors, fingerprint) = crate::storage::load(path)?;
 
-        // 配置指纹校验：装配不一致显式报错（修 B1/B2）
+        // 配置指纹校验（修 B1/B2），分维度严格度（见下方说明）：
         let actual = cfg.fingerprint();
-        if fingerprint != actual {
+        let analyzer_ok = fingerprint.analyzer_id == actual.analyzer_id;
+        let chunker_ok = fingerprint.chunker == actual.chunker;
+        // embedder：仅当**快照含向量**时才严格校验（id + dim 必须一致，否则
+        // 用错模型重建向量索引会维度/语义错）；快照纯 BM25 时无向量可重建，
+        // 装配有无 embedder 都是正确的（纯 BM25 检索不碰向量），故不校验。
+        // 这使 CLI `search --index` 能加载 build 产出的两种快照（含向量 / 纯 BM25）。
+        let embedder_ok = fingerprint.embedder_id.is_empty()
+            || (fingerprint.embedder_id == actual.embedder_id
+                && fingerprint.dim == actual.dim);
+        if !(analyzer_ok && chunker_ok && embedder_ok) {
             return Err(Error::ConfigMismatch {
                 expected: fingerprint.to_string(),
                 actual: actual.to_string(),

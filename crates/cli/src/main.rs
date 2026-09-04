@@ -5,7 +5,7 @@
 //! - `search --mode {bm25|vector|hybrid}`：`--input` 重建 或 `--index` 从快照加载
 //! - `compare`：三路同屏对比
 //!
-//! 向量索引用 `HnswRsIndex`（P4 A/B 结论：原生增量 insert，见 p4-design.md）。
+//! P6 起经门面层（`SearchIndex` / `Searcher`）组装；快照加载校验配置指纹（B1）。
 
 mod bench;
 
@@ -14,16 +14,14 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
-use helix_core::analyze::MixedAnalyzer;
 use helix_core::chunk::Chunker;
-use helix_core::document::{content_hash, DocRecord};
+use helix_core::document::{content_hash, DocRecord, Document};
 use helix_core::embed::{Embedder, LocalEmbedder};
 use helix_core::index::Index;
-use helix_core::query::{EmptyReason, Hit, QueryExecutor, SearchMode, SearchResponse};
+use helix_core::query::{EmptyReason, Hit, SearchMode, SearchResponse};
 use helix_core::schema::Filter;
-use helix_core::storage;
+use helix_core::search::SearchIndex;
 use helix_core::types::ChunkId;
-use helix_core::vector::{HnswRsIndex, NormalizedVector, VectorIndex};
 
 #[derive(Parser)]
 #[command(name = "helix", version, about = "HelixIndex 检索内核命令行工具")]
@@ -131,24 +129,11 @@ fn parse_filters(specs: &[String]) -> Result<Option<Filter>> {
     Ok(Some(Filter::And(conditions)))
 }
 
-/// 从 JSONL 语料构建索引（默认 Chunker 512/64）。
-pub(crate) fn load_corpus(path: &Path) -> Result<(Index, MixedAnalyzer)> {
-    load_corpus_with(path, &Chunker::default())
-}
-
-/// 从 JSONL 语料构建索引，指定 Chunker（bench 的"每段落强制单 chunk"
-/// 评测路径用——T2Ranking 段落级标注防多 chunk 双计，见 p5-design 5.2 步骤 8）。
-pub(crate) fn load_corpus_with(path: &Path, chunker: &Chunker) -> Result<(Index, MixedAnalyzer)> {
-    let analyzer = MixedAnalyzer::new();
-    let index = build_index(path, chunker, &analyzer)?;
-    Ok((index, analyzer))
-}
-
 /// 底层构建：用调用方提供的 analyzer 从 JSONL 构建索引。
 ///
-/// 与 [`load_corpus_with`] 的区别仅在于 analyzer 由外部注入——
 /// 供 bench 的 `--analyzer charabia` 对照实验在**索引侧切换分词器**（R4：
 /// 索引/查询两侧必须用同一 Analyzer，因此 analyzer 由调用方持有并复用）。
+/// （I-10 后 main 三命令走门面层，此函数仅 bench.rs 使用；I-12 迁 bench 后移除。）
 pub(crate) fn build_index(
     path: &Path,
     chunker: &Chunker,
@@ -196,6 +181,7 @@ pub(crate) fn build_index(
 }
 
 /// embed 所有分片，返回 (chunk_id, 原始向量)。
+/// （I-10 后仅 bench.rs 使用；I-12 迁 bench 后移除。）
 pub(crate) fn embed_chunks(
     index: &Index,
     embedder: &LocalEmbedder,
@@ -213,23 +199,26 @@ pub(crate) fn embed_chunks(
         .collect())
 }
 
-/// 从原始向量重建向量索引（HnswRsIndex，A/B 结论：原生增量）。
-fn rebuild_vector_index(vectors: &[(ChunkId, Vec<f32>)]) -> Result<HnswRsIndex> {
-    let mut vi = HnswRsIndex::with_capacity(vectors.len().max(1024));
-    for (id, v) in vectors {
-        vi.add(*id, NormalizedVector::new(v.clone()))?;
-    }
-    Ok(vi)
-}
-
 fn build(args: BuildArgs) -> Result<()> {
     let started = std::time::Instant::now();
-    let (index, _) = if args.single_chunk {
-        // 评测口径：每段落强制单 chunk（对齐 NFR-01/03 的"1 万 chunk"目标规模）
-        load_corpus_with(&args.input, &Chunker::new(200_000, 0))?
+
+    // 门面层装配（p6-design 4.1）：默认 MixedAnalyzer + bge-small-zh + HNSW；
+    // --single-chunk 切评测口径 chunker；--vectors 决定是否配 embedder。
+    let chunker = if args.single_chunk {
+        Chunker::new(200_000, 0)
     } else {
-        load_corpus(&args.input)?
+        Chunker::default()
     };
+    let mut builder = SearchIndex::builder().chunker(chunker);
+    if !args.vectors {
+        builder = builder.embedder(None);
+    }
+    let mut index = builder.build();
+
+    // 读语料 → 批量摄入（倒排 + 写缓冲；向量延后到 commit）
+    let docs = read_corpus_documents(&args.input)?;
+    index.add_documents(docs)?;
+
     println!("索引构建完成:");
     println!("  文档数   = {}", index.num_docs());
     println!("  分片数   = {}", index.num_chunks());
@@ -241,49 +230,66 @@ fn build(args: BuildArgs) -> Result<()> {
         return Ok(());
     };
 
-    // 可选：嵌入并保存向量
-    let vectors = if args.vectors {
-        let embedder = LocalEmbedder::new()?;
+    // 向量嵌入：--vectors 时 commit 触发批量 embed
+    if args.vectors {
         let t = std::time::Instant::now();
-        let v = embed_chunks(&index, &embedder)?;
+        index.commit()?;
         println!(
             "  embed {} 条 耗时 {:?}（NFR-03 口径 = embed + 落盘，不含 HNSW）",
-            v.len(),
+            index.num_chunks(),
             t.elapsed()
         );
-        v
-    } else {
-        Vec::new()
-    };
+    }
 
-    // 配置指纹（I-10 迁移到门面层 save 后由 Config 自动生成；此处临时构造）
-    let fingerprint = helix_core::storage::ConfigFingerprint {
-        analyzer_id: "mixed".to_string(),
-        embedder_id: if vectors.is_empty() {
-            String::new()
-        } else {
-            "bge-small-zh-v1.5".to_string()
-        },
-        dim: if vectors.is_empty() { 0 } else { 512 },
-        chunker: if args.single_chunk {
-            (200_000, 0)
-        } else {
-            (512, 64)
-        },
-    };
-    storage::save(&out, &index, &vectors, &fingerprint)?;
+    index.save(&out)?;
     println!(
         "  快照已写入 {}（{}，{}）耗时 {:?}",
         out.display(),
-        if vectors.is_empty() {
-            "纯文本"
-        } else {
+        if args.vectors {
             "含向量"
+        } else {
+            "纯文本"
         },
         humansize(&out),
         started.elapsed()
     );
     Ok(())
+}
+
+/// 从 JSONL 语料读取为 `Document` 输入 DTO（build / search --input / compare 共用）。
+fn read_corpus_documents(path: &Path) -> Result<Vec<Document>> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("读取语料失败: {}", path.display()))?;
+
+    let mut docs = Vec::new();
+    for (lineno, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = serde_json::from_str(line)
+            .with_context(|| format!("第 {} 行不是合法 JSON", lineno + 1))?;
+        let source = v
+            .get("source")
+            .and_then(|s| s.as_str())
+            .unwrap_or("<unknown>")
+            .to_string();
+        let text = v
+            .get("text")
+            .and_then(|s| s.as_str())
+            .with_context(|| format!("第 {} 行缺少 text 字段", lineno + 1))?;
+        let metadata = v.get("metadata").cloned().unwrap_or(serde_json::json!({}));
+        docs.push(
+            Document::new(text)
+                .with_source(source)
+                .with_metadata(metadata),
+        );
+    }
+
+    if docs.is_empty() {
+        bail!("语料为空: {}", path.display());
+    }
+    Ok(docs)
 }
 
 fn humansize(p: &Path) -> String {
@@ -306,65 +312,53 @@ fn search(args: SearchArgs) -> Result<()> {
     let mode = parse_mode(&args.mode)?;
     let filter = parse_filters(&args.filter)?;
 
-    // --index 与 --input 二选一
-    let (index, analyzer, snapshot_vectors) = match (&args.index, &args.input) {
+    // --index 与 --input 二选一，经门面层组装
+    let searcher = match (&args.index, &args.input) {
         (Some(idx_path), None) => {
             let t = std::time::Instant::now();
-            let (index, vectors, _fp) = storage::load(idx_path)
+            // 门面层 load（默认装配 + 配置指纹校验，修 B1：不再写死 MixedAnalyzer）
+            let index = SearchIndex::load(idx_path)
                 .with_context(|| format!("加载快照失败: {}", idx_path.display()))?;
             eprintln!("[快照加载 {} 耗时 {:?}]", idx_path.display(), t.elapsed());
-            (index, MixedAnalyzer::new(), vectors)
+            index.into_searcher()?
         }
         (None, Some(input)) => {
-            let (index, analyzer) = load_corpus(input)?;
-            (index, analyzer, Vec::new())
+            // 现场建库（默认装配：MixedAnalyzer + bge + HNSW，向量模式可用）
+            let mut index = SearchIndex::builder().build();
+            let docs = read_corpus_documents(input)?;
+            index.add_documents(docs)?;
+            index.into_searcher()?
         }
         _ => bail!("--index 与 --input 必须二选一"),
     };
 
-    // 向量模式：查询侧向量化必须要 LocalEmbedder；
-    // 文档向量优先用快照里的（build 时已 embed），--input 时现场 embed。
-    let embedder;
-    let vi;
-    let mut searcher = QueryExecutor::new(&index, &analyzer);
-    if mode != SearchMode::Bm25 {
-        embedder = LocalEmbedder::new()?;
-        let vectors = if !snapshot_vectors.is_empty() {
-            snapshot_vectors
-        } else {
-            embed_chunks(&index, &embedder)?
-        };
-        vi = rebuild_vector_index(&vectors)?;
-        searcher = searcher.with_vector(&embedder, &vi);
+    // 检索（builder 承载 mode / top_n / filter）
+    let mut req = searcher
+        .search_with(&args.query)
+        .mode(mode)
+        .top_n(args.k);
+    if let Some(f) = filter.as_ref() {
+        req = req.filter(f);
     }
-
-    let resp = searcher.search_filtered(&args.query, mode, args.k, filter.as_ref())?;
+    let resp = req.exec()?;
     print_response(&resp, &args.query, args.explain);
     Ok(())
 }
 
 fn compare(args: CompareArgs) -> Result<()> {
-    let (index, analyzer) = load_corpus(&args.input)?;
-    let embedder = LocalEmbedder::new()?;
-    let vectors = embed_chunks(&index, &embedder)?;
-    let vi = rebuild_vector_index(&vectors)?;
-    let searcher = QueryExecutor::new(&index, &analyzer).with_vector(&embedder, &vi);
+    // 门面层默认装配（含向量），一次建库三路同屏
+    let mut index = SearchIndex::builder().build();
+    let docs = read_corpus_documents(&args.input)?;
+    index.add_documents(docs)?;
+    let searcher = index.into_searcher()?;
 
     println!("查询: {}\n", args.query);
     println!("=== BM25 ===");
-    print_hits(&searcher.search(&args.query, SearchMode::Bm25, args.k)?.hits);
+    print_hits(&searcher.search_with(&args.query).mode(SearchMode::Bm25).top_n(args.k).exec()?.hits);
     println!("\n=== Vector ===");
-    print_hits(
-        &searcher
-            .search(&args.query, SearchMode::Vector, args.k)?
-            .hits,
-    );
+    print_hits(&searcher.search_with(&args.query).mode(SearchMode::Vector).top_n(args.k).exec()?.hits);
     println!("\n=== Hybrid (RRF) ===");
-    print_hits(
-        &searcher
-            .search(&args.query, SearchMode::Hybrid, args.k)?
-            .hits,
-    );
+    print_hits(&searcher.search_with(&args.query).mode(SearchMode::Hybrid).top_n(args.k).exec()?.hits);
     Ok(())
 }
 
