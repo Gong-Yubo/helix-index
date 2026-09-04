@@ -7,6 +7,44 @@
 > P0~P5 的条目为**逆向补写**（2026-09-03），依据各阶段设计文档与 git 历史整理；
 > 此后每次变更即时追加。
 
+## [Unreleased]
+
+### V2 Step 1 — 正确性修复（PR #6，2026-09-05）
+
+设计文档 `docs/devel/v2-step1-design.md`（v0.3）。
+
+#### 修复
+
+- **Q-C1（软删除后向量残留）**：已删 chunk 的向量仍留在 HNSW 图里，会霸占 Top-K 名额
+  却进不了最终 hits——表现为「要 5 条只给 2 条」，且 Agent 无法区分「库里只有 2 条」
+  与「有 5 条但 3 个位置被幽灵占了」。新增存活位图作为软删除的**单一真源**，
+  检索期以谓词下推到向量路
+- **Q-C1（跨快照永续）**：`SearchIndex::remove` 同步摘除 `raw_vectors`，
+  与存活位图构成两道互相独立的防线
+- **Q-I1/I2（过滤 O(N) 全扫）**：新增 doc 级字段索引 + 惰性 `CandidateFilter` 谓词，
+  每 query 成本从 O(N) 次 JSON 取值降为 O(query 词数 + 匹配文档数)，与语料规模解耦
+
+#### 新增
+
+- `Index::with_max_values_per_field(n)`：字段索引基数阈值可配（默认 1024）。
+  ⚠️ 高基数字段（毫秒时间戳、雪花 ID）超过阈值即**永久降级**，该字段上所有过滤
+  会退回 O(N) 全扫——这是 Q-I1 尚未覆盖的已知短板，详见 `field_index.rs` 模块文档
+- `Metrics::filter_eval` / `allowed` / `vector_shortfall`：过滤下推后的可观测性。
+  `vector_shortfall` 按 `allowed` 归一（小语料下不为噪声所淹没），
+  是 V2.1 是否引入 prefilter 的判据
+
+#### 变更
+
+- `VectorIndex::search_filtered` / `Retriever::search_filtered` 接受
+  `Option<&dyn CandidateFilter>`；**`None` 表示不过滤**（结果含已软删除条目），
+  该契约在 `predicate.rs` 与两个 trait 的文档、以及 T17 中三层钉死
+- HNSW 双路径：无用户过滤（热路径）走普通 `search()` 保住 fast-return，
+  按存活比例过采样；有用户过滤走 `search_filter`，`ef` 仅作搜索宽度
+- 空结果原因遵循 **query 侧信号优先**：query 无命中时一律报 `AllTermsUnmatched`
+  而非 `FilteredOut`，避免误导 Agent 去调过滤条件。
+  ⚠️ 该判据用的是 BM25 词典探针，Vector 模式下存在已知误报（见 `query_has_hits` 文档）
+- 快照 `FORMAT_VERSION` 维持 2：存活位图与字段索引均可从 `docs` 重建，无需升版
+
 ## [0.2.0] — 2026-09-04（P6 接口重构）
 
 依据 issue #1「融合索引接口重新设计」重构库的对外接口层，引入门面层。

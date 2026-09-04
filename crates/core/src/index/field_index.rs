@@ -38,6 +38,22 @@
 //!
 //! 保护对象是 **terms + numbers 的合计键数**，避免出现"terms 受保护但
 //! numbers 爆炸"的缝（评审 P2-4）。
+//!
+//! ## ⚠️ 已知短板：高基数 Range 过滤会整体退化
+//!
+//! **毫秒时间戳、雪花 ID 这类字段正是最常见的真实过滤场景**（"最近 7 天"、
+//! "某个时间窗内的日志"），但它们的基数天然超过任何合理上限，于是：
+//!
+//! - 该字段**永久降级**（`degraded` 粘滞，见 `FieldValues` 的字段文档）
+//! - 该字段上的**所有**过滤（含 Range）退回 O(N) 全扫
+//! - 即 **Q-I1 的优化对这类场景收益为 0**——本模块要治的病，恰好没治到
+//!
+//! 撞线比直觉更快：数值字段**同时**登记 terms 键与 numbers 键、两者合计计入限额，
+//! 所以毫秒时间戳约 **512 篇**文档就降级（不是 1024）。
+//!
+//! 缓解手段是调高上限（见 [`crate::index::Index::with_max_values_per_field`]），代价是内存随基数线性增长。
+//! 真正的解法（prefilter / 排序列）属 V2.1 议题，**讨论时应以高基数 Range 为第一用例**，
+//! 而不是泛泛的 tag 等值过滤；S1-10 的 bench 需补「降级字段 Range 过滤」档位量化该退化。
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
@@ -57,6 +73,11 @@ pub const DEFAULT_MAX_VALUES_PER_FIELD: usize = 1024;
 /// 用 [`f64::total_cmp`] 而非位模式变换：语义与 `total_cmp` 完全一致，
 /// 且不必手写「正数翻符号位 / 负数全翻」的位技巧，可读性更好。
 /// （设计文档写的是位模式，实现改用等价且更安全的 `total_cmp`。）
+///
+/// ⚠️ 注意 [`PartialEq`] 用 `==` 而 [`Ord`] 用 `total_cmp`，二者**仅在 NaN 上不一致**
+/// （`NaN != NaN`，但 `total_cmp` 给它一个确定的全序位）。这不是疏漏：
+/// `serde_json::Number` 不接受 NaN / Infinity（解析与构造都会拒绝），所以键里不可能
+/// 出现 NaN，该不一致**不可达**；而 `==` 的语义必须与 `value.as_f64()` 的等值判断对齐。
 #[derive(Debug, Clone, Copy)]
 struct NumKey(f64);
 
@@ -89,7 +110,14 @@ struct FieldValues {
     numbers: BTreeMap<NumKey, DocBits>,
     /// `terms` 与 `numbers` 的**合计**键数（基数保护判据）
     value_count: usize,
-    /// 已达基数上限：新 value 键不再登记，求值退化为全表扫描
+    /// 已达基数上限：新 value 键不再登记，求值退化为全表扫描。
+    ///
+    /// ⚠️ **粘滞是有意设计，不要当成 bug 修掉**：降级之后被跳过的值**不在索引里**，
+    /// 即使后来删除操作把 `value_count` 扣回阈值以下，复位本标记也会让求值器
+    /// 拿到一张「看起来完整、实际漏键」的位图——那是**假阴性**，比慢严重得多。
+    ///
+    /// save/load 后本标记会归零（字段索引不入快照，`import` 用 `rebuild` 完整重灌），
+    /// 这与粘滞**并不矛盾**：rebuild 时数据是全量的，不存在「被跳过的窗口」。
     degraded: bool,
 }
 
