@@ -18,7 +18,7 @@ pub const MAGIC: &[u8; 4] = b"IDX1";
 /// 当前格式版本（base）。
 ///
 /// **P6 / I-08**：1 → 2（快照新增 `ConfigFingerprint` section，p6-design 8.3）。
-/// 实际写入/读取的版本号用 [`effective_version`]（positions 时 base+1），
+/// 实际写入/读取的版本号用 `effective_version()`（positions 时 base+1），
 /// 使 `positions` 快照与非 positions 快照**互斥**（否则两者版本号相同但
 /// `Posting` 布局不同，仅靠 CRC 兜底——这是 I-09 修掉的现存隐患）。
 pub const FORMAT_VERSION: u32 = 2;

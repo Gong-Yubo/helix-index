@@ -251,9 +251,7 @@ impl SearchIndex {
     /// （检索时回捞会跳过墓碑 chunk，见 `search_parts`）。若之后 `save`，
     /// `raw_vectors` 中对应的旧向量条目会被下次 flush/重建丢弃。
     pub fn remove(&mut self, doc_id: DocId) -> Result<()> {
-        self.inner
-            .index
-            .remove(doc_id, self.cfg.analyzer.as_ref())
+        self.inner.index.remove(doc_id, self.cfg.analyzer.as_ref())
     }
 
     /// 落盘快照（**隐含 commit**，p6-design 6.2：不允许带未刷缓冲落盘）。
@@ -261,12 +259,8 @@ impl SearchIndex {
     /// 快照写入当前装配的配置指纹（p6-design 8.2），供 `load` 校验。
     pub fn save(&mut self, path: &std::path::Path) -> Result<()> {
         self.commit()?;
-        let vectors: Vec<(ChunkId, Vec<f32>)> = self
-            .inner
-            .raw_vectors
-            .as_deref()
-            .unwrap_or(&[])
-            .to_vec();
+        let vectors: Vec<(ChunkId, Vec<f32>)> =
+            self.inner.raw_vectors.as_deref().unwrap_or(&[]).to_vec();
         crate::storage::save(path, &self.inner.index, &vectors, &self.cfg.fingerprint())
     }
 
@@ -303,8 +297,7 @@ impl SearchIndex {
         // 装配有无 embedder 都是正确的（纯 BM25 检索不碰向量），故不校验。
         // 这使 CLI `search --index` 能加载 build 产出的两种快照（含向量 / 纯 BM25）。
         let embedder_ok = fingerprint.embedder_id.is_empty()
-            || (fingerprint.embedder_id == actual.embedder_id
-                && fingerprint.dim == actual.dim);
+            || (fingerprint.embedder_id == actual.embedder_id && fingerprint.dim == actual.dim);
         if !(analyzer_ok && chunker_ok && embedder_ok) {
             return Err(Error::ConfigMismatch {
                 expected: fingerprint.to_string(),

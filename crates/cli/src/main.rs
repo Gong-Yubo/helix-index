@@ -333,10 +333,7 @@ fn search(args: SearchArgs) -> Result<()> {
     };
 
     // 检索（builder 承载 mode / top_n / filter）
-    let mut req = searcher
-        .search_with(&args.query)
-        .mode(mode)
-        .top_n(args.k);
+    let mut req = searcher.search_with(&args.query).mode(mode).top_n(args.k);
     if let Some(f) = filter.as_ref() {
         req = req.filter(f);
     }
@@ -354,11 +351,32 @@ fn compare(args: CompareArgs) -> Result<()> {
 
     println!("查询: {}\n", args.query);
     println!("=== BM25 ===");
-    print_hits(&searcher.search_with(&args.query).mode(SearchMode::Bm25).top_n(args.k).exec()?.hits);
+    print_hits(
+        &searcher
+            .search_with(&args.query)
+            .mode(SearchMode::Bm25)
+            .top_n(args.k)
+            .exec()?
+            .hits,
+    );
     println!("\n=== Vector ===");
-    print_hits(&searcher.search_with(&args.query).mode(SearchMode::Vector).top_n(args.k).exec()?.hits);
+    print_hits(
+        &searcher
+            .search_with(&args.query)
+            .mode(SearchMode::Vector)
+            .top_n(args.k)
+            .exec()?
+            .hits,
+    );
     println!("\n=== Hybrid (RRF) ===");
-    print_hits(&searcher.search_with(&args.query).mode(SearchMode::Hybrid).top_n(args.k).exec()?.hits);
+    print_hits(
+        &searcher
+            .search_with(&args.query)
+            .mode(SearchMode::Hybrid)
+            .top_n(args.k)
+            .exec()?
+            .hits,
+    );
     Ok(())
 }
 
