@@ -4,7 +4,7 @@
 //!   cargo run -p helix-core --example search_basic
 //!
 //! 演示内核对外的最小闭环：`Index` + `Analyzer` + `Chunker` 建索引，
-//! `LocalEmbedder` + `HnswRsIndex` 建向量侧，`Searcher` 编排 hybrid 检索，
+//! `LocalEmbedder` + `HnswRsIndex` 建向量侧，`QueryExecutor` 编排 hybrid 检索，
 //! 最终用 `Hit::to_context_block()` 产出可直接拼进 prompt 的上下文块。
 
 use helix_core::analyze::MixedAnalyzer;
@@ -13,7 +13,7 @@ use helix_core::document::{content_hash, Document};
 use helix_core::embed::{Embedder, LocalEmbedder};
 use helix_core::fusion::RrfFusion;
 use helix_core::index::Index;
-use helix_core::query::{SearchMode, Searcher};
+use helix_core::query::{QueryExecutor, SearchMode};
 use helix_core::vector::{HnswRsIndex, NormalizedVector, VectorIndex};
 
 fn main() -> anyhow::Result<()> {
@@ -61,7 +61,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     // ---- 3. hybrid 检索（RRF 融合，默认 k=60 / 权重 1:1.5）----
-    let searcher = Searcher::new(&index, &analyzer)
+    let searcher = QueryExecutor::new(&index, &analyzer)
         .with_vector(&embedder, &hnsw)
         .with_fusion(Box::new(RrfFusion::default()));
     let resp = searcher.search("如何加快检索速度", SearchMode::Hybrid, 3)?;

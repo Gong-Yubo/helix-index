@@ -19,7 +19,7 @@ use helix_core::chunk::Chunker;
 use helix_core::document::{content_hash, Document};
 use helix_core::embed::{Embedder, LocalEmbedder};
 use helix_core::index::Index;
-use helix_core::query::{EmptyReason, Hit, SearchMode, SearchResponse, Searcher};
+use helix_core::query::{EmptyReason, Hit, QueryExecutor, SearchMode, SearchResponse};
 use helix_core::schema::Filter;
 use helix_core::storage;
 use helix_core::types::ChunkId;
@@ -311,7 +311,7 @@ fn search(args: SearchArgs) -> Result<()> {
     // 文档向量优先用快照里的（build 时已 embed），--input 时现场 embed。
     let embedder;
     let vi;
-    let mut searcher = Searcher::new(&index, &analyzer);
+    let mut searcher = QueryExecutor::new(&index, &analyzer);
     if mode != SearchMode::Bm25 {
         embedder = LocalEmbedder::new()?;
         let vectors = if !snapshot_vectors.is_empty() {
@@ -333,7 +333,7 @@ fn compare(args: CompareArgs) -> Result<()> {
     let embedder = LocalEmbedder::new()?;
     let vectors = embed_chunks(&index, &embedder)?;
     let vi = rebuild_vector_index(&vectors)?;
-    let searcher = Searcher::new(&index, &analyzer).with_vector(&embedder, &vi);
+    let searcher = QueryExecutor::new(&index, &analyzer).with_vector(&embedder, &vi);
 
     println!("查询: {}\n", args.query);
     println!("=== BM25 ===");

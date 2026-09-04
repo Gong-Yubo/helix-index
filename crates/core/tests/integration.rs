@@ -10,7 +10,7 @@ use helix_core::document::{content_hash, Document};
 use helix_core::embed::Embedder;
 use helix_core::error::Result;
 use helix_core::index::Index;
-use helix_core::query::{SearchMode, Searcher};
+use helix_core::query::{QueryExecutor, SearchMode};
 use helix_core::storage;
 use helix_core::types::ChunkId;
 use helix_core::vector::{BruteForceIndex, NormalizedVector};
@@ -105,7 +105,7 @@ fn build_vector_index(index: &Index) -> BruteForceIndex {
     BruteForceIndex::from_entries(entries)
 }
 
-fn search_ids(searcher: &Searcher, query: &str, mode: SearchMode) -> Vec<(ChunkId, f32)> {
+fn search_ids(searcher: &QueryExecutor, query: &str, mode: SearchMode) -> Vec<(ChunkId, f32)> {
     searcher
         .search(query, mode, 10)
         .unwrap()
@@ -121,7 +121,7 @@ fn 快照加载后检索结果一致() {
     let (index, analyzer) = build_full_index();
     let vi = build_vector_index(&index);
     let e = FakeEmbedder;
-    let searcher = Searcher::new(&index, &analyzer).with_vector(&e, &vi);
+    let searcher = QueryExecutor::new(&index, &analyzer).with_vector(&e, &vi);
 
     let query = "检索算法";
 
@@ -153,7 +153,7 @@ fn 快照加载后检索结果一致() {
             .collect(),
     );
     let analyzer2 = MixedAnalyzer::new();
-    let searcher2 = Searcher::new(&loaded, &analyzer2).with_vector(&e, &vi2);
+    let searcher2 = QueryExecutor::new(&loaded, &analyzer2).with_vector(&e, &vi2);
 
     // 三模式结果完全一致
     assert_eq!(bm25_before, search_ids(&searcher2, query, SearchMode::Bm25));
@@ -173,11 +173,11 @@ fn 并发检索安全且确定() {
     let (index, analyzer) = build_full_index();
     let vi = build_vector_index(&index);
     let e = FakeEmbedder;
-    let searcher = Arc::new(Searcher::new(&index, &analyzer).with_vector(&e, &vi));
+    let searcher = Arc::new(QueryExecutor::new(&index, &analyzer).with_vector(&e, &vi));
 
     let expected = search_ids(&searcher, "检索", SearchMode::Hybrid);
 
-    // scoped threads：Searcher 借用了栈上的 index/analyzer/e/vi，
+    // scoped threads：QueryExecutor 借用了栈上的 index/analyzer/e/vi，
     // 不能用 thread::spawn（要求 'static），thread::scope 允许借用局部变量
     std::thread::scope(|scope| {
         for _ in 0..8 {

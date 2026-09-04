@@ -30,7 +30,7 @@ use helix_core::chunk::Chunker;
 use helix_core::embed::LocalEmbedder;
 use helix_core::fusion::RrfFusion;
 use helix_core::index::Index;
-use helix_core::query::{SearchMode, Searcher};
+use helix_core::query::{QueryExecutor, SearchMode};
 use helix_core::retriever::Bm25Params;
 use helix_core::storage;
 use helix_core::types::ChunkId;
@@ -516,8 +516,8 @@ fn make_searcher<'a>(
     rrf_k: f32,
     rrf_weights: &[f32],
     mode: SearchMode,
-) -> Result<Searcher<'a>> {
-    let mut s = Searcher::new(&setup.index, setup.analyzer.as_ref()).with_bm25_params(params);
+) -> Result<QueryExecutor<'a>> {
+    let mut s = QueryExecutor::new(&setup.index, setup.analyzer.as_ref()).with_bm25_params(params);
     if mode != SearchMode::Bm25 {
         let e = setup
             .embedder
@@ -540,7 +540,7 @@ fn make_searcher<'a>(
 // ---------------------------------------------------------------------------
 
 fn eval_effect(
-    searcher: &Searcher,
+    searcher: &QueryExecutor,
     judgments: &[Judgment],
     mode: SearchMode,
     k: usize,
@@ -642,7 +642,7 @@ struct LatencyResult {
 }
 
 fn eval_latency(
-    searcher: &Searcher,
+    searcher: &QueryExecutor,
     judgments: &[Judgment],
     mode: SearchMode,
     k: usize,
