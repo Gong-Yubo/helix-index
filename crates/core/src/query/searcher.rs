@@ -40,6 +40,23 @@ pub enum SearchMode {
     Hybrid,
 }
 
+impl SearchMode {
+    /// 从字符串解析检索模式（大小写不敏感）。
+    ///
+    /// 支持 `"bm25"` / `"vector"` / `"hybrid"` 及其变体；
+    /// 未知字符串返回 `Err`（Agent 场景 mode 常来自 LLM 输出，需容错提示）。
+    pub fn parse(s: &str) -> std::result::Result<SearchMode, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "bm25" | "keyword" | "lexical" => Ok(SearchMode::Bm25),
+            "vector" | "semantic" | "embedding" => Ok(SearchMode::Vector),
+            "hybrid" | "fusion" => Ok(SearchMode::Hybrid),
+            other => Err(format!(
+                "未知检索模式: {other:?}（支持 bm25 / vector / hybrid）"
+            )),
+        }
+    }
+}
+
 /// `search_parts` 的全部依赖（借用型）。
 ///
 /// 两个入口（`QueryExecutor` 与门面层 owned `Searcher`）都把自己的状态

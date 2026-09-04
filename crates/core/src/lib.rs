@@ -45,6 +45,7 @@ pub mod query;
 pub mod rerank;
 pub mod retriever;
 pub mod schema;
+pub mod search;
 pub mod storage;
 pub mod types;
 pub mod vector;
@@ -53,6 +54,8 @@ pub mod vector;
 pub mod prelude {
     pub use crate::document::{Chunk, DocRecord, Document};
     pub use crate::error::{Error, Result};
+    pub use crate::query::{EmptyReason, Hit, SearchMode, SearchResponse};
     pub use crate::schema::Filter;
+    pub use crate::search::{SearchIndex, SearchIndexBuilder, Searcher, VectorBackend};
     pub use crate::types::{ChunkId, DocId, Score, TermId};
 }

@@ -258,6 +258,18 @@ impl Index {
         self.forward.doc(doc_id)
     }
 
+    /// 按 content_hash 查存活文档（幂等 upsert 查询，FR-15）。
+    /// 供门面层 `add` 短路查重：命中则直接返回 `deduped`，不重复分块/插入。
+    pub fn doc_id_by_hash(&self, hash: u64) -> Option<DocId> {
+        if hash == 0 {
+            return None;
+        }
+        self.content_hashes
+            .get(&hash)
+            .copied()
+            .filter(|&id| self.forward.doc(id).is_some())
+    }
+
     /// 某分片的 term 数（dl）。已删除分片返回 0（但调用方通常先判活）。
     pub fn chunk_len(&self, chunk_id: ChunkId) -> u32 {
         self.chunk_lens.get(chunk_id as usize).copied().unwrap_or(0)

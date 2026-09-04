@@ -12,6 +12,7 @@ use crate::document::Chunk;
 use crate::types::DocId;
 
 /// 分块器
+#[derive(Debug, Clone, Copy)]
 pub struct Chunker {
     /// 每块的最大字符数（按 char 计）
     chunk_chars: usize,
