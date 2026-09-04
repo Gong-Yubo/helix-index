@@ -3,14 +3,14 @@
 //! 用 `Vec<Option<T>>`，`None` 即墓碑：删除时不移动元素（保持 ID 稳定），
 //! 检索时按 ID O(1) 取回，再判断 `None` 过滤。
 
-use crate::document::{Chunk, Document};
+use crate::document::{Chunk, DocRecord};
 use crate::types::{ChunkId, DocId};
 
 /// 正排存储：chunk_id / doc_id → 内容与元数据（`None` 表示墓碑位）。
 #[derive(Debug, Default)]
 pub struct ForwardStore {
     chunks: Vec<Option<Chunk>>,
-    docs: Vec<Option<Document>>,
+    docs: Vec<Option<DocRecord>>,
 }
 
 impl ForwardStore {
@@ -20,7 +20,7 @@ impl ForwardStore {
     }
 
     /// 插入文档并返回分配的 DocId。
-    pub fn insert_doc(&mut self, mut doc: Document) -> DocId {
+    pub fn insert_doc(&mut self, mut doc: DocRecord) -> DocId {
         let id = self.docs.len() as DocId;
         doc.doc_id = id;
         self.docs.push(Some(doc));
@@ -41,7 +41,7 @@ impl ForwardStore {
     }
 
     /// 取文档（墓碑位返回 `None`）。
-    pub fn doc(&self, id: DocId) -> Option<&Document> {
+    pub fn doc(&self, id: DocId) -> Option<&DocRecord> {
         self.docs.get(id as usize).and_then(|o| o.as_ref())
     }
 
@@ -88,12 +88,12 @@ impl ForwardStore {
     }
 
     /// 导出快照用的 (docs, chunks)。`Option::None` 即墓碑，原样保留。
-    pub fn export(&self) -> (&[Option<Document>], &[Option<Chunk>]) {
+    pub fn export(&self) -> (&[Option<DocRecord>], &[Option<Chunk>]) {
         (&self.docs, &self.chunks)
     }
 
     /// 从快照恢复。
-    pub fn import(docs: Vec<Option<Document>>, chunks: Vec<Option<Chunk>>) -> Self {
+    pub fn import(docs: Vec<Option<DocRecord>>, chunks: Vec<Option<Chunk>>) -> Self {
         Self { chunks, docs }
     }
 }

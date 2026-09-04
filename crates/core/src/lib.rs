@@ -51,7 +51,7 @@ pub mod vector;
 
 /// 常用类型与错误的统一导入路径
 pub mod prelude {
-    pub use crate::document::{Chunk, Document};
+    pub use crate::document::{Chunk, DocRecord, Document};
     pub use crate::error::{Error, Result};
     pub use crate::schema::Filter;
     pub use crate::types::{ChunkId, DocId, Score, TermId};

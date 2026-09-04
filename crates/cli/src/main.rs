@@ -16,7 +16,7 @@ use clap::{Parser, Subcommand};
 
 use helix_core::analyze::MixedAnalyzer;
 use helix_core::chunk::Chunker;
-use helix_core::document::{content_hash, Document};
+use helix_core::document::{content_hash, DocRecord};
 use helix_core::embed::{Embedder, LocalEmbedder};
 use helix_core::index::Index;
 use helix_core::query::{EmptyReason, Hit, QueryExecutor, SearchMode, SearchResponse};
@@ -178,7 +178,7 @@ pub(crate) fn build_index(
             .with_context(|| format!("第 {} 行缺少 text 字段", lineno + 1))?;
         let metadata = v.get("metadata").cloned().unwrap_or(serde_json::json!({}));
 
-        let doc = Document {
+        let doc = DocRecord {
             doc_id: 0,
             source,
             metadata,

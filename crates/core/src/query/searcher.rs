@@ -346,7 +346,7 @@ mod tests {
     use super::*;
     use crate::analyze::MixedAnalyzer;
     use crate::chunk::Chunker;
-    use crate::document::Document;
+    use crate::document::DocRecord;
     use crate::vector::BruteForceIndex;
 
     /// 确定性假 Embedder：FNV-1a 哈希 → 8 维归一化向量（同一文本恒同一向量）。
@@ -390,7 +390,7 @@ mod tests {
         let chunker = Chunker::default();
         let mut index = Index::new();
         for (i, text) in texts.iter().enumerate() {
-            let doc = Document {
+            let doc = DocRecord {
                 doc_id: 0,
                 source: format!("doc-{i}"),
                 metadata: serde_json::json!({}),

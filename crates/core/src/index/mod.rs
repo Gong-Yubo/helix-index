@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::analyze::{Analyzer, Token};
-use crate::document::{Chunk, Document};
+use crate::document::{Chunk, DocRecord};
 use crate::error::Result;
 use crate::types::{ChunkId, DocId, TermId};
 
@@ -47,7 +47,7 @@ pub struct Index {
 /// `term_dict` **按 TermId 升序**、`content_hashes` **按 hash 升序**导出，
 /// 保证快照字节流确定（NFR-06）且 round-trip 后 TermId / ID 映射稳定。
 ///
-/// ⚠️ `Document.metadata` 是 `serde_json::Value`，其序列化走 `serialize_any`，
+/// ⚠️ `DocRecord.metadata` 是 `serde_json::Value`，其序列化走 `serialize_any`，
 /// **bincode 2 不支持**（非自描述格式）——因此快照里用 `DocumentDto`
 /// 把 metadata 存成 JSON 字符串，导入时再解析回来。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,8 +81,8 @@ pub struct DocumentDto {
     pub content_hash: u64,
 }
 
-impl From<&Document> for DocumentDto {
-    fn from(d: &Document) -> Self {
+impl From<&DocRecord> for DocumentDto {
+    fn from(d: &DocRecord) -> Self {
         Self {
             doc_id: d.doc_id,
             source: d.source.clone(),
@@ -92,7 +92,7 @@ impl From<&Document> for DocumentDto {
     }
 }
 
-impl From<DocumentDto> for Document {
+impl From<DocumentDto> for DocRecord {
     fn from(d: DocumentDto) -> Self {
         Self {
             doc_id: d.doc_id,
@@ -116,7 +116,7 @@ impl Index {
     /// - 每个分片独立分词、独立维护 postings 与统计量
     pub fn add(
         &mut self,
-        doc: Document,
+        doc: DocRecord,
         chunks: Vec<Chunk>,
         analyzer: &dyn Analyzer,
     ) -> Result<(DocId, Vec<ChunkId>)> {
@@ -254,7 +254,7 @@ impl Index {
     }
 
     /// 取文档（墓碑位返回 `None`）。
-    pub fn doc(&self, doc_id: DocId) -> Option<&Document> {
+    pub fn doc(&self, doc_id: DocId) -> Option<&DocRecord> {
         self.forward.doc(doc_id)
     }
 
@@ -299,10 +299,10 @@ impl Index {
     /// 从快照恢复。**不重建向量索引**——向量由 storage 层按原始向量重建（D1）。
     pub fn import(sections: SnapshotSections) -> Self {
         let inverted = InvertedIndex::import(sections.term_dict, sections.postings);
-        let docs: Vec<Option<Document>> = sections
+        let docs: Vec<Option<DocRecord>> = sections
             .docs
             .into_iter()
-            .map(|d| d.map(Document::from))
+            .map(|d| d.map(DocRecord::from))
             .collect();
         let forward = ForwardStore::import(docs, sections.chunks);
         let content_hashes: HashMap<u64, DocId> = sections.content_hashes.into_iter().collect();
@@ -339,8 +339,8 @@ mod tests {
     use crate::chunk::Chunker;
     use crate::document::content_hash;
 
-    fn make_doc(source: &str, text: &str) -> Document {
-        Document {
+    fn make_doc(source: &str, text: &str) -> DocRecord {
+        DocRecord {
             doc_id: 0,
             source: source.to_string(),
             metadata: serde_json::json!({}),

@@ -142,7 +142,7 @@ mod tests {
     use super::*;
     use crate::analyze::MixedAnalyzer;
     use crate::chunk::Chunker;
-    use crate::document::Document;
+    use crate::document::DocRecord;
 
     fn tmp_judgments(name: &str, content: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("idx-bench-test-{}", std::process::id()));
@@ -170,7 +170,7 @@ mod tests {
         for (i, (src, text)) in [("a", "文本一"), ("b", "文本二")].iter().enumerate() {
             index
                 .add(
-                    Document {
+                    DocRecord {
                         doc_id: 0,
                         source: src.to_string(),
                         metadata: serde_json::json!({}),
@@ -222,7 +222,7 @@ mod tests {
         let mut index = Index::new();
         index
             .add(
-                Document {
+                DocRecord {
                     doc_id: 0,
                     source: "real".into(),
                     metadata: serde_json::json!({}),

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use helix_core::analyze::MixedAnalyzer;
 use helix_core::chunk::Chunker;
-use helix_core::document::{content_hash, Document};
+use helix_core::document::{content_hash, DocRecord};
 use helix_core::embed::Embedder;
 use helix_core::error::Result;
 use helix_core::index::Index;
@@ -79,7 +79,7 @@ fn build_full_index() -> (Index, MixedAnalyzer) {
     let chunker = Chunker::default();
     let mut index = Index::new();
     for (source, text) in CORPUS {
-        let doc = Document {
+        let doc = DocRecord {
             doc_id: 0,
             source: source.to_string(),
             metadata: serde_json::json!({}),

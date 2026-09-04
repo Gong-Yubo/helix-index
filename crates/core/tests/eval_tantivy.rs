@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use helix_core::analyze::{Analyzer, MixedAnalyzer};
 use helix_core::bench::{self, Judgment};
 use helix_core::chunk::Chunker;
-use helix_core::document::Document;
+use helix_core::document::DocRecord;
 use helix_core::index::Index;
 use helix_core::retriever::{Bm25Params, Bm25Retriever, Retriever};
 
@@ -83,7 +83,7 @@ fn 自研bm25与tantivy真实语料对照() {
     let chunker = Chunker::new(200_000, 0);
     let mut ours = Index::new();
     for (source, text) in &corpus {
-        let doc = Document {
+        let doc = DocRecord {
             doc_id: 0,
             source: source.clone(),
             metadata: serde_json::json!({"origin": "t2ranking"}),

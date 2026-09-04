@@ -9,7 +9,7 @@
 
 use helix_core::analyze::MixedAnalyzer;
 use helix_core::chunk::Chunker;
-use helix_core::document::{content_hash, Document};
+use helix_core::document::{content_hash, DocRecord};
 use helix_core::embed::{Embedder, LocalEmbedder};
 use helix_core::fusion::RrfFusion;
 use helix_core::index::Index;
@@ -32,7 +32,7 @@ fn main() -> anyhow::Result<()> {
         let v: serde_json::Value = serde_json::from_str(line)?;
         let source = v["source"].as_str().unwrap_or("<unknown>").to_string();
         let text = v["text"].as_str().unwrap().to_string();
-        let doc = Document {
+        let doc = DocRecord {
             doc_id: 0,
             source,
             metadata: v.get("metadata").cloned().unwrap_or(serde_json::json!({})),

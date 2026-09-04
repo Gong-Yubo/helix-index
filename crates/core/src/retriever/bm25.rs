@@ -120,10 +120,10 @@ impl Retriever for Bm25Retriever<'_> {
 mod tests {
     use super::*;
     use crate::analyze::MixedAnalyzer;
-    use crate::document::{Chunk, Document};
+    use crate::document::{Chunk, DocRecord};
 
-    fn doc(source: &str, _text: &str) -> Document {
-        Document {
+    fn doc(source: &str, _text: &str) -> DocRecord {
+        DocRecord {
             doc_id: 0,
             source: source.to_string(),
             metadata: serde_json::json!({}),

@@ -67,7 +67,7 @@ fn bm25_排序对照_tantivy() {
     // ---- 我们这边：建索引 ----
     let mut ours = Index::new();
     for (i, text) in CORPUS.iter().enumerate() {
-        let doc = helix_core::document::Document {
+        let doc = helix_core::document::DocRecord {
             doc_id: 0,
             source: format!("doc-{i}"),
             metadata: serde_json::json!({}),

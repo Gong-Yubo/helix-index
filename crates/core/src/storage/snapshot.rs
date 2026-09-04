@@ -78,13 +78,13 @@ pub fn load(path: &Path) -> Result<LoadedSnapshot> {
 mod tests {
     use super::*;
     use crate::analyze::MixedAnalyzer;
-    use crate::document::{Chunk, Document};
+    use crate::document::{Chunk, DocRecord};
 
     fn build_index() -> Index {
         let analyzer = MixedAnalyzer::new();
         let mut index = Index::new();
         for (i, text) in ["BM25 检索算法", "向量检索"].iter().enumerate() {
-            let doc = Document {
+            let doc = DocRecord {
                 doc_id: 0,
                 source: format!("doc-{i}"),
                 metadata: serde_json::json!({"tag": "rust"}),

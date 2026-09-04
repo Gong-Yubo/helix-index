@@ -60,7 +60,7 @@ mod tests {
     #![allow(non_snake_case)]
     use super::*;
     use crate::analyze::MixedAnalyzer;
-    use crate::document::{Chunk, Document};
+    use crate::document::{Chunk, DocRecord};
 
     fn build_index_with_metadata() -> Index {
         let analyzer = MixedAnalyzer::new();
@@ -73,7 +73,7 @@ mod tests {
         .iter()
         .enumerate()
         {
-            let doc = Document {
+            let doc = DocRecord {
                 doc_id: 0,
                 source: format!("doc-{i}"),
                 metadata: serde_json::json!({"tag": tag, "year": year}),
