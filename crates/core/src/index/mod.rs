@@ -45,6 +45,8 @@ pub struct Index {
     /// 字段索引：field → value → doc 位图（过滤下推，FR-27）
     ///
     /// **不入快照**：可由 `docs` 的 metadata 全量重建，因此 `FORMAT_VERSION` 无需升版。
+    /// 副作用是**基数阈值也不随快照持久化**——`import` 会用默认阈值重建（见
+    /// [`Index::with_max_values_per_field`]）。
     field_index: FieldIndex,
 }
 
@@ -113,6 +115,27 @@ impl Index {
     /// 创建空索引。
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 用**自定义字段索引基数上限**创建空索引（默认 [`DEFAULT_MAX_VALUES_PER_FIELD`]）。
+    ///
+    /// # 为什么需要这个入口
+    ///
+    /// 单字段的不同取值超过上限即**永久降级**（`FieldIndex` 的 `degraded` 粘滞），
+    /// 该字段上的所有过滤退回 O(N) 全扫。默认 1024 覆盖 tag / 类别 / 状态这类维度，
+    /// 但**高基数字段正是最常见的真实过滤场景**——毫秒时间戳、uuid、trace_id 都会
+    /// 立刻撞线，于是 Q-I1 的优化对它们整体失效。
+    ///
+    /// 若业务确需在此类字段上做 Range / Eq 过滤，可用本入口调高上限；代价是
+    /// 「每个 value 一张 doc 位图」的内存随基数线性增长（记入 NFR-05）。
+    ///
+    /// ⚠️ 阈值**不随快照持久化**：字段索引不入快照，`import` 一律用默认阈值重建。
+    /// 需要自定义阈值时必须在装载后重新摄入，或接受导入后的默认行为。
+    pub fn with_max_values_per_field(max_values_per_field: usize) -> Self {
+        Self {
+            field_index: FieldIndex::with_max_values(max_values_per_field),
+            ..Default::default()
+        }
     }
 
     /// 摄入一个文档及其分片，返回 `(doc_id, chunk_ids)`。
