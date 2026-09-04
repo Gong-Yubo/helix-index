@@ -256,7 +256,22 @@ fn build(args: BuildArgs) -> Result<()> {
         Vec::new()
     };
 
-    storage::save(&out, &index, &vectors)?;
+    // 配置指纹（I-10 迁移到门面层 save 后由 Config 自动生成；此处临时构造）
+    let fingerprint = helix_core::storage::ConfigFingerprint {
+        analyzer_id: "mixed".to_string(),
+        embedder_id: if vectors.is_empty() {
+            String::new()
+        } else {
+            "bge-small-zh-v1.5".to_string()
+        },
+        dim: if vectors.is_empty() { 0 } else { 512 },
+        chunker: if args.single_chunk {
+            (200_000, 0)
+        } else {
+            (512, 64)
+        },
+    };
+    storage::save(&out, &index, &vectors, &fingerprint)?;
     println!(
         "  快照已写入 {}（{}，{}）耗时 {:?}",
         out.display(),
@@ -295,7 +310,7 @@ fn search(args: SearchArgs) -> Result<()> {
     let (index, analyzer, snapshot_vectors) = match (&args.index, &args.input) {
         (Some(idx_path), None) => {
             let t = std::time::Instant::now();
-            let (index, vectors) = storage::load(idx_path)
+            let (index, vectors, _fp) = storage::load(idx_path)
                 .with_context(|| format!("加载快照失败: {}", idx_path.display()))?;
             eprintln!("[快照加载 {} 耗时 {:?}]", idx_path.display(), t.elapsed());
             (index, MixedAnalyzer::new(), vectors)

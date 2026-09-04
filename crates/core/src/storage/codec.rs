@@ -15,11 +15,13 @@ use crate::error::{Error, Result};
 /// 魔数。变更即视为不兼容格式。
 pub const MAGIC: &[u8; 4] = b"IDX1";
 
-/// 当前格式版本。
+/// 当前格式版本（base）。
 ///
-/// 注意：`positions` feature 会改变 `Posting` 的序列化布局，
-/// 该 feature 的开关必须在版本号上体现（这里约定：positions 开启时版本 +1 写入）。
-pub const FORMAT_VERSION: u32 = 1;
+/// **P6 / I-08**：1 → 2（快照新增 `ConfigFingerprint` section，p6-design 8.3）。
+/// ⚠️ 与 `positions` feature 的交互：`positions` 会改变 `Posting` 布局，
+/// 该 feature 的开关必须体现在版本号上——用 [`effective_version`] 在 base 上 +1
+/// （base=2 / positions=3，见 I-09）。
+pub const FORMAT_VERSION: u32 = 2;
 
 pub const HEADER_LEN: usize = 12;
 

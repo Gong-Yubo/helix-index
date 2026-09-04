@@ -35,4 +35,12 @@ pub trait Embedder: Send + Sync {
     fn is_normalized(&self) -> bool {
         false
     }
+
+    /// 模型身份标识（配置指纹用，p6-design 8.2）。
+    ///
+    /// 默认 `"custom"`；`LocalEmbedder` 显式返回 `"bge-small-zh-v1.5"`。
+    /// 快照 load 时用它校验"当前装配的模型 == 建库时模型"（R2 / 维度一致性）。
+    fn id(&self) -> &'static str {
+        "custom"
+    }
 }

@@ -53,6 +53,11 @@ impl Embedder for CachedEmbedder {
     fn is_normalized(&self) -> bool {
         self.inner.is_normalized()
     }
+
+    fn id(&self) -> &'static str {
+        // 装饰器透传底层模型身份（缓存不影响模型）
+        self.inner.id()
+    }
 }
 
 #[cfg(test)]

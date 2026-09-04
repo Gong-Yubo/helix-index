@@ -82,6 +82,10 @@ impl Embedder for LocalEmbedder {
     fn is_normalized(&self) -> bool {
         true
     }
+
+    fn id(&self) -> &'static str {
+        "bge-small-zh-v1.5"
+    }
 }
 
 #[cfg(test)]

@@ -22,13 +22,57 @@ pub struct Snapshot {
     /// 原始向量（可选 section：纯 BM25 索引为空）。
     /// 加载后由调用方重建向量索引（D1：存原始数据，不序列化 HNSW 图）。
     pub vectors: Vec<(ChunkId, Vec<f32>)>,
+    /// 配置指纹（FORMAT_VERSION 2 新增，p6-design 8.2）：记录建库时的
+    /// analyzer / embedder / 维度 / chunker，load 时校验装配一致性（修 B1/B2）。
+    pub fingerprint: ConfigFingerprint,
+}
+
+/// 快照记录的配置指纹（p6-design 8.2）。
+///
+/// load 时与"当前装配"比对，不一致报 [`Error::ConfigMismatch`]——
+/// 这是修 B1（`search --index` 写死 `MixedAnalyzer`，charabia 建库会静默换分词器）
+/// 的根本手段：让"用错分词器"从静默降级变成显式报错。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigFingerprint {
+    /// 分词器身份（`Analyzer::id`，如 "mixed" / "charabia"）
+    pub analyzer_id: String,
+    /// 模型身份（`Embedder::id`，如 "bge-small-zh-v1.5"；空串 = 纯 BM25）
+    pub embedder_id: String,
+    /// 向量维度（纯 BM25 为 0）
+    pub dim: u32,
+    /// 分块参数 (chunk_chars, overlap_chars)
+    pub chunker: (usize, usize),
+}
+
+impl std::fmt::Display for ConfigFingerprint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "analyzer={}, embedder={}, dim={}, chunker={}/{}",
+            self.analyzer_id,
+            if self.embedder_id.is_empty() {
+                "<none>"
+            } else {
+                &self.embedder_id
+            },
+            self.dim,
+            self.chunker.0,
+            self.chunker.1
+        )
+    }
 }
 
 /// 保存索引（含可选向量）到 `path`。
-pub fn save(path: &Path, index: &Index, vectors: &[(ChunkId, Vec<f32>)]) -> Result<()> {
+pub fn save(
+    path: &Path,
+    index: &Index,
+    vectors: &[(ChunkId, Vec<f32>)],
+    fingerprint: &ConfigFingerprint,
+) -> Result<()> {
     let snapshot = Snapshot {
         sections: index.export(),
         vectors: vectors.to_vec(),
+        fingerprint: fingerprint.clone(),
     };
 
     let body = bincode::serde::encode_to_vec(&snapshot, bincode::config::standard())
@@ -46,10 +90,10 @@ pub fn save(path: &Path, index: &Index, vectors: &[(ChunkId, Vec<f32>)]) -> Resu
     Ok(())
 }
 
-/// 加载结果：索引 + 原始向量（调用方据此重建向量索引）。
-pub type LoadedSnapshot = (Index, Vec<(ChunkId, Vec<f32>)>);
+/// 加载结果：索引 + 原始向量 + 配置指纹（调用方据此重建向量索引 + 校验装配）。
+pub type LoadedSnapshot = (Index, Vec<(ChunkId, Vec<f32>)>, ConfigFingerprint);
 
-/// 从 `path` 加载，返回 `(索引, 原始向量)`。向量索引由调用方重建。
+/// 从 `path` 加载，返回 `(索引, 原始向量, 配置指纹)`。向量索引由调用方重建。
 pub fn load(path: &Path) -> Result<LoadedSnapshot> {
     let file = File::open(path).map_err(Error::Io)?;
     let mut r = BufReader::new(file);
@@ -71,7 +115,11 @@ pub fn load(path: &Path) -> Result<LoadedSnapshot> {
         .map_err(Error::Decode)
         .map(|(s, _)| s)?;
 
-    Ok((Index::import(snapshot.sections), snapshot.vectors))
+    Ok((
+        Index::import(snapshot.sections),
+        snapshot.vectors,
+        snapshot.fingerprint,
+    ))
 }
 
 #[cfg(test)]
@@ -103,6 +151,15 @@ mod tests {
         index
     }
 
+    fn fingerprint() -> ConfigFingerprint {
+        ConfigFingerprint {
+            analyzer_id: "mixed".to_string(),
+            embedder_id: String::new(),
+            dim: 0,
+            chunker: (512, 64),
+        }
+    }
+
     #[test]
     fn 快照roundtrip() {
         let dir = tempfile::tempdir().unwrap();
@@ -110,9 +167,9 @@ mod tests {
 
         let index = build_index();
         let vectors = vec![(0u32, vec![1.0, 0.0]), (1u32, vec![0.0, 1.0])];
-        save(&path, &index, &vectors).unwrap();
+        save(&path, &index, &vectors, &fingerprint()).unwrap();
 
-        let (loaded, lv) = load(&path).unwrap();
+        let (loaded, lv, _fp) = load(&path).unwrap();
         assert_eq!(loaded.num_chunks(), index.num_chunks());
         assert_eq!(loaded.total_len(), index.total_len());
         assert_eq!(lv, vectors);
@@ -129,8 +186,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("empty.idx");
         let index = build_index();
-        save(&path, &index, &[]).unwrap();
-        let (_, lv) = load(&path).unwrap();
+        save(&path, &index, &[], &fingerprint()).unwrap();
+        let (_, lv, _fp) = load(&path).unwrap();
         assert!(lv.is_empty());
     }
 
@@ -139,7 +196,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("corrupt.idx");
         let index = build_index();
-        save(&path, &index, &[]).unwrap();
+        save(&path, &index, &[], &fingerprint()).unwrap();
 
         // 篡改正文一个字节（header 12 字节之后）
         let mut bytes = std::fs::read(&path).unwrap();
@@ -155,7 +212,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("trunc.idx");
         let index = build_index();
-        save(&path, &index, &[]).unwrap();
+        save(&path, &index, &[], &fingerprint()).unwrap();
 
         let bytes = std::fs::read(&path).unwrap();
         // 只保留 header —— 解码失败或 CRC 失败，总之必须报错

@@ -140,9 +140,15 @@ fn 快照加载后检索结果一致() {
         .live_chunks()
         .map(|c| (c.chunk_id, fake_vec(&c.text)))
         .collect();
-    storage::save(&path, &index, &vectors).unwrap();
+    let fingerprint = helix_core::storage::ConfigFingerprint {
+        analyzer_id: "mixed".to_string(),
+        embedder_id: "fake".to_string(),
+        dim: 16,
+        chunker: (512, 64),
+    };
+    storage::save(&path, &index, &vectors, &fingerprint).unwrap();
 
-    let (loaded, lv) = storage::load(&path).unwrap();
+    let (loaded, lv, _fp) = storage::load(&path).unwrap();
     assert_eq!(lv.len(), vectors.len(), "向量应随快照保存");
 
     // 加载后：重建向量索引（D1：存原始数据，加载重建）。

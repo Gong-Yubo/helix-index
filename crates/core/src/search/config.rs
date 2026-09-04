@@ -16,6 +16,7 @@ use std::sync::Arc;
 use crate::analyze::{Analyzer, MixedAnalyzer};
 use crate::chunk::Chunker;
 use crate::embed::Embedder;
+use crate::error::Result;
 use crate::fusion::{FusionStrategy, RrfFusion};
 use crate::rerank::{NoOpReranker, Reranker};
 use crate::retriever::Bm25Params;
@@ -46,6 +47,22 @@ pub struct Config {
     pub bm25_params: Bm25Params,
     /// 写缓冲批量 embed 阈值
     pub batch_size: usize,
+}
+
+impl Config {
+    /// 生成配置指纹（p6-design 8.2）：快照记录 + load 校验用。
+    pub fn fingerprint(&self) -> crate::storage::ConfigFingerprint {
+        crate::storage::ConfigFingerprint {
+            analyzer_id: self.analyzer.id().to_string(),
+            embedder_id: self
+                .embedder
+                .as_ref()
+                .map(|e| e.id().to_string())
+                .unwrap_or_default(),
+            dim: self.embedder.as_ref().map(|e| e.dim() as u32).unwrap_or(0),
+            chunker: (self.chunker.chunk_chars(), self.chunker.overlap_chars()),
+        }
+    }
 }
 
 /// 向量后端选择（逃生舱：诊断用 brute 精确对照，p6-design 7.3）。
@@ -142,6 +159,17 @@ impl SearchIndexBuilder {
         let cfg = self.build_config();
         let backend = self.backend();
         crate::search::SearchIndex::from_config(cfg, backend)
+    }
+
+    /// 按**当前装配**从快照加载（p6-design 8.2 的"标准姿势"）。
+    ///
+    /// 加载非默认快照（如 charabia 建库）时，先
+    /// `builder().analyzer(..).embedder(..).chunker(..)` 装配好再调用本方法；
+    /// 装配与快照指纹不一致时报 `ConfigMismatch`（绝不静默换分词器）。
+    pub fn load(self, path: &std::path::Path) -> Result<crate::search::SearchIndex> {
+        let cfg = self.build_config();
+        let backend = self.backend();
+        crate::search::SearchIndex::load_with(cfg, backend, path)
     }
 
     /// 用默认值 + 覆盖项组装出一个 `Config`。

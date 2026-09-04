@@ -50,6 +50,13 @@ pub trait Analyzer: Send + Sync {
     fn analyze_query(&self, text: &str) -> Vec<Token> {
         self.analyze_doc(text)
     }
+    /// 分析器身份标识（配置指纹用，p6-design 8.2）。
+    ///
+    /// 默认 `"custom"`；`MixedAnalyzer` / `CharabiaAnalyzer` 显式覆盖。
+    /// 快照 load 时用它校验"当前装配的分词器 == 建库时分词器"（R4）。
+    fn id(&self) -> &'static str {
+        "custom"
+    }
 }
 
 /// 中英混合分析器：NFKC 归一化 → 中英分段 → 中文 jieba / 拉丁切词 → 过滤链。
@@ -128,6 +135,10 @@ impl Analyzer for MixedAnalyzer {
         self.analyze(text)
     }
     // analyze_query 走默认实现，与 analyze_doc 完全一致。
+
+    fn id(&self) -> &'static str {
+        "mixed"
+    }
 }
 
 #[cfg(test)]

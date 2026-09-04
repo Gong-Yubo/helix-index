@@ -14,4 +14,4 @@ mod codec;
 mod snapshot;
 
 pub use codec::{FORMAT_VERSION, MAGIC};
-pub use snapshot::{load, save};
+pub use snapshot::{load, save, ConfigFingerprint};

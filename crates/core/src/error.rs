@@ -62,6 +62,15 @@ pub enum Error {
     /// 调用方传入的参数不合法（如 judgments 格式错误、权重数量不对）
     #[error("非法输入: {0}")]
     InvalidInput(String),
+
+    /// 快照加载时装配与建库时不一致（p6-design 8.2，修 B1/B2）
+    #[error("配置不匹配: 快照期望 {expected}，当前装配 {actual}")]
+    ConfigMismatch {
+        /// 快照记录的配置指纹（建库时）
+        expected: String,
+        /// 当前装配的配置指纹
+        actual: String,
+    },
 }
 
 /// 统一结果类型

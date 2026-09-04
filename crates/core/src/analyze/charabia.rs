@@ -78,6 +78,10 @@ impl Analyzer for CharabiaAnalyzer {
         }
         tokens
     }
+
+    fn id(&self) -> &'static str {
+        "charabia"
+    }
 }
 
 fn is_cjk(s: &str) -> bool {

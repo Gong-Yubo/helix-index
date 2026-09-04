@@ -24,4 +24,8 @@ impl Embedder for RemoteEmbedder {
     fn embed_query(&self, _text: &str) -> Result<Vec<f32>> {
         Err(Error::NoEmbedder)
     }
+
+    fn id(&self) -> &'static str {
+        "remote"
+    }
 }

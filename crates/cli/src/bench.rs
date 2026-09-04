@@ -401,7 +401,7 @@ fn load_setup(args: &BenchArgs, need_vector: bool) -> Result<Setup> {
     let (index, vectors, analyzer) = match (&args.index, &args.input) {
         (Some(path), None) => {
             let t = Instant::now();
-            let (index, vectors) =
+            let (index, vectors, _fp) =
                 storage::load(path).with_context(|| format!("加载快照失败: {}", path.display()))?;
             println!("[快照加载 耗时 {:?}（NFR-04 口径之一）]", t.elapsed());
             // 快照不携带 analyzer 信息，--index 路径只能用自研链；

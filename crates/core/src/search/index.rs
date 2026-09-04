@@ -226,6 +226,8 @@ impl SearchIndex {
     }
 
     /// 落盘快照（**隐含 commit**，p6-design 6.2：不允许带未刷缓冲落盘）。
+    ///
+    /// 快照写入当前装配的配置指纹（p6-design 8.2），供 `load` 校验。
     pub fn save(&mut self, path: &std::path::Path) -> Result<()> {
         self.commit()?;
         let vectors: Vec<(ChunkId, Vec<f32>)> = self
@@ -234,23 +236,41 @@ impl SearchIndex {
             .as_deref()
             .unwrap_or(&[])
             .to_vec();
-        crate::storage::save(path, &self.inner.index, &vectors)
+        crate::storage::save(path, &self.inner.index, &vectors, &self.cfg.fingerprint())
     }
 
     /// 从快照加载（默认装配）。
     ///
     /// - 快照存**原始数据 + 原始向量**（D1），加载后重建倒排 + 向量索引
-    /// - 配置指纹校验（I-08）尚未接入：加载时用当前 builder 装配重建
+    /// - **配置指纹校验**（p6-design 8.2 / 修 B1/B2）：快照记录的指纹与当前
+    ///   默认装配不一致时报 [`Error::ConfigMismatch`]，绝不静默换分词器/模型
     /// - 若快照含向量但当前装配无 embedder，向量不重建（纯 BM25）
+    ///
+    /// 加载**非默认装配**的快照（如 charabia）请用
+    /// `SearchIndexBuilder::load(path)`（先按已知配置装配、再 load）。
     pub fn load(path: &std::path::Path) -> Result<Self> {
-        let cfg = SearchIndexBuilder::default().build_config();
-        let backend = SearchIndexBuilder::default().backend();
+        let builder = SearchIndexBuilder::default();
+        let cfg = builder.build_config();
+        let backend = builder.backend();
         Self::load_with(cfg, backend, path)
     }
 
     /// 按给定装配从快照加载（`load` 的实现主体）。
-    fn load_with(cfg: Config, backend: VectorBackend, path: &std::path::Path) -> Result<Self> {
-        let (index, raw_vectors) = crate::storage::load(path)?;
+    pub(crate) fn load_with(
+        cfg: Config,
+        backend: VectorBackend,
+        path: &std::path::Path,
+    ) -> Result<Self> {
+        let (index, raw_vectors, fingerprint) = crate::storage::load(path)?;
+
+        // 配置指纹校验：装配不一致显式报错（修 B1/B2）
+        let actual = cfg.fingerprint();
+        if fingerprint != actual {
+            return Err(Error::ConfigMismatch {
+                expected: fingerprint.to_string(),
+                actual: actual.to_string(),
+            });
+        }
 
         // 重建向量索引（D1：不序列化 HNSW 图，用原始向量重建）
         let vector_index = match (cfg.embedder.as_ref(), raw_vectors.is_empty()) {
@@ -365,7 +385,11 @@ mod tests {
         idx.add("向量检索计算余弦相似度").unwrap();
         idx.save(&path).unwrap();
 
-        let loaded = SearchIndex::load(&path).unwrap();
+        // 纯 BM25 快照：按同装配（embedder=None）load，指纹一致
+        let loaded = SearchIndexBuilder::default()
+            .embedder(None)
+            .load(&path)
+            .unwrap();
         assert_eq!(loaded.num_chunks(), idx.num_chunks());
 
         // 检索能力保留：doc_freq 一致
@@ -382,5 +406,45 @@ mod tests {
         assert_eq!(idx.num_chunks(), 1);
         idx.remove(out.doc_id).unwrap();
         assert_eq!(idx.num_chunks(), 0);
+    }
+
+    #[test]
+    fn 装配不一致load报ConfigMismatch() {
+        use crate::analyze::Analyzer;
+
+        // 用 id 非默认的自定义 analyzer 建库（模拟 charabia 等非默认装配）
+        struct CustomAnalyzer;
+        impl Analyzer for CustomAnalyzer {
+            fn analyze_doc(&self, text: &str) -> Vec<crate::analyze::Token> {
+                crate::analyze::MixedAnalyzer::new().analyze_doc(text)
+            }
+            fn id(&self) -> &'static str {
+                "custom-analyzer"
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mismatch.idx");
+
+        // 用 custom analyzer 建库 + 落盘
+        let mut idx = SearchIndex::from_config(
+            SearchIndexBuilder::default()
+                .embedder(None)
+                .analyzer(Arc::new(CustomAnalyzer))
+                .build_config(),
+            VectorBackend::Brute,
+        );
+        idx.add("BM25 检索算法").unwrap();
+        idx.save(&path).unwrap();
+
+        // 用默认（mixed）装配 load → 必须报 ConfigMismatch（修 B1）
+        let err = match SearchIndex::load(&path) {
+            Ok(_) => panic!("装配不一致应报 ConfigMismatch"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, Error::ConfigMismatch { .. }),
+            "应为 ConfigMismatch，得到 {err:?}"
+        );
     }
 }

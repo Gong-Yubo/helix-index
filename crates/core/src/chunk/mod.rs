@@ -33,6 +33,16 @@ impl Chunker {
         }
     }
 
+    /// 每块最大字符数（配置指纹用，p6-design 8.2）。
+    pub fn chunk_chars(&self) -> usize {
+        self.chunk_chars
+    }
+
+    /// 相邻块重叠字符数（配置指纹用，p6-design 8.2）。
+    pub fn overlap_chars(&self) -> usize {
+        self.overlap_chars
+    }
+
     /// 把一段文本切成若干 `Chunk`。文本过短时退化为单块。
     pub fn chunk(&self, doc_id: DocId, text: &str) -> Vec<Chunk> {
         // 预计算每个 char 下标对应的 byte 偏移，O(1) 转 byte
