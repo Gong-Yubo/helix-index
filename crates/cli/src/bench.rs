@@ -401,19 +401,20 @@ fn load_setup(args: &BenchArgs, need_vector: bool) -> Result<Setup> {
     let (index, vectors, analyzer) = match (&args.index, &args.input) {
         (Some(path), None) => {
             let t = Instant::now();
-            let (index, vectors, _fp) =
+            let (index, vectors, fp) =
                 storage::load(path).with_context(|| format!("加载快照失败: {}", path.display()))?;
             println!("[快照加载 耗时 {:?}（NFR-04 口径之一）]", t.elapsed());
-            // 快照不携带 analyzer 信息，--index 路径只能用自研链；
-            // --analyzer charabia 须走 --input 重建（索引侧也要切换分词器，R4）。
-            if args.analyzer != "mixed" {
-                println!(
-                    "[⚠️ --index 快照路径忽略 --analyzer={}（快照不存分词器；\
-                     charabia 对照请用 --input 重建，保证索引/查询两侧一致）]",
-                    args.analyzer
-                );
+            // P11（B1 的 bench 侧修复，评审 P11）：快照记录的 analyzer 指纹与请求的
+            // --analyzer 必须一致，不一致报 ConfigMismatch——不再"打印警告并回退 mixed"
+            // （回退会让索引/查询两侧分词器不一致，是 R4 正确性事故）。
+            let analyzer = build_analyzer(args)?;
+            if analyzer.id() != fp.analyzer_id {
+                return Err(helix_core::error::Error::ConfigMismatch {
+                    expected: format!("analyzer={}", fp.analyzer_id),
+                    actual: format!("analyzer={}", analyzer.id()),
+                }
+                .into());
             }
-            let analyzer: Box<dyn Analyzer> = Box::new(MixedAnalyzer::new());
             (index, vectors, analyzer)
         }
         (None, Some(path)) => {
