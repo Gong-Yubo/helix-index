@@ -2,14 +2,14 @@
 
 | 项目 | 内容 |
 | --- | --- |
-| 版本 | **v1.0（待评审）** |
-| 日期 | 2026-09-03 |
-| 状态 | ⬜ **待拍板**（决策点 D-I1 ~ D-I6 未决，未动代码） |
+| 版本 | **v1.1（已按评审修订）** |
+| 日期 | 2026-09-04 |
+| 状态 | ⬜ **待拍板**（决策点 D-I1 ~ D-I8 未决，未动代码；已消化评审 P1~P11 + `search` 接口改为仅 query 必选） |
 | 来源 | [issue #1「融合索引接口重新设计」](https://github.com/Gong-Yubo/helix-index/issues/1) |
 | 评审 | [issue #1 评论（方案摘要 + D-I1~D-I7 待拍板）](https://github.com/Gong-Yubo/helix-index/issues/1#issuecomment-5526051968) |
 | 前提 | P0~P5 + v1 收尾全部完成（`v1-finish-design.md` V1-00~V1-16 已落地，CI 9/9 绿） |
 | 上游 | `requirements-spec.md`（FR/NFR 定义源）、`architecture-design.md`（模块边界 4.2、ADR-001~008）、`plan.md` |
-| 定位 | **不改算法、不改评测口径、不改 CLI 参数**，只重构库的**对外接口层**，让 `index.add(doc)` / `searcher.search(query, mode, top_n)` 成为默认路径 |
+| 定位 | **不改算法、不改评测口径、不改 CLI 参数**，只重构库的**对外接口层**，让 `index.add(doc)` / `searcher.search(query)` 成为默认路径 |
 
 > 命名说明：本文件按 `p0~p5-design.md` 的既有约定命名，编号 P6。
 > 但 `plan.md` 当前已把 **P6 定义为「v2：Rerank / MMR / 自研索引」**。
@@ -25,6 +25,11 @@
 > 重构后，接口如下易用：
 > - 索引构建接口：`index.add(doc)`
 > - 检索接口：`searcher.search(query, mode, top_n)`
+
+> **2026-09-04 调整**：经讨论，`searcher.search` 的 **mode 与 top_n 改为可选参数，只有 query 必选**。
+> Rust 无默认参数/函数重载，故以 `search(query)` 单参数（默认值）+ `search_with(query)` builder 实现（见 7.1）。
+> issue 原话的 `search(query, mode, top_n)` 三参数形态，语义上等价于
+> `search_with(query).mode(mode).top_n(top_n).exec()`。
 
 ### 1.2 现状实测：最小闭环要写 79 行、碰 8 个对象
 
@@ -103,8 +108,8 @@
    不再需要 `Searcher<'a>` 去借 4 个外部对象。
 5. **检索侧用 builder 承载可选参数**（LanceDB `.limit().where().rerank()`、
    Meilisearch `.with_query().with_limit()`），主参数保持最简形式。
-   → 对应我们的 `search(query, mode, top_n)`：三个参数都是**必需**的，
-   可选参数（filter / explain / BM25 参数）走 builder。
+   → 对应我们的 `search(query)`：**只有 query 必选**，mode / top_n 走默认值，
+   其余可选参数（filter / explain / BM25 参数）走 builder（见 7.1）。
 
 ### 2.3 三条反模式（本方案明确不采纳）
 
@@ -175,12 +180,12 @@ let searcher = Searcher::new(&index, &analyzer)   // ⑦ 借 4 个对象，无�
 let resp = searcher.search("如何加快检索速度", SearchMode::Hybrid, 3)?;
 ```
 
-**After（目标，15 行）**
+**After（目标，约 12 行）**
 
 ```rust
 use helix_core::prelude::*;
 
-let mut index = SearchIndex::builder().build()?;   // ① 零配置：MixedAnalyzer + 512/64 + bge-small-zh + HNSW + RRF(60, 1:1.5)
+let mut index = SearchIndex::builder().build()?;   // ① 零配置：MixedAnalyzer + bge-small-zh + HNSW + RRF(60, 1:1.5)
 for line in corpus.lines() {
     let v: serde_json::Value = serde_json::from_str(line)?;
     index.add(Document::new(v["text"].as_str().unwrap())
@@ -190,10 +195,20 @@ for line in corpus.lines() {
 index.commit()?;                                   // ② 刷写缓冲（批量 embed）；此后数据可见
 
 let searcher = index.into_searcher();              // ③ 'static / Clone / Send+Sync，可存进 struct
-let resp = searcher.search("如何加快检索速度", SearchMode::Hybrid, 3)?;   // ④ ← issue 目标形态
+let resp = searcher.search("如何加快检索速度")?;    // ④ 只有 query 必选；mode=Hybrid(自动)、top_n=10
 ```
 
-单文档场景（Agent 零散写入）可以更短：
+需要定制 mode / top_n 时走 builder（等价于 issue 原文的三参数）：
+
+```rust
+let resp = searcher
+    .search_with("如何加快检索速度")
+    .mode(SearchMode::Hybrid)   // 也接受 .mode("hybrid")
+    .top_n(3)
+    .exec()?;
+```
+
+单文档场景（Agent 零散写入）更短：
 
 ```rust
 index.add("这是一段要入库的文本")?;   // impl Into<Document> for &str / String
@@ -212,13 +227,13 @@ index.add("这是一段要入库的文本")?;   // impl Into<Document> for &str 
 | `SearchIndex::remove(doc_id)` | 墓碑删除 + 统计量回滚（复用现有 `Index::remove`） |
 | `SearchIndex::commit()` | 刷写缓冲（批量 embed + 灌向量索引）；**此后数据对外可见** |
 | `SearchIndex::into_searcher()` | 交出所有权，产出 `'static` 的 `Searcher` |
-| `SearchIndex::search(q, mode, n)` | 便利法：内部 `commit()` 后直接在当前状态上检索（写完马上查的最常见路径） |
+| `SearchIndex::search(&mut self, q)` | 便利法：内部 `commit()` 后立即检索（写完马上查的路径）；**需 `&mut self`**，只读共享请 `into_searcher()` |
 | `SearchIndex::save(path)` / `SearchIndex::load(path)` | 落盘 / 加载（含配置指纹校验，见第 8 节） |
 | `Searcher`（新） | owned 只读检索器：`'static + Clone + Send + Sync` |
-| `Searcher::search(query, mode, top_n)` | ← issue 目标形态 |
-| `Searcher::search_with(query, mode)` → `SearchRequest` | builder：`.top_n(n)` `.filter(&f)` `.explain(bool)` `.exec()` |
-| `Searcher::into_index()` | 换回写端（零拷贝），继续增量写入 |
-| `document::Document`（重定义） | **输入 DTO**：`{ text, source, metadata, dedup_key }`，无 `doc_id` |
+| `Searcher::search(query)` | ← 主形态：**只有 query 必选**，mode 与 top_n 取默认值（见 7.1） |
+| `Searcher::search_with(query)` → `SearchRequest` | builder 承载可选参数：`.mode(m)` `.top_n(n)` `.filter(&f)` `.explain(b)` `.exec()` |
+| `Searcher::into_index()` | 换回写端（零拷贝，见 6.4 的 P3 修正），继续增量写入 |
+| `document::Document`（重定义） | **输入 DTO**：`{ text, source, metadata, dedup_key }`，无 `doc_id`；`dedup_key` 语义见 6.1 |
 | `document::DocRecord`（新） | 存储记录：原 `Document`（`{ doc_id, source, metadata, content_hash }`，无 text） |
 | `AddOutcome` | `{ doc_id: DocId, chunk_ids: Vec<ChunkId>, deduped: bool }` |
 
@@ -321,9 +336,14 @@ pub struct Searcher {
 ```
 
 `Config` 里 `Arc<dyn Analyzer>` / `Arc<dyn Embedder>` / `Arc<dyn FusionStrategy>` / `Arc<dyn Reranker>`
-——四个 trait 现状均已声明 `Send + Sync`（`Analyzer`、`Embedder`、`FusionStrategy`、`VectorIndex` 已确认），
+（注意：**Reranker 在 `Config`；`VectorIndex` 在 `Inner`，是 `Box<dyn VectorIndex>`**）。
+这六个 trait 现状**全部**已声明 `Send + Sync`（逐一核实），
 因此 `Inner + Config: Send + Sync` → **`Searcher: 'static + Clone + Send + Sync`**，
 可以直接放进 axum 的 `AppState`、可以 `Arc<Searcher>` 分发给 handler、可以 `move` 进 rayon 任务。
+
+> **注意**：`SearchIndex` 本身是 **`!Sync`**（含可变 `pending`，且 `add(&mut self)`）。
+> 它可 `Send`（能整体 move 到别的线程），但**不可跨线程共享**——G3 只覆盖 `Searcher`。
+> 跨线程共享读请用 `Searcher`；跨线程写（FR-17 完整版）留 P7。
 
 ---
 
@@ -333,16 +353,23 @@ pub struct Searcher {
 
 ```
 add(Document)
-  ├─ 1. dedup_key 或 content_hash(text) 查重 → 命中则直接返回 deduped=true（FR-15）
+  ├─ 1. 查重（FR-15）：content_hash = xxh64(dedup_key.unwrap_or(text)) → 命中则直接返回 deduped=true
   ├─ 2. Chunker::chunk(0, &text)      → Vec<Chunk>        （char 计数 / byte 偏移，约定不变）
   ├─ 3. Index::add(DocRecord, chunks, &*analyzer)          （倒排 / 正排 / 统计量，立即完成）
   └─ 4. 每个 chunk 文本 push 进 pending 缓冲
-        └─ pending.len() >= batch_size 时自动 flush（不阻塞，见 6.2）
+        └─ pending.len() >= batch_size 时同步 flush（不新起线程，见 6.2）
 ```
 
 **L2 归一化由 flush 路径内部调用 `NormalizedVector::new` 保证**，用户代码里不再出现这个概念。
 **BGE instruction 前缀仍由 `Embedder::embed_query` 自己加（R2），门面层不加任何前缀**，
 只负责"入库调 `embed_documents`、查询调 `embed_query`"——这个调用契约现在由库保证，不再靠用户自觉。
+
+**`dedup_key` 语义（评审 P6）**：
+- `content_hash = xxh64(dedup_key.unwrap_or(text))`——`dedup_key` 存在时以它为准（而非 text 哈希），
+  是**替代**不是**并存**的第二把键
+- `dedup_key` 持久化进 `DocRecord`，remove→re-add 时从快照原样恢复，幂等判定不变
+- 边界：同一逻辑文档第一次带 key、第二次不带（text 相同）→ hash 不同 → 判为不同文档重复入库。
+  这是**调用方的责任**（同一逻辑文档应始终使用同一 `dedup_key`），`user-guide.md` 写明；库不拦
 
 ### 6.2 写缓冲与批量 embed（NFR-03 的硬约束）
 
@@ -369,58 +396,73 @@ add(Document)
 2. 给"可见性"一个显式动作，比"写完立即可见"更容易推理（尤其在并发/多线程写入时）
 3. 为 6.4 的 delta 分段留出语义空间——将来 `commit()` 就是"刷成一个新 segment"
 
-代价是**多一步**。缓解：`SearchIndex::search(q, mode, n)` 便利法内部自动 `commit()`，
+代价是**多一步**。缓解：`SearchIndex::search(&mut self, q)` 便利法内部自动 `commit()`，
 覆盖"写完马上查"的最常见路径；只在需要长期持有 `Searcher` 时才显式 `into_searcher()`。
 
 ### 6.4 读写关系：本轮用「所有权切换」，FR-17 完整版留到 P7
 
 | 方案 | 形态 | 并发 | 成本 | 采纳 |
 | --- | --- | --- | --- | --- |
-| **A. 所有权切换（typestate）** | `let searcher = index.into_searcher();` … `let index = searcher.into_index();` | 同一时刻独占一端 | **零拷贝、零锁、编译期保证** | ✅ **本轮** |
+| **A. 所有权切换（typestate）** | `let searcher = index.into_searcher();` … `let index = searcher.into_index();` | 同一时刻独占一端 | **零拷贝、零锁、编译期保证**（见下方 P3 修正） | ✅ **本轮** |
 | B. 内部 `RwLock` | `index.searcher()` 借用 | 读写可并发 | 锁竞争 → P99 抖动（NFR-02 风险）；`Inner` 需整体 `Send+Sync` | ❌ 本轮不做 |
 | C. delta 分段（FR-17 正解） | `main: Arc<Segment>` + `delta` 合并查询 | 真·读不阻塞写 | 需跨两棵树合并 BM25（df / avgdl 可加，需实现） | ⬜ P7 |
 
-**为什么 A 够用且正确**：`into_searcher()` 只移动 `Arc<Inner>`，不复制任何数据；
-`SearchIndex` 被消耗后无人能改 `Inner`，因此 `Searcher` 的 `Arc` 语义上是不可变快照（refcount 可 >1 供 `Clone`）。
+**为什么 A 够用且正确**：`into_searcher()` **隐含 flush**（把 `pending` 刷进 `inner`，与 `save()` 隐含
+`commit()` 同构，最不意外；否则未 embed 的 `pending` 去处无从定义——评审 P2），然后只移动 `Arc<Inner>`，
+不复制任何数据。`SearchIndex` 被消耗后，若 `Searcher` 未被 `Clone`，则无人能改 `Inner`，`Searcher` 语义上是不可变快照。
 FR-17 的完整版（真·读不阻塞写）属于**并发能力**，不是**接口易用性**问题，
 且现状本就不支持（B4）——**不应让它阻塞本轮重构**。
 届时从 A 升级到 C，**`into_searcher()` 可以平滑换成 `searcher()`，API 形态不变，第一轮的投入不浪费。**
+
+> **⚠️ P3 修正：「零拷贝」只在无 clone 残留时成立**：`Searcher: Clone`（G3）意味着 `into_searcher()` 之后
+> 用户可能 `clone()` 出多份 reader。此时 `into_index()` 拿回的 `Inner` 的 `Arc` refcount 可能 > 1，
+> 再 `add()` 时 `Arc::make_mut` 会**静默深拷贝整个 `Inner`**（倒排 + 正排 + 统计量 + raw_vectors）。
+> 这**不是正确性 bug**（旧 reader 继续读旧快照、新写入进新 `Inner`，快照隔离语义反而正确），
+> 但"零拷贝"承诺会静默失效。缓解：`add` 内加
+> `debug_assert!(Arc::strong_count(&self.inner) == 1, "Searcher 仍有 clone 残留，本次 add 将触发 Inner 深拷贝")`；
+> 真正的 copy-on-write（结构共享）留 P7 的 delta 分段。
 
 ---
 
 ## 7. 检索路径
 
-### 7.1 三个必需参数 + builder 承载可选参数
+### 7.1 只有 query 必选：mode 与 top_n 走默认值 + builder
 
 ```rust
-// 主形态（issue 要求）：三个必需参数
-let resp = searcher.search("如何加快检索", SearchMode::Hybrid, 10)?;
+// 主形态：只有 query 必选，其余取默认值（mode 由装配自动推断，top_n=10）
+let resp = searcher.search("如何加快检索")?;
 
-// 可选参数走 builder（对齐 LanceDB / Meilisearch）
+// 需要定制时走 builder（对齐 LanceDB / Meilisearch）
 let resp = searcher
-    .search_with("如何加快检索", SearchMode::Hybrid)
+    .search_with("如何加快检索")
+    .mode(SearchMode::Hybrid)            // 也接受 .mode("hybrid")
     .top_n(10)
-    .filter(&Filter::eq("lang", "zh"))     // FR-14
-    .explain(true)                          // FR-13
+    .filter(&Filter::eq("lang", "zh"))   // FR-14
+    .explain(true)                       // FR-13
     .exec()?;
 ```
 
-`search(q, mode, n)` 就是 `search_with(q, mode).top_n(n).exec()` 的语法糖，无第二份逻辑。
+`search(q)` 就是 `search_with(q).exec()` 的语法糖，无第二份逻辑。
+
+**默认值**（I-06 落地时固化）：
+- `top_n` 默认 **10**（单轮 prompt 的合理长度；LanceDB 默认 10、Meilisearch 默认 20，10 是检索结果进 prompt 的常见上限）
+- `mode` 默认**按装配自动推断**：配置了 embedder + 向量索引 → `Hybrid`；否则 → `Lexical`（BM25）。
+  这是"零配置可用"的应有之义，任何时候都可用 builder 覆盖
 
 ### 7.2 `mode` 参数：enum 为主，同时接受字符串
 
-保留 `SearchMode` enum（类型安全、编译期拒绝拼写错误，符合 Rust 惯例），
-但**额外支持字符串**——Agent 场景里 mode 常来自 LLM 输出或配置文件：
+`mode` 移入 builder（不再是 `search` 的位置参数），保留 `SearchMode` enum（类型安全、
+编译期拒绝拼写错误），同时 builder 的 `.mode()` 额外接受字符串——Agent 场景里 mode 常来自 LLM 输出或配置文件：
 
 ```rust
-let resp = searcher.search(q, "hybrid", 10)?;   // impl TryInto<SearchMode>
-let resp = searcher.search(q, SearchMode::Hybrid, 10)?;  // enum，零开销
+let resp = searcher.search_with(q).mode("hybrid").exec()?;             // &str，解析失败 → Error::InvalidInput
+let resp = searcher.search_with(q).mode(SearchMode::Hybrid).exec()?;   // enum，零开销
 ```
 
-签名：`fn search<M: TryInto<SearchMode>>(&self, query: &str, mode: M, top_n: usize) -> Result<SearchResponse>`
-（`M::Error: Display`，解析失败 → `Error::InvalidInput`）。
-**实现前需先验证这个泛型签名能过编译**（I-06 的冒烟项）；若不行，退化为
-`search(q, mode, n)`（enum）+ `search_mode_str(q, "hybrid", n)` 两个方法。
+签名：`fn mode<M: Into<SearchMode>>(self, mode: M) -> Self`，配套 `impl FromStr for SearchMode`
+（或 `TryFrom<&str>`）。字符串解析失败的处理点（`.mode()` 返回 `Self` 无法直接 `?`）
+**是 I-06 的冒烟项**：优先让 `FromStr` 的 `Err` 延迟到 `exec()` 统一返回 `Error::InvalidInput`；
+若不可行，退化方案是 `.mode()` 仅收 enum，字符串走自由函数 `SearchMode::parse("hybrid")?` 再传入。
 
 ### 7.3 逃生舱映射表（证明 G4：现有可调能力一个不丢）
 
@@ -468,8 +510,11 @@ pub struct ConfigFingerprint {
 - `Analyzer` 增加 `fn id(&self) -> &'static str`（**默认实现返回 `"custom"`**，
   不强制所有实现改，但 `MixedAnalyzer` / `CharabiaAnalyzer` 必须显式覆盖）
 - `Embedder` 已隐含模型信息，增加 `fn id(&self) -> &str` 同例
-- `SearchIndex::load(path)` 校验指纹与当前装配的组件是否一致，
-  不一致 → **新增 `Error::ConfigMismatch` 明确报错**，绝不静默
+- `SearchIndex::load(path)` 校验指纹与当前装配的组件是否一致，不一致 →
+  **新增 `Error::ConfigMismatch { expected, actual }` 明确报错**，绝不静默，
+  `Display` **两侧指纹都打印**（否则用户只能盲试"该配什么"——评审 P7）
+- **load 的标准姿势**：先按已知配置 `builder().analyzer(..).embedder(..).chunker(..)` 装配好，再 `load(path)`；
+  `user-guide.md` 写明这一姿势，避免"默认装配必然 mismatch"的困惑
 
 ### 8.3 格式版本
 
@@ -477,8 +522,15 @@ pub struct ConfigFingerprint {
 现状 `codec.rs` 的版本校验是严格相等（`found != FORMAT_VERSION` → `SnapshotVersionMismatch`），
 所以旧快照会被干净地拒绝，不会读到垃圾数据。
 
-⚠️ **与 `positions` feature 的交互**：`codec.rs:20` 约定"positions 开启时版本 +1 写入"。
-base 升到 2 后，positions 应写 3——**这个约定在 I-09 必须同步更新并加注释**，否则两个 feature 会撞版本号。
+⚠️ **与 `positions` feature 的交互（评审 P1：这是"待实现"，不是"更新注释"）**：
+`codec.rs:20-22` 只有一句"positions 开启时版本 +1 写入"的**注释**，`write_header` / `read_header`
+直接读写常量 `FORMAT_VERSION`，全仓库**没有任何** `cfg!(feature = "positions")` 的 +1 逻辑。
+也就是说，**现状**：positions 快照与非 positions 快照版本号相同、但 `Posting` 布局不同
+（`posting.rs:15-16` 有条件字段），仅靠 CRC 兜底互斥——**这是现存隐患，不是本次设计引入的**。
+
+→ **I-09 是"实现任务"而非"改注释"**：引入 `effective_version()`，在 `write_header` / `read_header`
+按 `cfg!(feature = "positions")` 对 base 版本 +1（base=2 / positions=3），
+并补"positions 快照 ↔ 非 positions 快照互拒"测试（`SnapshotVersionMismatch`，不得靠 CRC 兜底）。
 
 **代价（需明确告知）**：现有 `.idx` 快照全部失效，需重建。`data/*.snapshot` 与评测脚本里的
 快照路径要一起更新（I-10 的验收项之一）。
@@ -502,11 +554,11 @@ LanceDB 有 `EmbeddingRegistry` 可以按配置自动重建 embedding 函数。
 | **I-05** | 新增 owned `Searcher` + `SearchRequest` builder + `into_searcher` / `into_index` | I-01, I-03 | 低 |
 | **I-06** | `mode` 支持 `&str`（`TryInto` 泛型签名编译验证） | I-05 | 低（有退化方案） |
 | **I-07** | `remove` / `save` / `load` 接入门面层 | I-04 | 低 |
-| **I-08** | `ConfigFingerprint` + `Analyzer::id` / `Embedder::id` + `Error::ConfigMismatch` | I-07 | 中（升 FORMAT_VERSION） |
-| **I-09** | `codec.rs` 版本约定更新（base 2 / positions 3）+ 快照兼容性测试 | I-08 | 低 |
+| **I-08** | `ConfigFingerprint` + `Analyzer::id` / `Embedder::id` + `Error::ConfigMismatch { expected, actual }` | I-07 | 中（升 FORMAT_VERSION） |
+| **I-09** | **实现** `effective_version()`（base 2 / positions 3）+ positions↔非positions 互拒测试 + 快照兼容性测试（把注释约定落成实现，修掉现存隐患） | I-08 | 中 |
 | **I-10** | CLI 切到新 API（`build` / `search` / `compare`）——**参数与输出一字不改** | I-04~I-08 | 中 |
 | **I-11** | `examples/search_basic.rs` 重写（79 → ≤15 行）+ `docs/user-guide.md` 库接入章节重写 | I-10 | 低 |
-| **I-12** | **bench 迁移到新 API + 回归对账**（最高风险项） | I-10, I-05 | **高** |
+| **I-12** | **bench 迁移到新 API + 回归对账**（最高风险项）；同步删除 `load_setup` 的 `--analyzer` 警告回退逻辑，改由指纹校验硬报 `ConfigMismatch`（评审 P11） | I-10, I-05 | **高** |
 | I-13 | `plan.md` 阶段表更新（P6 接口重构 / P7 顺延）+ 本文档状态回写 | I-12 | 低 |
 | I-14 | 旧 `QueryExecutor` / `Index::add` 是否 `#[deprecated]`（见 D-I6） | I-13 | 低 |
 
@@ -533,6 +585,7 @@ LanceDB 有 `EmbeddingRegistry` 可以按配置自动重建 embedding 函数。
 **接口易用性（G1 / G2）**
 - [ ] `examples/search_basic.rs` ≤ 15 行，且代码里不出现 `content_hash`、`NormalizedVector`、`&analyzer`、`Chunker`
 - [ ] `index.add("纯文本")` 可编译通过
+- [ ] `searcher.search("查询")` 单参数可编译通过；`search_with("查询").mode(..).top_n(..).exec()` 可编译通过
 - [ ] `Searcher: 'static + Clone + Send + Sync` —— 用编译期断言验证
   （`fn assert_send_sync<T: Send + Sync + 'static>() {}`）
 - [ ] `docs/user-guide.md` 的六 trait 替换矩阵更新为新的注入点
@@ -553,6 +606,7 @@ LanceDB 有 `EmbeddingRegistry` 可以按配置自动重建 embedding 函数。
 - [ ] B1：用 charabia 建库 → 用 MixedAnalyzer 加载 → **必须报 `ConfigMismatch`**，不得静默
 - [ ] B2：`FORMAT_VERSION` = 2，旧快照触发 `SnapshotVersionMismatch`
 - [ ] B3：`Document` 含 `text`，`content_hash` 由库内计算
+- [ ] **P1（positions）**：`--features positions` 建的快照与默认快照**互拒**（`SnapshotVersionMismatch`），不得靠 CRC 兜底
 
 ### 10.2 决策点（待拍板）
 
@@ -565,6 +619,7 @@ LanceDB 有 `EmbeddingRegistry` 可以按配置自动重建 embedding 函数。
 | **D-I5** | 快照升 `FORMAT_VERSION` 2 存配置指纹（旧 `.idx` 全部需重建）？ | **是**。B1 是静默错误，代价高；旧快照只有 2 个（`data/*.snapshot`），重建成本可控 |
 | **D-I6** | 旧 API（`QueryExecutor` / `Index::add`）是否标 `#[deprecated]`？ | **本轮不加**。内部 bench / 测试仍在用，`#[deprecated]` 会因 `-D warnings` 打断 CI；等 P7 完成再评估 |
 | **D-I7** | `batch_size` 默认值？ | **不预设，实测校准**（32 / 64 / 128 / 256 四档，T2Ranking 12K 语料） |
+| **D-I8** | `search` 默认值：`top_n=10`、`mode` 按装配自动推断（有向量→Hybrid，无→Lexical）？ | **是**。top_n=10 是单轮 prompt 的合理长度（LanceDB 默认 10）；mode 自动推断是"零配置可用"的应有之义，任何时候可用 builder 覆盖 |
 
 ---
 
@@ -574,8 +629,8 @@ LanceDB 有 `EmbeddingRegistry` 可以按配置自动重建 embedding 函数。
 | --- | --- | --- | --- |
 | R1 | **`raw_vectors` 内存翻倍**：向量索引 + 原始向量两份（12K×512 约 24.6MB → ~49MB） | NFR-05 | 快照策略 D1 要求存原始向量，无法回避。提供 `.keep_raw_vectors(false)` 逃生舱（省内存，代价是无法保存含向量快照）；**NFR-05 必须重新实测并记录** |
 | R2 | **写缓冲让 `add` 延迟有长尾**（偶发一次 batch embed） | 写入端体验 | 文档明确写明；提供 `add_documents` 批量路径；`helix build` 走批量路径，不受影响 |
-| R3 | **`commit()` 后首次 `add` 不会触发深拷贝**（所有权切换方案下 refcount 恒为 1） | —— | 已通过 6.4 方案 A 规避；若将来升级到方案 C 需重新评估 |
-| R4 | **泛型 `TryInto<SearchMode>` 签名可能编译不过** | I-06 | 有退化方案（两个方法）；I-06 第一步就验证 |
+| R3 | **"零拷贝"仅在无 `Searcher` clone 残留时成立**；`clone()` 后继续 `add` 会静默深拷贝整个 `Inner` | 性能语义 | 见 6.4「P3 修正」：`debug_assert!(Arc::strong_count == 1)` 提示；结构共享留 P7 |
+| R4 | **mode 字符串接受方式（`FromStr` 的 Err 延后到 `exec()`）可能编译/语义不成立** | I-06 | 有退化方案（`.mode()` 仅收 enum，字符串走 `SearchMode::parse`）；I-06 第一步就验证 |
 | R5 | **bench 迁移改变向量插入顺序 → HNSW 图不同 → 评测数字变化** | 评测可复现性 | 验收只要求"结论一致 + 差异在抖动容差内"；**brute 后端要求逐位一致**（10.1） |
 | R6 | **breaking change 与版本**：`Document` 语义变化、`FORMAT_VERSION` 变化 | 用户 | 项目当前 0.1.0，语义化版本允许 breaking；CHANGELOG 需显式记录迁移步骤 |
 | R7 | **过度隐藏导致排查困难**：chunk/embed 全藏起来后，用户遇到"这段话为什么没召回"失去抓手 | 可观测性 | 保留 `--explain`（FR-13）全部能力；新增 `Searcher::config_report()` 打印 analyzer / chunker / embedder / chunk 参数实际取值 |
