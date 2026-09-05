@@ -45,20 +45,7 @@
   ⚠️ 该判据用的是 BM25 词典探针，Vector 模式下存在已知误报（见 `query_has_hits` 文档）
 - 快照 `FORMAT_VERSION` 维持 2：存活位图与字段索引均可从 `docs` 重建，无需升版
 
-### 修复 — bench oracle 深度 panic（issue #9，2026-09-05）
-
-#### 修复
-
-- **`--oracle-depth ≥ 501` 触发 `clamp` panic**（`min > max`，与 debug/release 无关）：
-  `oracle_depth_for` 的下界 `k × depth` 随用户参数无界增长，上界固定 `ORACLE_MAX_DEPTH=5000`，
-  二者未对齐。修复为**下界先被上限夹住再 clamp**，与早退分支对齐；同时两处乘法改
-  `saturating_mul`（极端参数下「深度过大」不再变成「bench 崩溃」）
-- `--oracle-depth` clap 侧加范围校验 `1..=500`（k=10 时 k×depth ≤ 5000 恰不撞上限），
-  非法值直接给出明确错误而非中途 panic 丢现场
-- 边界单测：`depth ∈ {501, 600, 5000, usize::MAX/2, usize::MAX}` 全组合不 panic 且
-  收敛上限；默认 depth=10 语义回归
-
-### V2 Step 1 收尾 — 性能与 fixture（S1-10 / S1-11，2026-09-05）
+### V2 Step 1 收尾 — 性能与 fixture（PR #8，S1-10 / S1-11，2026-09-05）
 
 设计文档 `v2-step1-design.md` §10.1 有完整数据；架构文档同步至 **v1.5**（新增 ADR-010）。
 
@@ -126,6 +113,19 @@
   不应随仓库公开
 - CLI 的 `--filter` 解析支持 range（`field>=n` / `field<n`），并对不支持的运算符
   （`<=` / `>`）给出**明确指出**而非含混的「数值解析失败」；配套 7 项单测 + CI smoke
+
+### 修复 — bench oracle 深度 panic（PR #10，issue #9，2026-09-05）
+
+#### 修复
+
+- **`--oracle-depth ≥ 501` 触发 `clamp` panic**（`min > max`，与 debug/release 无关）：
+  `oracle_depth_for` 的下界 `k × depth` 随用户参数无界增长，上界固定 `ORACLE_MAX_DEPTH=5000`，
+  二者未对齐。修复为**下界先被上限夹住再 clamp**，与早退分支对齐；同时两处乘法改
+  `saturating_mul`（极端参数下「深度过大」不再变成「bench 崩溃」）
+- `--oracle-depth` clap 侧加范围校验 `1..=500`（k=10 时 k×depth ≤ 5000 恰不撞上限），
+  非法值直接给出明确错误而非中途 panic 丢现场
+- 边界单测：`depth ∈ {501, 600, 5000, usize::MAX/2, usize::MAX}` 全组合不 panic 且
+  收敛上限；默认 depth=10 语义回归
 
 ## [0.2.0] — 2026-09-04（P6 接口重构）
 

@@ -99,7 +99,7 @@
 
 #### Step 1 · 正确性修复（地基，最先做）
 
-> **详细设计**：`docs/devel/v2-step1-design.md`（**v1.0**，2026-09-05，已吸收外部评审并**实施完成**）。
+> **详细设计**：`docs/devel/v2-step1-design.md`（**v1.1**，2026-09-05，已吸收外部评审并**实施完成**）。
 > v0.2 关键修订：`hnsw_rs::search_filter` 的停止条件**原判断有误**——带 filter 时**从不 fast return**，且堆未满时距离剪枝全程关闭 ⇒ `allowed < ef` 时必然整图遍历（结构性，tuning 治不了）。
 > 由此新增：**无过滤热路径走普通 `search()` + 按存活比例过采样**（保住 fast-return 与 `EF_SEARCH=200`），**有过滤才走 `search_filter`**。另新增字段索引全类型覆盖、惰性谓词（消除 O(N) 展开）、`query_has_hits` 探针。
 > 已回答 H2（向量软删除的真实语义）并核实 `hnsw_rs::search_filter` 的真实行为；
@@ -110,8 +110,9 @@
 | # | 任务 | 交付 |
 | --- | --- | --- |
 | S1-01~09 | 正确性（位图 / 存活位图 / 字段索引 / 谓词 / 快照重建 / 两路下推 / HNSW 双路径 / 编排层） | PR #6（`61e3dac`），8 个 CI job 全绿；GLM-5.3 评审 Approve |
-| S1-10 | fixture + bench 选择度曲线 + NFR-02 重测 | `scripts/gen_synth_corpus.py`（确定性合成生成器）+ `scripts/eval_filter.sh`（一键扫描）+ bench 新增 `--filter` / `--filter-cost` / 自适应 oracle |
-| S1-11 | 文档回写 | 架构文档 **v1.5**（ADR-010、§5.4/§5.4.1、§5.5/§5.5.1、§7.5 重写、§7.6.1、§8.3/§8.4、R11~R18）+ 需求文档 v1.5 + `docs/README.md` 索引 |
+| S1-10 | fixture + bench 选择度曲线 + NFR-02 重测 | PR #8（`0d87b39`）：`scripts/gen_synth_corpus.py`（确定性合成生成器）+ `scripts/eval_filter.sh`（一键扫描）+ bench 新增 `--filter` / `--filter-cost` / 自适应 oracle |
+| S1-11 | 文档回写 | PR #8（`0d87b39`）：架构文档 **v1.5**（ADR-010、§5.4/§5.4.1、§5.5/§5.5.1、§7.5 重写、§7.6.1、§8.3/§8.4、R11~R18）+ 需求文档 v1.5 + `docs/README.md` 索引 + 设计文档 v1.0 |
+| — | issue #9（bench `--oracle-depth ≥ 501` clamp panic） | PR #10（`e1e4b60`）：下界先被上限夹住再 clamp + `saturating_mul` + clap `1..=500` 范围校验 + 边界单测；设计文档升 v1.1（§0.3） |
 
 **S1-10 实测结论 —— A. 1 万级**（release，K=10，60 query × 10 reps）：
 
