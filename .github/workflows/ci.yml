@@ -155,3 +155,18 @@ jobs:
         run: |
           ./target/release/helix search --input data/corpus.jsonl --mode bm25 \
             --filter topic=vector "向量检索"
+      # V2 Step 1 / S1-10：`--filter` 扩展出范围运算符后没有 CI 覆盖，补上。
+      # demo 语料只有字符串字段 `topic`，没有数值字段，所以这里**不断言命中**——
+      # 它真正覆盖的是「range 落在字段索引里不存在的字段」这条路径
+      # （`doc_bits` 返回 None → 回落全扫），验证其不 panic 且退出码为 0。
+      # 真正的选择度 / 延迟曲线由 scripts/eval_filter.sh 在本地跑（分钟级，不进 CI）。
+      - name: metadata range filter
+        run: |
+          ./target/release/helix search --input data/corpus.jsonl --mode bm25 \
+            --filter "score>=0" --filter "score<100" "向量检索"
+          # `<=` / `>` 必须显式报错，不能被静默当成等值匹配
+          if ./target/release/helix search --input data/corpus.jsonl --mode bm25 \
+              --filter "score<=100" "向量检索" 2>/dev/null; then
+            echo "错误：不支持的运算符 <= 应当被拒绝" >&2
+            exit 1
+          fi

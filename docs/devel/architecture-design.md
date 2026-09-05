@@ -4,9 +4,9 @@
 
 | 项目   | 内容                   |
 | ---- | -------------------- |
-| 文档版本 | v1.4                 |
+| 文档版本 | v1.5                 |
 | 创建日期 | 2026-09-02           |
-| 状态   | P6 接口重构设计已并入（对外接口门面层，见第 10 章） |
+| 状态   | V2 Step 1（向量软删除 + 过滤下推）已并入，见 ADR-010 / §5.4 / §5.5 / §7.5 |
 | 技术栈  | Rust 1.90+ / 2021 edition |
 | 文件名   | `architecture-design.md` |
 | 配套文档 | `requirements-spec.md`（需求分析说明书） |
@@ -77,6 +77,7 @@
 | ADR-007 | **`tantivy` 仅作 dev 依赖的 BM25 正确性基线** | 不用它实现功能，**用它证明自己写得对**；自研最大风险是"写错了看不出来" | FR-03、FR-04 |
 | ADR-008 | **MSRV 提到 1.90 并用 `cargo-deny` 强制 License 白名单** | NFR-08 的 1.80 已被主流依赖突破；License 友好是硬要求，人工审查不可靠 | NFR-08 |
 | ADR-009 | **对外接口采用「门面层 + 共用编排内核」**（`SearchIndex` 写端 / owned `Searcher` 读端） | 复用同一编排实现避免逻辑漂移；重构是"加法"，bench/测试零改动，逃生舱保证能力不丢 | issue #1 |
+| ADR-010 | **向量软删除 + 过滤下推**（存活位图作单一真源 + 谓词注入 + HNSW 双路径） | 双写必漂移且向量侧状态无法从快照恢复；无过滤是热路径，不为"几乎全通过"的谓词付整图遍历代价 | `v2-step1-design.md` |
 
 ---
 
@@ -286,27 +287,84 @@ pub trait Embedder: Send + Sync {
 
 ### 5.4 VectorIndex
 
+> **V2 Step 1 演进**（ADR-010）：新增 `search_filtered`，把过滤从"检索后 post-filter"
+> 下推到 ANN 内部。详细推导见 `docs/devel/v2-step1-design.md` §3 / §5.7。
+
 ```rust
 pub trait VectorIndex: Send + Sync {
-    fn dim(&self) -> usize;
+    /// 增量插入一条向量（两个实现均支持）
+    fn add(&mut self, id: ChunkId, vec: NormalizedVector) -> Result<()>;
+
+    /// 检索最近的 k 条**且通过 `filter` 的**候选，返回 `(chunk_id, distance)`，按距离**升序**。
+    fn search_filtered(
+        &self,
+        query: &NormalizedVector,
+        k: usize,
+        filter: Option<&dyn CandidateFilter>,
+    ) -> Result<Vec<(ChunkId, f32)>>;
+
+    /// 不带过滤的检索（默认转发到 `search_filtered`，`None` 语义见下）
+    fn search(&self, query: &NormalizedVector, k: usize) -> Result<Vec<(ChunkId, f32)>> {
+        self.search_filtered(query, k, None)
+    }
+
+    /// 已入库向量条数（**含已软删除的**；与存活数无关）
     fn len(&self) -> usize;
-    fn build(vectors: Vec<Vec<f32>>, ids: Vec<ChunkId>) -> Result<Self>
-    where
-        Self: Sized;
-    /// 契约：返回按 Score **降序**（相似度，越大越相似）
-    fn search(&self, query: &[f32], k: usize) -> Result<Vec<(ChunkId, Score)>>;
+    fn is_empty(&self) -> bool { self.len() == 0 }
 }
 ```
 
-> trait 契约固定为**相似度降序**，而底层 HNSW 返回的是距离升序。转换责任放在实现内部（见 7.3），业务层永远只看相似度。
+- `distance` 是**平方欧氏距离**（越小越近）；转相似度由上层负责（见 7.3）
+- `filter = Some(f)`：返回的**每一条都必须满足 `f.contains(id)`**。允许返回少于 k 条（过滤后不足），
+  **不允许**用未通过过滤的候选凑数
+- ⚠️ **`filter = None` = 不过滤，结果可能包含已软删除的 chunk**。这是逃生舱路径的**已知契约不是 bug**：
+  `hnsw_rs` 无法从图中物理摘除向量，存活过滤必须由编排层注入谓词完成（`predicate` 模块文档 + T17 断言）
+
+#### 5.4.1 软删除：存活状态的单一真源在 `Index`，不在 `VectorIndex`
+
+Q-C1（删除后向量残留霸占 Top-K 名额）的修复。可选方案是把 `tombstone` 加进 `VectorIndex`，
+但被否决——**双写必漂移**，且 `load` 时 `raw_vectors` 全量重灌，向量侧状态无法从快照恢复。
+
+因此定案（D-S1-01）：
+
+- 存活位图（`bitmap::ChunkBits`）与 `chunks` 的 `Some`/`None` 在 **`Index::forward` 的同一函数内**维护
+  （`insert_chunk` 置位、`tombstone_chunk` 清位），快照 `import` 时 `rebuild`
+- 检索时以**谓词**（`predicate::AliveOnly`）传给向量路，向量索引自身不持有存活状态
+- `SearchIndex::remove` 额外摘除 `raw_vectors`，与存活位图构成**跨快照永续的两道防线**（T2 刻意绕过防线①验证防线②）
+
+#### 5.4.2 HnswRs 的双路径与 `ef` 策略
+
+`hnsw_rs::search_filter` 有三个反直觉的结构性行为（源码逐行核实，见设计 §3）：
+
+1. **带 filter 时从不 fast-return**，唯一正常终止是候选耗尽
+2. **堆未满时距离剪枝全程关闭** ⇒ `allowed < ef` 时**必然整图遍历**（库层机制，调参治不了）
+3. `ef = ef_arg.max(knbn)` ⇒ **`knbn` 才是输出条数旋钮，`ef` 只是搜索宽度**
+
+由此定案双路径：
+
+| 路径 | 场景 | 实现 | `ef` | `knbn` |
+| --- | --- | --- | --- | --- |
+| **A** | 无用户过滤（热路径） | 普通 `search()` + 返回后 `retain(alive)` | `200`（`EF_SEARCH`） | `min(len, ceil(k/alive_ratio)+k).min(1024)` 按删除比例过采样 |
+| **B** | 有用户过滤 | `search_filter` + `FilterT` 适配器 | `min(max(4k,k), 256)`（纯宽度） | `k` |
+
+路径 A **必须**走普通 `search()`：用 `search_filter` 跑 AliveOnly 会禁用 fast-return，
+改变热路径的成本结构（P99 敏感，T14① 强制验证）。
+
+> ⚠️ 不要用 `ef.min(allowed)` 夹逼——`allowed < ef` 时堆恒填不满、剪枝本就关闭，该 `min` 不生效；
+> `allowed ≥ 4k` 时它又不生效。**低选择度下的整图遍历是已知代价，宁可召回不足并用
+> `Metrics::vector_shortfall` 暴露，也不假装能调参解决**（R13）。
 
 ### 5.5 Retriever
+
+> **V2 Step 1 演进**（ADR-010）：`RetrieveRequest` 的过滤载体从 `Option<&Filter>`（领域对象）
+> 换成 `Option<&dyn CandidateFilter>`（谓词 trait）。BM25 侧因此不再自己遍历 postings 判过滤。
 
 ```rust
 pub struct RetrieveRequest<'a> {
     pub query: &'a AnalyzedQuery,
     pub k: usize,
-    pub filter: Option<&'a Filter>,
+    /// **谓词**而非领域对象：由编排层求值一次后复用（见 5.5.1）
+    pub filter: Option<&'a dyn CandidateFilter>,
 }
 
 pub struct ScoredHit {
@@ -321,6 +379,25 @@ pub trait Retriever: Send + Sync {
 ```
 
 `name()` 用于 `Explain` 中标识来源 lane，是 FR-13 可解释性的基础。
+
+`filter` 的契约与 `VectorIndex::search_filtered` **完全一致**（含 `None = 不过滤` 的逃生舱语义），
+两路共用 `predicate` 模块，避免「同一份过滤在两个 lane 里含义不同」。
+
+#### 5.5.1 为什么换成谓词（Q-I1/I2）
+
+V1 的 `Option<&Filter>` 让 BM25 侧对每个候选 chunk 调 `Filter::matches(metadata)`，
+复杂度 **O(语料规模)**——每 query 都要全扫一遍 metadata，与命中多少无关。
+
+改成谓词后，求值被提到编排层**一次**完成（`query::filter::doc_bits`）：
+
+- 字段索引（`index::field_index`）把 `field → value → doc 位图` 预先建好，等值/range 查询
+  退化为几次位图交并，成本与语料规模**解耦**
+- 位图再包成惰性 `ChunkFilter`，`contains(chunk_id)` 是 O(1) 位测试（内部经 `doc_of` 映射到 doc 位）
+- 结果：`allowed_chunks`（旧，全扫 + HashSet）→ `doc_bits + 惰性谓词`（新），T13 实测对照见设计文档 §10
+
+⚠️ **已知短板**：字段索引有基数保护（`terms + numbers` 合计 1024），**高基数字段会永久降级**，
+该字段上的过滤回落到 O(N) 全扫。毫秒时间戳 / 雪花 ID 这类最常见的真实过滤场景**约 512 篇**就撞线
+（数值字段同时登记 terms 键与 numbers 键，各占一份额度）。这是 V2.1 prefilter / 排序列方案的**第一用例**。
 
 ### 5.6 FusionStrategy
 
@@ -565,62 +642,49 @@ score(d) = Σ_{lane i}  w_i / (k + rank_i(d))
 
 **FR-11 加权归一作为可选策略**：若业务确实需要，采用「除以该 lane Top-1 分数」而非 min-max，并在单候选时退化为 1.0。
 
-### 7.5 增量写入（FR-17）
+### 7.5 增量写入与软删除（FR-17 / FR-26）
 
-**约束**：`instant-distance` 的 `Builder::build()` 一次性消费 points，**没有增量插入 API**。
+> **V2 Step 1 重写**：本节原描述 `instant-distance + delta 区` 方案。该方案已在 **D8 决策**中
+> 彻底移除（依赖 + `hnsw.rs` + `ImmutableIndex` 变体一并删除，生产路径切 `hnsw_rs`），
+> delta 区设计随之取消（T4-06 不再存在）。以下为当前实现。
 
-**解法：主索引 + delta 区**
+**选型**：`hnsw_rs` 0.3.4（MIT/Apache-2.0，纯 Rust），依据 ADR-002 记录的 P4 A/B 结论 ——
+召回同为 0.970，但原生增量 **1.5ms/条** vs instant-distance 全量重建 **31s/万条**。
+它原生支持 `insert(&self, (&[f32], usize))`，构造后可随时单条插入，**无需 delta 区与后台重建**。
 
-```rust
-pub struct VectorStore {
-    sealed: Option<HnswMap<NormalizedVector, ChunkId>>,  // 主 HNSW，不可变
-    delta:  Vec<(ChunkId, NormalizedVector)>,            // 未建图的新向量
-}
+#### 7.5.1 软删除的三条路径
 
-// 检索：两处都查，合并取 Top-K
-fn search(&self, q: &[f32], k: usize) -> Vec<(ChunkId, Score)> {
-    let mut out = self.sealed.as_ref().map(|h| h.search(...)).unwrap_or_default();
-    out.extend(brute_force(&self.delta, q, k));
-    out.sort_by(|a, b| b.1.total_cmp(&a.1));
-    out.truncate(k);
-    out
-}
+`hnsw_rs` 与 `instant-distance` 都**没有 remove API**，删除只能靠墓碑。V2 Step 1 之前只在正排侧
+打墓碑（`chunks[id] = None`），向量图里仍留着向量 —— 它会**继续霸占 Top-K 名额**，表现为
+「删了 20 篇后 Top-5 只剩 2 条」（Q-C1）。修复后三条路径的一致性维护：
 
-// 合并触发条件（满足任一）
-fn should_rebuild(&self) -> bool {
-    self.delta.len() >= 1000
-        || self.delta.len() as f32
-            >= self.sealed_len() as f32 * 0.1
-}
-```
+| 路径 | 维护点 | 检索期作用 |
+| --- | --- | --- |
+| 正排 `chunks: Vec<Option<Chunk>>` | `Index::tombstone_chunk` | 文本回捞时 `None` 直接跳过 |
+| 存活位图 `bitmap::ChunkBits` | **同一函数内**紧邻 `chunks` 写入 | 存活状态**单一真源**，检索时以谓词下推到两路 |
+| 倒排 postings | 物理摘除 | BM25 路因此**无需**存活过滤，编排层传 `None` |
 
-**代价分析**（须写入文档，避免误用）
+⚠️ **为什么不给 `VectorIndex` 加 `tombstone`**：双写必漂移；且 `load` 时 `raw_vectors` 全量重灌，
+向量侧状态**无法从快照恢复**。所以存活状态只存在 `Index` 一处，检索时以谓词注入（D-S1-01）。
 
-- delta 区是**线性扫描**，复杂度 O(|delta| × dim)。将其规模限制在总量的 10% 以内，可保证其对延迟的影响可控
-- 重建是 O(n log n)，但可后台异步执行，读请求由旧主索引 + delta 继续服务
-- 倒排索引本身可增量写入（HashMap 插入），不受此限制
+#### 7.5.2 跨快照永续的两道防线（T2 集成测试覆盖）
 
-**⚠️ 本方案待 P4 复核（见 9.2 与 ADR-002）**
+1. `SearchIndex::remove` 主动 `raw_vectors.retain(...)` 摘除被删文档 → 落盘快照里没有幽灵向量
+2. 即便快照里带着幽灵向量（T2 刻意**绕过防线①**、直接走 `storage::save`），`load` 后 `import`
+   重建存活位图，检索期谓词仍会滤掉它
 
-`hnsw_rs` 0.3.4（MIT/Apache-2.0，**纯 Rust**）原生支持增量插入，且与本设计的归一化方案天然契合：
+**已知代价**：`remove` 每次全量 `raw_vectors.retain`，批量删 N 篇是 O(N·M)。暂不处理 ——
+物理回收归 **Step 5 compaction**，届时可一并引入 `remove_many(&[DocId])` 批量入口。
 
-- `pub fn insert(&self, datav_with_id: (&[T], usize))` —— 构造后可随时单条插入，无需 delta 区与后台重建
-- `pub fn search_filter(&self, data, knbn, ef, filter: Option<&dyn FilterT>)` —— 内建查询时过滤，直接服务 FR-14
-- `DistDot` 的语义与 7.3 完全一致：**要求向量入库前 L2 归一化**（文档原文：*"essentially the Cosine distance but we suppose all vectors have been l2 normalized to unity BEFORE INSERTING in HNSW"*），并自带 `l2_normalize` 辅助函数
+> 若后续需要**物理删除**（而非墓碑），`hnsw_rs` 与 `instant-distance` 都不满足，路径为 `usearch`
+> （Apache-2.0，支持 `add` / `remove` / `filtered_search` / `exact_search`，但经 `cxx` 引入 C++ 依赖）；
+> `arroy`（LMDB 后端）因与"内存 + 快照"路线冲突而排除。
 
-因此 R1 不一定是"必须绕开的约束"，也可能是"换选型即可消除的约束"。**P4 实现 T4-06 之前，先用 `hnsw_rs` 做一次 A/B 原型**（第二个 `VectorIndex` 实现）：
+**P4 A/B 已定案**：结论与 `DistDot` 的归一化语义见 **ADR-002**。补充两点实现层面的坑：
 
-| 对比项     | instant-distance + delta | hnsw_rs 原生增量 |
-| ------- | ------------------------ | -------------- |
-| 增量写入延迟  | O(1) 写 delta，但重建时 O(n log n) | 直接入图          |
-| 检索路径    | 主索引 + delta 两处扫描后合并      | 单次检索           |
-| 过滤支持    | 检索后过滤                    | `search_filter` 原生支持 |
-| 删除      | 墓碑 + 过滤（本方案）             | 同样只能墓碑（**无 remove API**，与本方案一致，不构成劣势） |
-| 依赖      | 纯 Rust                   | 纯 Rust         |
-
-若 `hnsw_rs` 在召回一致性与延迟上达标，**删除 delta 区设计**（T4-06 一并取消），代码量与复杂度均显著下降。
-
-> 若后续需要**物理删除**（而非墓碑），`hnsw_rs` 与 `instant-distance` 都不满足，此时路径为 `usearch`（Apache-2.0，支持 `add` / `remove` / `filtered_search` / `exact_search`，但通过 `cxx` 引入 C++ 依赖）；`arroy`（LMDB 后端）因与"内存 + 快照"路线冲突而排除。
+- ⚠️ `hnsw_rs` 的 `DistDot` 在 aarch64 上有 `assert!(dot <= 1.0)` 浮点断言，自匹配时 `dot = 1.0000002`
+  会 panic → 本项目使用自定义的 `DistDotClamped`
+- ⚠️ crate 名是 **`hnsw_rs`**（下划线）
 
 ### 7.6 快照格式（FR-16）
 
@@ -638,11 +702,28 @@ fn should_rebuild(&self) -> bool {
 └────────────────────────────────────────┘
 ```
 
-- 序列化用 **bincode 3.0.0**（MIT）。
-  > 修正：初版文档称"bincode 1.3 与 `instant-distance` 的 `with-serde` 内部 bincode 对齐"——**该说法有误**。`instant-distance` 0.6.1 的 `with-serde` 只引入 `serde` 与 `serde-big-array`，**不含 bincode**。bincode 版本无外部约束，可自由选择。
+- 序列化用 **bincode 2.0.1**（MIT）。
+  > 修正：初版文档称"bincode 1.3 与 `instant-distance` 的 `with-serde` 内部 bincode 对齐"——**该说法有误**。`instant-distance` 0.6.1 的 `with-serde` 只引入 `serde` 与 `serde-big-array`，**不含 bincode**。
+  > ⚠️ 另有两处版本坑：**bincode 3.0.0 是玩笑发布**（源码仅一行 `compile_error!`），crates.io 的 `max_version` 不等于可用版本；bincode 2 需显式开 `serde` feature 才有 `bincode::serde`。
+  > ⚠️ bincode 2 **不支持 `serde_json::Value`**（`serialize_any` → `AnyNotSupported`）→ 快照对 metadata 用 DTO 存 JSON 字符串。
 - **P4 阶段与 `rkyv` 实测对比**：`rkyv` 0.8.18（MIT）为零反序列化格式，配合 `memmap2` 可使加载接近 O(1)，对 NFR-04（冷启动 < 2s）极具吸引力。代价是所有落盘结构需 `derive(Archive)`，格式升级要额外处理版本兼容。**取舍规则：若 bincode 在 1 万 chunk 快照上已满足 NFR-04，则不引入 rkyv。** 快照结构已在 `storage/codec.rs` 抽象，切换不影响上层。
 - `format_version` 用于向后兼容检测：版本不匹配时直接报错而非静默读错
 - CRC32 校验防止读到半截文件（进程被 kill 的常见后果）
+
+#### 7.6.1 V2 Step 1：新增结构**不入快照**，故 `FORMAT_VERSION` 保持 2
+
+V2 Step 1 引入了两份全新状态，但**都不落盘**：
+
+| 结构 | 是否入快照 | 理由 |
+| --- | --- | --- |
+| 存活位图 `ChunkBits` | ❌ | 由 `chunks` 的 `Some`/`None` 在 `import` 时 `rebuild` 得到，无信息损失 |
+| 字段索引 `FieldIndex` | ❌ | 由 `docs` 的 metadata 全量重建 |
+
+代价是冷启动多一次重建（O(总 chunk 数) + O(总 metadata 键数)），收益是**旧快照可直接加载**
+（`SnapshotSections` 结构未动）。这也让本 Step 与 ADR-011（图持久化，Step 2）**完全解耦**。
+
+⚠️ 字段索引快照后复位的副作用：`degraded` 标志会清零（重建是完整重灌，不存在"被跳过的窗口"，
+所以复位是**正确**的）。它与"运行期 `degraded` 粘滞"形成表面矛盾，已在 `field_index.rs` 注明。
 
 ---
 
@@ -655,9 +736,11 @@ fn should_rebuild(&self) -> bool {
 | 两路召回并行                                 | BM25 lane 与向量 lane 用 rayon 并行，取较慢者耗时    | NFR-02 |
 | 查询路径零磁盘 IO                             | 全内存索引；过滤在融合前用 bitmap 做，不触碰正排            | NFR-02 |
 | query embedding 缓存                     | **`moka`** 并发缓存（带 TTL），Agent 多轮循环中大量 query 是重复的 | FR-20  |
-| 复用 `instant_distance::Search` 对象       | 避免每次查询重新分配堆内存                           | NFR-02 |
+| 复用 `hnsw_rs::Hnsw` 实例                 | 避免每次查询重新分配堆内存                           | NFR-02 |
 | 批量摄入并行                                 | rayon 并行分词与 embedding                   | FR-19  |
 | 融合层不回捞正文                               | 只在最后对 Top-K 做一次正排回捞                     | NFR-02 |
+| 过滤下推（V2 Step 1）                        | 字段索引把 `field → value → doc 位图` 预先建好，求值从 O(语料) 降到 O(匹配文档数) | NFR-02 / FR-27 |
+| 无过滤热路径保 fast-return（V2 Step 1）         | 无用户过滤时**刻意不走** `search_filter`：它会禁用 `hnsw_rs` 的 fast-return，改变 P99 的成本结构 | NFR-02 |
 
 > Embedding 是最大延迟源：本地 bge-small 单条约 5~15ms，远程 API 则 50~200ms。**若使用远程 embedding，NFR-02 的 20ms 上限不可能达成**，此时应改为监控 P99 并单独上报 embedding 耗时。
 
@@ -679,6 +762,33 @@ fn should_rebuild(&self) -> bool {
 ```
 search: took=8.2ms bm25=1.4ms(vector=6.1ms parallel) candidates=187 fused=50 took_total=8.2ms
 ```
+
+**V2 Step 1 新增 `query::Metrics` 三项**（服务于"Agent 需要自查检索质量"这一核心差异）：
+
+| 字段 | 含义 | 用途 |
+| --- | --- | --- |
+| `filter_eval` | 过滤求值耗时 | 定位 Q-I1 未覆盖到的降级字段全扫 |
+| `allowed` | 通过过过滤的候选数 | 低选择度的直接读数 |
+| `vector_shortfall` | `min(candidate_k, allowed) - 实得条数` | filtered-ANN 召回静默下降的可观测信号；**V2.1 是否引入 prefilter 结构的判据** |
+
+⚠️ **当前限制（已知，待排期）**：`Metrics` 只在 `search_parts` 内聚合并 `tracing::info!` 输出，
+**不在 `SearchResponse` 里、也不进 `bench::QueryMetrics`**。后果是：宿主不挂 tracing subscriber
+就静默丢弃；**无法单测**；**无法被 bench 聚合**。在它被真正暴露出来之前，上述三项指标无人可见。
+
+### 8.4 空结果的语义（V2 Step 1）
+
+Agent 场景里空结果必须是**可归因**的——调用方要能区分"该建索引了"和"过滤条件写错了"。
+编排层按 **query 侧信号优先**判定 `EmptyReason`：
+
+| query 有命中 | filter 有匹配 | 判定 |
+| --- | --- | --- |
+| 否 | — | `AllTermsUnmatched`（探针：`query_has_hits` 走 BM25 词典） |
+| 是 | 否 | `FilteredOut` |
+| 是 | 是（但语料空） | `NoDocuments` |
+
+⚠️ **探针的适用边界**：`query_has_hits` 是纯 **BM25 侧**信号（走 `Index::term_id + postings_by_id`）。
+在 `SearchMode::Vector` 下它退化成"语料里有没有这些词"，与向量召回无关 → 空结果会误报
+`AllTermsUnmatched`。该行为**非 V2 Step 1 引入**，T16 已把它钉成契约。真正区分需要向量路自己的探针（V2.1）。
 
 ---
 
@@ -825,6 +935,24 @@ positions     = []                        # posting 存储位置信息
 - **理由**：① 新旧共用同一 `search_parts`，避免两份编排逻辑漂移；② 重构是"加法"，bench / 集成测试 / 单测零改动，评测可复现性不受威胁；③ 逃生舱保证现有可调能力（brute 后端、BM25/RRF 网格、charabia、裸 embedder）一个不丢。
 - **代价**：`Document` 拆为输入 DTO + `DocRecord`（breaking）；快照升 `FORMAT_VERSION` 2 存配置指纹（旧 `.idx` 需重建）；`raw_vectors` 使向量内存翻倍（NFR-05 重测）。
 - **相关需求**：FR-12 / FR-14 / FR-15 / FR-17 / NFR-03 / NFR-05；对应 plan.md P6（I-01~I-14）
+
+#### ADR-010：向量软删除用「存活位图 + 谓词下推」，而非给 `VectorIndex` 加墓碑
+
+- **状态**：已接受（2026-09-05 新增，依据 `v2-step1-design.md` v1.0 决策点 D-S1-01~D-S1-12）
+- **背景**：两个独立缺陷。① **Q-C1**：软删除只在正排打墓碑，向量图里仍留着向量，继续**霸占 Top-K 名额**——删 20 篇后 Top-5 只剩 2 条，且不报错。② **Q-I1/I2**：过滤是检索后 post-filter 且每候选调 `Filter::matches(metadata)`，复杂度 **O(语料规模)**，与命中多少无关。
+- **决策**：
+  1. 存活状态的**单一真源**放在 `Index::forward` 的位图（`ChunkBits`），与 `chunks` 的 `Some`/`None` 在**同一函数内**维护；**不给 `VectorIndex` 加 `tombstone`**。检索时以谓词（`predicate::CandidateFilter`）注入两路。
+  2. 新增 `field_index`（`field → value → doc 位图`）+ 惰性 `ChunkFilter` 谓词，把过滤从 O(语料) 降到 O(匹配文档数)。
+  3. HnswRs **双路径**：无用户过滤走普通 `search()`（保 `fast-return`，按存活比例过采样 `knbn`）；有用户过滤才走 `search_filter`。
+- **理由**：
+  1. **双写必漂移**——向量侧若也持有存活态，两处状态需要跨快照同步，而 `load` 时 `raw_vectors` 全量重灌，向量侧状态**无法从快照恢复**。
+  2. 谓词是**叶模块**（`predicate.rs`），`vector` / `retriever` 只依赖它、不依赖 `index` 或 `query::filter`，分层不破。
+  3. 无过滤是**热路径**。`hnsw_rs` 的 `search_filter` 会禁用 fast-return；用它跑 `AliveOnly` 会为「几乎全通过」的谓词付出整图遍历的代价。双路径把成本只对真正需要过滤的查询收取。
+- **代价**：
+  - 位图与字段索引**不入快照**（`import` 时重建），冷启动多一次 O(N) 遍历；换来 `FORMAT_VERSION` 保持 2、旧快照可直接加载。
+  - 字段索引有**基数保护**（`terms + numbers` 合计 1024），高基数字段（毫秒时间戳 / 雪花 ID）**约 512 篇**就永久降级，该字段上过滤回落 O(N) 全扫 —— **Q-I1 对最常见的真实场景收益为 0**。这是 V2.1 prefilter / 排序列方案的**第一用例**。
+  - 带过滤的 vector 路 P99 显著高于无过滤（1 万级实测 3.5ms → 9~11.5ms），根因是 `hnsw_rs` 的 `search_filter` 在候选不足时关闭距离剪枝 → 近似整图遍历。**这是库层结构性行为，调参治不了**。
+- **相关需求**：FR-26 / FR-27 / FR-28 / NFR-02 / NFR-06；对应 `plan-v2.md` Step 1（S1-01~S1-11）
 
 ---
 
@@ -1105,7 +1233,7 @@ pub enum Error {
 
 | #  | 风险                                          | 影响                                 | 应对措施                                                                  |
 | -- | ------------------------------------------- | ---------------------------------- | --------------------------------------------------------------------- |
-| R1 | **`instant-distance` 无增量插入 API**            | 增量写入需全量重建                          | ① 主索引 + delta 暴力区（7.5）；② **P4 用 `hnsw_rs`（纯 Rust、原生增量 insert）做 A/B，达标则换选型、删除 delta 区，风险随之消除**；③ 需物理删除时走 `usearch`（引入 C++ 依赖） |
+| R1 | ~~**`instant-distance` 无增量插入 API**~~ **（已消除）** | — | **D8 决策：已换 `hnsw_rs`（纯 Rust、原生增量 `insert`），delta 暴力区设计随之删除**，依赖 + `hnsw.rs` + `ImmutableIndex` 变体一并移除。残余：需物理删除时走 `usearch`（引入 C++ 依赖），见 7.5 |
 | R2 | **BGE 查询侧前缀遗漏**                             | 向量检索效果显著下降，且**极难自查**（代码能跑、分数看着也正常） | `Embedder` 强制区分 `embed_query` / `embed_documents`；写单测断言；README 显著位置标注 |
 | R3 | **fastembed 首次下载模型失败/极慢**（国内访问 HuggingFace） | 阻塞 P2 阶段                           | ① 支持 `HF_ENDPOINT` 镜像环境变量；② 支持指定本地模型目录；③ `remote-embed` 作为兜底路径        |
 | R4 | **索引侧/查询侧分词不一致**                            | 召回率莫名偏低，排查成本极高                     | 默认实现强制 `analyze_query → analyze_doc`；单测断言两侧一致                         |
@@ -1115,8 +1243,17 @@ pub enum Error {
 | R8 | **OR 语义下长 query 噪声稀释**                      | Agent 的长问句中虚词干扰排序                  | BM25 的 idf 天然抑制高频虚词；若仍不足，v2 增加 query term 裁剪（按 idf 阈值）                |
 | R9 | **`fastembed` 精确锁定 `ort =2.0.0-rc.13`（预发布）** | 依赖树不可浮动；ort 2.0 正式版 API 变动需等上游跟进   | ① **`Cargo.lock` 必须入库**（plan.md T0-03）；② 5.x 与 6.x 依赖相同，换版本无法规避；③ 极端情况下走兜底路径：直接用 `ort 1.16.3` + `tokenizers` 自研 BGE 推理（约 150 行） |
 | R10 | **传递依赖 License 漂移**                       | 某个传递依赖换成 GPL 系列而无人发现，破坏"License 友好"约束 | 引入 `cargo-deny` 白名单校验并接入 CI/本地 `make deny`（ADR-008）                    |
+| R11 | **filtered-ANN 低选择度召回不足** —— `hnsw_rs` 结构性行为 | 低选择度过滤查询返回少于 k 条 | 过采样 + `ef` 策略（path B）；`Metrics::vector_shortfall` 暴露；bench 出三元数据；V2.1 复议 prefilter 结构 |
+| R12 | **字段索引与正排 metadata 漂移**                      | 过滤结果静默错误 | 单一入口维护 + `import` 重建 + 等价性性质测试（T6/T7）+ 时序测试（T15） |
+| R13 | **`search_filter` 在中/低选择度下必然整图遍历** —— 堆填不满 ⇒ 距离剪枝全程关闭（`hnsw.rs:1019`）。**库层机制，不是参数问题** | 带过滤 P99 随语料规模上升 | path B 的 `EF_FILTER_MAX=256` 只限高选择度宽度；中/低选择度无法避免——**接受并测量**（T12）；V2.1 复议 prefilter |
+| R14 | **字段索引内存（高基数字段）**                          | 内存膨胀 | 基数保护（对 `terms+numbers` **合计**生效）；阈值可配（`Index::with_max_values_per_field`）；实测记入 NFR-05 |
+| R15 | **无过滤热路径退化**：`search_filter` 会禁用 fast-return | 所有无过滤查询的 P99 与召回受影响 | path A 走普通 `search()` 保住 fast-return 与 `EF_SEARCH=200`；T14 强制验证 P99 与召回重合率 |
+| R16 | **直连向量路 / BM25 路绕过存活过滤**（契约 `None = 不过滤`） | "Q-C1 已修复"在这些路径上被绕过而不自知 | 契约写进 trait rustdoc；T17 显式断言；`VectorBackend::Brute` 逃生舱文档标注 |
+| R17 | **`hnsw_rs::search` 有固有近似误差** —— 即使 `knbn == len`、`ef=200` 也可能少返回（20 点图 200 次采样：191 次满 / 8 次少 1 / 1 次少 2）。**库层行为，不是过采样参数问题** | ① 存活过滤后仍可能凑不满 k；② 任何对"返回条数"的严格断言都可能 flaky | ① 过采样已含 `+k` 方差余量；② `Metrics::vector_shortfall` 暴露；③ **验收测试配比须让存活数 ≥ 2×K**；④ S1-10 在 10 万级语料测出真实量级：分路重合率 1.0000、平均条数 10.00，K=10 下未观测到可见缺口 |
+| **R18** | **低选择度过滤查询的延迟爆炸**（S1-10 实测）。10 万级：选择度 1% → vector P99 **41.33ms**（7.1×），0.1% → **158.45ms**（**27.3×**），降级字段 Range → 124.26ms（21.4×）。机理是 R13 的整图遍历，但量级是**规模 × 选择度的复合**，非单纯线性随规模 | 带过滤查询在选择度 ≤1% 时**违反 NFR-02**（限额 10/20ms，超 4~16×）；10 万级上不可用于在线路径 | ① **V2.0 接受**——正确性优先于延迟（项目质量属性优先级），且优化前的 post-filter 在该选择度下几乎返回不了结果；② 由 `Metrics::vector_shortfall` 与 bench 三元数据暴露；③ **V2.1 必须解决**：数据已支持的廉价方案是 **allowed 很小时绕开 ANN 直接暴力扫描 allowed 集合**（10 万级 0.1% 档位 allowed=100，约 0.05ms vs 158ms）。本轮**刻意不实现**——S1-10 的验收目标是"让数据说话"，实现决策归 V2.1 |
 
 > 项目级风险（工具链未安装、语料与标注依赖、模型域不匹配）见 `requirements-spec.md` 第 8、9 章。
+> V2 Step 1 的完整风险表（含触发条件、残余风险、验收挂钩）见 `v2-step1-design.md` §10。
 
 ---
 
@@ -1134,7 +1271,8 @@ pub enum Error {
 | 版本   | 日期         | 变更                                                                     |
 | ---- | ---------- | ---------------------------------------------------------------------- |
 | v1.0 | 2026-09-02 | 由 `archive/requirements-and-design_v1.0.md` v1.0 拆分而来。承接第 5、6、7、8、9、10、11.1、11.2、12 章内容；新增「文档信息」「架构概述与关键决策」「质量属性设计」「ADR 决策记录」「实施计划与需求映射」五节 |
-| v1.2 | 2026-09-02 | **P0 执行后回写**（详见 `p0-design.md` 第 12 章）：① 序列化定为 **`bincode 2.0.1`**（3.0.0 为玩笑发布）；② `moka` 需显式启用 `sync` feature；③ `fastembed` 必须 `default-features = false` 以移除 NCSA 依赖链；④ 模型实际来源为 `Xenova/bge-small-zh-v1.5`（非 Qdrant）；⑤ 枚举变体确认为 `BGESmallZHV15`（非 `BGESmallZH`） |
 | v1.1 | 2026-09-02 | 依据 `thirdparty.md` 调研结论回写：① 新增 ADR-007（tantivy 作 dev 基线）、ADR-008（MSRV 1.90 + cargo-deny）；② 7.1 引入 `unicode-segmentation` / `unicode-normalization`，不再手写 Unicode 分段；③ 7.5 补充 `hnsw_rs` A/B 复核路径；④ 7.6 修正 bincode 选型理由（instant-distance 不含 bincode）并新增 `rkyv` A/B 取舍规则；⑤ 8.1 缓存由 `lru` 改为 `moka`；⑥ 9.1/9.2 版本与候选同步至实测值（fastembed 6.0.2、arroy 0.8.0、新增 hnsw_rs/usearch）；⑦ 12.1 新增 tantivy 对照测试；⑧ 13 更新 R1、新增 R9/R10 |
-| v1.4 | 2026-09-04 | 依据 `p6-design.md` v2.0（issue #1 接口重构，决策点 D-I1~D-I8 已拍板）：① 新增**第 10 章「对外接口设计（门面层）」**，原 10~14 章顺延为 11~15；② 新增 ADR-009（门面层 + 共用编排内核）；③ 5.1 `Document` 拆为输入 DTO + `DocRecord`；④ 4.2 补门面层边界；⑤ 11.3 错误类型新增 `ConfigMismatch`；⑥ 阶段表 P6 重定义为接口重构、原 v2 顺延 P7。详细设计见 `p6-design.md`，任务级见 `plan.md` |
+| v1.2 | 2026-09-02 | **P0 执行后回写**（详见 `p0-design.md` 第 12 章）：① 序列化定为 **`bincode 2.0.1`**（3.0.0 为玩笑发布）；② `moka` 需显式启用 `sync` feature；③ `fastembed` 必须 `default-features = false` 以移除 NCSA 依赖链；④ 模型实际来源为 `Xenova/bge-small-zh-v1.5`（非 Qdrant）；⑤ 枚举变体确认为 `BGESmallZHV15`（非 `BGESmallZH`） |
 | v1.3 | 2026-09-03 | 依据 `p5-design.md` v1.2（评测数据源切换 T2Ranking）同步：① 4.x 目录树 data/ 注释更新；② 10.2 CLI 示例改 `data/t2-queries.jsonl`；③ 11 阶段门槛 P5 行更新（T2Ranking 装配 + 分级 NDCG）。评测数据集的**需求定义**见需求文档 9.4（v1.2），本文档不复制 |
+| v1.4 | 2026-09-04 | 依据 `p6-design.md` v2.0（issue #1 接口重构，决策点 D-I1~D-I8 已拍板）：① 新增**第 10 章「对外接口设计（门面层）」**，原 10~14 章顺延为 11~15；② 新增 ADR-009（门面层 + 共用编排内核）；③ 5.1 `Document` 拆为输入 DTO + `DocRecord`；④ 4.2 补门面层边界；⑤ 11.3 错误类型新增 `ConfigMismatch`；⑥ 阶段表 P6 重定义为接口重构、原 v2 顺延 P7。详细设计见 `p6-design.md`，任务级见 `plan.md` |
+| v1.5 | 2026-09-05 | 依据 `v2-step1-design.md` v0.3（V2 Step 1：向量软删除 + 过滤下推）回写：① 5.4 `VectorIndex` 新增 `search_filtered` 与 `None` 契约，新增 5.4.1 存活单一真源；② 5.5 `Retriever` 的过滤载体从 `Option<&Filter>` 改为 `Option<&dyn CandidateFilter>`，新增 5.5.1；③ **7.5 整节重写**（原 instant-distance + delta 方案已在 D8 移除）；④ 7.6 修正 bincode 版本坑，新增 7.6.1「新增结构不入快照」；⑤ 8.1 去掉失效的 `instant_distance::Search` 复用、新增过滤下推两行；⑥ 新增 8.3 的 `query::Metrics` 三项与其**当前不可观测**的限制、新增 8.4 空结果语义；⑦ 新增 **ADR-010**；⑧ 14 章 R1 标记已消除、新增 R11~R18；⑨ 9.3 决策表补 ADR-010 行 |

@@ -72,7 +72,9 @@ struct SearchArgs {
     /// 返回条数
     #[arg(short, long, default_value_t = 10)]
     k: usize,
-    /// 元数据过滤（field=value，等值匹配，可多次出现）
+    /// 元数据过滤（`field=value` 等值 / `field>=v` / `field<v` 数值范围；
+    /// 逗号分隔或多次出现，语义为 And）。范围语义是 `[下界, 上界)`，
+    /// 故只提供 `>=` 与 `<`；需要闭区间上界请写 `< 上界+1`
     #[arg(long)]
     filter: Vec<String>,
     /// 打印 explain 详情（匹配词 + 两路 rank/score）
@@ -114,19 +116,73 @@ fn parse_mode(s: &str) -> Result<SearchMode> {
     }
 }
 
-/// 解析 `field=value` 形式的过滤条件（等值匹配）。
-fn parse_filters(specs: &[String]) -> Result<Option<Filter>> {
-    if specs.is_empty() {
-        return Ok(None);
-    }
-    let mut conditions = Vec::with_capacity(specs.len());
-    for s in specs {
-        match s.split_once('=') {
-            Some((f, v)) => conditions.push(Filter::eq(f, v)),
-            None => bail!("过滤条件格式应为 field=value，收到 {s:?}"),
+/// 解析过滤条件：`field=value`（等值）/ `field>=v` 或 `field<v`（数值范围）。
+///
+/// 多个条件用逗号分隔或重复传参，语义为 **And**。
+///
+/// # 为什么只支持 `>=` 与 `<`
+///
+/// [`Filter::Range`] 的语义是 **`[gte, lte)`**（下界含、上界不含）。把 `<=v`
+/// 静默改写成 `<(v + ε)` 会引入浮点陷阱——ε 的选取没有唯一解（v 是 100 还是
+/// 1e-9 差着十几个数量级），改写后边界行为取决于 ε，等于把正确性押在常量上。
+/// 因此这里**只暴露与 Range 语义天然对齐的两个运算符**；需要闭区间上界时请
+/// 显式写 `< 上界+1`（数值字段）或改用等值。
+pub(crate) fn parse_filters(specs: &[String]) -> Result<Option<Filter>> {
+    let mut conditions = Vec::new();
+    for spec in specs {
+        for s in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            conditions.push(parse_one_filter(s)?);
         }
     }
-    Ok(Some(Filter::And(conditions)))
+    match conditions.len() {
+        0 => Ok(None),
+        1 => Ok(conditions.pop()),
+        _ => Ok(Some(Filter::And(conditions))),
+    }
+}
+
+/// 解析单个 `field<op>value` 条件。
+fn parse_one_filter(s: &str) -> Result<Filter> {
+    // ⚠️ 顺序有讲究，改动前先想清楚：
+    //   1. `<=` / `>` 必须在 `<` / `>=` **之前**判掉。否则 `score<=100` 会被
+    //      `split_once('<')` 切成 ("score", "=100")，报 "invalid float literal" ——
+    //      错误能被捕获，但信息完全误导（用户看不出是运算符不支持）。
+    //   2. `>=` 必须在 `>` 之后无关，但必须在 `=` 之前（`>=` 含 `=`）。
+    if s.contains("<=") || s.contains('>') && !s.contains(">=") {
+        bail!(
+            "不支持的运算符：{s:?}。Filter::Range 语义是 [gte, lte)，\
+             只能用 `>=` 与 `<`；需要闭区间上界请写 `< 上界+1`"
+        );
+    }
+    if let Some((f, v)) = s.split_once(">=") {
+        let gte: f64 = v
+            .trim()
+            .parse()
+            .with_context(|| format!("范围下界不是数值: {s:?}"))?;
+        return Ok(Filter::Range {
+            field: f.trim().to_string(),
+            gte,
+            lte: f64::INFINITY,
+        });
+    }
+    if let Some((f, v)) = s.split_once('<') {
+        if v.trim().is_empty() {
+            bail!("过滤条件缺少上界: {s:?}");
+        }
+        let lte: f64 = v
+            .trim()
+            .parse()
+            .with_context(|| format!("范围上界不是数值: {s:?}"))?;
+        return Ok(Filter::Range {
+            field: f.trim().to_string(),
+            gte: f64::NEG_INFINITY,
+            lte,
+        });
+    }
+    match s.split_once('=') {
+        Some((f, v)) => Ok(Filter::eq(f.trim(), v.trim())),
+        None => bail!("过滤条件格式应为 field=value / field>=v / field<v，收到 {s:?}"),
+    }
 }
 
 /// 底层构建：用调用方提供的 analyzer 从 JSONL 构建索引。
@@ -432,5 +488,81 @@ fn empty_reason_text(r: EmptyReason) -> &'static str {
         EmptyReason::NoDocuments => "索引为空",
         EmptyReason::AllTermsUnmatched => "查询词全部未命中（可能含幻觉词）",
         EmptyReason::FilteredOut => "候选被过滤条件全部排除",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! `--filter` 的解析是 CLI 侧少数有真实分支逻辑的地方，且有**顺序依赖**
+    //! （`<=` / `>` 必须在 `<` / `>=` 之前判掉，否则报错信息会误导），
+    //! 因此在这里钉住。CI 的 smoke 只覆盖到「跑通不报错」。
+
+    use super::{parse_filters, parse_one_filter};
+    use helix_core::schema::Filter;
+
+    #[test]
+    fn 等值过滤() {
+        assert!(matches!(
+            parse_one_filter("topic=vector").unwrap(),
+            Filter::Eq { ref field, ref value } if field == "topic" && value == "vector"
+        ));
+    }
+
+    #[test]
+    fn 范围过滤_半开区间() {
+        // Filter::Range 语义是 [gte, lte)，只开半边时另一端取无穷
+        let open_lo = parse_one_filter("score<100").unwrap();
+        assert!(matches!(
+            open_lo,
+            Filter::Range { ref field, gte, lte } if field == "score" && gte == f64::NEG_INFINITY && lte == 100.0
+        ));
+        let open_hi = parse_one_filter("score>=0").unwrap();
+        assert!(matches!(
+            open_hi,
+            Filter::Range { ref field, gte, lte } if field == "score" && gte == 0.0 && lte == f64::INFINITY
+        ));
+    }
+
+    #[test]
+    fn 支持的组合会合成_and() {
+        let f = parse_filters(&["score>=0".to_string(), "score<100".to_string()])
+            .unwrap()
+            .expect("两个条件应合成一个 Filter");
+        assert!(matches!(f, Filter::And(ref v) if v.len() == 2));
+    }
+
+    #[test]
+    fn 逗号分隔与多次传参等价() {
+        let a = parse_filters(&["topic=vector,lang=zh".to_string()]).unwrap();
+        let b = parse_filters(&["topic=vector".to_string(), "lang=zh".to_string()]).unwrap();
+        assert!(matches!(a, Some(Filter::And(ref v)) if v.len() == 2));
+        assert!(matches!(b, Some(Filter::And(ref v)) if v.len() == 2));
+    }
+
+    #[test]
+    fn 空输入是不过滤() {
+        assert!(parse_filters(&[]).unwrap().is_none());
+        assert!(parse_filters(&["".to_string()]).unwrap().is_none());
+    }
+
+    /// ⚠️ 顺序敏感的回归测试：`<=` 若被 `split_once('<')` 截走，会切成
+    /// ("score", "=100") 然后报 "invalid float literal" —— 错误能被捕获，
+    /// 但用户看不出是**运算符不支持**。这里断言错误信息指向运算符。
+    #[test]
+    fn 不支持的运算符必须明确指出而非报数值解析失败() {
+        for spec in ["score<=100", "score>5"] {
+            let err = parse_one_filter(spec).unwrap_err().to_string();
+            assert!(
+                err.contains("不支持的运算符"),
+                "{spec:?} 应明确提示运算符不支持，实际报错: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn 缺上界与非法数值会报错() {
+        assert!(parse_one_filter("score<").is_err());
+        assert!(parse_one_filter("score>=abc").is_err());
+        assert!(parse_one_filter("score").is_err());
     }
 }

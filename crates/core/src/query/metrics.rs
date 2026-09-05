@@ -1,4 +1,18 @@
 //! 可观测性：检索过程的轻量指标（NFR-07）。
+//!
+//! # ⚠️ 如何观测（当前限制）
+//!
+//! `Metrics` **只在 `search_parts` 内部聚合，经 [`Metrics::log`] 以 `tracing::info!`
+//! 输出**（事件名 `search`）——它既不在 `SearchResponse` 里，也不进 bench 的
+//! `bench::QueryMetrics`。由此有三个后果：
+//!
+//! - 宿主程序必须挂 `tracing` subscriber 才能拿到这些数字，否则静默丢弃
+//! - **无法对其做单元测试**（外部拿不到实例）
+//! - **无法被 bench 聚合**——而 `vector_shortfall` 的定位正是「V2.1 是否引入
+//!   prefilter 的判据」。真要用它做决策，得先把 `Metrics` 暴露进响应或 bench 采集链路
+//!
+//! 这个缺口是已知且未修的（见 issue #7），先让口径正确（按 `allowed` 归一），
+//! 再让口径可观测。
 
 use std::time::Duration;
 
@@ -19,9 +33,13 @@ pub struct Metrics {
     pub filter_eval: Duration,
     /// 通过过滤的候选总数（`CandidateFilter::allowed_count`；无过滤时为存活 chunk 数）
     pub allowed: usize,
-    /// 向量路"想取 `candidate_k` 条、实得 n 条"的缺口（暴露 filtered-ANN 的降级）
+    /// 向量路「本该拿到 `min(candidate_k, allowed)` 条、实得 n 条」的缺口。
     ///
-    /// > 0 表示低选择度下 ANN 凑不够候选——不是错误，但会让召回静默下降，
+    /// 归一到 `allowed`（通过过滤的候选总数）而非裸 `candidate_k`：候选池本身不足
+    /// `candidate_k` 时（小语料、高选择度过滤）`candidate_k - len` 恒为正，会让
+    /// 「filtered-ANN 是否降级」这个信号彻底失去鉴别力。
+    ///
+    /// > 0 表示低选择度下 ANN 没凑够候选——不是错误，但会让召回静默下降，
     /// > 必须可观测（V2.1 是否引入 prefilter 结构的判据）。
     pub vector_shortfall: usize,
 }

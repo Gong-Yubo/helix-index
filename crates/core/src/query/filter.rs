@@ -519,13 +519,48 @@ mod tests {
         assert_eq!(p.allowed_count(), 3);
     }
 
-    /// 高基数字段降级后，字段索引自动回落到全扫（正确性不丢）。
+    /// 建一个「高基数字段必然降级」的索引：`uuid` / `ts` 每篇一个独一无二的值。
+    ///
+    /// 阈值取 8（远小于文档数），因此两个高基数字段**必然**在摄入途中降级；
+    /// `tag` 只有两个取值，保持未降级（用来验证降级是**按字段**而非按索引）。
+    fn build_degraded_index(n: usize) -> Index {
+        let analyzer = MixedAnalyzer::new();
+        let mut index = Index::with_max_values_per_field(8);
+        for i in 0..n {
+            let text = format!("第 {i} 篇 检索 文档");
+            let doc = DocRecord {
+                doc_id: 0,
+                source: format!("d{i}"),
+                metadata: serde_json::json!({
+                    "uuid": format!("u{i}"),
+                    // 毫秒时间戳：Q-I1 优化对它整体失效的典型场景（评审 P2-2）
+                    "ts": 1_700_000_000_000.0 + i as f64,
+                    "tag": if i % 2 == 0 { "rust" } else { "go" },
+                }),
+                content_hash: 0,
+            };
+            let chunk = Chunk {
+                chunk_id: 0,
+                doc_id: 0,
+                ordinal: 0,
+                text,
+                char_start: 0,
+                char_end: 0,
+            };
+            index.add(doc, vec![chunk], &analyzer).unwrap();
+        }
+        index
+    }
+
+    /// 未降级字段走索引路径，且结果与全扫 oracle 一致。
+    ///
+    /// ⚠️ 这个测试**不覆盖**降级回退分支（它断言的正是 `!is_degraded`）。
+    /// 真正的回退分支由 [`降级字段回落到全扫且结果与oracle一致`] 覆盖。
     #[test]
-    fn 降级字段自动回落全扫() {
+    fn 未降级字段走索引路径且与全扫一致() {
         let analyzer = MixedAnalyzer::new();
         let mut index = Index::new();
-        // 每篇一个独一无二的 uuid → 触发基数保护（默认上限 1024 需更多文档，
-        // 这里直接构造一个已知降级字段来验证回落路径）
+        // 40 < DEFAULT_MAX_VALUES_PER_FIELD(1024)，uuid 不会降级
         for i in 0..40 {
             let text = format!("第 {i} 篇 检索 文档");
             let doc = DocRecord {
@@ -545,11 +580,99 @@ mod tests {
             index.add(doc, vec![chunk], &analyzer).unwrap();
         }
 
-        // 未降级：字段索引路径
+        // 未降级：字段索引路径（若这里就降级了，本测试名实不符，说明阈值被改动过）
         assert!(!index.field_index().is_degraded("uuid"));
         assert_eq!(
             doc_bits(&Filter::eq("uuid", "u7"), &index),
             doc_bits_scan(&Filter::eq("uuid", "u7"), &index)
         );
+    }
+
+    /// **降级回退分支**：字段索引降级后 `doc_bits` 回落到全扫，结果仍与 oracle 恒等。
+    ///
+    /// 这是「正确性不受影响，只是慢」这条契约的直接证据。取值覆盖三类：
+    ///
+    /// 1. 降级**之前**已登记的值（`u3`）——索引里有，走索引路径
+    /// 2. 降级**之后**被跳过的值（`u30`）——索引里没有，**必须**走回退
+    /// 3. 高基数数值字段的 Range（毫秒时间戳）——最常见的真实受害者
+    ///
+    /// 若把 `doc_bits` 里的 `None → doc_bits_scan` 回退摘掉，第 2、3 类会立刻转红。
+    #[test]
+    fn 降级字段回落到全扫且结果与oracle一致() {
+        let index = build_degraded_index(40);
+
+        // 前置条件：两个高基数字段确实降级了（否则本测试与未降级用例等价，无鉴别力）
+        assert!(
+            index.field_index().is_degraded("uuid"),
+            "40 个独一无二 uuid 在阈值 8 下必须降级"
+        );
+        assert!(
+            index.field_index().is_degraded("ts"),
+            "毫秒时间戳是最典型的高基数 Range 字段，必须降级"
+        );
+        // 降级是**按字段**的：低基数字段不受牵连
+        assert!(
+            !index.field_index().is_degraded("tag"),
+            "降级必须按字段隔离，低基数 tag 不应被牵连"
+        );
+
+        // 1) 降级前已登记的值：索引路径与 oracle 一致
+        assert_eq!(
+            doc_bits(&Filter::eq("uuid", "u3"), &index),
+            doc_bits_scan(&Filter::eq("uuid", "u3"), &index),
+            "降级前登记的值：索引路径应与全扫一致"
+        );
+
+        // 2) 降级后被跳过的值：索引里根本没有它的键，只能靠回退
+        for value in ["u8", "u20", "u30", "u39"] {
+            assert_eq!(
+                doc_bits(&Filter::eq("uuid", value), &index),
+                doc_bits_scan(&Filter::eq("uuid", value), &index),
+                "降级后被跳过的值 {value} 必须靠全扫回退才能得到正确结果"
+            );
+        }
+
+        // 3) 高基数字段上的 Range 过滤（Q-I1 对这类场景整体失效）
+        let range = Filter::Range {
+            field: "ts".into(),
+            gte: 1_700_000_000_010.0,
+            lte: 1_700_000_000_025.0,
+        };
+        let scanned = doc_bits_scan(&range, &index);
+        assert!(
+            scanned.count_ones() > 0,
+            "区间内应有文档，否则本测试无鉴别力"
+        );
+        assert_eq!(
+            doc_bits(&range, &index),
+            scanned,
+            "降级字段的 Range 必须回落到全扫，不能返回不完整的位图"
+        );
+
+        // 4) 降级字段与未降级字段的组合：部分回退后交集仍正确
+        for value in ["u30", "u7"] {
+            let combined = Filter::And(vec![Filter::eq("uuid", value), Filter::eq("tag", "rust")]);
+            assert_eq!(
+                doc_bits(&combined, &index),
+                doc_bits_scan(&combined, &index),
+                "And(降级字段={value}, 未降级 tag) 组合下回退仍须与全扫一致"
+            );
+        }
+
+        // 5) 谓词构建层同样成立（回退后 allowed_count 也必须与全扫一致）
+        for value in ["u30", "u7"] {
+            let filter = Filter::eq("uuid", value);
+            let predicate = try_build_predicate(&index, Some(&filter))
+                .unwrap_or_else(|| panic!("{value} 应有命中，谓词不应为 None"));
+            let actual = index
+                .live_chunks()
+                .filter(|c| predicate.contains(c.chunk_id))
+                .count();
+            assert_eq!(
+                predicate.allowed_count(),
+                actual,
+                "降级字段 {value} 的 allowed_count 与实际通过数不符"
+            );
+        }
     }
 }

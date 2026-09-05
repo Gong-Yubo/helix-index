@@ -14,8 +14,14 @@
 //! - `--runs N > 1`：每次**重建 HNSW 图**再评测（模拟跨进程图差异，R-P5-13
 //!   抖动披露；brute 后端无抖动，跳过）
 //! - 主表 Recall/MRR 双列（thr=1 / thr=2）+ graded NDCG
+//! - `--filter`：过滤档位（V2 Step 1 / S1-10）。有过滤时额外输出 **post-filter
+//!   oracle 对照**——无过滤取 Top(k×--oracle-depth) 再按 doc 位图过滤取前 k，
+//!   即 Step 1 之前的行为，作为「下推是否回退」的基线（T9 / T14）
+//! - `--filter-cost`：过滤求值耗时对照（T13）——旧 `allowed_chunks` 全扫 vs
+//!   新 `doc_bits` + 惰性谓词，并附 `doc_bits_scan`（降级字段实际走的路径）
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -26,12 +32,18 @@ use clap::Args;
 use helix_core::analyze::CharabiaAnalyzer;
 use helix_core::analyze::{Analyzer, MixedAnalyzer};
 use helix_core::bench::{self, Judgment, QueryMetrics};
+use helix_core::bitmap::DocBits;
 use helix_core::chunk::Chunker;
 use helix_core::embed::LocalEmbedder;
 use helix_core::fusion::RrfFusion;
 use helix_core::index::Index;
+use helix_core::predicate::CandidateFilter;
+use helix_core::query::filter::{
+    allowed_chunk_count, allowed_chunks, doc_bits, doc_bits_scan, ChunkFilter,
+};
 use helix_core::query::{QueryExecutor, SearchMode};
 use helix_core::retriever::Bm25Params;
+use helix_core::schema::Filter;
 use helix_core::storage;
 use helix_core::types::ChunkId;
 use helix_core::vector::{BruteForceIndex, HnswRsIndex, NormalizedVector, VectorIndex};
@@ -105,6 +117,20 @@ pub struct BenchArgs {
     /// 跳过延迟测量（只跑效果；网格搜索时用）
     #[arg(long)]
     pub no_latency: bool,
+    /// 过滤档位（`field=value` / `field>=v` / `field<v`，逗号分隔；可重复传）。
+    ///
+    /// 传了它，bench 会在效果/延迟两阶段都带上过滤，并额外跑 **post-filter
+    /// oracle 对照**，输出「选择度 × 延迟 × 召回」三元数据
+    /// （V2 Step 1 · S1-10 的 T12 / T14；档位清单见 `scripts/eval_filter.sh`）
+    #[arg(long)]
+    pub filter: Vec<String>,
+    /// 过滤求值耗时对照（T13）：旧 `allowed_chunks` 全扫 vs 新 `doc_bits` + 惰性谓词，
+    /// 并附 `doc_bits_scan`（降级字段实际走的路径）
+    #[arg(long)]
+    pub filter_cost: bool,
+    /// post-filter oracle 的过采样深度：无过滤取 Top (k × 该值) 后再按过滤条件截断
+    #[arg(long, default_value_t = 10)]
+    pub oracle_depth: usize,
 }
 
 /// 评测环境：索引 + 分词器 + 可选向量后端。
@@ -142,6 +168,32 @@ struct PerQuery {
 
 struct ModeResult {
     per_query: Vec<PerQuery>,
+    /// 过滤档位下的质量指标（无过滤时为 `None`）
+    filter_quality: Option<FilterQuality>,
+}
+
+/// 过滤场景的质量指标：T12 三元数据里的「召回」轴，以及 T14 的判据。
+struct FilterQuality {
+    /// 相对 **post-filter oracle** 的 Top-K 重合率（`|F ∩ O| / |O|`）。
+    ///
+    /// oracle = 无过滤取 Top(k×depth) 再按过滤条件截断取前 k，即 **Step 1 之前
+    /// 的行为**。这是 T14① 的核心判据（目标 ≥ 0.99）：下推不该改变"谁最相关"，
+    /// 只该改变"多快找到"。
+    recall_vs_oracle: f64,
+    /// 平均返回条数：低选择度下不足 k 时，暴露 R11（filtered-ANN 召回不足）
+    /// 与 R17（hnsw_rs 固有近似误差）的真实量级
+    mean_hits: f64,
+    /// 平均**用户视角**缺口 = `min(k, allowed) - 实得条数`。
+    ///
+    /// ⚠️ 与 `Metrics::vector_shortfall` 口径不同：后者按融合前的候选池
+    /// `min(candidate_k, allowed)` 算，bench 侧拿不到内部 `candidate_k`，
+    /// 这里用 k 代替。两者都叫"缺口"，但分母不同，不可混用。
+    mean_shortfall: f64,
+    /// oracle 自身的平均条数——**基线的自证**。
+    ///
+    /// 低于 K 说明 oracle 没能凑够 K 条（过采样深度不足），此时 `recall_vs_oracle`
+    /// 的分母是残缺的，重合率**不可信**，必须连同本字段一起看。
+    oracle_mean_hits: f64,
 }
 
 impl ModeResult {
@@ -199,6 +251,14 @@ pub fn run(args: BenchArgs) -> Result<()> {
     let judgments = bench::load_judgments(&args.queries)
         .with_context(|| format!("加载 judgments 失败: {}", args.queries.display()))?;
     bench::validate_sources(&judgments, &setup.index)?;
+
+    // 过滤档位（V2 Step 1 / S1-10）：解析一次，效果与延迟两阶段共用。
+    // `allowed` 是选择度的分子——三元数据里的「选择度」轴。
+    let filter = crate::parse_filters(&args.filter)?;
+    let bits = filter.as_ref().map(|f| doc_bits(f, &setup.index));
+    let allowed = bits
+        .as_ref()
+        .map_or(0, |b| allowed_chunk_count(b, &setup.index));
     println!(
         "评测配置: {} queries × {} 段落，K={}，BM25(k1={}, b={})，RRF(k={}, w={:?})，向量后端 {}{}",
         judgments.len(),
@@ -213,6 +273,17 @@ pub fn run(args: BenchArgs) -> Result<()> {
             .map(|e| format!("(ef_search={e})"))
             .unwrap_or_default()
     );
+    if let Some(f) = filter.as_ref() {
+        let total = setup.index.num_chunks().max(1) as f64;
+        let depth_eff = oracle_depth_for(&setup.index, allowed, args.k, args.oracle_depth);
+        println!(
+            "过滤档位: {f:?}\n           allowed = {allowed} chunk（选择度 {:.4}%），\
+             oracle = 无过滤 Top({depth_eff}) 后过滤（按选择度自适应）\n\
+           ⚠️  过滤场景下主表的 Recall/MRR/NDCG **无意义**（相关文档大概率不在 allowed 内），\
+             唯一可信的是下面的「过滤质量」表",
+            allowed as f64 / total * 100.0,
+        );
+    }
 
     let mut json = serde_json::json!({
         "config": {
@@ -221,10 +292,19 @@ pub fn run(args: BenchArgs) -> Result<()> {
             "ef_search": args.ef_search, "modes": args.modes,
             "queries": args.queries.display().to_string(),
             "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+            "filter": args.filter.join(" AND "),
+            "oracle_depth": args.oracle_depth,
         },
         "n_queries": judgments.len(),
         "n_corpus": setup.index.num_chunks(),
     });
+    if filter.is_some() {
+        json["filter"] = serde_json::json!({
+            "spec": args.filter.join(" AND "),
+            "allowed_chunks": allowed,
+            "selectivity": allowed as f64 / setup.index.num_chunks().max(1) as f64,
+        });
+    }
 
     // ---- 2. 阶段 A：效果（--runs 轮，每轮重建 HNSW 图模拟跨进程差异）----
     let runs = args.runs.max(1);
@@ -246,7 +326,19 @@ pub fn run(args: BenchArgs) -> Result<()> {
             let searcher = make_searcher(&setup, bm25_params, rrf_k, &rrf_weights, mode)?;
             results.insert(
                 mode_name(mode).to_string(),
-                eval_effect(&searcher, &judgments, mode, args.k),
+                eval_effect(
+                    &searcher,
+                    &setup.index,
+                    &judgments,
+                    mode,
+                    args.k,
+                    FilterCtx {
+                        filter: filter.as_ref(),
+                        bits: bits.as_ref(),
+                        allowed,
+                        oracle_depth: args.oracle_depth,
+                    },
+                ),
             );
         }
         // 每轮 NDCG 记录（含第一轮；--runs > 1 时用于抖动区间披露）
@@ -266,6 +358,9 @@ pub fn run(args: BenchArgs) -> Result<()> {
         );
         if run_i == 1 {
             print_effect(&results, &judgments, args.k);
+            if filter.is_some() {
+                print_filter_quality(&results, args.k, allowed);
+            }
             first_results = Some(results);
         } else {
             let line: Vec<String> = ndcg_by_mode
@@ -335,22 +430,67 @@ pub fn run(args: BenchArgs) -> Result<()> {
             args.reps,
             judgments.len()
         );
-        println!("{:<8} {:>10} {:>10}", "mode", "P50(ms)", "P99(ms)");
+        if filter.is_some() {
+            println!(
+                "{:<8} {:>10} {:>10} {:>10} {:>10}",
+                "mode", "P50(ms)", "P99(ms)", "平均条数", "平均缺口"
+            );
+        } else {
+            println!("{:<8} {:>10} {:>10}", "mode", "P50(ms)", "P99(ms)");
+        }
         for &mode in &modes {
             let searcher = make_searcher(&setup, bm25_params, rrf_k, &rrf_weights, mode)?;
-            let lat = eval_latency(&searcher, &judgments, mode, args.k, args.warmup, args.reps);
-            println!(
-                "{:<8} {:>10.2} {:>10.2}",
-                mode_name(mode),
-                lat.p50_ms,
-                lat.p99_ms
+            let lat = eval_latency(
+                &searcher,
+                &judgments,
+                mode,
+                args.k,
+                args.warmup,
+                args.reps,
+                FilterCtx {
+                    filter: filter.as_ref(),
+                    bits: bits.as_ref(),
+                    allowed,
+                    oracle_depth: args.oracle_depth,
+                },
             );
+            if filter.is_some() {
+                println!(
+                    "{:<8} {:>10.2} {:>10.2} {:>10.2} {:>10.2}",
+                    mode_name(mode),
+                    lat.p50_ms,
+                    lat.p99_ms,
+                    lat.mean_hits,
+                    lat.mean_shortfall
+                );
+            } else {
+                println!(
+                    "{:<8} {:>10.2} {:>10.2}",
+                    mode_name(mode),
+                    lat.p50_ms,
+                    lat.p99_ms
+                );
+            }
             latency.insert(
                 mode_name(mode).to_string(),
-                serde_json::json!({"p50_ms": lat.p50_ms, "p99_ms": lat.p99_ms, "n_samples": lat.n}),
+                serde_json::json!({
+                    "p50_ms": lat.p50_ms,
+                    "p99_ms": lat.p99_ms,
+                    "n_samples": lat.n,
+                    "mean_hits": lat.mean_hits,
+                    "mean_shortfall": lat.mean_shortfall,
+                }),
             );
         }
         json["latency"] = latency.into();
+    }
+
+    // ---- 3.5 阶段 D：过滤求值耗时对照（T13，仅 --filter-cost）----
+    if args.filter_cost {
+        match filter.as_ref() {
+            Some(f) => eval_filter_cost(&setup.index, f, args.warmup, args.reps.max(3))?,
+            None => eprintln!("⚠️  --filter-cost 需要配合 --filter 使用，本次忽略"),
+        }
     }
 
     // ---- 4. 阶段 C：网格 ----
@@ -540,21 +680,109 @@ fn make_searcher<'a>(
 // 阶段 A：效果
 // ---------------------------------------------------------------------------
 
+/// 执行一次检索（有过滤走 `search_filtered`，无过滤走 `search`）。
+fn run_once(
+    searcher: &QueryExecutor,
+    query: &str,
+    mode: SearchMode,
+    k: usize,
+    filter: Option<&Filter>,
+) -> helix_core::error::Result<helix_core::query::SearchResponse> {
+    match filter {
+        Some(f) => searcher.search_filtered(query, mode, k, Some(f)),
+        None => searcher.search(query, mode, k),
+    }
+}
+
+/// **post-filter oracle**：无过滤取 Top (k×depth) 再按 doc 位图过滤，取前 k。
+///
+/// 这就是 **Step 1 之前的行为**（融合后 post-filter），用作「下推是否回退」的基线。
+/// `depth` 过采样是为了消除截断误差：若只对无过滤 Top-k 做过滤，一旦前 k 条恰好
+/// 大多不在 allowed 内，oracle 自己就残缺——那不是下推的锅，是基线造得不对。
+fn oracle_top_k(
+    searcher: &QueryExecutor,
+    bits: &DocBits,
+    query: &str,
+    mode: SearchMode,
+    k: usize,
+    depth: usize,
+) -> Vec<ChunkId> {
+    let resp = searcher
+        .search(query, mode, k * depth)
+        .expect("oracle 检索失败");
+    resp.hits
+        .iter()
+        .filter(|h| bits.contains(h.doc_id))
+        .take(k)
+        .map(|h| h.chunk_id)
+        .collect()
+}
+
+/// 过滤档位的上下文（`--filter` 派生出的四样东西）。
+///
+/// 直接动机是 clippy 的 `too_many_arguments`（阈值 7）——但捆成一束也确实比
+/// 四个散参更能表达「它们同生共死」：`filter` 为 `None` 时其余三个必为空/零，
+/// 由 [`FilterCtx::none`] 一次性构造，调用方不可能漏掉其中一个。
+#[derive(Clone, Copy)]
+struct FilterCtx<'a> {
+    /// 传给内核的过滤条件；`None` = 不过滤
+    filter: Option<&'a Filter>,
+    /// `filter` 求得的 doc 位图；`None` = 无过滤。带过滤时用于 oracle 与 `allowed`
+    bits: Option<&'a DocBits>,
+    /// `bits` 内的 chunk 数（`allowed_chunk_count`），用于「用户视角缺口」的分母
+    allowed: usize,
+    /// oracle 过采样深度的安全系数，见 [`oracle_depth_for`]
+    oracle_depth: usize,
+}
+
+impl FilterCtx<'_> {
+    /// 无过滤档位：位图与 `allowed` 皆空，过滤相关统计整段跳过。
+    fn none() -> Self {
+        Self {
+            filter: None,
+            bits: None,
+            allowed: 0,
+            oracle_depth: 1,
+        }
+    }
+}
+
 fn eval_effect(
     searcher: &QueryExecutor,
+    index: &Index,
     judgments: &[Judgment],
     mode: SearchMode,
     k: usize,
+    ctx: FilterCtx<'_>,
 ) -> ModeResult {
+    // 过滤档位下的额外统计（无过滤时整段跳过，成本为零）
+    let allowed = ctx.allowed;
+    // oracle 深度按选择度自适应：低选择度下固定 10×K 根本凑不够 K 条
+    // （1% 选择度 + K=10 需要 ≈1000 条候选才能捞到 10 条 allowed），
+    // 固定深度会让 oracle 自己残缺，重合率因此虚高——这是首版实测踩到的坑。
+    let depth_eff = oracle_depth_for(index, allowed, k, ctx.oracle_depth);
+    let mut hits_sum = 0usize;
+    let mut shortfall_sum = 0usize;
+    let mut overlap_sum = 0usize;
+    let mut oracle_sum = 0usize;
+
     let mut per_query = Vec::with_capacity(judgments.len());
     for j in judgments {
-        let resp = searcher
-            .search(&j.query, mode, k)
+        let resp = run_once(searcher, &j.query, mode, k, ctx.filter)
             .unwrap_or_else(|e| panic!("检索失败（qid={}）: {e}", j.qid));
         let ranked: Vec<&str> = resp.hits.iter().map(|h| h.source.as_str()).collect();
         let grades = j.grades();
         let thr1 = bench::evaluate(&ranked, &grades, k, 1);
         let thr2 = bench::evaluate(&ranked, &grades, k, 2);
+
+        if let Some(b) = ctx.bits {
+            hits_sum += resp.hits.len();
+            shortfall_sum += k.min(allowed).saturating_sub(resp.hits.len());
+            let oracle = oracle_top_k(searcher, b, &j.query, mode, k, depth_eff);
+            let got: HashSet<ChunkId> = resp.hits.iter().map(|h| h.chunk_id).collect();
+            overlap_sum += oracle.iter().filter(|c| got.contains(c)).count();
+            oracle_sum += oracle.len();
+        }
         per_query.push(PerQuery {
             qid: j.qid.clone(),
             qtype: j.qtype.clone(),
@@ -562,7 +790,76 @@ fn eval_effect(
             thr2,
         });
     }
-    ModeResult { per_query }
+
+    let n = judgments.len().max(1);
+    let filter_quality = ctx.bits.map(|_| FilterQuality {
+        recall_vs_oracle: overlap_sum as f64 / oracle_sum.max(1) as f64,
+        mean_hits: hits_sum as f64 / n as f64,
+        mean_shortfall: shortfall_sum as f64 / n as f64,
+        oracle_mean_hits: oracle_sum as f64 / n as f64,
+    });
+    ModeResult {
+        per_query,
+        filter_quality,
+    }
+}
+
+/// 见 [`oracle_depth_for`]；oracle 深度的绝对上限。
+///
+/// 低选择度下「捞够 K 条」需要的候选数会爆炸（0.1% × K=10 ⇒ 约 1 万条），
+/// 而每次 oracle 都是一次完整检索（10 万级上 hybrid 单发就是几十毫秒），
+/// 不设上限会让 T12 的选择度扫描从"分钟级"变成"小时级"。超限时宁可让
+/// 基线残缺并由 `oracle条数` 列自证，也不能让扫描跑不完。
+const ORACLE_MAX_DEPTH: usize = 5_000;
+
+/// oracle 的过采样深度：按选择度自适应，目标是让 oracle 稳定凑够 K 条。
+///
+/// 直觉：选择度 s 下，要捞到 K 条 allowed，无过滤候选需约 `K / s` 条；
+/// 再乘 `--oracle-depth` 作为安全系数（默认 10，吸收「Top 区并非均匀含
+/// allowed」的偏差）。上界是 [`ORACLE_MAX_DEPTH`] 与全库条数中的较小值，
+/// 下界是 `K × depth`（高选择度时 `K/s` 反而小于它，不该缩水）。
+fn oracle_depth_for(index: &Index, allowed: usize, k: usize, oracle_depth: usize) -> usize {
+    let total = index.num_chunks().max(1) as f64;
+    let sel = allowed as f64 / total;
+    if sel <= 0.0 {
+        return (k * oracle_depth).max(k).min(ORACLE_MAX_DEPTH.max(k));
+    }
+    let need = (k as f64 / sel).ceil() as usize * oracle_depth;
+    need.clamp((k * oracle_depth).max(k), ORACLE_MAX_DEPTH.max(k))
+        .min(total as usize)
+}
+
+/// 过滤质量表：T12 三元数据的「召回」轴 + T14 的判据。
+fn print_filter_quality(results: &HashMap<String, ModeResult>, k: usize, allowed: usize) {
+    println!("\n== 过滤质量（vs post-filter oracle，K={k}，allowed={allowed}）==");
+    println!(
+        "{:<8} {:>10} {:>10} {:>12} {:>10}",
+        "mode", "平均条数", "平均缺口", "重合率", "oracle条数"
+    );
+    for name in ["bm25", "vector", "hybrid"] {
+        if let Some(q) = results.get(name).and_then(|r| r.filter_quality.as_ref()) {
+            // 两种告警语义不同，别混为一谈：
+            //   - 重合率 <0.99 → **下推回退**（本次实现的锅，必须查）
+            //   - oracle < K   → 基线本身没凑够 K（allowed 内匹配 query 的文档
+            //                    就这么少，是数据约束不是缺陷），此时重合率的
+            //                    鉴别力有限——分母小，两边同样少就容易"全中"
+            let flag = if q.recall_vs_oracle < 0.99 {
+                "  ⚠️ 下推回退"
+            } else if q.oracle_mean_hits < k as f64 * 0.9 {
+                "  （基线<K，鉴别力有限）"
+            } else {
+                ""
+            };
+            println!(
+                "{:<8} {:>10.2} {:>10.2} {:>12.4} {:>10.2}{}",
+                name, q.mean_hits, q.mean_shortfall, q.recall_vs_oracle, q.oracle_mean_hits, flag
+            );
+        }
+    }
+    println!(
+        "  oracle条数 = post-filter 基线自身的平均条数（<K 时重合率的分母偏小，\n  \
+         只能证明「下推没比 post-filter 更差」，不能证明「召回足够」）。"
+    );
 }
 
 fn print_effect(results: &HashMap<String, ModeResult>, judgments: &[Judgment], k: usize) {
@@ -640,6 +937,10 @@ struct LatencyResult {
     p50_ms: f64,
     p99_ms: f64,
     n: usize,
+    /// 平均返回条数（无过滤时恒为 K，除非语料不足）
+    mean_hits: f64,
+    /// 平均用户视角缺口 `min(K, allowed) − len`（无过滤时 `allowed=0`，恒为 0）
+    mean_shortfall: f64,
 }
 
 fn eval_latency(
@@ -649,24 +950,149 @@ fn eval_latency(
     k: usize,
     warmup: usize,
     reps: usize,
+    ctx: FilterCtx<'_>,
 ) -> LatencyResult {
+    let allowed = ctx.allowed;
     let mut samples: Vec<f64> = Vec::with_capacity(judgments.len() * reps);
+    let mut hits_sum = 0usize;
+    let mut shortfall_sum = 0usize;
+    let mut n_resp = 0usize;
     for j in judgments {
         for _ in 0..warmup {
-            let _ = searcher.search(&j.query, mode, k);
+            let _ = run_once(searcher, &j.query, mode, k, ctx.filter);
         }
         for _ in 0..reps {
             let t = Instant::now();
-            let _ = searcher.search(&j.query, mode, k);
+            let r = run_once(searcher, &j.query, mode, k, ctx.filter);
             samples.push(t.elapsed().as_secs_f64() * 1000.0);
+            if let Ok(resp) = r {
+                hits_sum += resp.hits.len();
+                shortfall_sum += k.min(allowed).saturating_sub(resp.hits.len());
+                n_resp += 1;
+            }
         }
     }
     samples.sort_by(|a, b| a.partial_cmp(b).expect("延迟样本无 NaN"));
     let n = samples.len();
+    let denom = n_resp.max(1) as f64;
     LatencyResult {
         p50_ms: bench::percentile(&samples, 50.0),
         p99_ms: bench::percentile(&samples, 99.0),
         n,
+        mean_hits: hits_sum as f64 / denom,
+        mean_shortfall: shortfall_sum as f64 / denom,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 阶段 D：过滤求值耗时对照（T13）
+// ---------------------------------------------------------------------------
+
+/// 对照三条路径的**求值本身**耗时（不含检索）
+///
+/// 1. `allowed_chunks` —— Step 1 之前的实现：展开成 `HashSet<ChunkId>`，O(N)
+/// 2. `doc_bits` + `ChunkFilter` —— Step 1 之后：doc 位图 + 惰性谓词，O(匹配文档数)
+/// 3. `doc_bits_scan` —— 全扫兜底：**降级字段实际走的就是它**（评审 P2-2 主场景）
+///
+/// 顺带做一次一致性校验：路径 1 与路径 2 的允许集大小必须相等
+/// （单测里的等价性证明，在真实 fixture 上再验一次）。
+fn eval_filter_cost(index: &Index, filter: &Filter, warmup: usize, reps: usize) -> Result<()> {
+    use std::hint::black_box;
+
+    macro_rules! time_it {
+        ($samples:expr, $e:expr) => {{
+            let t = Instant::now();
+            let v = $e;
+            $samples.push(t.elapsed().as_secs_f64() * 1000.0);
+            black_box(v)
+        }};
+    }
+
+    let mut old_ms = Vec::with_capacity(reps);
+    let mut new_ms = Vec::with_capacity(reps);
+    let mut scan_ms = Vec::with_capacity(reps);
+
+    for _ in 0..warmup {
+        black_box(allowed_chunks(filter, index));
+        black_box(doc_bits(filter, index));
+        black_box(doc_bits_scan(filter, index));
+    }
+    let (mut old_n, mut new_n) = (0usize, 0usize);
+    for _ in 0..reps {
+        let s = time_it!(old_ms, allowed_chunks(filter, index));
+        old_n = s.len();
+        // 新路径 = doc_bits（字段索引位图）+ ChunkFilter::new（O(匹配文档数) 计数）
+        let cf = time_it!(new_ms, ChunkFilter::new(doc_bits(filter, index), index));
+        new_n = cf.allowed_count();
+        time_it!(scan_ms, doc_bits_scan(filter, index));
+    }
+
+    let mean = |v: &Vec<f64>| v.iter().sum::<f64>() / v.len().max(1) as f64;
+    let p99 = |v: &Vec<f64>| {
+        let mut s = v.clone();
+        s.sort_by(|a, b| a.partial_cmp(b).expect("无 NaN"));
+        bench::percentile(&s, 99.0)
+    };
+    println!("\n== 过滤求值耗时（T13：warmup {warmup} + {reps} reps，仅求值，不含检索）==");
+    println!("{:<34} {:>12} {:>12}", "路径", "平均(ms)", "P99(ms)");
+    println!(
+        "{:<34} {:>12.4} {:>12.4}",
+        "allowed_chunks（旧·全扫 HashSet）",
+        mean(&old_ms),
+        p99(&old_ms)
+    );
+    println!(
+        "{:<34} {:>12.4} {:>12.4}",
+        "doc_bits + 惰性谓词（新）",
+        mean(&new_ms),
+        p99(&new_ms)
+    );
+    println!(
+        "{:<34} {:>12.4} {:>12.4}",
+        "doc_bits_scan（降级字段实际路径）",
+        mean(&scan_ms),
+        p99(&scan_ms)
+    );
+    let speed = if mean(&new_ms) > 0.0 {
+        mean(&old_ms) / mean(&new_ms)
+    } else {
+        f64::INFINITY
+    };
+    println!("加速比（旧/新，按平均）: {speed:.1}×");
+
+    if old_n != new_n {
+        // 这不是性能问题而是**正确性**问题：两条路径的允许集不一致
+        // 说明字段索引与全扫语义已经错开（R12）。bench 不 panic（保留现场数据），
+        // 但必须显眼——单测 T6/T8 覆盖的是随机 metadata，这里是真实 fixture。
+        eprintln!(
+            "⚠️⚠️  允许集大小不一致：allowed_chunks={old_n} vs doc_bits={new_n}\n\
+             ⚠️⚠️  字段索引与全扫语义已错开（R12），请立即用 T6/T8 复现"
+        );
+    }
+
+    // 降级状态直接暴露：`ts_ms` / `uuid` 这类高基数字段必然降级，
+    // 该字段上的所有过滤查询都会退回 doc_bits_scan（Q-I1 对它收益为 0）
+    let degraded: Vec<&str> = collect_fields(filter)
+        .iter()
+        .filter(|f| index.field_index().is_degraded(f))
+        .copied()
+        .collect();
+    println!(
+        "降级字段: {}",
+        if degraded.is_empty() {
+            "无（全部走字段索引）".to_string()
+        } else {
+            format!("{degraded:?} → 该字段退化为全扫（Q-I1 对它收益为 0）")
+        }
+    );
+    Ok(())
+}
+
+/// 收集过滤条件里出现的所有字段名（用于降级诊断）。
+fn collect_fields(filter: &Filter) -> Vec<&str> {
+    match filter {
+        Filter::Eq { field, .. } | Filter::Range { field, .. } => vec![field.as_str()],
+        Filter::And(v) | Filter::Or(v) => v.iter().flat_map(collect_fields).collect(),
     }
 }
 
@@ -695,7 +1121,15 @@ fn eval_grid(setup: &Setup, judgments: &[Judgment], k: usize, rrf_k: f32) -> Res
                 &[1.0, 1.0],
                 SearchMode::Bm25,
             )?;
-            let r = eval_effect(&searcher, judgments, SearchMode::Bm25, k);
+            // 网格搜索只调参、不过滤：整束传 none
+            let r = eval_effect(
+                &searcher,
+                &setup.index,
+                judgments,
+                SearchMode::Bm25,
+                k,
+                FilterCtx::none(),
+            );
             let a = r.agg(|p| &p.thr1);
             println!(
                 "  k1={:<4} b={:<5} NDCG={:.4} Recall={:.4} MRR={:.4}",
@@ -787,10 +1221,24 @@ fn mode_to_json(r: &ModeResult) -> serde_json::Value {
             })
         })
         .collect();
-    serde_json::json!({
+    // 过滤质量只在传了 --filter 时存在；写进 json 让脚本能汇总三元数据，
+    // 否则「重合率」只活在 stdout 里，无法跨档位对账
+    let fq = r.filter_quality.as_ref().map(|q| {
+        serde_json::json!({
+            "recall_vs_oracle": q.recall_vs_oracle,
+            "mean_hits": q.mean_hits,
+            "mean_shortfall": q.mean_shortfall,
+            "oracle_mean_hits": q.oracle_mean_hits,
+        })
+    });
+    let mut out = serde_json::json!({
         "thr1": {"recall": a1.recall, "mrr": a1.mrr, "ndcg": a1.ndcg, "n": a1.n},
         "thr2": {"recall": a2.recall, "mrr": a2.mrr, "n": a2.n},
         "buckets": buckets,
         "per_query": per_query,
-    })
+    });
+    if let Some(v) = fq {
+        out["filter_quality"] = v;
+    }
+    out
 }

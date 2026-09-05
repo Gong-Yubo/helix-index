@@ -115,11 +115,12 @@ impl VectorIndex for HnswRsIndex {
             return Ok(Vec::new());
         }
 
-        let is_filtered = filter.is_some_and(|f| f.kind() == FilterKind::Filtered);
-        let mut out: Vec<(ChunkId, f32)> = if is_filtered {
-            self.search_path_b(query, k, filter)
-        } else {
-            self.search_path_a(query, k, filter)
+        // 路径分派用 `match` 而非「bool 判据 + Option 形参」：路径 B 只在**确实存在
+        // 用户过滤谓词**时被选中，写成 match 后「走了下推却没谓词」在类型层面即不可达，
+        // 不必再留一条永远进不去的 `None` 分支（评审 nit-9；注释会过期，类型不会）。
+        let mut out: Vec<(ChunkId, f32)> = match filter {
+            Some(f) if f.kind() == FilterKind::Filtered => self.search_path_b(query, k, f),
+            other => self.search_path_a(query, k, other),
         };
 
         // 统一稳定排序（距离升序 → chunk_id 升序），保 NFR-06 确定性
@@ -165,24 +166,21 @@ impl HnswRsIndex {
     }
 
     /// 路径 B：`search_filter` + `FilterT` 适配器（真下推，但无 fast-return）。
+    ///
+    /// 谓词是**非可选**的：本路径只在确实存在用户过滤时被分派（见调用点的 `match`），
+    /// 因此不存在「走了下推却没有谓词」的状态需要兜底。
     fn search_path_b(
         &self,
         query: &NormalizedVector,
         k: usize,
-        filter: Option<&dyn CandidateFilter>,
+        filter: &dyn CandidateFilter,
     ) -> Vec<(ChunkId, f32)> {
         // knbn 是输出条数旋钮，ef 只是搜索宽度（§3.3 结论 4）
         let ef = (k * EF_FILTER_FACTOR).max(k).min(EF_FILTER_MAX);
-        let neighbours = match filter {
-            Some(f) => {
-                // `FilterT` 对 `Fn(&usize) -> bool` 有 blanket impl，闭包即可适配
-                let adapt = |id: &usize| f.contains(*id as ChunkId);
-                self.hnsw
-                    .search_filter(query.as_slice(), k, ef, Some(&adapt))
-            }
-            None => self.hnsw.search_filter(query.as_slice(), k, ef, None),
-        };
-        neighbours
+        // `FilterT` 对 `Fn(&usize) -> bool` 有 blanket impl，闭包即可适配
+        let adapt = |id: &usize| filter.contains(*id as ChunkId);
+        self.hnsw
+            .search_filter(query.as_slice(), k, ef, Some(&adapt))
             .into_iter()
             .map(|n| (n.d_id as ChunkId, 2.0 * n.distance))
             .collect()
@@ -398,7 +396,9 @@ mod tests {
                 let t0 = std::time::Instant::now();
                 let got = idx.search_filtered(&q, 10, Some(&predicate)).unwrap();
                 lat_us.push(t0.elapsed().as_micros());
-                shortfall.push(10usize.saturating_sub(got.len()));
+                // 缺口口径与 `Metrics::vector_shortfall` 一致（按 allowed 归一），
+                // 否则 bench 打印值与运行时指标对不上
+                shortfall.push(10usize.min(allowed).saturating_sub(got.len()));
 
                 // 召回基线：暴力 + 同谓词（精确 oracle）
                 let oracle: Vec<u32> = brute
