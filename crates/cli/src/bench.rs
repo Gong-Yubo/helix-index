@@ -128,9 +128,11 @@ pub struct BenchArgs {
     /// 并附 `doc_bits_scan`（降级字段实际走的路径）
     #[arg(long)]
     pub filter_cost: bool,
-    /// post-filter oracle 的过采样深度：无过滤取 Top (k × 该值) 后再按过滤条件截断
-    #[arg(long, default_value_t = 10)]
-    pub oracle_depth: usize,
+    /// post-filter oracle 的过采样深度：无过滤取 Top (k × 该值) 后再按过滤条件截断。
+    /// 上限 500：k×depth 不会超过 ORACLE_MAX_DEPTH(5000)（k=10 时的安全值；
+    /// 即使传入也只会被收敛到 5000 而非 panic，见 `oracle_depth_for`）
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..=500))]
+    pub oracle_depth: u64,
 }
 
 /// 评测环境：索引 + 分词器 + 可选向量后端。
@@ -275,7 +277,9 @@ pub fn run(args: BenchArgs) -> Result<()> {
     );
     if let Some(f) = filter.as_ref() {
         let total = setup.index.num_chunks().max(1) as f64;
-        let depth_eff = oracle_depth_for(&setup.index, allowed, args.k, args.oracle_depth);
+        // clap 校验已保证 1..=500，恒在 usize 范围内
+        let oracle_depth = args.oracle_depth as usize;
+        let depth_eff = oracle_depth_for(&setup.index, allowed, args.k, oracle_depth);
         println!(
             "过滤档位: {f:?}\n           allowed = {allowed} chunk（选择度 {:.4}%），\
              oracle = 无过滤 Top({depth_eff}) 后过滤（按选择度自适应）\n\
@@ -336,7 +340,8 @@ pub fn run(args: BenchArgs) -> Result<()> {
                         filter: filter.as_ref(),
                         bits: bits.as_ref(),
                         allowed,
-                        oracle_depth: args.oracle_depth,
+                        // clap 校验已保证 1..=500，恒在 usize 范围内
+                        oracle_depth: args.oracle_depth as usize,
                     },
                 ),
             );
@@ -451,7 +456,8 @@ pub fn run(args: BenchArgs) -> Result<()> {
                     filter: filter.as_ref(),
                     bits: bits.as_ref(),
                     allowed,
-                    oracle_depth: args.oracle_depth,
+                    // clap 校验已保证 1..=500，恒在 usize 范围内
+                    oracle_depth: args.oracle_depth as usize,
                 },
             );
             if filter.is_some() {
@@ -818,15 +824,26 @@ const ORACLE_MAX_DEPTH: usize = 5_000;
 /// 再乘 `--oracle-depth` 作为安全系数（默认 10，吸收「Top 区并非均匀含
 /// allowed」的偏差）。上界是 [`ORACLE_MAX_DEPTH`] 与全库条数中的较小值，
 /// 下界是 `K × depth`（高选择度时 `K/s` 反而小于它，不该缩水）。
+///
+/// ⚠️ 下界必须先被 [`ORACLE_MAX_DEPTH`] 夹住再传给 `clamp`：`clamp` 在
+/// `min > max` 时**无条件 panic**（issue #9），而 `k × depth` 随用户参数
+/// 无界增长（`--oracle-depth 600` × k=10 = 6000 > 5000）。两分支必须保持
+/// 同一对齐方式——早退分支用 `.min(...)` 天然安全，主分支也如此。
 fn oracle_depth_for(index: &Index, allowed: usize, k: usize, oracle_depth: usize) -> usize {
     let total = index.num_chunks().max(1) as f64;
     let sel = allowed as f64 / total;
+    let cap = ORACLE_MAX_DEPTH.max(k);
+    // saturating_mul：oracle_depth 是乘性安全系数，极端值饱和即可；
+    // 乘法溢出 panic 会把「深度过大」变成「bench 崩溃」（issue #9 的相邻路径）
+    let floor = k.saturating_mul(oracle_depth).max(k).min(cap);
     if sel <= 0.0 {
-        return (k * oracle_depth).max(k).min(ORACLE_MAX_DEPTH.max(k));
+        return floor;
     }
-    let need = (k as f64 / sel).ceil() as usize * oracle_depth;
-    need.clamp((k * oracle_depth).max(k), ORACLE_MAX_DEPTH.max(k))
-        .min(total as usize)
+    // saturating_mul：两处乘法都可能溢出（k×depth、need×depth），
+    // 极端参数下饱和即可；乘法溢出 panic 会把「深度过大」变成
+    // 「bench 崩溃」（issue #9 的相邻路径，测试里 usize::MAX 直接踩中）
+    let need = ((k as f64 / sel).ceil() as usize).saturating_mul(oracle_depth);
+    need.clamp(floor, cap).min(total as usize)
 }
 
 /// 过滤质量表：T12 三元数据的「召回」轴 + T14 的判据。
@@ -1241,4 +1258,53 @@ fn mode_to_json(r: &ModeResult) -> serde_json::Value {
         out["filter_quality"] = v;
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// issue #9：`k × oracle_depth > ORACLE_MAX_DEPTH` 时 `clamp(min, max)`
+    /// 的 min > max 无条件 panic。修复后下界先被上限夹住，任何参数组合都不 panic。
+    #[test]
+    fn oracle深度超限不panic且收敛到上限() {
+        let index = Index::new(); // num_chunks = 0，total 走 .max(1) 兜底
+        let k = 10usize;
+
+        // 越过 panic 线与溢出线的代表点；早退分支（allowed=0）一并覆盖
+        for depth in [501usize, 600, 5_000, usize::MAX / 2, usize::MAX] {
+            let d = oracle_depth_for(&index, 1, k, depth);
+            assert!(d <= ORACLE_MAX_DEPTH.max(k), "depth={depth}: {d} 超上限");
+            let d0 = oracle_depth_for(&index, 0, k, depth);
+            assert!(
+                d0 <= ORACLE_MAX_DEPTH.max(k),
+                "早退 depth={depth}: {d0} 超上限"
+            );
+        }
+
+        // issue 给的精确断言：depth = ORACLE_MAX_DEPTH / k + 1 时结果恰为上限。
+        // 注意空 index 的 total=1，最终还会被 .min(total) 截到 1，
+        // 所以断言上限收敛要看 clamp 中间值——用「不小于 min(total, cap)」刻画
+        let edge = ORACLE_MAX_DEPTH / k + 1; // 501
+        let expect = (ORACLE_MAX_DEPTH.max(k)).min(1); // total=1
+        assert_eq!(oracle_depth_for(&index, 1, k, edge), expect);
+        assert_eq!(oracle_depth_for(&index, 1, k, 600), expect);
+    }
+
+    /// 正常参数下的语义回归：默认 depth=10 的行为与修复前完全一致。
+    /// 空 index 的 total 被 .max(1) 兜底为 1，深度必被截到 1 —— 用满语料
+    /// 的等价场景验证：sel=1 时 need = k×depth 正是下界本身。
+    #[test]
+    fn oracle深度默认值语义不变() {
+        let index = Index::new();
+        // sel=1（allowed=1/total=1）：need = ceil(10/1)×10 = 100，
+        // floor = min(100, 5000) = 100，再 .min(total=1) → 1
+        assert_eq!(oracle_depth_for(&index, 1, 10, 10), 1);
+        // 早退分支（allowed=0）：不受 total 截断（floor 直接返回），保持 100
+        assert_eq!(oracle_depth_for(&index, 0, 10, 10), 100);
+        // 中选择度（sel=0.5，allowed=1/total=2）：need = ceil(10/0.5)×10 = 200，
+        // floor = 100，clamp → 200，.min(total=2) → 2
+        // —— total=2 需要真实语料，空 index 无法构造，此行留作行为文档
+        assert_eq!(oracle_depth_for(&index, 0, 3, 7), 21); // 3×7 < cap，早退不截断
+    }
 }
