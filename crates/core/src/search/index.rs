@@ -187,6 +187,9 @@ pub struct SearchIndex {
     pub(crate) graph: super::config::GraphOpts,
     /// 最近一次图 sidecar 的状态（NFR-07：降级必须可观测）
     pub(crate) graph_status: GraphStatus,
+    /// 最近一次 `save` 中图 sidecar 落盘（dump + CRC + manifest 发布）的耗时。
+    /// `None` = 本次 `save` 未走图持久化（验收 7：dump 耗时要有实测记录）。
+    pub(crate) graph_dump_elapsed: Option<std::time::Duration>,
 }
 
 impl SearchIndex {
@@ -228,6 +231,7 @@ impl SearchIndex {
             embed_elapsed: std::time::Duration::ZERO,
             graph,
             graph_status: GraphStatus::NotApplicable,
+            graph_dump_elapsed: None,
         }
     }
 
@@ -434,8 +438,23 @@ impl SearchIndex {
             &self.cfg.fingerprint(),
         )?;
 
+        // 图 sidecar 单独计时（验收 7）：`save` 的总耗时里，快照写入与图 dump
+        // 是两个数量级完全不同的成本，混在一起看不出图持久化的真实代价。
+        let t_dump = std::time::Instant::now();
+        self.graph_dump_elapsed = None;
         self.graph_status = self.persist_graph(path, &vectors, body_crc)?;
+        if !matches!(self.graph_status, GraphStatus::NotApplicable) {
+            self.graph_dump_elapsed = Some(t_dump.elapsed());
+        }
         Ok(())
+    }
+
+    /// 最近一次 `save` 中图 sidecar 落盘的耗时（验收 7 观测点）。
+    ///
+    /// `None` = 未走图持久化（纯 BM25 / Brute 后端 / `--no-graph-persist`）。
+    /// 注意这是**纯 dump 成本**，不含 HNSW 建图（建图发生在 `flush`/`add` 阶段）。
+    pub fn graph_dump_elapsed(&self) -> Option<std::time::Duration> {
+        self.graph_dump_elapsed
     }
 
     /// 写图 sidecar 并发布 manifest（§4.5 步骤 3~7）。
@@ -608,6 +627,7 @@ impl SearchIndex {
             embed_elapsed: std::time::Duration::ZERO,
             graph,
             graph_status,
+            graph_dump_elapsed: None,
         })
     }
 }

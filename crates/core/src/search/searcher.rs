@@ -103,6 +103,8 @@ impl Searcher {
                 embed_elapsed: std::time::Duration::ZERO,
                 graph: self.graph,
                 graph_status: self.graph_status,
+                // 读端从未执行过 save，图 dump 耗时无意义（不是 0，是「未发生」）
+                graph_dump_elapsed: None,
             }),
             Err(_) => Err(Error::InvalidInput(
                 "Searcher 仍有 clone 残留，无法换回写端（先 drop 其他 reader）".to_string(),

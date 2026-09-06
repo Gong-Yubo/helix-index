@@ -24,6 +24,8 @@ H1（图持久化格式 + 多文件原子性）结案，Step 3 原子快照直�
   「Brute 无图」成为类型事实而非运行时 if；`HnswRsIndex` 实现 dump/load
 - **`GraphStatus { Loaded, Rebuilt(reason), NotApplicable }`**：降级**必须可观测**（NFR-07），
   `SearchIndex::graph_status()` 暴露；默认「警告后降级」，`GraphPersistMode::Strict` 可升级为 Err
+- `SearchIndex::graph_dump_elapsed()`：图 sidecar 落盘耗时单独观测（验收 7；
+  快照写入与图 dump 是两个数量级不同的成本，混在一起看不出图持久化的真实代价）
 - 配置入口新增 `ef_search(n)` / `graph_mode(mode)` / `without_graph_persist()`
 - `storage::save_with_crc` / `load_with_crc`：读写路径带出正文 CRC（图的版本锚点）
 
