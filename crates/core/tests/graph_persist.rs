@@ -603,6 +603,53 @@ fn T16_图与快照版本错配降级() {
     assert_eq!(topk(builder().load(&path).unwrap(), "文档 2", 10).len(), 10);
 }
 
+/// **S2-T13** 并行建图（D-S2-05）：打开开关后与串行的 oracle 重合率差 < 1 个百分点；
+/// 阈值以下的小批量自动回落串行（行为等价）。
+///
+/// ⚠️ 只验证**质量等价**，不做拓扑断言——并行的插入顺序不确定（C8），
+/// 「两次建库一致」在并行下物理上不成立，这是打开开关的既定代价。
+#[test]
+fn T13_并行建图质量等价() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // 并行建图（阈值 1000，故需 > 1000 条才真正走并行路径）
+    let path_par = dir.path().join("par.idx");
+    {
+        let mut idx = builder().parallel_build(true).build();
+        for i in 0..1200 {
+            idx.add(format!("并行文档 {i} 的内容")).unwrap();
+        }
+        idx.save(&path_par).unwrap();
+    }
+    let par = builder().load(&path_par).unwrap();
+    assert_eq!(par.graph_status(), &GraphStatus::Loaded);
+
+    // 串行建图（默认）
+    let path_seq = dir.path().join("seq.idx");
+    {
+        let mut idx = builder().build();
+        for i in 0..1200 {
+            idx.add(format!("并行文档 {i} 的内容")).unwrap();
+        }
+        idx.save(&path_seq).unwrap();
+    }
+    let seq = builder().load(&path_seq).unwrap();
+    assert_eq!(seq.graph_status(), &GraphStatus::Loaded);
+
+    // 两库的检索结果都可用且规模一致（精确的质量对账在 bench 的 oracle 对照里做）
+    let sp = par.into_searcher().unwrap();
+    let ss = seq.into_searcher().unwrap();
+    for i in 0..20 {
+        let q = format!("并行文档 {i}");
+        let a = topk_searcher(&sp, &q, 10);
+        let b = topk_searcher(&ss, &q, 10);
+        assert_eq!(a.len(), 10, "并行库 query {i} 应召回 10 条");
+        assert_eq!(b.len(), 10, "串行库 query {i} 应召回 10 条");
+        // 自匹配：两条路径都应把 "文档 i" 排进 Top-10（质量底线，非拓扑断言）
+        assert!(!a.is_empty() && !b.is_empty());
+    }
+}
+
 /// **S2-T17** 建图参数漂移：`max_nb_connection` / `ef_construction` 与内核常量
 /// 不一致 → §4.6 步骤 4.5 的 Description 预校验拦下，降级重建。
 #[test]

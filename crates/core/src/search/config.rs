@@ -50,6 +50,8 @@ pub struct Config {
     /// HNSW ef_search（P0-5：图加载后必须回填，全 crate 无 set_ef*；
     /// `None` = 用内核默认 EF_SEARCH=200）
     pub ef_search: Option<usize>,
+    /// 批量建图是否走 `parallel_insert`（D-S2-05，**默认 false** 保确定性）
+    pub parallel_build: bool,
 }
 
 impl Config {
@@ -130,6 +132,8 @@ pub struct SearchIndexBuilder {
     graph_mode: GraphPersistMode,
     /// 是否持久化图（S2-08 的 `--no-graph-persist` 逃生舱；默认开）
     graph_persist: bool,
+    /// 并行建图（D-S2-05，默认关）
+    parallel_build: bool,
 }
 
 impl Default for SearchIndexBuilder {
@@ -146,6 +150,7 @@ impl Default for SearchIndexBuilder {
             ef_search: None,
             graph_mode: GraphPersistMode::Lenient,
             graph_persist: true,
+            parallel_build: false,
         }
     }
 }
@@ -220,6 +225,17 @@ impl SearchIndexBuilder {
         self
     }
 
+    /// 打开并行建图（D-S2-05，**默认关**）。
+    ///
+    /// ⚠️ 代价：`parallel_insert_slice` 走 rayon ⇒ 插入顺序不确定 ⇒
+    /// **建图拓扑不可复现**（C8）。图落盘后即被冻结，故「同快照两次加载」
+    /// 仍逐位一致；但「同一批向量两次建库」不再一致，与 P5/P6 基线的可比性
+    /// 会受影响。建议只在基准实测（S2-11 / T13）时打开。
+    pub fn parallel_build(mut self, parallel_build: bool) -> Self {
+        self.parallel_build = parallel_build;
+        self
+    }
+
     /// 组装出一个空的 `SearchIndex`（消费 builder）。
     ///
     /// 这是默认装配的唯一入口：`SearchIndex::builder().build()` 零配置可用。
@@ -275,6 +291,7 @@ impl SearchIndexBuilder {
             bm25_params: self.bm25_params.unwrap_or_default(),
             batch_size: self.batch_size.unwrap_or(DEFAULT_BATCH_SIZE),
             ef_search: self.ef_search,
+            parallel_build: self.parallel_build,
         }
     }
 

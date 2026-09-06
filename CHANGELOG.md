@@ -9,6 +9,35 @@
 
 ## [Unreleased]
 
+### V2 Step 2 · CLI / bench 接线与并行建图（S2-08 / S2-09 / S2-11）
+
+#### 新增（CLI）
+
+- `helix build` 打印**图 sidecar 落盘观测**：点数 / 图体积（graph + data）/ 快照体积 /
+  磁盘增量倍数——验收 7「体积与耗时有实测记录」的数据来源
+- `helix build --no-graph-persist`：逃生舱（写库但不落图，省约 1.6× 磁盘，
+  代价是下次冷启动重建图）
+- `helix search --index` 打印**图状态**：持久化图（快路径）/ ⚠️ 降级重建（含原因）/
+  不适用（D-S2-04：降级必须显式可见）
+
+#### 新增（bench）
+
+- `--index` 路径接图持久化（D-S2-06）：先从 sidecar 加载图，不可用才重建。
+  校验逻辑与门面层**共用** `vector::load_graph_checked`（禁止复制校验——漏项即
+  把坏文件交给满是 `unwrap()` 的 `load_hnsw`）
+- `--input` 内存直建路径维持重建并打印提示（P1-6 的倾向方案：bench 关注检索延迟，
+  冷启动在 S2-T14 单独测）
+- `--runs > 1` 的每轮重建**刻意跳过图**（传 `None`）：本就要制造跨进程差异观测
+  R-P5-13，读图会让每轮结果相同、`--runs` 失去意义
+
+#### 新增（并行建图，D-S2-05）
+
+- `VectorIndex::add_batch` + `HnswRsIndex` 覆盖为 `parallel_insert_slice`；
+  门面层 `flush` 改走批量路径
+- 阈值 `PARALLEL_INSERT_THRESHOLD = 1000`（以下回落串行）+ 开关
+  `SearchIndexBuilder::parallel_build(true)` —— **默认关**：并行插入顺序不确定 ⇒
+  拓扑不可复现（C8），保住与 P5/P6 基线的可比性，先出实测再定默认值
+
 ### V2 Step 2 · 图持久化与冷启动（ADR-A 方案 C，2026-09-06）
 
 设计文档 `docs/devel/v2-step2-design.md`（**v0.3，ADR-A 已拍板**）；

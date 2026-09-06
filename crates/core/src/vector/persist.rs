@@ -168,6 +168,87 @@ impl VectorGraphPersist for HnswRsIndex {
     }
 }
 
+/// 「校验 + 加载」一站式入口（v2-step2-design §4.6 的完整读取序列）。
+///
+/// 门面层与 bench（底层路径）共用同一份校验，**禁止在调用侧复制校验逻辑**——
+/// 复制必然漏项，而漏项的代价是把坏文件交给满是 `unwrap()` 的 `load_hnsw`（C3）。
+///
+/// - `body_crc`：快照正文 CRC（图的版本锚点，由 `storage::load_with_crc` 带出）
+/// - `dim`：`ConfigFingerprint.dim`
+/// - `nb_vectors`：快照中的向量条数（图中点数因墓碑恒 >= 它）
+/// - `ef_search`：加载后回填（P0-5：全 crate 无 `set_ef*`）
+///
+/// 返回 `Err(reason)` 表示应降级重建（图是缓存，丢弃不丢功能）。
+#[allow(clippy::too_many_arguments)]
+pub fn load_graph_checked(
+    snapshot: &Path,
+    body_crc: u32,
+    dim: u32,
+    nb_vectors: u64,
+    ef_search: usize,
+) -> std::result::Result<HnswRsIndex, String> {
+    // 步骤 3：读 manifest（缺失 / header 错 / CRC 错 / 解码错 → 降级）
+    let paths = graph_paths(snapshot);
+    let m = match crate::storage::read_manifest(&paths.manifest) {
+        Ok(Some(m)) => m,
+        Ok(None) => return Err("manifest 缺失或损坏".to_string()),
+        Err(e) => return Err(format!("manifest 读取失败: {e}")),
+    };
+
+    // 步骤 4：逐项校验
+    if m.manifest_version != crate::storage::MANIFEST_VERSION {
+        return Err(format!("manifest_version {} 未知", m.manifest_version));
+    }
+    if m.dist_id != crate::storage::DIST_ID {
+        return Err(format!("dist_id 不匹配: {}", m.dist_id));
+    }
+    if m.platform != crate::storage::PLATFORM_LE64 {
+        return Err(format!("platform 不匹配: {:#x}", m.platform));
+    }
+    if m.dim != dim {
+        return Err(format!("dim 不匹配: 图 {} vs 指纹 {dim}", m.dim));
+    }
+    if m.snapshot_crc != body_crc {
+        return Err(format!(
+            "snapshot_crc 不匹配: 图绑定 {:#010x} vs 快照 {body_crc:#010x}",
+            m.snapshot_crc
+        ));
+    }
+    let snapshot_len = std::fs::metadata(snapshot).map(|md| md.len()).unwrap_or(0);
+    if m.snapshot_len != snapshot_len {
+        return Err(format!(
+            "snapshot_len 不匹配: {} vs {snapshot_len}",
+            m.snapshot_len
+        ));
+    }
+    let (gc, gl) =
+        crate::storage::file_crc32_len(&paths.graph).map_err(|e| format!("图文件读取失败: {e}"))?;
+    if gc != m.graph_crc || gl != m.graph_len {
+        return Err("图拓扑文件 CRC/长度不符".to_string());
+    }
+    let (dc, dl) = crate::storage::file_crc32_len(&paths.data)
+        .map_err(|e| format!("图数据文件读取失败: {e}"))?;
+    if dc != m.data_crc || dl != m.data_len {
+        return Err("图数据文件 CRC/长度不符".to_string());
+    }
+
+    // 步骤 4.5：Description 预校验（P1-1 / P1-3）
+    validate_graph_description(snapshot, &m).map_err(|e| e.to_string())?;
+
+    // 步骤 5：加载（此刻文件已过五道先验）
+    let loaded = <HnswRsIndex as VectorGraphPersist>::load_graph(snapshot, &m, ef_search)
+        .map_err(|e| format!("图加载失败: {e}"))?;
+
+    // 步骤 6：图中点数恒 >= 原始向量条数（墓碑摘不掉，§4.6）
+    if (loaded.len() as u64) < nb_vectors {
+        return Err(format!(
+            "图中点数 {} < 快照向量条数 {nb_vectors}",
+            loaded.len()
+        ));
+    }
+    Ok(loaded)
+}
+
 /// 加载侧的 `Description` 预校验（v2-step2-design §4.6 步骤 4.5 / P1-1）。
 ///
 /// 在把图文件交给满是 `unwrap()` 的 `load_hnsw` 之前，先读自描述头逐项比对。

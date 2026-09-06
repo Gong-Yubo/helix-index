@@ -11,10 +11,7 @@ use crate::document::{content_hash, DocRecord, Document};
 use crate::error::{Error, Result};
 use crate::index::Index;
 use crate::types::{ChunkId, DocId};
-use crate::vector::{
-    validate_graph_description, BruteForceIndex, HnswRsIndex, NormalizedVector, VectorGraphPersist,
-    VectorIndex,
-};
+use crate::vector::{BruteForceIndex, HnswRsIndex, NormalizedVector, VectorIndex};
 
 use super::config::{Config, GraphPersistMode, SearchIndexBuilder, VectorBackend};
 
@@ -101,78 +98,18 @@ fn try_load_graph(
     if !graph.persist {
         return Err("图持久化已关闭（--no-graph-persist）".to_string());
     }
-
-    // 路径必须有文件名（与写侧同一约束，评审 #12 nit）
-    crate::storage::require_file_name(snapshot).map_err(|e| e.to_string())?;
-
-    // 步骤 3：读 manifest（文件不存在 / header 错 / CRC 错 / 解码错 → 降级）
-    let paths = crate::storage::graph_paths(snapshot);
-    let m = match crate::storage::read_manifest(&paths.manifest) {
-        Ok(Some(m)) => m,
-        Ok(None) => return Err("manifest 缺失或损坏".to_string()),
-        Err(e) => return Err(format!("manifest 读取失败: {e}")),
-    };
-
-    // 步骤 4：逐项校验（任一不符 → 降级）
-    if m.manifest_version != crate::storage::MANIFEST_VERSION {
-        return Err(format!("manifest_version {} 未知", m.manifest_version));
-    }
-    if m.dist_id != crate::storage::DIST_ID {
-        return Err(format!("dist_id 不匹配: {}", m.dist_id));
-    }
-    if m.platform != crate::storage::PLATFORM_FINGERPRINT {
-        return Err(format!("platform 不匹配: {:#x}", m.platform));
-    }
-    if m.dim != fingerprint.dim {
-        return Err(format!(
-            "dim 不匹配: 图 {} vs 指纹 {}",
-            m.dim, fingerprint.dim
-        ));
-    }
-    if m.snapshot_crc != *body_crc {
-        return Err(format!(
-            "snapshot_crc 不匹配: 图绑定 {:#010x} vs 快照 {:#010x}",
-            m.snapshot_crc, body_crc
-        ));
-    }
-    let snapshot_len = std::fs::metadata(snapshot).map(|md| md.len()).unwrap_or(0);
-    if m.snapshot_len != snapshot_len {
-        return Err(format!(
-            "snapshot_len 不匹配: {} vs {snapshot_len}",
-            m.snapshot_len
-        ));
-    }
-    // 两个图文件的 len + CRC（流式，不整读）
-    let (gc, gl) =
-        crate::storage::file_crc32_len(&paths.graph).map_err(|e| format!("图文件读取失败: {e}"))?;
-    if gc != m.graph_crc || gl != m.graph_len {
-        return Err("图拓扑文件 CRC/长度不符".to_string());
-    }
-    let (dc, dl) = crate::storage::file_crc32_len(&paths.data)
-        .map_err(|e| format!("图数据文件读取失败: {e}"))?;
-    if dc != m.data_crc || dl != m.data_len {
-        return Err("图数据文件 CRC/长度不符".to_string());
-    }
-
-    // 步骤 4.5：Description 预校验（P1-1 / P1-3：建图参数漂移也在这里拦下）
-    validate_graph_description(snapshot, &m).map_err(|e| e.to_string())?;
-
-    // 步骤 5：加载图（此刻文件已过五道先验，load_hnsw 不应再碰坏数据）
-    let loaded = <HnswRsIndex as VectorGraphPersist>::load_graph(snapshot, &m, ef_search)
-        .map_err(|e| format!("图加载失败: {e}"))?;
-
-    // 步骤 6：加载后补校验——图中点数恒 >= 原始向量条数（墓碑摘不掉，§4.6）
-    if (loaded.len() as u64) < raw_vectors.len() as u64 {
-        return Err(format!(
-            "图中点数 {} < 快照向量条数 {}",
-            loaded.len(),
-            raw_vectors.len()
-        ));
-    }
-    Ok(loaded)
+    // 校验 + 加载的完整序列在 `persist::load_graph_checked`：门面层与 bench（底层
+    // 路径）共用同一份校验——**复制校验逻辑必然漏项**，漏项 = 把坏文件交给满是
+    // `unwrap()` 的 `load_hnsw`（C3）
+    crate::vector::load_graph_checked(
+        snapshot,
+        *body_crc,
+        fingerprint.dim,
+        raw_vectors.len() as u64,
+        ef_search,
+    )
 }
 
-/// 降级报告（D-S2-04 / NFR-07）：默认警告后继续，strict 模式升级为 Err。
 fn warn_graph_degraded(reason: &str, mode: GraphPersistMode) -> Result<()> {
     match mode {
         GraphPersistMode::Lenient => {
@@ -267,7 +204,7 @@ impl SearchIndex {
                         Some(ef) => idx.with_ef_search(ef),
                         None => idx,
                     };
-                    Box::new(idx) as Box<dyn VectorIndex>
+                    Box::new(idx.with_parallel_build(cfg.parallel_build)) as Box<dyn VectorIndex>
                 }
             }),
             None => None,
@@ -374,15 +311,24 @@ impl SearchIndex {
         self.embed_elapsed += t.elapsed();
         debug_assert_eq!(vecs.len(), texts.len(), "embed 输出条数应与输入一致");
 
-        // 归一化 + 灌向量索引 + 记录原始向量（快照用）
+        // 归一化 + 灌向量索引 + 记录原始向量（快照用）。
+        // V2 Step 2：改用 `add_batch`——达阈值且开了并行建图开关时由实现走
+        // `parallel_insert_slice`，否则串行（默认，保确定性）。小批量下批量路径
+        // 与逐条 add 行为等价，故无需分支。
         let vi = self.inner.vector_index.as_mut().ok_or(Error::NoEmbedder)?;
-        for (pending, v) in self.pending.iter().zip(vecs) {
-            let nv = NormalizedVector::new(v);
-            if let Some(raw) = self.inner.raw_vectors.as_mut() {
-                raw.push((pending.chunk_id, nv.as_slice().to_vec()));
-            }
-            vi.add(pending.chunk_id, nv)?;
-        }
+        let items: Vec<(ChunkId, NormalizedVector)> = self
+            .pending
+            .iter()
+            .zip(vecs)
+            .map(|(pending, v)| {
+                let nv = NormalizedVector::new(v);
+                if let Some(raw) = self.inner.raw_vectors.as_mut() {
+                    raw.push((pending.chunk_id, nv.as_slice().to_vec()));
+                }
+                (pending.chunk_id, nv)
+            })
+            .collect();
+        vi.add_batch(&items)?;
         self.pending.clear();
         Ok(())
     }
