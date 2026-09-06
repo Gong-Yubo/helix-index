@@ -62,8 +62,8 @@
 | Q-C2 | 墓碑 chunk 永久保留，不物理回收 | `index/forward.rs` | 中（资源） |
 | Q-C3 | 快照落盘无原子性，崩溃损坏 | `storage/snapshot.rs` | 中（正确性） |
 | Q-P1 | NFR-03 构建 225.5s 未达标（ort ~51 条/s） | `eval-report.md` 8.2 | 中 |
-| Q-P2 | NFR-04 冷启动图重建 11.57s（图不持久化，D7） | `eval-report.md` 8.3 | 中 |
-| Q-P3 | 图重建抖动 R-P5-13（NDCG 极差 0.0024） | `eval-report.md` 3.4 | 低 |
+| Q-P2 | NFR-04 冷启动图重建 11.57s（图不持久化，D7） | `eval-report.md` 8.3 | 中 → **✅ 已解决**（V2 Step 2 / ADR-A，实测完整冷启动 ≈100ms） |
+| Q-P3 | 图重建抖动 R-P5-13（NDCG 极差 0.0024） | `eval-report.md` 3.4 | 低 → **✅ 已解决**（图落盘即冻结拓扑，同快照两次加载逐位一致） |
 | Q-I1 | 过滤位图 `allowed_chunks` 全表扫描 O(N)，10 万级威胁 P99 | `query/filter.rs:39` | 高（延迟） |
 | Q-I2 | 过滤是 post-filter，低选择度隔离召回暴跌 | `query/searcher.rs`、`query/filter.rs` | 高（召回） |
 | Q-M1 | embed 串行（`LocalEmbedder` Mutex 全程持锁） | `embed/local.rs:67,75` | 中 |
@@ -169,6 +169,25 @@
 - **验收**：12K 冷启动（加载 + 图加载）< 2s；**同一快照两次加载**检索结果逐位一致（消 R-P5-13；注意「两次重建」在 `parallel_insert` 下不成立，验收必须指「同快照两次加载」）。
 - **风险**：低（API 已源码核实；开工前复核另发现两项：Description 落盘 magic 实为 4、重载图 datamap_opt=true 拒绝覆盖旧文件——对策均已成文，见设计文档「开工前复核记录」）。
 - **量级**：M。
+
+> **状态（2026-09-06）：实施完成，等待合并。** S2-01~S2-12 全部落地，守门全绿
+> （fmt / clippy `-D warnings` / 208 测试 / MSRV 1.90 / rustdoc / `--no-default-features` /
+> `--features charabia` / cargo-deny）。分三个 PR：#12（core 图持久化）、
+> #13（CLI/bench 接线 + 并行建图）、文档回写。
+>
+> **12K 实测（`data/t2-corpus.jsonl`，release，macOS aarch64）**：
+>
+> | 项 | 实测 | 判据 |
+> | --- | --- | --- |
+> | 快照加载（含位图/字段索引重建） | 76.9ms | —— |
+> | 图 sidecar 加载 | 23.3ms | —— |
+> | **完整冷启动** | **≈100ms** | **< 2s ✅**（余量 20×） |
+> | 降级路径（图 sidecar 缺失） | 53.3ms + 图重建 9.96s ≈ **10.0s** | 对照：即 D7 时代的水平 |
+> | 图 dump 耗时 | 43.5ms（31.6MB） | 远低于预估，非瓶颈 |
+> | 磁盘增量 | 52.3MB → 84.1MB（**1.6×**，graph 7.9 + data 23.7） | 已接受（R22） |
+>
+> ⚠️ **达标依赖图 sidecar 命中**——降级路径仍是 ~10s。这正是 NFR-07「降级不得静默」
+> 的由来：`GraphStatus::Rebuilt(reason)` 必须显式可见，否则 NFR-04 会静默失效而不自知。
 
 #### Step 3 · 可靠性
 
@@ -338,7 +357,7 @@
    - **NFR-03 备注刷新为 225.5s**（P6 重测值，替换 P5 的 236.7s）；NFR-04 明确「快照 + 图加载」口径。
 2. `architecture-design.md`：
    - 新增 **ADR-A**（图持久化格式 + 多文件原子性）、**ADR-010**（向量软删除 / 过滤下推 / 图持久化的架构决策）。
-   - **第 14 章风险表 R1 补「已关闭」状态**（P5 已换 hnsw_rs，instant-distance 移除）；**p5-design 的 D7 结案**（图持久化落地）。
+   - **第 14 章风险表 R1 补「已关闭」状态**（P5 已换 hnsw_rs，instant-distance 移除）；**p5-design 的 D7 结案**（图持久化落地）——**✅ 已由 V2 Step 2 完成**（2026-09-06）：ADR-A 方案 C，12K 完整冷启动 11.57s → ≈100ms，NFR-04 达标；R-P5-13 一并消解（图落盘即冻结拓扑，同快照两次加载逐位一致）。
    - ADR-002（instant-distance）在 ADR-010 落地时标废。
 3. `CHANGELOG.md` / README「已知局限」随版本发布更新。
 4. 详细设计（ADR-A、H2/H3 等）在对应步骤开工时单独出 `pX-design.md`，不在本文件展开。

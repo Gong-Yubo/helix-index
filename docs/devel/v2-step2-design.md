@@ -1,6 +1,6 @@
 # HelixIndex V2 · Step 2 详细设计（图持久化 + 并行建图：冷启动与确定性）
 
-> 面向 Agent 场景的通用检索引擎内核——V2 Step 2 的详细设计（**待评审**）。
+> 面向 Agent 场景的通用检索引擎内核——V2 Step 2 的详细设计（**已实施，等合并**）。
 > 本文件回答：HNSW 图怎么落盘、落在哪、和快照怎么对齐、坏了怎么办、怎么验证。
 > **本文同时承载 ADR-A**（plan-v2 §4.0 H1：图持久化格式 + 多文件原子性），ADR-A 是 Step 2 与 Step 3 的共享前置。
 
@@ -8,7 +8,7 @@
 | --- | --- |
 | 版本 | **v0.3（终审拍板，开工版）** |
 | 日期 | 2026-09-06 |
-| 状态 | **ADR-A 已拍板（D-S2-01~07 全部定稿）**；v0.2 的 7 决策已获外部评审同意；v0.3 补录开工前源码复核的两项新事实（见「开工前复核记录」），**进入实施（S2-01~S2-12）** |
+| 状态 | **ADR-A 已拍板（D-S2-01~07 全部定稿）**；v0.2 的 7 决策已获外部评审同意；v0.3 补录开工前源码复核的两项新事实（见「开工前复核记录」）。<br>**2026-09-06 实施完成（S2-01~S2-12，守门全绿，等用户合并）** —— 实测见文末「实施结果（S2-10 实测）」 |
 | 上游 | `plan-v2.md`（Step 2 / H1 / Q-P2 / Q-P3 / D7）、`requirements-spec.md` v1.5（FR-29 / FR-16 / NFR-04 / NFR-06）、`architecture-design.md` v1.5（§5.4 / §7.5 / §7.6 / R1~R18） |
 | 范围 | T7-05 图持久化 + 并行建图；**ADR-A 定稿** |
 | 非范围 | 原子快照的实施（Step 3，本文只定协议）、墓碑物理回收（Step 5）、embed 并行与增量构建（Step 4）、精排（Step 6） |
@@ -789,3 +789,60 @@ Error::GraphStale { reason: String };
 | chunk_id append-only（墓碑位不复用） | `crates/core/src/index/forward.rs:49-61` |
 | 软删除后图里留墓碑（无 remove API） | `architecture-design.md` §7.5.1 |
 | NFR-04 / 体积 / 内存的实测基线 | `docs/devel/eval-report.md` §8.3、§8.4 |
+
+---
+
+## 实施结果（S2-10 实测，2026-09-06）
+
+S2-01~S2-12 全部落地，守门全绿（fmt / clippy `--workspace --all-targets -D warnings` /
+208 测试 / MSRV 1.90 / rustdoc `-D warnings` / `--no-default-features` /
+`--features charabia` / cargo-deny）。分三个 PR：**#12**（core 图持久化）、
+**#13**（CLI/bench 接线 + 并行建图）、文档回写。
+
+环境：macOS aarch64 / release / `data/t2-corpus.jsonl` 12,000 chunk / bge-small-zh-v1.5。
+
+### 验收对照
+
+| # | 验收 | 结果 |
+| --- | --- | --- |
+| 1 | 完整冷启动 < 2s | ✅ **≈100ms**（快照 76.9ms + 图 23.3ms），余量 20× |
+| 2 | 消解 R-P5-13（同快照两次加载逐位一致） | ✅ S2-T1/T2 覆盖，前置断言 `GraphStatus::Loaded` |
+| 3 | 图可丢弃（四种场景降级仍可用） | ✅ S2-T4/T5/T6 覆盖 |
+| 4 | 损坏输入不 panic | ✅ S2-T5 覆盖（截断 1%/50%/99% + magic 篡改） |
+| 5 | 旧快照可加载 | ✅ S2-T6 覆盖（oracle Top-10 重合率 ≥ 0.95） |
+| 6 | 不破坏逃生舱与正确性 | ✅ S2-T13/T15/T16 覆盖 |
+| 7 | 体积与耗时有实测记录 | ✅ 见下表 |
+| 8 | 守门全绿 | ✅ |
+
+### 体积与耗时（12K）
+
+| 项 | 实测 |
+| --- | --- |
+| 快照 `foo.idx` | 52.3 MB |
+| 图 `foo.idx.hnsw.graph` | 7.9 MB |
+| 数据 `foo.idx.hnsw.data` | 23.7 MB |
+| manifest | 91 B |
+| **磁盘增量** | **84.1 MB（1.6×）** |
+| 图 sidecar dump 耗时 | **43.5ms**（含 CRC 扫两遍 + manifest 原子发布） |
+| 图 sidecar 加载耗时 | **23.3ms**（含五道先验校验） |
+| 快照加载耗时 | 76.9ms（含位图/字段索引重建） |
+| **完整冷启动** | **≈100ms**（改造前 ≈11.6s，**约 116×**） |
+| 降级路径（图缺失） | 53.3ms + 图重建 **9.96s** |
+
+### 实施中修正的两处实测预期
+
+- **R25「每 save 全量重 dump」不是瓶颈**：预估「30MB 级写入 + CRC 扫两遍」会贵，
+  实测仅 **43.5ms**。dirty 标记优化暂不需要（100 万级需复核）
+- **`--no-graph-persist` 的价值被重新定位**：它省的是磁盘（1.6× → 1×），
+  不是构建时间（dump 只占全链路 203s 中的 43ms）
+
+### 上游回写已落位（S2-12）
+
+1. 需求 `requirements-spec.md` **v1.6**：NFR-06 删去过时论据「HNSW seed 固定」、
+   NFR-04 口径改为「完整冷启动」并补实测、NFR-07 扩「降级不得静默」、FR-29 落定
+2. 架构 `architecture-design.md` **v1.6**：**ADR-A** 入 2.3 与 9.4、新增 5.4.3 与 7.6.2、
+   8.2/8.3 口径修正、10.3 补观测方法、新增 14.1（R19~R25）
+3. `plan-v2.md`：Step 2 状态与实测表、Q-P2/Q-P3 标记已解决、D7 结案
+4. `eval-report.md` 8.3：冷启动小节重写（P5 vs V2 Step 2 对照）
+5. `docs/README.md`：v2-step2-design 入索引、eval_perf.sh 口径说明
+6. `CHANGELOG.md`、`user-guide.md`（图 sidecar 用户可见行为）

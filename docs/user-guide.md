@@ -43,7 +43,7 @@
 ## 1.2 build 参数
 
 ```
-helix build --input <语料> [--output <快照>] [--vectors] [--single-chunk]
+helix build --input <语料> [--output <快照>] [--vectors] [--single-chunk] [--no-graph-persist]
 ```
 
 | 参数 | 默认 | 说明 |
@@ -52,6 +52,7 @@ helix build --input <语料> [--output <快照>] [--vectors] [--single-chunk]
 | `-o, --output` | 无 | 快照输出路径。不指定则只在内存中构建（进程结束即弃） |
 | `--vectors` | 关 | 同时 embed 并保存向量，**vector/hybrid 检索必需**；首次运行会下载模型（约 91MB） |
 | `--single-chunk` | 关 | 每段落强制单 chunk。评测口径专用——段落级标注时会防"同一 passage 的多个 chunk 各占位次"的双计 |
+| `--no-graph-persist` | 关 | 只写快照、**不写图 sidecar**。省约 **0.6× 磁盘**（12K：52.3MB 而非 84.1MB），代价是下次冷启动要重建图（≈10s）。磁盘紧张或排查图问题时用 |
 
 输出示例：
 
@@ -61,9 +62,25 @@ helix build --input <语料> [--output <快照>] [--vectors] [--single-chunk]
   分片数   = 12000
   词项总数 = 3200042
   平均分片 = 266.67
-  embed 12000 条 耗时 233.70s（NFR-03 口径 = embed + 落盘，不含 HNSW）
-  快照已写入 data/t2-index-sc.snapshot（含向量，52.3 MB）耗时 236.69s
+  embed 12000 条 耗时 188.52s（NFR-03 口径 = embed，不含 HNSW / 落盘）
+  快照已写入 /tmp/step2-12k.idx（含向量，52.3 MB）耗时 95.34ms
+  总耗时 203.20s（含 embed / 落盘 / 图 dump）
+  图 sidecar dump 耗时 43.52ms（纯落盘，不含 HNSW 建图）
+  图 sidecar 落盘 12000 点 / 31.6 MB（graph 7.9 MB + data 23.7 MB；快照 52.3 MB，磁盘增量 1.6×）
 ```
+
+**建库会多出三个文件**（图 sidecar，V2 Step 2 起）：
+
+```
+foo.idx                  ← 快照（真源）
+foo.idx.hnsw.graph       ← HNSW 图拓扑
+foo.idx.hnsw.data        ← 向量副本（hnsw_rs 的 dump 只支持全量模式，省不掉）
+foo.idx.hnsw.manifest    ← 发布点（91B）：记父快照 CRC + 两个文件的 CRC/长度
+```
+
+图是**快照的派生缓存，可随时删除**——删掉后下次加载自动重建（慢但结果正确）。
+⚠️ **拷贝/分发索引时四个文件要一起带**：少任何一个都会降级到重建路径。
+⚠️ **图 sidecar 不可跨平台搬运**（裸 f32 + native endian），换平台请只带 `foo.idx` 让它重建。
 
 ## 1.3 search 参数
 
@@ -208,7 +225,7 @@ make eval-quality
 | --- | --- | --- |
 | `helix bench -i x.jsonl` 报"快照版本不兼容" | 你把语料传给了 `--input` 之外的位置；注意 `-i` 恒等于 `--input` | 语料用 `-i`，快照用 `--index` |
 | 建库极慢（12K 段落 ~237s） | ort CPU 推理吞吐约 50 条/秒，**NFR-03 未达标** | 见 [2.4 性能预期](#24-性能预期)；P6 会做并行/量化/增量 |
-| 加载快照后首次检索仍要等 ~11s | HNSW **图不持久化**，加载后需重建（D7） | 已知问题，P6 做图持久化 |
+| 加载快照后首次检索仍要等 ~10s | 图 sidecar **未命中**（文件被删 / 没一起拷贝 / 快照被重写过 / 跨平台搬运） | 看 stderr 的 `[向量图加载：⚠️ 降级重建（原因：…）]`；四文件一起带、或干脆只带 `foo.idx` 让它重建 |
 | `vector`/`hybrid` 模式首次运行很久 | 首次下载 bge-small-zh-v1.5（约 91MB） | 缓存在 `~/.cache/helix-index/models`，仅首次 |
 | 同一 query 两次跑分数略有不同 | HNSW 图每次构建不同（R-P5-13） | NDCG 抖动约 0.002，不影响结论；用 `--runs` 观察 |
 
@@ -315,8 +332,10 @@ helix-core = { version = "0.1.0", default-features = false }
 | BM25 延迟 | P50 1.13ms / P99 3.90ms | < 5ms | ✅ |
 | 向量延迟 | P50 4.26ms / P99 8.37ms | < 10ms | ✅ |
 | 混合延迟 | P50 4.41ms / P99 8.70ms | P99 < 20ms | ✅ |
-| 快照加载 | 53~107ms | < 2s | ✅ |
-| **HNSW 图重建** | **11.57s** | 秒级 | ⚠️ 图不持久化（D7） |
+| 快照加载（含位图/字段索引重建） | 76.9ms | < 2s | ✅ |
+| HNSW 图加载（图持久化后） | 23.3ms | — | ✅ |
+| **完整冷启动**（上两项之和） | **≈100ms** | < 2s | ✅（改造前 ≈11.6s，约 116×） |
+| 图重建（**降级路径**，图 sidecar 缺失/损坏时） | 9.96s | — | ⚠️ 仅降级时触发 |
 | **构建含 embedding** | **236.7s（12K 段落）** | < 120s | ⚠️ 未达标 |
 | 峰值内存 | 383MB（整进程，含模型+ort） | — | 向量本身仅 24.6MB |
 

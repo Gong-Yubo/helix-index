@@ -9,6 +9,42 @@
 
 ## [Unreleased]
 
+### V2 Step 2 · 实测与文档回写（S2-10 / S2-12，2026-09-06）
+
+#### 12K 实测（`data/t2-corpus.jsonl`，release，macOS aarch64）
+
+| 项 | 改造前（图不持久化） | 改造后 |
+| --- | --- | --- |
+| 快照加载（含位图/字段索引重建） | 53.4ms | 76.9ms |
+| 图加载 | ——（无此路径） | **23.3ms** |
+| **完整冷启动** | **≈11.6s** ❌ | **≈100ms** ✅（约 116×） |
+| 图重建（降级路径） | 11.57s | 9.96s |
+| 图 sidecar dump | —— | 43.5ms |
+| 磁盘占用 | 52.3MB | 84.1MB（**1.6×**，graph 7.9 + data 23.7） |
+
+**NFR-04 达标**（限额 2s，余量 20×），代价是磁盘 +60%（R22）。
+⚠️ 达标**依赖图 sidecar 命中**——降级路径仍是 ~10s，故 NFR-07 扩口径为「降级不得静默」。
+
+#### 文档回写（S2-12）
+
+- **需求 `requirements-spec.md` → v1.6**：FR-29 落定（补实现方案与实测）；
+  NFR-04 口径收紧为「完整冷启动」并补实测；**NFR-06 删去过时论据「HNSW seed 固定」**
+  （`StdRng::from_os_rng()` 无 seed API，两次建库拓扑本就不同），改为
+  「图持久化冻结拓扑 ⇒ 同快照两次加载逐位一致」；NFR-07 扩「降级不得静默」
+- **架构 `architecture-design.md` → v1.6**：**ADR-A** 入 §2.3 决策摘要与 §9.4 决策记录
+  （含 §7.6.1 曾预引用的「ADR-011」统一为 ADR-A）；新增 §5.4.3「图持久化
+  `VectorGraphPersist`」（basename 铁律 / `ef_search` 是入参 / `Box::leak` 三条结构性约束）、
+  §7.6.2 图 sidecar 布局、§14.1 风险表 **R19~R25**；§8.2 NFR-06 与 §8.3 NFR-07 口径修正；
+  §10.3 补 `graph_status()` / `graph_dump_elapsed()`
+- **`plan-v2.md`**：Step 2 状态与实测表；Q-P2 / Q-P3 标记已解决；**D7 结案**
+- **`eval-report.md` §8.3**：冷启动小节重写（P5 vs V2 Step 2 对照），
+  同步 §9 未达预期项与 §10 残留问题
+- **`user-guide.md`**：图 sidecar 的用户可见行为（四个文件要一起带 / 不可跨平台搬运 /
+  `--no-graph-persist` / 降级时看 stderr 的原因）
+- **`docs/README.md`**：`v2-step2-design.md` 入索引，风险范围 R1~R18 → R1~R25
+- **`scripts/eval_perf.sh`**：NFR-04 改为三口径分别计时并**自动求和判定**
+  （快照加载 + 图 sidecar 加载 = 完整冷启动 vs 2000ms），图重建单列为降级路径
+
 ### V2 Step 2 · CLI / bench 接线与并行建图（S2-08 / S2-09 / S2-11）
 
 #### 新增（CLI）
@@ -310,8 +346,9 @@ H1（图持久化格式 + 多文件原子性）结案，Step 3 原子快照直�
 
 | 项 | 现状 | 计划 |
 | --- | --- | --- |
-| NFR-03 构建耗时 | 12K 段落 236.7s（目标 <120s） | P6：并行 / 量化 / 增量构建 |
-| NFR-04 冷启动 | HNSW 图重建 11.57s（图不持久化） | P6：hnswio 图持久化（D7） |
+| NFR-03 构建耗时 | 12K 段落 236.7s（目标 <120s） | V2 Step 4：并行 / 量化 / 增量构建 |
+| ~~NFR-04 冷启动~~ | ~~HNSW 图重建 11.57s~~ → **✅ 已达标**（V2 Step 2 图持久化，完整冷启动 ≈100ms） | 已解决；残留风险：降级路径仍 ~10s，故配 NFR-07 降级可观测 |
+| 磁盘占用 +60% | 图 sidecar 使 52.3MB → 84.1MB（1.6×），`hnsw_rs` 只支持全量 dump，省不掉 | V2 Step 5 compaction 时一并优化；当前用 `--no-graph-persist` 逃生舱 |
 | paraphrase 桶融合 | hybrid 被弱路 BM25 稀释 | P6：自适应融合 / reranker 兜底 |
 | 假负例敏感度 | 未做对照 | P6：仅 qrels 语料重建对照 |
 
