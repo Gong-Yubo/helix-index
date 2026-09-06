@@ -650,21 +650,31 @@ fn build_backend(
             // V2 Step 2（D-S2-06）：优先从图 sidecar 加载，失败才重建。
             // 校验逻辑与门面层共用 `load_graph_checked`（禁止在此复制校验）。
             if let Some((base, body_crc, dim)) = graph_src {
-                match helix_core::vector::load_graph_checked(
+                // 图加载**单独计时**：NFR-04 的「完整冷启动」= 快照加载 + 图加载，
+                // 两者都持久化后应远小于图重建。与 10.2「勿混口径」一致。
+                let t = Instant::now();
+                let loaded = helix_core::vector::load_graph_checked(
                     base,
                     *body_crc,
                     *dim,
                     vectors.len() as u64,
                     ef,
-                ) {
+                );
+                match loaded {
                     Ok(idx) => {
                         eprintln!(
-                            "[HNSW 图从 sidecar 加载成功（冷启动快路径；消 R-P5-13 图抖动）]"
+                            "[HNSW 图从 sidecar 加载成功 耗时 {:?}（冷启动快路径；\
+                             NFR-04 口径之二；消 R-P5-13 图抖动）]",
+                            t.elapsed()
                         );
                         return Ok(VectorBackend::Hnsw(idx));
                     }
                     Err(reason) => {
-                        eprintln!("[HNSW 图 sidecar 不可用（{reason}），降级重建（冷启动会变慢）]")
+                        eprintln!(
+                            "[HNSW 图 sidecar 不可用（{reason}），降级重建（冷启动会变慢）；\
+                             校验耗时 {:?}]",
+                            t.elapsed()
+                        )
                     }
                 }
             } else {

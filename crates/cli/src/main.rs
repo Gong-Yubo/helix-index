@@ -323,7 +323,10 @@ fn build(args: BuildArgs) -> Result<()> {
         started.elapsed()
     );
 
-    // V2 Step 2：图 sidecar 落盘观测（S2-08；体积增量 / 点数，验收 7 的数据来源）
+    // V2 Step 2：图 sidecar 落盘观测（S2-08；体积增量 / 点数 / dump 耗时，验收 7 数据来源）
+    if let Some(dump) = index.graph_dump_elapsed() {
+        println!("  图 sidecar dump 耗时 {dump:?}（纯落盘，不含 HNSW 建图）");
+    }
     if args.vectors && !args.no_graph_persist {
         let paths = helix_core::storage::graph_paths(&out);
         if let Ok(Some(m)) = helix_core::storage::read_manifest(&paths.manifest) {
