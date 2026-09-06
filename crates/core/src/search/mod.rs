@@ -15,6 +15,6 @@ mod config;
 mod index;
 mod searcher;
 
-pub use config::{SearchIndexBuilder, VectorBackend};
-pub use index::{AddOutcome, SearchIndex};
+pub use config::{GraphPersistMode, SearchIndexBuilder, VectorBackend};
+pub use index::{AddOutcome, GraphStatus, SearchIndex};
 pub use searcher::{SearchRequest, Searcher};

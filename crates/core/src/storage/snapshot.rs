@@ -62,13 +62,16 @@ impl std::fmt::Display for ConfigFingerprint {
     }
 }
 
-/// 保存索引（含可选向量）到 `path`。
-pub fn save(
+/// 保存索引（含可选向量）到 `path`，返回快照**正文的 CRC32**（P0-6）。
+///
+/// 返回的 CRC 供图 sidecar manifest 的 `snapshot_crc` 填写——它是图的
+/// 「版本锚点」：save 写出新快照后旧图立即失效（CRC 变了 → 降级重建）。
+pub fn save_with_crc(
     path: &Path,
     index: &Index,
     vectors: &[(ChunkId, Vec<f32>)],
     fingerprint: &ConfigFingerprint,
-) -> Result<()> {
+) -> Result<u32> {
     let snapshot = Snapshot {
         sections: index.export(),
         vectors: vectors.to_vec(),
@@ -87,14 +90,27 @@ pub fn save(
     codec::write_header(&mut w, crc).map_err(Error::Io)?;
     w.write_all(&body).map_err(Error::Io)?;
     w.flush().map_err(Error::Io)?;
-    Ok(())
+    Ok(crc)
+}
+
+/// 保存索引（含可选向量）到 `path`（兼容签名，内部转发并丢弃 CRC）。
+pub fn save(
+    path: &Path,
+    index: &Index,
+    vectors: &[(ChunkId, Vec<f32>)],
+    fingerprint: &ConfigFingerprint,
+) -> Result<()> {
+    save_with_crc(path, index, vectors, fingerprint).map(|_| ())
 }
 
 /// 加载结果：索引 + 原始向量 + 配置指纹（调用方据此重建向量索引 + 校验装配）。
 pub type LoadedSnapshot = (Index, Vec<(ChunkId, Vec<f32>)>, ConfigFingerprint);
 
-/// 从 `path` 加载，返回 `(索引, 原始向量, 配置指纹)`。向量索引由调用方重建。
-pub fn load(path: &Path) -> Result<LoadedSnapshot> {
+/// 带正文 CRC 的加载结果：`snapshot_crc` 供图 manifest 校验（§4.6 步骤 4）。
+pub type LoadedSnapshotWithCrc = (Index, Vec<(ChunkId, Vec<f32>)>, ConfigFingerprint, u32);
+
+/// 从 `path` 加载，带出快照正文的 CRC32（供图 sidecar 的版本锚点校验）。
+pub fn load_with_crc(path: &Path) -> Result<LoadedSnapshotWithCrc> {
     let file = File::open(path).map_err(Error::Io)?;
     let mut r = BufReader::new(file);
 
@@ -106,7 +122,8 @@ pub fn load(path: &Path) -> Result<LoadedSnapshot> {
     r.read_to_end(&mut body).map_err(Error::Io)?;
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(&body);
-    if hasher.finalize() != expected_crc {
+    let actual_crc = hasher.finalize();
+    if actual_crc != expected_crc {
         return Err(Error::SnapshotCorrupted);
     }
 
@@ -119,7 +136,13 @@ pub fn load(path: &Path) -> Result<LoadedSnapshot> {
         Index::import(snapshot.sections),
         snapshot.vectors,
         snapshot.fingerprint,
+        actual_crc,
     ))
+}
+
+/// 从 `path` 加载，返回 `(索引, 原始向量, 配置指纹)`。向量索引由调用方重建。
+pub fn load(path: &Path) -> Result<LoadedSnapshot> {
+    load_with_crc(path).map(|(i, v, f, _)| (i, v, f))
 }
 
 #[cfg(test)]
@@ -218,5 +241,51 @@ mod tests {
         // 只保留 header —— 解码失败或 CRC 失败，总之必须报错
         std::fs::write(&path, &bytes[..12]).unwrap();
         assert!(load(&path).is_err());
+    }
+
+    /// P0-6：save_with_crc 与 load_with_crc 的 CRC 必须一致（图的版本锚点）。
+    #[test]
+    fn with_crc往返一致() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crc.idx");
+        let index = build_index();
+        let vectors = vec![(0u32, vec![1.0, 0.0])];
+        let saved_crc = save_with_crc(&path, &index, &vectors, &fingerprint()).unwrap();
+
+        let (_, lv, _, loaded_crc) = load_with_crc(&path).unwrap();
+        assert_eq!(saved_crc, loaded_crc, "save 与 load 的正文 CRC 必须一致");
+        assert_eq!(lv, vectors);
+    }
+
+    /// 快照重写后 CRC 必须变化（旧图 manifest 因此自然失效）。
+    #[test]
+    fn 快照变更后crc变化() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rev.idx");
+        let mut index = build_index();
+        let v1 = vec![(0u32, vec![1.0, 0.0])];
+        let c1 = save_with_crc(&path, &index, &v1, &fingerprint()).unwrap();
+
+        // 再加一篇文档后重写
+        let analyzer = MixedAnalyzer::new();
+        let doc = DocRecord {
+            doc_id: 0,
+            source: "doc-x".to_string(),
+            metadata: serde_json::json!({}),
+            content_hash: 999,
+        };
+        let chunk = Chunk {
+            chunk_id: 0,
+            doc_id: 0,
+            ordinal: 0,
+            text: "新增文本".to_string(),
+            char_start: 0,
+            char_end: 0,
+        };
+        index.add(doc, vec![chunk], &analyzer).unwrap();
+        let v2 = vec![(0u32, vec![1.0, 0.0]), (1u32, vec![0.0, 1.0])];
+        let c2 = save_with_crc(&path, &index, &v2, &fingerprint()).unwrap();
+
+        assert_ne!(c1, c2, "内容不同 CRC 应不同（版本锚点的成立前提）");
     }
 }

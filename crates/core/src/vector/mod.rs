@@ -4,13 +4,21 @@
 //!
 //! 本模块**不认识文本，只认 `Vec<f32>`**；入库前必须 L2 归一化。
 //! `NormalizedVector` 的构造函数已强制归一化，因此这里不会再出现未归一化向量。
+//!
+//! # 图持久化（V2 Step 2 / ADR-A）
+//!
+//! HNSW 图以 sidecar 派生缓存落盘（`persist` 模块），**不进快照正文**。
+//! 「哪些后端可持久化」由 [`VectorIndex::as_graph_persist`] 在类型层表达：
+//! 默认 `None`（Brute），`HnswRsIndex` 覆盖为 `Some(self)`。
 
 mod brute;
 mod hnsw_rs_index;
+mod persist;
 mod point;
 
 pub use brute::BruteForceIndex;
 pub use hnsw_rs_index::HnswRsIndex;
+pub use persist::{validate_graph_description, GraphStats, VectorGraphPersist};
 pub use point::NormalizedVector;
 
 use crate::error::Result;
@@ -21,6 +29,17 @@ use crate::types::ChunkId;
 pub trait VectorIndex: Send + Sync {
     /// 增量插入一条向量。当前实现（`HnswRsIndex` / `BruteForceIndex`）均支持。
     fn add(&mut self, id: ChunkId, vec: NormalizedVector) -> Result<()>;
+
+    /// 批量插入（D-S2-05 / S2-11）。默认实现为逐条 `add`（串行）；
+    /// `HnswRsIndex` 可覆盖为 `parallel_insert_slice`（并行建图开关，
+    /// 由门面层按阈值决定是否走批量路径——**默认串行**，保住与 P5 基线的
+    /// 可比性：并行插入顺序不确定 ⇒ 拓扑不可复现，先出实测再定默认值）。
+    fn add_batch(&mut self, items: &[(ChunkId, NormalizedVector)]) -> Result<()> {
+        for (id, v) in items {
+            self.add(*id, v.clone())?;
+        }
+        Ok(())
+    }
 
     /// 检索最近的 k 条**且通过 `filter` 的**候选，返回 `(chunk_id, distance)`，按距离**升序**。
     ///
@@ -51,5 +70,12 @@ pub trait VectorIndex: Send + Sync {
     /// 是否为空索引。
     fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// 若该后端支持图持久化，返回其 [`VectorGraphPersist`] 视图；否则 `None`
+    /// （P0-4：门面层从 `Box<dyn VectorIndex>` 触达持久化能力的**唯一**通道。
+    /// 默认 `None` ⇒ 「Brute 无图」是类型事实。对象安全、零破坏。）
+    fn as_graph_persist(&self) -> Option<&dyn VectorGraphPersist> {
+        None
     }
 }

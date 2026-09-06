@@ -11,9 +11,128 @@ use crate::document::{content_hash, DocRecord, Document};
 use crate::error::{Error, Result};
 use crate::index::Index;
 use crate::types::{ChunkId, DocId};
-use crate::vector::{BruteForceIndex, HnswRsIndex, NormalizedVector, VectorIndex};
+use crate::vector::{
+    validate_graph_description, BruteForceIndex, HnswRsIndex, NormalizedVector, VectorGraphPersist,
+    VectorIndex,
+};
 
-use super::config::{Config, SearchIndexBuilder, VectorBackend};
+use super::config::{Config, GraphPersistMode, SearchIndexBuilder, VectorBackend};
+
+/// 图 sidecar 的状态（V2 Step 2 / NFR-07：降级不能静默）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GraphStatus {
+    /// 图从 sidecar 加载成功（冷启动快路径）
+    Loaded,
+    /// 不适用（Brute 后端 / 纯 BM25 / 无向量）
+    NotApplicable,
+    /// 降级重建（含原因：manifest 缺失 / CRC 不符 / 参数漂移 / dump 失败…）
+    Rebuilt(String),
+}
+
+/// 尝试从图 sidecar 加载 HNSW 图（v2-step2-design §4.6 的读取序列）。
+///
+/// 返回 `Err(reason)` 表示**应降级重建**（图是缓存，不丢功能）。
+/// 调用方负责按 `GraphPersistMode` 决定「警告」还是「报错」。
+///
+/// # 安全前提（C3）
+///
+/// `hnsw_rs` 的 reload 路径有 12 处 `assert_eq!` / `unwrap()` / `exit(1)`，
+/// 「文件能打开但内容坏」会 panic 或强杀进程。因此**必须在把文件交给
+/// `load_hnsw` 之前**完成全部校验：manifest 逐项 → 两文件 CRC → Description 预校验。
+fn try_load_graph(
+    snapshot: &std::path::Path,
+    body_crc: &u32,
+    fingerprint: &crate::storage::ConfigFingerprint,
+    raw_vectors: &[(ChunkId, Vec<f32>)],
+    graph: super::config::GraphOpts,
+    ef_search: usize,
+) -> std::result::Result<HnswRsIndex, String> {
+    // 逃生舱：--no-graph-persist 时不碰图
+    if !graph.persist {
+        return Err("图持久化已关闭（--no-graph-persist）".to_string());
+    }
+
+    // 步骤 3：读 manifest（文件不存在 / header 错 / CRC 错 / 解码错 → 降级）
+    let paths = crate::storage::graph_paths(snapshot);
+    let m = match crate::storage::read_manifest(&paths.manifest) {
+        Ok(Some(m)) => m,
+        Ok(None) => return Err("manifest 缺失或损坏".to_string()),
+        Err(e) => return Err(format!("manifest 读取失败: {e}")),
+    };
+
+    // 步骤 4：逐项校验（任一不符 → 降级）
+    if m.manifest_version != crate::storage::MANIFEST_VERSION {
+        return Err(format!("manifest_version {} 未知", m.manifest_version));
+    }
+    if m.dist_id != crate::storage::DIST_ID {
+        return Err(format!("dist_id 不匹配: {}", m.dist_id));
+    }
+    if m.platform != crate::storage::PLATFORM_LE64 {
+        return Err(format!("platform 不匹配: {:#x}", m.platform));
+    }
+    if m.dim != fingerprint.dim {
+        return Err(format!(
+            "dim 不匹配: 图 {} vs 指纹 {}",
+            m.dim, fingerprint.dim
+        ));
+    }
+    if m.snapshot_crc != *body_crc {
+        return Err(format!(
+            "snapshot_crc 不匹配: 图绑定 {:#010x} vs 快照 {:#010x}",
+            m.snapshot_crc, body_crc
+        ));
+    }
+    let snapshot_len = std::fs::metadata(snapshot).map(|md| md.len()).unwrap_or(0);
+    if m.snapshot_len != snapshot_len {
+        return Err(format!(
+            "snapshot_len 不匹配: {} vs {snapshot_len}",
+            m.snapshot_len
+        ));
+    }
+    // 两个图文件的 len + CRC（流式，不整读）
+    let (gc, gl) =
+        crate::storage::file_crc32_len(&paths.graph).map_err(|e| format!("图文件读取失败: {e}"))?;
+    if gc != m.graph_crc || gl != m.graph_len {
+        return Err("图拓扑文件 CRC/长度不符".to_string());
+    }
+    let (dc, dl) = crate::storage::file_crc32_len(&paths.data)
+        .map_err(|e| format!("图数据文件读取失败: {e}"))?;
+    if dc != m.data_crc || dl != m.data_len {
+        return Err("图数据文件 CRC/长度不符".to_string());
+    }
+
+    // 步骤 4.5：Description 预校验（P1-1 / P1-3：建图参数漂移也在这里拦下）
+    validate_graph_description(snapshot, &m).map_err(|e| e.to_string())?;
+
+    // 步骤 5：加载图（此刻文件已过五道先验，load_hnsw 不应再碰坏数据）
+    let loaded = <HnswRsIndex as VectorGraphPersist>::load_graph(snapshot, &m, ef_search)
+        .map_err(|e| format!("图加载失败: {e}"))?;
+
+    // 步骤 6：加载后补校验——图中点数恒 >= 原始向量条数（墓碑摘不掉，§4.6）
+    if (loaded.len() as u64) < raw_vectors.len() as u64 {
+        return Err(format!(
+            "图中点数 {} < 快照向量条数 {}",
+            loaded.len(),
+            raw_vectors.len()
+        ));
+    }
+    Ok(loaded)
+}
+
+/// 降级报告（D-S2-04 / NFR-07）：默认警告后继续，strict 模式升级为 Err。
+fn warn_graph_degraded(reason: &str, mode: GraphPersistMode) -> Result<()> {
+    match mode {
+        GraphPersistMode::Lenient => {
+            eprintln!(
+                "[警告] 向量图 sidecar 不可用（原因：{reason}），已降级为加载后重建（冷启动会变慢）"
+            );
+            Ok(())
+        }
+        GraphPersistMode::Strict => Err(Error::GraphStale {
+            reason: reason.to_string(),
+        }),
+    }
+}
 
 /// 已提交状态（`Arc` 共享：`into_searcher` 零拷贝移交给读端）。
 pub(crate) struct Inner {
@@ -64,6 +183,10 @@ pub struct SearchIndex {
     /// 累计 embed 推理耗时（`flush` 中累加，供 NFR-03 构建耗时口径观测）。
     /// 只计 `embed_documents` 推理本身，不含归一化 / 灌向量索引。
     pub(crate) embed_elapsed: std::time::Duration,
+    /// 图持久化开关（ef_search 回填 / strict 模式 / 逃生舱）
+    pub(crate) graph: super::config::GraphOpts,
+    /// 最近一次图 sidecar 的状态（NFR-07：降级必须可观测）
+    pub(crate) graph_status: GraphStatus,
 }
 
 impl SearchIndex {
@@ -73,12 +196,22 @@ impl SearchIndex {
     }
 
     /// 从已构建的 `Config` 与后端选择组装空索引。
-    pub(crate) fn from_config(cfg: Config, backend: VectorBackend) -> Self {
+    pub(crate) fn from_config(
+        cfg: Config,
+        backend: VectorBackend,
+        graph: super::config::GraphOpts,
+    ) -> Self {
+        let ef_search = cfg.ef_search;
         let vector_index = match cfg.embedder.as_ref() {
             Some(_) => Some(match backend {
                 VectorBackend::Brute => Box::new(BruteForceIndex::new()) as Box<dyn VectorIndex>,
                 VectorBackend::Hnsw => {
-                    Box::new(HnswRsIndex::with_capacity(1024)) as Box<dyn VectorIndex>
+                    let idx = HnswRsIndex::with_capacity(1024);
+                    let idx = match ef_search {
+                        Some(ef) => idx.with_ef_search(ef),
+                        None => idx,
+                    };
+                    Box::new(idx) as Box<dyn VectorIndex>
                 }
             }),
             None => None,
@@ -93,6 +226,8 @@ impl SearchIndex {
             inner,
             pending: Vec::new(),
             embed_elapsed: std::time::Duration::ZERO,
+            graph,
+            graph_status: GraphStatus::NotApplicable,
         }
     }
 
@@ -242,6 +377,8 @@ impl SearchIndex {
         Ok(crate::search::Searcher {
             cfg: self.cfg,
             inner: Arc::new(self.inner),
+            graph: self.graph,
+            graph_status: self.graph_status,
         })
     }
 
@@ -279,11 +416,97 @@ impl SearchIndex {
     /// 落盘快照（**隐含 commit**，p6-design 6.2：不允许带未刷缓冲落盘）。
     ///
     /// 快照写入当前装配的配置指纹（p6-design 8.2），供 `load` 校验。
+    ///
+    /// # 图 sidecar（V2 Step 2 / §4.5）
+    ///
+    /// 顺序：写快照正文（取回 body_crc）→ dump 图 → 算两文件 CRC → 读回
+    /// `Description` → 原子发布 manifest。**manifest 是唯一发布点**：
+    /// 图 dump 失败时（P0-3）默认只警告、不发布 manifest，`save` 仍返回 Ok——
+    /// 图是缓存，下次冷启动降级重建即可，快照本身完好。
     pub fn save(&mut self, path: &std::path::Path) -> Result<()> {
         self.commit()?;
         let vectors: Vec<(ChunkId, Vec<f32>)> =
             self.inner.raw_vectors.as_deref().unwrap_or(&[]).to_vec();
-        crate::storage::save(path, &self.inner.index, &vectors, &self.cfg.fingerprint())
+        let body_crc = crate::storage::save_with_crc(
+            path,
+            &self.inner.index,
+            &vectors,
+            &self.cfg.fingerprint(),
+        )?;
+
+        self.graph_status = self.persist_graph(path, &vectors, body_crc)?;
+        Ok(())
+    }
+
+    /// 写图 sidecar 并发布 manifest（§4.5 步骤 3~7）。
+    ///
+    /// 返回最终的 `GraphStatus`；`--no-graph-persist` 或纯 BM25 / Brute 时
+    /// 清理可能残留的旧 sidecar 后返回 `NotApplicable`。
+    fn persist_graph(
+        &mut self,
+        path: &std::path::Path,
+        vectors: &[(ChunkId, Vec<f32>)],
+        body_crc: u32,
+    ) -> Result<GraphStatus> {
+        // 逃生舱 / 无向量 / Brute 后端：不写图，并清掉可能存在的僵尸 sidecar
+        //（否则「关掉向量重建库」会留下永远匹配不上的旧图文件，§5.4）
+        let Some(vi) = self.inner.vector_index.as_ref() else {
+            crate::storage::remove_sidecars(path)?;
+            return Ok(GraphStatus::NotApplicable);
+        };
+        if !self.graph.persist || vectors.is_empty() {
+            crate::storage::remove_sidecars(path)?;
+            return Ok(GraphStatus::NotApplicable);
+        }
+        let Some(g) = vi.as_graph_persist() else {
+            // Brute 无图（类型事实，P0-4）
+            crate::storage::remove_sidecars(path)?;
+            return Ok(GraphStatus::NotApplicable);
+        };
+
+        let stats = match g.dump_graph(path) {
+            Ok(s) => s,
+            Err(e) => {
+                // P0-3：图是缓存，save 不得因图失败而失败
+                if self.graph.mode == GraphPersistMode::Strict {
+                    return Err(e);
+                }
+                // 已发布的旧 manifest 必须删除（否则下次加载会拿到过期图）
+                crate::storage::remove_sidecars(path)?;
+                eprintln!("[警告] 向量图落盘失败，已跳过（缓存，快照本身完好）: {e}");
+                return Ok(GraphStatus::Rebuilt(format!("图落盘失败: {e}")));
+            }
+        };
+
+        // CRC + 长度（流式）
+        let paths = crate::storage::graph_paths(path);
+        let (graph_crc, graph_len) = crate::storage::file_crc32_len(&paths.graph)?;
+        let (data_crc, data_len) = crate::storage::file_crc32_len(&paths.data)?;
+
+        let m = crate::storage::GraphManifest {
+            manifest_version: crate::storage::MANIFEST_VERSION,
+            producer: format!("helix-core-{}", env!("CARGO_PKG_VERSION")),
+            graph_format: stats.graph_format,
+            dist_id: crate::storage::DIST_ID.to_string(),
+            platform: crate::storage::PLATFORM_LE64,
+            max_nb_connection: stats.max_nb_connection,
+            ef_construction: stats.ef_construction,
+            snapshot_crc: body_crc,
+            snapshot_len: std::fs::metadata(path).map(|md| md.len()).unwrap_or(0),
+            dim: self.cfg.fingerprint().dim,
+            nb_point: stats.nb_point,
+            graph_crc,
+            graph_len,
+            data_crc,
+            data_len,
+        };
+        crate::storage::write_manifest_atomic(&paths.manifest, &m)?;
+        Ok(GraphStatus::Loaded)
+    }
+
+    /// 最近一次图 sidecar 的状态（NFR-07 可观测性：降级必须可见）。
+    pub fn graph_status(&self) -> &GraphStatus {
+        &self.graph_status
     }
 
     /// 从快照加载（默认装配）。
@@ -299,16 +522,20 @@ impl SearchIndex {
         let builder = SearchIndexBuilder::default();
         let cfg = builder.build_config();
         let backend = builder.backend();
-        Self::load_with(cfg, backend, path)
+        Self::load_with(cfg, backend, builder.graph_opts(), path)
     }
 
     /// 按给定装配从快照加载（`load` 的实现主体）。
+    ///
+    /// 图 sidecar 的读取与校验见 `try_load_graph`（v2-step2-design §4.6）；
+    /// **任何不符都降级为从 `raw_vectors` 全量重建**（图是派生缓存，丢弃不丢功能）。
     pub(crate) fn load_with(
         cfg: Config,
         backend: VectorBackend,
+        graph: super::config::GraphOpts,
         path: &std::path::Path,
     ) -> Result<Self> {
-        let (index, raw_vectors, fingerprint) = crate::storage::load(path)?;
+        let (index, raw_vectors, fingerprint, body_crc) = crate::storage::load_with_crc(path)?;
 
         // 配置指纹校验（修 B1/B2），分维度严格度（见下方说明）：
         let actual = cfg.fingerprint();
@@ -327,10 +554,12 @@ impl SearchIndex {
             });
         }
 
-        // 重建向量索引（D1：不序列化 HNSW 图，用原始向量重建）
+        // 重建向量索引（V2 Step 2：优先从图 sidecar 加载，失败则降级重建）
+        let mut graph_status = GraphStatus::NotApplicable;
         let vector_index = match (cfg.embedder.as_ref(), raw_vectors.is_empty()) {
             (Some(_), false) => Some(match backend {
                 VectorBackend::Brute => {
+                    // Brute 逃生舱：忽略图（精确扫描是确定性的，无需缓存）
                     let entries: Vec<(ChunkId, NormalizedVector)> = raw_vectors
                         .iter()
                         .map(|(id, v)| (*id, NormalizedVector::new(v.clone())))
@@ -338,11 +567,31 @@ impl SearchIndex {
                     Box::new(BruteForceIndex::from_entries(entries)) as Box<dyn VectorIndex>
                 }
                 VectorBackend::Hnsw => {
-                    let mut vi = HnswRsIndex::with_capacity(raw_vectors.len().max(1024));
-                    for (id, v) in &raw_vectors {
-                        vi.add(*id, NormalizedVector::new(v.clone()))?;
+                    let ef_search = graph.ef_search.unwrap_or(HnswRsIndex::default_ef_search());
+                    match try_load_graph(
+                        path,
+                        &body_crc,
+                        &fingerprint,
+                        &raw_vectors,
+                        graph,
+                        ef_search,
+                    ) {
+                        Ok(loaded) => {
+                            graph_status = GraphStatus::Loaded;
+                            Box::new(loaded) as Box<dyn VectorIndex>
+                        }
+                        Err(reason) => {
+                            // 降级：图是缓存，丢弃只影响冷启动耗时
+                            warn_graph_degraded(&reason, graph.mode)?;
+                            graph_status = GraphStatus::Rebuilt(reason);
+                            let mut vi = HnswRsIndex::with_capacity(raw_vectors.len().max(1024))
+                                .with_ef_search(ef_search);
+                            for (id, v) in &raw_vectors {
+                                vi.add(*id, NormalizedVector::new(v.clone()))?;
+                            }
+                            Box::new(vi) as Box<dyn VectorIndex>
+                        }
                     }
-                    Box::new(vi) as Box<dyn VectorIndex>
                 }
             }),
             _ => None,
@@ -357,6 +606,8 @@ impl SearchIndex {
             },
             pending: Vec::new(),
             embed_elapsed: std::time::Duration::ZERO,
+            graph,
+            graph_status,
         })
     }
 }
@@ -368,7 +619,7 @@ mod tests {
 
     fn bm25_index() -> SearchIndex {
         let cfg = SearchIndexBuilder::default().embedder(None).build_config();
-        SearchIndex::from_config(cfg, VectorBackend::Brute)
+        SearchIndex::from_config(cfg, VectorBackend::Brute, Default::default())
     }
 
     #[test]
@@ -489,6 +740,7 @@ mod tests {
                 .analyzer(Arc::new(CustomAnalyzer))
                 .build_config(),
             VectorBackend::Brute,
+            Default::default(),
         );
         idx.add("BM25 检索算法").unwrap();
         idx.save(&path).unwrap();
