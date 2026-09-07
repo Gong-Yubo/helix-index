@@ -10,7 +10,7 @@
 | 状态 | **决策已定案（D-J1~J7 + D-J8~J11）；Step 1 / Step 2 已完成并合并；Step 3+ 按 2026-09-07 复审重排** |
 | 上游 | `requirements-spec.md`（需求定义源）、`architecture-design.md`（架构/ADR）、`eval-report.md`（P5 实测） |
 | 前置 | V1（P0~P6）全部完成，见 `plan.md`（V1 计划，已冻结，不再更新） |
-| 复审 | `plan-v2-review.md`（2026-09-07 复审稿，D1~D4 已拍板并回写本文） |
+| 复审 | 2026-09-07 全量复审（7 处调整 A1~A7 + 4 个拍板问题 D1~D4）**结论已全部并入本文**，不另立复审文档；调整项索引与建议执行顺序见 **§附-3** |
 
 > ⚠️ **编号变更（2026-09-07）**：V2.0 剩余步骤与 V2.1 全部步骤**从 Step 3 起重新编号**。
 > 旧号→新号对照见 §附-2。历史设计文档（`v2-step1-design.md` / `v2-step2-design.md`）中的
@@ -54,7 +54,9 @@
 | **D-J6** | 量化模型 | ✅ **不引入**；走「并行 + 增量构建」（fastembed 无 `bge-small-zh-v1.5` 量化变体） |
 | **D-J7** | T7-05 改义 | ✅ 由 `plan.md` 原「自研 HNSW / 评估 arroy」改义为「hnsw_rs 能力接入（图持久化 + 并行建图）」——依据 §附 调研：hnsw_rs 0.3.4 已原生支持，自研不必要 |
 
-### 2.3 复审决策（2026-09-07，依据 `plan-v2-review.md`，D1~D4 已拍板）
+### 2.3 复审决策（2026-09-07 全量复审，D1~D4 已拍板）
+
+> 复审共提出 7 处调整（A1~A7），**全部采纳**并已落到本文对应章节，索引见 **§附-3**。
 
 | 编号 | 决策 | 结论 | 对应复审问题 |
 | --- | --- | --- | --- |
@@ -114,6 +116,7 @@
 
 > **执行顺序（2026-09-07 重排后）**：Step 3 可靠性 → Step 4 资源回收 → Step 5 查询性能与可观测
 > → Step 6 构建性能与多线程 → Step 7 精排。横切任务（T7-21 / T7-24）走独立 PR，不占步骤号。
+> **含横切任务的完整执行顺序见 §附-3**。
 
 #### Step 1 · 正确性修复（地基，最先做）
 
@@ -496,7 +499,7 @@
 - `docs/devel/eval-report.md` §8 NFR 实测、§9 数据诚信、§10 残留问题
 - 依赖源码（已核实）：`hnsw_rs-0.3.4` —— `parallel_insert`/`search_filter`/`FilterT`/`load_hnsw` 属实；图落盘为**双文件**（`HnswIo` + `DumpInit`，`hnsw.graph` + `hnsw.data`）；**无 remove/delete API**。`fastembed-6.0.2` —— `TextRerank`/`RerankerModel::BGERerankerV2M3`/`with_intra_threads` 属实；`bge-reranker-v2-m3` 含 `model.onnx.data` 外置数据文件。
 
-- **2026-09-07 复审补充核实**（详见 `plan-v2-review.md` 附）：`fastembed-6.0.2`
+- **2026-09-07 复审补充核实**：`fastembed-6.0.2`
   `src/init.rs:30-33` —— `intra_threads` 默认 `None` = 用满所有核；`src/init.rs:133` —— `with_intra_threads` 存在；
   `src/text_embedding/impl.rs:373` —— `embed` 单 session 按 `DEFAULT_BATCH_SIZE=256` 串行分块；
   `src/models/text_embedding.rs` —— **无中文量化变体**（量化仅 `NomicEmbedTextV15Q` / `ParaphraseMLMiniLML12V2Q`）；
@@ -507,7 +510,7 @@
 
 ## 附-2：步骤编号映射（2026-09-07 重排）
 
-> 重排依据：`plan-v2-review.md` 复审 + 用户拍板 D-J8~D-J11。**Step 1 / Step 2 编号不变**。
+> 重排依据：2026-09-07 全量复审（调整项索引见 §附-3）+ 用户拍板 D-J8~D-J11。**Step 1 / Step 2 编号不变**。
 
 | 新编号 | 主题 | 旧编号 | 变动原因 |
 | --- | --- | --- | --- |
@@ -522,3 +525,41 @@
 
 **历史文档的编号**：`v2-step1-design.md` / `v2-step2-design.md` 中的 Step 编号**指重排前**，
 已在各自文档头部加注记；`plan.md`（V1）与 `p0~p6-design.md` 不受影响。
+
+---
+
+## 附-3：2026-09-07 复审 —— 调整项索引与建议执行顺序
+
+> 复审当时的结论不另立文档，本表保留**可追溯性**：每条调整项对应本文的落地位置。
+
+### A1~A7 索引
+
+| # | 调整项 | 优先级 | 落地位置 |
+| --- | --- | --- | --- |
+| **A1** | Step 3 范围/验收按 ADR-A 重写（快照**本体**至今非原子，崩溃 = `SnapshotCorrupted` = 索引丢失，不是降级） | 高 | §4 Step 3（S3-a~e） |
+| **A2** | Step 4（现 Step 6）的技术前提有一半被证伪（`intra_threads` 默认满核、批次已测、并行建图仅占 4%）⇒ embed 并行降级为 spike，并纳入从未评估的 **CoreML EP** | 高 | §4 Step 6（E1/E2/E3） |
+| **A3** | NFR-03 `<120s` 无已识别路径可达 ⇒ 需求侧决策 | 高 | §2.3 D-J8、§4 Step 6 双口径、需求文档 NFR-03 |
+| **A4** | 4 个 S 级任务插队：parallel 默认翻转 / 低选择度兜底 / `Metrics` 可观测 / 工程卫生 | 中 | §4「横切任务」T7-21、T7-24；Step 5 的 T7-22、T7-23 |
+| **A5** | Step 5（现 Step 4）补「compaction 后必须重发 manifest」+ workload 脚本，并提前 | 中 | §4 Step 4 |
+| **A6** | Step 6（现 Step 7）补三条前置：复现基线 / 模型下载可行性 / H3 未决 | 中 | §4 Step 7 |
+| **A7** | 计划文档自身一致性（版本状态、进度表、NFR-04 数字、FR-31 优先级、NFR-11 口径） | 低 | §2 / §6 / §7 / 需求文档 |
+
+### 建议执行顺序（含横切任务）
+
+| 顺序 | 内容 | 量级 | 决策点 / 依赖 |
+| --- | --- | --- | --- |
+| 1 | **Step 3** 原子快照（S3-a~e，含 R19） | S | 无；排最前（Q-C3 定级「高（正确性）」） |
+| 2 | **T7-24** 工程卫生（CI 触发 / gitignore / 分支清理） | S | 无 |
+| 3 | **T7-21** `parallel_build` 默认翻转 | S | 独立 PR；须同步改 S2-T22 |
+| 4 | **Step 5** T7-22 低选择度兜底 + T7-23 `Metrics` 可观测 | S | 新增 NFR-13；T7-23 是 Step 6 前置 |
+| 5 | **Step 4** 墓碑回收（含 manifest 重发 + workload 脚本） | M | Step 1 |
+| 6 | **Step 6** spike（E1/E2/E3）→ 视数据决定是否投 M 级 | S → M | NFR-03 按 D-J8 新口径 |
+| 7 | **Step 7** 精排 | M | 先复现基线 + 定 H3 + 确认模型下载 |
+
+> 排序原则：**正确性与确定性优先于性能**；收益不确定的（A2）排在确定的之后。
+
+### 跟踪缺口（待用户决定，未在本轮处理）
+
+- Step 3 ~ Step 7 目前**只有 Step 6（构建性能）有跟踪 issue**；标签只有
+  `V2-Step2 / V2-Step4 / V2-Step6 / V2-Step6+`，**缺 Step 3 / Step 5**，
+  且 `V2-Step4` 的语义已由「构建性能」变为「资源回收」⇒ 重命名会动到历史 issue。
