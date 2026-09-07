@@ -1,7 +1,7 @@
 HelixIndex — 第三方资产声明
 ============================
 
-HelixIndex 本身采用 **MIT OR Apache-2.0** 双许可（见 LICENSE-MIT / LICENSE-APACHE）。
+HelixIndex 本身采用 **MIT** 单许可（见 `LICENSE-MIT`）。
 本文件列出本项目**使用或随附的第三方资产**及其许可与引用义务。
 
 Rust 依赖（crate）的许可由 `cargo-deny` 自动校验（NFR-09，配置见 `deny.toml`），
@@ -21,7 +21,8 @@ Yan Zhang, Wenwen Li. T2Ranking: A Large-scale Chinese Benchmark for Passage
 Ranking. In Proceedings of SIGIR 2023.
 ```
 
-- 说明：原始数据（`collection.tsv` 等，约 3.5GB）不随仓库分发；
+- 说明：原始数据（`collection.tsv` 等，约 3.5GB）不随仓库分发，**按需下载**：
+  `./data/download_t2ranking.sh`（含 sha256 校验，下载到 `data/t2ranking/`）。
   仓库内 `data/t2-corpus.jsonl` / `data/t2-queries.jsonl` 是由 `t2_prep.rs`
   从该数据集确定性装配的子集，随仓库分发以便评测可复现。
 

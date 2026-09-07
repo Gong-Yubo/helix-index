@@ -20,6 +20,13 @@
 - **进度与状态回写**：`plan-v2.md` 进度表 Step 1/Step 2 打勾；Step 2 状态段改为「已完成并合并」
   并记 main 提交链（含「堆叠 PR base 非 main ⇒ 显示 MERGED 但内容没进 main」的坑）；
   **Q-C3 定级回写**为「高（正确性）」并注明是本文（V2 Step 2）重新定级。
+- **许可改为 MIT 单许可**：删除 `LICENSE-APACHE`，`Cargo.toml` 的 `license` 由
+  `MIT OR Apache-2.0` 改为 `MIT`；`NOTICE` 与 `README` 同步（第三方依赖仍允许
+  Apache-2.0，`deny.toml` 白名单不变——那是依赖的许可，不是本项目的）。
+- **新增 `data/download_t2ranking.sh`**：T2Ranking 原始数据（约 3.5GB）的下载脚本入库，
+  带 sha256 校验（三个文件的实测校验和写进清单）、断点续传、按文件名过滤下载，
+  支持 `HF_ENDPOINT` 镜像与 `SKIP_SHA=1`。此前该数据只有本机有、获取过程无记录，
+  评测子集无法重新装配。
 
 ### V2 Step 2 · 评审回应（2026-09-07，GLM 外部评审）
 

@@ -53,6 +53,7 @@ devel/requirements-spec.md        devel/architecture-design.md
 | `scripts/eval_perf.sh` | **NFR-02/04/05 实测**（T2Ranking 真实语料）。NFR-04 自 V2 Step 2 起按**三口径**分别计时并自动求和判定：快照加载 + 图 sidecar 加载 = 完整冷启动（<2s），图重建单列为降级路径 | `make eval-perf` |
 | `scripts/eval_filter.sh` | **过滤选择度扫描**：8 档位 × 3 模式 → 选择度 × 延迟 × 召回三元数据 + NFR-02 自动判定 | 需先跑 `gen_synth_corpus.py` |
 | `scripts/gen_synth_corpus.py` | **确定性合成 fixture**（固定 seed）：主题化文本聚类 + 可精确控制的选择度档位，含档位自检 | T2Ranking 无法控制选择度，故选择度实验用它 |
+| `data/download_t2ranking.sh` | **T2Ranking 原始数据下载**（约 3.5GB，带 sha256 校验、断点续传、支持 `HF_ENDPOINT` 镜像） | 仅在需**重新装配**评测子集时运行；装配用 `t2_prep` example |
 
 > ⚠️ 延迟数字**在 CI 共享 runner 上不具可引用性**，两个 eval 脚本都只用于**本地**实测与决策。
 

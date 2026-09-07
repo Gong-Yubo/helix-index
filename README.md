@@ -106,3 +106,20 @@ make report CHECK=--check                         # 报告数字逐格对账
 
 - 使用文档：[`docs/user-guide.md`](docs/user-guide.md)
 - 开发文档索引：[`docs/README.md`](docs/README.md)，开工前先读 `docs/devel/plan.md`
+
+## 评测语料（可选）
+
+`data/t2-corpus.jsonl` / `data/t2-queries.jsonl` 已随仓库分发，`bench` 开箱即用。
+如需**重新装配**该子集（改抽样参数 / 上游数据集更新），先下载 T2Ranking 原始数据
+（约 3.5GB，不入库）：
+
+```bash
+./data/download_t2ranking.sh                 # → data/t2ranking/（带 sha256 校验）
+cargo run --release -p helix-core --example t2_prep -- \
+    --t2ranking data/t2ranking --out data
+```
+
+## 许可
+
+**MIT**（见 [`LICENSE-MIT`](LICENSE-MIT)）。第三方数据集、模型与运行时的许可及引用义务
+见 [`NOTICE`](NOTICE)。
