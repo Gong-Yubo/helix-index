@@ -25,6 +25,10 @@ use super::index::{Inner, SearchIndex};
 pub struct Searcher {
     pub(crate) cfg: Arc<Config>,
     pub(crate) inner: Arc<Inner>,
+    /// 图持久化开关（V2 Step 2：`into_index` 往返时保留，避免 strict 设置丢失）
+    pub(crate) graph: crate::search::config::GraphOpts,
+    /// 最近一次图 sidecar 状态（NFR-07 可观测性，读端也能查）
+    pub(crate) graph_status: crate::search::index::GraphStatus,
 }
 
 impl Searcher {
@@ -97,6 +101,10 @@ impl Searcher {
                 inner,
                 pending: Vec::new(),
                 embed_elapsed: std::time::Duration::ZERO,
+                graph: self.graph,
+                graph_status: self.graph_status,
+                // 读端从未执行过 save，图 dump 耗时无意义（不是 0，是「未发生」）
+                graph_dump_elapsed: None,
             }),
             Err(_) => Err(Error::InvalidInput(
                 "Searcher 仍有 clone 残留，无法换回写端（先 drop 其他 reader）".to_string(),
@@ -224,7 +232,8 @@ mod tests {
             .embedder(Some(Arc::new(FakeEmbedder)))
             .vector_backend(crate::search::VectorBackend::Brute)
             .build_config();
-        let mut idx = SearchIndex::from_config(cfg, crate::search::VectorBackend::Brute);
+        let mut idx =
+            SearchIndex::from_config(cfg, crate::search::VectorBackend::Brute, Default::default());
         idx.add("BM25 是经典关键词检索算法").unwrap();
         idx.add("向量检索把文本编码成向量").unwrap();
         idx.add("混合检索融合两路结果").unwrap();
@@ -300,7 +309,8 @@ mod tests {
         let cfg = super::super::config::SearchIndexBuilder::default()
             .embedder(None)
             .build_config();
-        let mut idx = SearchIndex::from_config(cfg, crate::search::VectorBackend::Brute);
+        let mut idx =
+            SearchIndex::from_config(cfg, crate::search::VectorBackend::Brute, Default::default());
         idx.add("BM25 检索算法").unwrap();
         let s = idx.into_searcher().unwrap();
         // 无向量侧：默认 mode 应为 Bm25（而非 Hybrid 报 NoEmbedder）

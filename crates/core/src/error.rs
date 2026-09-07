@@ -71,6 +71,18 @@ pub enum Error {
         /// 当前装配的配置指纹
         actual: String,
     },
+
+    /// 向量图 sidecar 读写失败（hnsw_rs 落盘/加载、manifest 编解码）
+    #[error("向量图读写失败: {0}")]
+    VectorGraph(String),
+
+    /// 图 sidecar 与快照不匹配（缺失/损坏/版本不符）。图是派生缓存，
+    /// 默认降级重建（警告输出）；仅 strict 模式（D-S2-04）作为 Err 返回。
+    #[error("向量图不可用（{reason}），已降级为加载后重建")]
+    GraphStale {
+        /// 降级原因（可观测，NFR-07：降级不能静默）
+        reason: String,
+    },
 }
 
 /// 统一结果类型

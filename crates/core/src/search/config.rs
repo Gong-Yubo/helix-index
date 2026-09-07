@@ -47,6 +47,9 @@ pub struct Config {
     pub bm25_params: Bm25Params,
     /// 写缓冲批量 embed 阈值
     pub batch_size: usize,
+    /// HNSW ef_search（P0-5：图加载后必须回填，全 crate 无 set_ef*；
+    /// `None` = 用内核默认 EF_SEARCH=200）
+    pub ef_search: Option<usize>,
 }
 
 impl Config {
@@ -75,6 +78,42 @@ pub enum VectorBackend {
     Hnsw,
 }
 
+/// 图持久化相关的三个开关（V2 Step 2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GraphOpts {
+    /// HNSW ef_search（图加载后回填，P0-5）
+    pub ef_search: Option<usize>,
+    /// 图 sidecar 行为（D-S2-04）
+    pub mode: GraphPersistMode,
+    /// 是否读写图 sidecar（`--no-graph-persist` 逃生舱）
+    pub persist: bool,
+}
+
+impl Default for GraphOpts {
+    /// **图持久化默认开**（`persist: true`）——注意 `bool` 的派生默认是 `false`，
+    /// 与语义相反，故此处手写（曾因此导致 save 永远不落图，测试全降级）。
+    fn default() -> Self {
+        Self {
+            ef_search: None,
+            mode: GraphPersistMode::Lenient,
+            persist: true,
+        }
+    }
+}
+
+/// 图 sidecar 不可用时的行为（D-S2-04）。
+///
+/// 图是派生缓存：默认「警告后降级重建」（降级必须可观测，NFR-07）；
+/// `strict` 把降级与 dump 失败升级为 `Err`（诊断 / CI 用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GraphPersistMode {
+    /// 警告后降级 / 跳过图（默认）
+    #[default]
+    Lenient,
+    /// 图不可用或 dump 失败即 `Err`
+    Strict,
+}
+
 /// `SearchIndex` 的配置入口。**所有方法可选，不调即用默认值**（零配置可用）。
 pub struct SearchIndexBuilder {
     analyzer: Option<Arc<dyn Analyzer>>,
@@ -85,6 +124,12 @@ pub struct SearchIndexBuilder {
     bm25_params: Option<Bm25Params>,
     batch_size: Option<usize>,
     backend: VectorBackend,
+    /// HNSW ef_search（P0-5：图加载后必须回填，全 crate 无 set_ef*）
+    ef_search: Option<usize>,
+    /// 图 sidecar 行为（D-S2-04，默认 Lenient）
+    graph_mode: GraphPersistMode,
+    /// 是否持久化图（S2-08 的 `--no-graph-persist` 逃生舱；默认开）
+    graph_persist: bool,
 }
 
 impl Default for SearchIndexBuilder {
@@ -98,6 +143,9 @@ impl Default for SearchIndexBuilder {
             bm25_params: None,
             batch_size: None,
             backend: VectorBackend::Hnsw,
+            ef_search: None,
+            graph_mode: GraphPersistMode::Lenient,
+            graph_persist: true,
         }
     }
 }
@@ -151,6 +199,27 @@ impl SearchIndexBuilder {
         self
     }
 
+    /// 覆盖 HNSW ef_search（图加载后回填用，P0-5；默认 200）。
+    /// bench 的 `--ef-search` 必须经这里流进来，否则逐位一致断言会因
+    /// ef 不同产生假差异（v2-step2-design §5.3 坑 3）。
+    pub fn ef_search(mut self, ef_search: usize) -> Self {
+        self.ef_search = Some(ef_search);
+        self
+    }
+
+    /// 图 sidecar 行为（D-S2-04：默认警告后降级；Strict 时图问题即 Err）。
+    pub fn graph_mode(mut self, mode: GraphPersistMode) -> Self {
+        self.graph_mode = mode;
+        self
+    }
+
+    /// 关闭图持久化（`--no-graph-persist` 逃生舱：写库但不落图、
+    /// 加载时也不尝试读图）。磁盘紧张 / 排查图问题用。
+    pub fn without_graph_persist(mut self) -> Self {
+        self.graph_persist = false;
+        self
+    }
+
     /// 组装出一个空的 `SearchIndex`（消费 builder）。
     ///
     /// 这是默认装配的唯一入口：`SearchIndex::builder().build()` 零配置可用。
@@ -158,7 +227,7 @@ impl SearchIndexBuilder {
     pub fn build(self) -> crate::search::SearchIndex {
         let cfg = self.build_config();
         let backend = self.backend();
-        crate::search::SearchIndex::from_config(cfg, backend)
+        crate::search::SearchIndex::from_config(cfg, backend, self.graph_opts())
     }
 
     /// 按**当前装配**从快照加载（p6-design 8.2 的"标准姿势"）。
@@ -169,7 +238,16 @@ impl SearchIndexBuilder {
     pub fn load(self, path: &std::path::Path) -> Result<crate::search::SearchIndex> {
         let cfg = self.build_config();
         let backend = self.backend();
-        crate::search::SearchIndex::load_with(cfg, backend, path)
+        crate::search::SearchIndex::load_with(cfg, backend, self.graph_opts(), path)
+    }
+
+    /// 图持久化相关的三个开关打包（供 `SearchIndex::load_with` 使用）。
+    pub(crate) fn graph_opts(self) -> GraphOpts {
+        GraphOpts {
+            ef_search: self.ef_search,
+            mode: self.graph_mode,
+            persist: self.graph_persist,
+        }
     }
 
     /// 用默认值 + 覆盖项组装出一个 `Config`。
@@ -196,6 +274,7 @@ impl SearchIndexBuilder {
                 .unwrap_or_else(|| Arc::new(NoOpReranker)),
             bm25_params: self.bm25_params.unwrap_or_default(),
             batch_size: self.batch_size.unwrap_or(DEFAULT_BATCH_SIZE),
+            ef_search: self.ef_search,
         }
     }
 

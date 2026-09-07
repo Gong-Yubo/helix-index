@@ -9,6 +9,56 @@
 
 ## [Unreleased]
 
+### V2 Step 2 · 图持久化与冷启动（ADR-A 方案 C，2026-09-06）
+
+设计文档 `docs/devel/v2-step2-design.md`（**v0.3，ADR-A 已拍板**）；
+H1（图持久化格式 + 多文件原子性）结案，Step 3 原子快照直接沿用本协议。
+
+#### 新增
+
+- **HNSW 图落盘（FR-29）**：快照旁多出三件套 `foo.idx.hnsw.graph` / `.hnsw.data` /
+  `.hnsw.manifest`。**`FORMAT_VERSION` 保持 2，快照格式一个字节不动**，旧快照照常可加载
+- **`GraphManifest`**：图的唯一原子发布点（tmp → fsync → rename → fsync 父目录）。
+  记录父快照 CRC 作「版本锚点」+ 两个图文件的 CRC/长度 + 距离标识 / 平台指纹 / 建图参数
+- **`VectorGraphPersist` trait**（D-S2-03）：`VectorIndex::as_graph_persist` 默认下转，
+  「Brute 无图」成为类型事实而非运行时 if；`HnswRsIndex` 实现 dump/load
+- **`GraphStatus { Loaded, Rebuilt(reason), NotApplicable }`**：降级**必须可观测**（NFR-07），
+  `SearchIndex::graph_status()` 暴露；默认「警告后降级」，`GraphPersistMode::Strict` 可升级为 Err
+- `SearchIndex::graph_dump_elapsed()`：图 sidecar 落盘耗时单独观测（验收 7；
+  快照写入与图 dump 是两个数量级不同的成本，混在一起看不出图持久化的真实代价）
+- 配置入口新增 `ef_search(n)` / `graph_mode(mode)` / `without_graph_persist()`
+- `storage::save_with_crc` / `load_with_crc`：读写路径带出正文 CRC（图的版本锚点）
+
+#### 图是快照的派生缓存（ADR-A 的核心）
+
+图**可随时丢弃**：删 manifest / 删图文件 / 篡改任一字节 / 快照更新而图未更新 /
+维度或平台不匹配 / 建图参数漂移 —— 一律降级为加载后重建，**功能不丢，只慢**。
+多文件原子性问题因此被消解：只要 manifest 原子发布且带 CRC，「要么全对、要么全不算」即成立。
+
+#### 开工前源码复核的两项新事实（N1 / N2）
+
+- **N1**：`Description::dump` 无条件写 `MAGICDESCR_4`，`load_description` 读回 **4 不是 3**。
+  协议本就用「读回值不硬编码」，无需改动
+- **N2**：`load_hnsw` 无条件设 `datamap_opt = true`，使 `file_dump` **拒绝覆盖**已存在的
+  `.hnsw.data`、改写随机后缀文件名（`foo.idx-1234.hnsw.graph`）——「加载 → 增量 add → save」
+  会静默把图写错位置。**对策：dump 前先删旧 sidecar 两文件**（图是缓存，删除最坏降级重建）
+
+#### 验收
+
+- **`crates/core/tests/graph_persist.rs` 新增 18 个端到端测试**（+ 13 个 storage 单测 + 6 个 persist 单测）
+  - 覆盖 **S2-T1/T2/T4~T12/T15~T21**；**S2-T3**（并行 vs 串行 oracle 质量等价）顺延至
+    S2-11 的 PR（依赖 `parallel_build`），**S2-T13/T14** 亦在该 PR（T13 并行质量、T14 dump 体积）
+  - ⚠️ T3 的意图（图路径与重建路径质量等价）已由 **T6 的 oracle 重合率断言**（≥0.95）
+    与 `persist.rs` roundtrip 的逐位一致断言先行覆盖
+  - 每个「应走快路径」的测试都先断言 `GraphStatus::Loaded`（P0-1：basename 拼错会让
+    所有「能加载」断言照样绿，只有 NFR-04 静默失效）
+- **验收 2（消解 R-P5-13）**：同一快照连续两次加载，200 条 query 的 Top-10 **逐位一致**。
+  ⚠️ 测试**必须先断言 `GraphStatus::Loaded`**——basename 拼错时降级路径一切正常、
+  所有「能加载」断言都会绿，只有 NFR-04 静默失效
+- **验收 3/4**：图可丢弃四场景 + 截断 1%/50%/99% 与 magic 篡改**均不 panic**（`hnsw_rs`
+  reload 路径有 12 处 `assert_eq!`/`unwrap()`/`exit(1)`，靠 manifest CRC + Description 预校验五道先验挡住）
+- NFR-04 的完整冷启动实测与体积数据待 S2-10 补录
+
 ### V2 Step 1 — 正确性修复（PR #6，2026-09-05）
 
 设计文档 `docs/devel/v2-step1-design.md`（v1.0）。

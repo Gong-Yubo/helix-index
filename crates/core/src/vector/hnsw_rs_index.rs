@@ -38,8 +38,12 @@ const PHYSICAL_OVERSAMPLE_CAP: usize = 1024;
 /// **不用库里的 `DistDot`**：它在 aarch64 的标量实现里有 `assert!(dot <= 1.)`，
 /// 自匹配等边界场景会因浮点舍入（dot = 1.0000002）直接 panic。
 /// 我们把点积 clamp 到 [−1, 1] 再相减，语义相同但数值安全。
+///
+/// ⚠️ **类型短名被烧进图文件**（C7）：`distname = type_name::<D>()` 写进
+/// `.hnsw.graph`，`load_hnsw` 按短名比对。**改名 = 旧图全部失效**（走降级
+/// 重建，不丢功能）；语义变更必须升 manifest 的 `dist_id`（R20）。
 #[derive(Default, Copy, Clone)]
-struct DistDotClamped;
+pub(crate) struct DistDotClamped;
 
 impl Distance<f32> for DistDotClamped {
     fn eval(&self, va: &[f32], vb: &[f32]) -> f32 {
@@ -71,10 +75,29 @@ impl HnswRsIndex {
         }
     }
 
+    /// 内核默认 ef_search（P0-5：图加载后未显式指定时用它回填）。
+    pub fn default_ef_search() -> usize {
+        EF_SEARCH
+    }
+
     /// 覆盖 ef_search（8.6 向量路诊断：ef_search ∈ {100, 200, 400} 最小校准）。
     pub fn with_ef_search(mut self, ef_search: usize) -> Self {
         self.ef_search = ef_search;
         self
+    }
+
+    /// 从持久化加载的 `Hnsw` 构造（V2 Step 2 / P0-5）。
+    ///
+    /// 字段对兄弟模块（`vector/persist.rs`）不可见，字面量构造编译不过——
+    /// 本构造器是**唯一**通道。`ef_search` 必须由调用方带入：全 crate 无
+    /// `set_ef*`，本字段是 ef 的唯一载体。
+    pub(crate) fn from_loaded(hnsw: Hnsw<'static, f32, DistDotClamped>, ef_search: usize) -> Self {
+        Self { hnsw, ef_search }
+    }
+
+    /// 内部 `Hnsw` 的只读访问（`vector/persist.rs` dump 统计用）。
+    pub(crate) fn hnsw(&self) -> &Hnsw<'static, f32, DistDotClamped> {
+        &self.hnsw
     }
 }
 
@@ -130,6 +153,13 @@ impl VectorIndex for HnswRsIndex {
 
     fn len(&self) -> usize {
         self.hnsw.get_nb_point()
+    }
+
+    /// P0-4：门面层从 `Box<dyn VectorIndex>` 触达图持久化能力的唯一通道。
+    /// 覆盖为 `Some(self)`；`BruteForceIndex` 用默认 `None`——「Brute 无图」
+    /// 由此成为类型事实而非运行时 if。
+    fn as_graph_persist(&self) -> Option<&dyn super::VectorGraphPersist> {
+        Some(self)
     }
 }
 
