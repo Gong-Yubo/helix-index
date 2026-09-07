@@ -11,16 +11,23 @@
 
 ### V2 Step 3 · 详细设计（2026-09-07）
 
-- 新增 `docs/devel/v2-step3-design.md`（v0.1，待评审）：**原子快照（T7-13 / FR-31 / Q-C3）**
-  的详细设计——`atomic_write` 通用原语抽取（tmp → fsync → rename → fsync 父目录，
-  快照与图 manifest 共用一份实现）、save 全序列崩溃窗口矩阵（任何窗口下 `load`
-  要么旧快照要么新快照，**绝不 `SnapshotCorrupted`**）、tmp 孤儿回收、
-  故障注入测试钩子（`#[doc(hidden)]` + checkpoint 注入，`catch_unwind` 验证不变式）、
-  **R19 写路径残余收敛**（`dump_graph` 包 `catch_unwind`，panic 汇入 P0-3 缓存失败语义链）。
-- 6 个待拍板决策（D-S3-01~06）：tmp 命名统一为追加式 `.tmp`（顺带修正 manifest tmp
-  的双 `hnsw` 怪名，本机实证）/ `atomic_write` 落 `storage/atomic.rs` 收写闭包
-  （避免 52MB 整包拷贝）/ 注入钩子形态 / R19 收敛方式 / 孤儿回收时机 / fsync 代价
-  接受且不提供跳过开关。
+- 新增 `docs/devel/v2-step3-design.md`（**v0.2**，评审意见修订版，待拍板）：
+  **原子快照（T7-13 / FR-31 / Q-C3）**的详细设计——`atomic_write` 通用原语抽取
+  （tmp → fsync → rename → fsync 父目录，快照与图 manifest 共用一份实现）、
+  save 全序列崩溃窗口矩阵（任何窗口下 `load` 要么旧快照要么新快照，
+  **绝不 `SnapshotCorrupted`**）、tmp 孤儿回收（快照 / manifest 分口径）、
+  故障注入测试钩子（常驻 `pub(crate)` + checkpoint 注入，注入测试内迁 crate 内
+  `#[cfg(test)]`，`catch_unwind` 验证不变式）、**R19 写路径残余收敛**
+  （`dump_graph` 包 `catch_unwind`，panic 汇入 P0-3 缓存失败语义链）。
+- **7 个待拍板决策（D-S3-01~07）**：tmp 命名统一为追加式 `.tmp`（顺带修正
+  manifest tmp 的双 `hnsw` 怪名，本机实证）/ `atomic_write` 落 `storage/atomic.rs`
+  收写闭包（避免 52MB 整包拷贝）/ 注入钩子形态（C′：不进公开面）/ R19 收敛方式 /
+  孤儿回收时机 / fsync 代价接受且不提供跳过开关 / Strict 失败路径是否补 sidecar 清理
+  （v0.2 评审新增）。
+- v0.2 回应首版评审 8 条意见（PR #26）：checkpoint 计数校正（4→3）、D-S3-03 方案
+  重构（B → C′，消除「零新增公开项」的结构性矛盾）、验收 3 按快照/manifest tmp
+  拆分口径、cp1/cp3 矩阵行按真实崩溃形态（进程崩溃 vs 掉电）改写、代码草图笔误
+  修正、panic=abort 约束降级为两级文档防线（库 profile 对宿主无效）。
 - 测试计划 S3-T1~T10 + 实施任务 S3-01~09（量级 S，默认单 PR）。
 
 ### V2 计划复审 + 步骤重排（2026-09-07）
