@@ -23,9 +23,9 @@
 | [`devel/p4-design.md`](./devel/p4-design.md)（P4 设计说明） | **P4 详细设计**：hnsw_rs 调研、快照格式、向量 A/B 方案、决策点 | 实现者（P4 已完成） |
 | [`devel/p5-design.md`](./devel/p5-design.md)（P5 设计说明） | **P5 详细设计**：T2Ranking 数据集选型与转换管线、评测指标（分级 NDCG）、bench 设计、NFR 实测协议、决策点 | 实现者（P5 已完成） |
 | [`devel/p6-design.md`](./devel/p6-design.md)（P6 设计说明） | **接口重构**：issue #1 的业界做法调研、`SearchIndex` / `Searcher` 门面设计、写缓冲与 commit 语义、配置指纹、任务清单与决策点（**已拍板 v2.0**） | 实现者、评审者（P6 已定稿） |
-| [`devel/plan-v2.md`](./devel/plan-v2.md)（V2 开发计划） | **V2（质量与性能夯实 + 精排）Step 1~7 任务清单与进度**。`plan.md` 冻结为 V1 计划，V2 走这份 | 实现者（V2 开工先看这个） |
+| [`devel/plan-v2.md`](./devel/plan-v2.md)（V2 开发计划） | **V2 任务清单与进度**：V2.0 = Step 1~7，V2.1 = Step 8~10（`plan.md` 冻结为 V1 计划）。⚠️ **2026-09-07 重排**：Step 3 起编号已变（旧号→新号见文末 §附-2 映射表）；同日全量复审（7 处调整 + 4 个拍板）已并入，索引见 §附-3 | 实现者（V2 开工先看这个） |
 | [`devel/v2-step1-design.md`](./devel/v2-step1-design.md)（V2 Step 1 设计） | **向量软删除 + 过滤下推**：`hnsw_rs::search_filter` 源码级行为核实、双路径设计、字段索引、风险表 R11~R18、S1-10 实测数据 | 实现者、评审者（Step 1 已完成） |
-| [`devel/v2-step2-design.md`](./devel/v2-step2-design.md)（V2 Step 2 设计） | **图持久化 + 并行建图（ADR-A 方案 C）**：`hnsw_rs` 图 IO 源码级三条硬事实、manifest 唯一原子发布点、五道先验校验、降级可观测、S2-01~12 任务拆分、风险表 R19~R25、12K 实测（完整冷启动 ≈100ms） | 实现者、评审者（Step 2 已实施，等合并） |
+| [`devel/v2-step2-design.md`](./devel/v2-step2-design.md)（V2 Step 2 设计） | **图持久化 + 并行建图（ADR-A 方案 C）**：`hnsw_rs` 图 IO 源码级三条硬事实、manifest 唯一原子发布点、五道先验校验、降级可观测、S2-01~12 任务拆分、风险表 R19~R25、12K 实测（完整冷启动 ≈100ms） | 实现者、评审者（Step 2 已完成并合并，main `9db2c00`） |
 | [`devel/eval-report.md`](./devel/eval-report.md)（P5 评测报告） | **P5 评测结论**：三路对照、分桶与符号检验、tantivy 基线、网格/RRF 定稿、charabia 对照、NFR 实测、数据诚信声明 | 决策者、接入方 |
 | [`devel/v1-finish-design.md`](./devel/v1-finish-design.md)（v1 收尾设计） | **使用文档 / 评测脚本 / CI / 改名与发布 / 工程收尾**的任务清单、执行顺序与决策点（含外部评审修正记录） | 实现者（v1 收尾进行中） |
 | [`devel/requirements-spec.md`](./devel/requirements-spec.md)（需求分析说明书）     | 做什么 / 为什么 / 怎么验收  | 决策者、场景层接入方、实现者 |
