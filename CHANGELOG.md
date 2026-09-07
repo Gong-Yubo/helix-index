@@ -9,6 +9,20 @@
 
 ## [Unreleased]
 
+### V2 Step 3 · 详细设计（2026-09-07）
+
+- 新增 `docs/devel/v2-step3-design.md`（v0.1，待评审）：**原子快照（T7-13 / FR-31 / Q-C3）**
+  的详细设计——`atomic_write` 通用原语抽取（tmp → fsync → rename → fsync 父目录，
+  快照与图 manifest 共用一份实现）、save 全序列崩溃窗口矩阵（任何窗口下 `load`
+  要么旧快照要么新快照，**绝不 `SnapshotCorrupted`**）、tmp 孤儿回收、
+  故障注入测试钩子（`#[doc(hidden)]` + checkpoint 注入，`catch_unwind` 验证不变式）、
+  **R19 写路径残余收敛**（`dump_graph` 包 `catch_unwind`，panic 汇入 P0-3 缓存失败语义链）。
+- 6 个待拍板决策（D-S3-01~06）：tmp 命名统一为追加式 `.tmp`（顺带修正 manifest tmp
+  的双 `hnsw` 怪名，本机实证）/ `atomic_write` 落 `storage/atomic.rs` 收写闭包
+  （避免 52MB 整包拷贝）/ 注入钩子形态 / R19 收敛方式 / 孤儿回收时机 / fsync 代价
+  接受且不提供跳过开关。
+- 测试计划 S3-T1~T10 + 实施任务 S3-01~09（量级 S，默认单 PR）。
+
 ### V2 计划复审 + 步骤重排（2026-09-07）
 
 - 对 `plan-v2.md` 做全量复审（7 处调整 A1~A7 + 4 个拍板问题 D1~D4），含
