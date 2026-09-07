@@ -26,7 +26,7 @@
 | [`devel/plan-v2.md`](./devel/plan-v2.md)（V2 开发计划） | **V2 任务清单与进度**：V2.0 = Step 1~7，V2.1 = Step 8~10（`plan.md` 冻结为 V1 计划）。⚠️ **2026-09-07 重排**：Step 3 起编号已变（旧号→新号见文末 §附-2 映射表）；同日全量复审（7 处调整 + 4 个拍板）已并入，索引见 §附-3 | 实现者（V2 开工先看这个） |
 | [`devel/v2-step1-design.md`](./devel/v2-step1-design.md)（V2 Step 1 设计） | **向量软删除 + 过滤下推**：`hnsw_rs::search_filter` 源码级行为核实、双路径设计、字段索引、风险表 R11~R18、S1-10 实测数据 | 实现者、评审者（Step 1 已完成） |
 | [`devel/v2-step2-design.md`](./devel/v2-step2-design.md)（V2 Step 2 设计） | **图持久化 + 并行建图（ADR-A 方案 C）**：`hnsw_rs` 图 IO 源码级三条硬事实、manifest 唯一原子发布点、五道先验校验、降级可观测、S2-01~12 任务拆分、风险表 R19~R25、12K 实测（完整冷启动 ≈100ms） | 实现者、评审者（Step 2 已完成并合并，main `9db2c00`） |
-| [`devel/v2-step3-design.md`](./devel/v2-step3-design.md)（V2 Step 3 设计） | **原子快照（崩溃一致性）**：`atomic_write` 通用原语（快照与 manifest 共用）、save 全序列崩溃窗口矩阵、tmp 孤儿回收、故障注入测试钩子、R19 写路径残余收敛（`catch_unwind`）、D-S3-01~06 决策点、S3-T1~T10 测试计划 | 实现者、评审者（**v0.1 待评审**） |
+| [`devel/v2-step3-design.md`](./devel/v2-step3-design.md)（V2 Step 3 设计） | **原子快照（崩溃一致性）**：`atomic_write` 通用原语（快照与 manifest 共用）、save 全序列崩溃窗口矩阵、tmp 孤儿回收、故障注入测试钩子（C′：`pub(crate)` 不进公开面）、R19 写路径残余收敛（`catch_unwind`）、D-S3-01~07 决策（**已全部拍板**）、S3-T1~T10 测试计划 | 实现者（**v0.3 已拍板，待实现**） |
 | [`devel/eval-report.md`](./devel/eval-report.md)（P5 评测报告） | **P5 评测结论**：三路对照、分桶与符号检验、tantivy 基线、网格/RRF 定稿、charabia 对照、NFR 实测、数据诚信声明 | 决策者、接入方 |
 | [`devel/v1-finish-design.md`](./devel/v1-finish-design.md)（v1 收尾设计） | **使用文档 / 评测脚本 / CI / 改名与发布 / 工程收尾**的任务清单、执行顺序与决策点（含外部评审修正记录） | 实现者（v1 收尾进行中） |
 | [`devel/requirements-spec.md`](./devel/requirements-spec.md)（需求分析说明书）     | 做什么 / 为什么 / 怎么验收  | 决策者、场景层接入方、实现者 |
