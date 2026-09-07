@@ -20,6 +20,10 @@
 | 版本   | 日期         | 状态  | 说明                          |
 | ---- | ---------- | --- | --------------------------- |
 | v1.0 | 2026-09-02 | 待评审 | 由 `archive/requirements-and-design_v1.0.md` v1.0 拆分重构而来 |
+| v1.1 | 2026-09-02 | 已定稿 | `thirdparty.md` 调研回写：ADR-007（tantivy dev 基线）/ ADR-008（MSRV 1.90 + cargo-deny）、Unicode 分段改用现成库 |
+| v1.2 | 2026-09-02 | 已定稿 | P0 执行后回写：bincode 定 2.0.1、fastembed 须 `default-features = false`、模型源修正为 `Xenova/bge-small-zh-v1.5` |
+| v1.3 | 2026-09-03 | 已定稿 | P5 评测数据源切换 **T2Ranking** 后的目录树 / CLI 示例 / 阶段门槛同步 |
+| v1.4 | 2026-09-04 | 已定稿 | `p6-design` 接口重构：新增第 10 章「对外接口设计（门面层）」+ ADR-009，原 10~14 章顺延 |
 | v1.5 | 2026-09-05 | 已定稿 | V2 Step 1（向量软删除 + 过滤下推）回写 |
 | v1.6 | 2026-09-06 | 已定稿 | **V2 Step 2（图持久化，ADR-A）回写**：5.4.3 / 7.6.2 / 8.2 / 8.3 / 14.1 |
 
@@ -390,6 +394,12 @@ pub trait VectorGraphPersist: VectorIndex {
 3. **`HnswIo` 必须比 `Hnsw` 活得长**（`load_hnsw*` 的 `'a: 'b`）⇒ 只能 `Box::leak`，
    且**必须丢弃返回的句柄**（泄漏是刻意的、有界的：每进程每索引一次）。
    用编译期断言 `const _: () = assert_send_sync::<HnswIo>();` 把 `Send + Sync` 前提钉住。
+
+4. **平台指纹必须按构建目标派生**（C4；评审 #12 发现 1）：`hnsw_rs` 落盘用
+   `to_ne_bytes()`（原生端序）+ `from_raw_parts` 裸拷贝 f32，图文件本身是 native-endian。
+   若 manifest 的 `platform` 字段写死常量，大端 / 32-bit 构建**同样写 0x01、同样接受 0x01**
+   ⇒ CRC 全对、platform 相符，却加载出字节序错误的向量，得到**静默错误的结果**。
+   实现为 `PLATFORM_FINGERPRINT = if cfg!(target_endian = "little") && cfg!(target_pointer_width = "64") { LE64 } else { OTHER }`。
 
 详见 7.6.2 节的文件布局与发布协议。
 
@@ -844,8 +854,19 @@ search: took=8.2ms bm25=1.4ms(vector=6.1ms parallel) candidates=187 fused=50 too
 
 **V2 Step 2 新增「降级可观测」**（NFR-07 口径延伸）：图 sidecar 不可用时必须显式报告，
 不得静默降级——静默会掩盖「图其实一直没生效」这类问题。载体是
-`SearchIndex::graph_status() -> GraphStatus { Loaded, Rebuilt(reason), NotApplicable }`，
-CLI `search --index` 与 bench 均打印。
+`SearchIndex::graph_status() -> GraphStatus`，CLI `search --index` 与 bench 均打印：
+
+| 变体 | 含义 | 语义边界 |
+| --- | --- | --- |
+| `Loaded` | 从 sidecar 加载成功（冷启动快路径） | 每个「应走快路径」的测试都**必须先断言它**（P0-1：basename 拼错时所有「能加载」断言照样绿） |
+| `Rebuilt(reason)` | 降级重建（manifest 缺失 / CRC 不符 / 参数漂移 / 平台不符…） | 结果仍然正确，只是冷启动慢 |
+| `PersistFailed(reason)` | **写侧**失败：图没落盘（非 Strict 下 `save()` 仍返回 Ok） | 与 `Rebuilt` 区分：这里什么都没重建，也不是「读不到图」（评审 #12 nit） |
+| `NotApplicable` | 不适用（Brute 后端 / 纯 BM25 / `--no-graph-persist`） | 从未发生图持久化 |
+
+> ⚠️ **P0-3 的边界（评审 #12 发现 2 后修订）**：「图是缓存 ⇒ `save` 不得因图失败而失败」
+> 覆盖的是**整条写图链路**（dump → CRC → manifest 原子发布 → 失败清理），
+> 而不只是 `dump_graph` 一步。快照落盘之后才写图，此时让 `save()` 返回 Err
+> 等于「缓存写坏了把主数据一起否决」。`GraphPersistMode::Strict` 是唯一的例外开关。
 
 ⚠️ **当前限制（已知，待排期）**：`Metrics` 只在 `search_parts` 内聚合并 `tracing::info!` 输出，
 **不在 `SearchResponse` 里、也不进 `bench::QueryMetrics`**。后果是：宿主不挂 tracing subscriber
@@ -1050,12 +1071,12 @@ positions     = []                        # posting 存储位置信息
      只有「图可丢弃 + 五道先验 CRC 校验」才能同时保住「不崩」与「不错」
   3. 方案 A/B 都要引入新的一致性协议；方案 C 的协议只有一条：**manifest 说了算**
 - **代价**：
-  - **磁盘 +60%**（12K 实测：52.3MB → 84.1MB，1.6×）。`hnsw_rs` 只暴露 `DumpMode::Full`，
+  - **磁盘 +60%**（12K 实测：52.3MB → ≈84MB，1.6×）。`hnsw_rs` 只暴露 `DumpMode::Full`，
     向量必然被复制一份，**省不掉**（R22）。`--no-graph-persist` 是逃生舱
   - 内存不变（只涨磁盘）；图 dump 43.5ms、图加载 23.3ms 均可忽略
   - **达标依赖图 sidecar 命中**——降级路径仍是 ~10s，故必须配 NFR-07 的「降级不得静默」
 - **实测（12K / release）**：完整冷启动 76.9ms（快照）+ 23.3ms（图）≈ **100ms** ✅（限额 2s）；
-  对照降级路径 53.3ms + 9.96s ≈ 10.0s
+  对照降级路径 56~78ms + ≈10~11.5s ≈ 11s
 - **相关需求**：FR-29 / NFR-04 / NFR-06 / NFR-07；对应 `plan-v2.md` Step 2（S2-01~S2-12）
 
 ---
@@ -1370,9 +1391,9 @@ pub enum Error {
 | **R19** | **`hnsw_rs` 在损坏输入上 panic / `exit(1)`**（C3；读路径 12 处 `assert_eq!`/`unwrap()`，写路径 `DumpInit` 打不开文件即 `panic_any`） | 崩溃恢复场景下进程直接死 | 读：**五道先验**（manifest CRC + 长度 + 维度 + 平台 + `Description` 预校验）全过才交给 `hnsw_rs`；写：前置探测目录可写 + 失败按 P0-3 语义处理 | 校验通过**之后**文件被并发改写仍可能 panic（无并发写同一快照语义，不处理）；写路径 `panic_any` 是 TOCTOU 窗口，**只能缩小不能归零**——`panic_any` 不是 `Err`，调用侧无法 catch |
 | **R20** | **距离类型路径被烧进图文件**（C7） | 重命名/移动 `DistDotClamped` 会让旧图全部失效 | 用 `load_hnsw`（**短名**比对）而非 `load_hnsw_with_dist`；manifest 记**自有** `dist_id`，与 Rust 类型路径解耦 | 类型**改名**仍会失效（走降级重建，不丢功能） |
 | **R21** | **平台/端序绑定**（C4）：图文件是裸 f32 + native endian | 快照拷到别的平台 → 图不可用 | manifest 记 `platform` 并校验，不匹配即降级 | 图 sidecar **不可跨平台搬运**是既定事实，需在用户文档声明 |
-| **R22** | **磁盘体积增加约 60%**（C8；`file_dump` 只支持 `DumpMode::Full`，向量必然被复制一份） | 大语料下显著。**12K 实测**：快照 52.3MB + graph 8.1MB + data 23.7MB = 84.1MB（**1.6×**） | 先接受并实测；`--no-graph-persist` 逃生舱；Step 5 compaction 重写图时一并优化 | 未解决，V2.0 接受 |
+| **R22** | **磁盘体积增加约 60%**（C8；`file_dump` 只支持 `DumpMode::Full`，向量必然被复制一份） | 大语料下显著。**12K 实测**：快照 52.3MB + graph 7.9~8.1MB + data 23.7MB ≈ **84MB**（**1.6×**；graph 体积随 HNSW 拓扑在跨进程间有小幅波动，与 R-P5-13 同源） | 先接受并实测；`--no-graph-persist` 逃生舱；Step 5 compaction 重写图时一并优化 | 未解决，V2.0 接受 |
 | **R23** | **`HnswIo` 必须比 `Hnsw` 活得长**（`load_hnsw*` 的 `'a: 'b`）⇒ 只能 `Box::leak` | 长生命周期服务反复加载会累积（每次约 200B + 路径串） | leak 后**丢弃句柄、不存字段**（P1-2），避免与 `Hnsw` 内部指向 Mmap 的共享借用形成别名 | 无回收路径；**依赖 `HnswIo: Send + Sync`** —— 已加编译期断言，`hnsw_rs` 升级时需复核 |
-| **R24** | **加载后增量插入的建图参数不同**（C8：重载后 `extend_candidates = true`，`Hnsw::new` 是 `false`） | 长期增量写入后图质量与纯内存建库存在偏差，可能影响召回 | S2-T10 覆盖；实测 oracle 重合率 | 无法在外部改私有字段；若实测偏差显著，需评估「加载后强制重建」 |
+| **R24** | **加载后增量插入的建图参数不同**（C8：重载后 `extend_candidates = true`，`Hnsw::new` 是 `false`） | 长期增量写入后图质量与纯内存建库存在偏差，可能影响召回 | S2-T10 覆盖；实测 oracle 重合率 | **残余应对已修正**：`Hnsw::set_extend_candidates(&mut self, bool)` 是**公开 API**（`hnsw.rs:853`），可在加载后显式对齐回 `false`；真正拿不到 setter 的是 `datamap_opt`（仅 `pub(crate)` getter）。故本项**可修**，待实测偏差决定是否实施 |
 | **R25** | **每次 `save` 全量重 dump 图** | 频繁 save 场景成本高。**12K 实测 43.5ms**（31.6MB 写入 + CRC 扫两遍）——远低于预估，当前**不是**瓶颈 | 先不优化；预留 dirty 标记（`dumped_len == len()` 可跳过）的位置 | 未解决；量级需在 100 万级复核 |
 
 ---
@@ -1395,5 +1416,5 @@ pub enum Error {
 | v1.2 | 2026-09-02 | **P0 执行后回写**（详见 `p0-design.md` 第 12 章）：① 序列化定为 **`bincode 2.0.1`**（3.0.0 为玩笑发布）；② `moka` 需显式启用 `sync` feature；③ `fastembed` 必须 `default-features = false` 以移除 NCSA 依赖链；④ 模型实际来源为 `Xenova/bge-small-zh-v1.5`（非 Qdrant）；⑤ 枚举变体确认为 `BGESmallZHV15`（非 `BGESmallZH`） |
 | v1.3 | 2026-09-03 | 依据 `p5-design.md` v1.2（评测数据源切换 T2Ranking）同步：① 4.x 目录树 data/ 注释更新；② 10.2 CLI 示例改 `data/t2-queries.jsonl`；③ 11 阶段门槛 P5 行更新（T2Ranking 装配 + 分级 NDCG）。评测数据集的**需求定义**见需求文档 9.4（v1.2），本文档不复制 |
 | v1.4 | 2026-09-04 | 依据 `p6-design.md` v2.0（issue #1 接口重构，决策点 D-I1~D-I8 已拍板）：① 新增**第 10 章「对外接口设计（门面层）」**，原 10~14 章顺延为 11~15；② 新增 ADR-009（门面层 + 共用编排内核）；③ 5.1 `Document` 拆为输入 DTO + `DocRecord`；④ 4.2 补门面层边界；⑤ 11.3 错误类型新增 `ConfigMismatch`；⑥ 阶段表 P6 重定义为接口重构、原 v2 顺延 P7。详细设计见 `p6-design.md`，任务级见 `plan.md` |
-| v1.6 | 2026-09-06 | 依据 `v2-step2-design.md` v0.3（V2 Step 2：图持久化，**ADR-A 方案 C 已拍板**）回写：① 2.2 的 NFR-06 行删去过时论据「seed 固定」（`StdRng::from_os_rng()` 无 seed API，与 8.2 直接冲突），改为「图持久化冻结拓扑」；② 2.3 与 9.4 新增 **ADR-A**（图 = 快照的派生缓存，含实测：完整冷启动 ≈100ms、磁盘 1.6×、dump 43.5ms），并说明 §7.6.1 曾预引用的「ADR-011」已统一为 ADR-A；③ **5.4.3 新增**「图持久化 `VectorGraphPersist`」（basename 铁律 / `ef_search` 是入参 / `Box::leak` 三条结构性约束）；④ 7.6.2 新增「V2 Step 2：图 sidecar（ADR-A）」；⑤ 8.2 NFR-06 口径改为「同快照两次加载逐位一致」；⑥ 8.3 NFR-07 扩「降级可观测」（`GraphStatus`）；⑦ 10.3 补 `graph_status()` / `graph_dump_elapsed()`；⑧ **14.1 新增 R19~R25**（含 12K 实测：R22 体积 1.6×、R25 dump 43.5ms） |
 | v1.5 | 2026-09-05 | 依据 `v2-step1-design.md` v0.3（V2 Step 1：向量软删除 + 过滤下推）回写：① 5.4 `VectorIndex` 新增 `search_filtered` 与 `None` 契约，新增 5.4.1 存活单一真源；② 5.5 `Retriever` 的过滤载体从 `Option<&Filter>` 改为 `Option<&dyn CandidateFilter>`，新增 5.5.1；③ **7.5 整节重写**（原 instant-distance + delta 方案已在 D8 移除）；④ 7.6 修正 bincode 版本坑，新增 7.6.1「新增结构不入快照」；⑤ 8.1 去掉失效的 `instant_distance::Search` 复用、新增过滤下推两行；⑥ 新增 8.3 的 `query::Metrics` 三项与其**当前不可观测**的限制、新增 8.4 空结果语义；⑦ 新增 **ADR-010**；⑧ 14 章 R1 标记已消除、新增 R11~R18；⑨ 9.3 决策表补 ADR-010 行 |
+| v1.6 | 2026-09-06 | 依据 `v2-step2-design.md` v0.3（V2 Step 2：图持久化，**ADR-A 方案 C 已拍板**）回写：① 2.2 的 NFR-06 行删去过时论据「seed 固定」（`StdRng::from_os_rng()` 无 seed API，与 8.2 直接冲突），改为「图持久化冻结拓扑」；② 2.3 与 9.4 新增 **ADR-A**（图 = 快照的派生缓存，含实测：完整冷启动 ≈100ms、磁盘 1.6×、dump 43.5ms），并说明 §7.6.1 曾预引用的「ADR-011」已统一为 ADR-A；③ **5.4.3 新增**「图持久化 `VectorGraphPersist`」（basename 铁律 / `ef_search` 是入参 / `Box::leak` 三条结构性约束）；④ 7.6.2 新增「V2 Step 2：图 sidecar（ADR-A）」；⑤ 8.2 NFR-06 口径改为「同快照两次加载逐位一致」；⑥ 8.3 NFR-07 扩「降级可观测」（`GraphStatus`）；⑦ 10.3 补 `graph_status()` / `graph_dump_elapsed()`；⑧ **14.1 新增 R19~R25**（含 12K 实测：R22 体积 1.6×、R25 dump 43.5ms） |

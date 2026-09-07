@@ -26,7 +26,7 @@
 | **D-S2-02** | 图 dump 会把向量**原样复制一份**（12K 约 +25MB），体积增加约 60%，接受吗 | **接受**（hnsw_rs 只暴露 `DumpMode::Full`，省不掉；内存不变、只涨磁盘） | 影响 S2-04 / S2-10 |
 | **D-S2-03** | 持久化能力在类型系统上怎么表达（改 `VectorIndex` trait / 新增 trait / 门面层按 backend 分派） | **新增独立 trait `VectorGraphPersist`**，门面层按 `VectorBackend` 分派 | 影响 S2-03 / S2-04 |
 | **D-S2-04** | 图出问题时的默认行为：**静默降级重建** / 警告后降级 / 直接报错 | **默认「警告后降级」**，提供 `strict` 选项；降级必须可观测（NFR-07） | 影响 S2-06 / 多个测试口径 |
-| **D-S2-05** | 并行建图 `parallel_insert` 是否纳入本 Step | **纳入为可选开关**，默认**关**（保住与 P5 基线的可比性），先出实测数据再定默认值 | 影响 S2-11 |
+| **D-S2-05** | 并行建图 `parallel_insert` 是否纳入本 Step | **纳入为可选开关**，默认**关**（保住与 P5 基线的可比性），先出实测数据再定默认值。<br>⚠️ **生效条件是「开关开 **且** `batch_size >= 1000`」（评审 #13 发现 1）** | 影响 S2-11 |
 | **D-S2-06** | 底层 `storage::load` 路径（bench）是否也接图持久化 | **接**（否则 10 万级评测仍要吃 11.57s 与 R-P5-13 抖动） | 影响 S2-05 / S2-09 工作量 |
 | **D-S2-07** | 配置指纹是否扩展（`vector_backend` / `dist_id` / 平台标记） | **不扩**（扩了会打断「Brute 逃生舱加载 Hnsw 建库快照」这一现有能力），改为写进 manifest 做交叉校验 | 影响 S2-04 / S2-07 |
 
@@ -298,12 +298,19 @@ pub struct GraphManifest {
                                             ← 原子发布点（P1-4 补目录 fsync）
 ```
 
-**写路径失败语义（P0-3，评审指出的缺口）**：图是**缓存**，所以 **`save` 不得因图失败而失败**。步骤 4 的 `file_dump` 失败（磁盘满 / 目录不可写 / `panic_any`）时：
+**写路径失败语义（P0-3，评审指出的缺口）**：图是**缓存**，所以 **`save` 不得因图失败而失败**。
+
+⚠️ **适用范围是步骤 4~7 的整条链路，不只是 `dump_graph`**（评审 #12 发现 2 后修订）：
+原实现只把 `dump_graph` 包进「Lenient 捕获」，紧随其后的 CRC 扫描（步骤 5）、
+manifest 原子发布（步骤 7）、以及失败后的 sidecar 清理仍会用 `?` 让 `save()` 返回 `Err`——
+而此刻快照**已经完整落盘**，等于「缓存写坏了把主数据一起否决」。
+实现上抽出 `write_graph_sidecar()` 作为**统一失败边界**，模式判定只做一次
+（清理失败同样只警告——残留文件不影响正确性）。
 
 | 模式 | 行为 |
 | --- | --- |
-| 默认 | 输出警告（含原因）→ **不发布 manifest**（若已发布则删除之）→ `save` **正常返回 Ok**。快照本身是完好的，下一次冷启动降级重建 |
-| `strict` | 返回 `Err(Error::VectorGraph(..))` |
+| 默认 | 输出警告（含原因）→ **不发布 manifest**（若已发布则删除之）→ `save` **正常返回 Ok**，<br>`graph_status = PersistFailed(reason)`。快照本身是完好的，下一次冷启动降级重建 |
+| `strict` | 返回 `Err(Error::VectorGraph(..))`，同时 `graph_status = PersistFailed(reason)`（调用方手里还有 idx，诊断需要） |
 
 > ⚠️ 前置检查（目录存在且可写）**只能缩小不能归零** panic 面：C3 的 `panic_any`（`hnswio.rs:208/226`）是 TOCTOU 窗口内的真实行为，且 `panic_any` 不是 `Err`，无法在调用侧 catch。⇒ R19 覆盖写路径。
 
@@ -625,6 +632,17 @@ GraphStale { reason: String },
 | **S2-T15** | manifest 版本未知（P1-5） | 手工构造 `manifest_version = 999` → 降级重建，`GraphStatus::Rebuilt`，不 panic |
 | **S2-T16** | 快照已更新、图未更新（P1-5） | 用旧 manifest 覆盖新 manifest（或改 `snapshot_crc`）→ 降级重建；对应 §4.7 矩阵行 |
 | **S2-T17** | 建图参数漂移（P1-3） | 手工把 `Description.max_nb_connection` / `ef` 与内核常量改成不一致 → 步骤 4.5 预校验拦下，降级重建 |
+| **S2-T18** | `GraphPersistMode::Strict` 写侧（评审后补） | 写图失败 → `save` 返回 **Err**，且 `graph_status` 仍记录 `PersistFailed` 便于诊断 |
+| **S2-T19** | 默认 `Lenient` 写侧（P0-3 的核心语义） | 写图失败 → **快照照常落盘**、`save` 返回 **Ok**、状态 `PersistFailed`；快照仍可加载（走重建） |
+| **S2-T20** | `without_graph_persist()` | 写侧不落图（`graph_dump_elapsed == None`）；读侧即便有合法 sidecar 也不读，且状态说明「已关闭」 |
+| **S2-T21** | `graph_dump_elapsed()` 语义 | 真落图 `Some` / 从未落图 `None`（不是 `Some(0ms)`） |
+| **S2-T22** ⚠️ | **并行分支真的被走到**（T13 的前置护栏） | 直接对 `HnswRsIndex::add_batch` 断言 `parallel_inserts()`：默认 0 / 批量 999 → 0 / 批量 1200 + 开关开 → 1 |
+
+> ⚠️ **T18~T22 是评审后补的**（#12 发现 3 / #13 发现 1）。其中 **T22 最关键的不是断言内容，
+> 而是它的存在**：T13 依赖「`parallel_build(true)` + `batch_size >= 1000`」这个**隐式耦合**，
+> 评审插桩发现默认配置下 `add_batch` 每次只收到 64 条（batch_size 默认值），
+> 38 次调用全部串行——「并行 vs 串行质量等价」实为「串行 vs 串行」且**全绿**。
+> 没有 T22 这个护栏，这个错误无法被测试发现。
 
 ---
 
@@ -660,7 +678,7 @@ GraphStale { reason: String },
 | **R21** | **平台/端序绑定**（C4）：裸 f32 + native endian | 快照拷到别的平台 → 图不可用 | manifest 记 `platform` 并校验，不匹配即降级 | 图 sidecar **不可跨平台搬运**是既定事实，需在用户文档声明 |
 | **R22** | **磁盘体积增加约 60%**（12K 估算：快照 52.3MB → +~25MB 数据文件 + ~8MB 图文件 ≈ 85MB，待 S2-T14 实测） | 大语料（100 万级）下显著 | 先接受并实测；Step 5 compaction 重写图时可一并优化；`--no-graph-persist` 逃生舱 | 未解决，V2.0 接受 |
 | **R23** | **`Box::leak` 的 `HnswIo`**（C6） | 每次加载泄漏约 200B + 路径串；长生命周期服务反复加载会累积 | 量级极小且可控；**leak 后丢弃句柄、不存字段**（P1-2，避免与 `Hnsw` 内部指向 Mmap 的共享借用形成别名）；S2-T12 护栏 | 目前无回收路径；**依赖 `HnswIo: Send + Sync`**，S2-03 加编译期断言，`hnsw_rs` 升级时需复核 |
-| **R24** | **加载后增量插入的建图参数不同**（C8：`extend_candidates` 重载后为 `true`，`Hnsw::new` 为 `false`） | 长期增量写入后，图质量与纯内存建库存在偏差，可能影响召回 | S2-T10 覆盖；实测 oracle 重合率；文档记录 | 无法在外部改私有字段；若实测偏差显著，需评估「加载后强制重建」策略 |
+| **R24** | **加载后增量插入的建图参数不同**（C8：`extend_candidates` 重载后为 `true`，`Hnsw::new` 为 `false`） | 长期增量写入后，图质量与纯内存建库存在偏差，可能影响召回 | S2-T10 覆盖；实测 oracle 重合率；文档记录 | ~~无法在外部改私有字段~~ **已修正（评审 #14 发现 2）**：`Hnsw::set_extend_candidates(&mut self, bool)` 是公开 API（`hnsw.rs:853`），可显式对齐；真正不可外部改的是 `datamap_opt`（只有 `pub(crate)` getter） |
 | **R25** | **每次 `save` 全量重 dump 图** | 频繁 save 场景成本高（30MB 级写入 + CRC 扫两遍） | 先不做优化；预留 dirty 标记（`dumped_len == len()` 可跳过）的位置，实测后决定 | 未解决 |
 
 **未决问题（需评审补充意见）**
@@ -795,7 +813,7 @@ Error::GraphStale { reason: String };
 ## 实施结果（S2-10 实测，2026-09-06）
 
 S2-01~S2-12 全部落地，守门全绿（fmt / clippy `--workspace --all-targets -D warnings` /
-208 测试 / MSRV 1.90 / rustdoc `-D warnings` / `--no-default-features` /
+213 测试 / MSRV 1.90 / `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` / `--no-default-features` /
 `--features charabia` / cargo-deny）。分三个 PR：**#12**（core 图持久化）、
 **#13**（CLI/bench 接线 + 并行建图）、文档回写。
 
@@ -805,14 +823,18 @@ S2-01~S2-12 全部落地，守门全绿（fmt / clippy `--workspace --all-target
 
 | # | 验收 | 结果 |
 | --- | --- | --- |
-| 1 | 完整冷启动 < 2s | ✅ **≈100ms**（快照 76.9ms + 图 23.3ms），余量 20× |
+| 1 | 完整冷启动 < 2s | ✅ **≈100ms**（快照 57~77ms + 图 23~37ms，实测 82~100ms），余量 20× |
 | 2 | 消解 R-P5-13（同快照两次加载逐位一致） | ✅ S2-T1/T2 覆盖，前置断言 `GraphStatus::Loaded` |
 | 3 | 图可丢弃（四种场景降级仍可用） | ✅ S2-T4/T5/T6 覆盖 |
 | 4 | 损坏输入不 panic | ✅ S2-T5 覆盖（截断 1%/50%/99% + magic 篡改） |
-| 5 | 旧快照可加载 | ✅ S2-T6 覆盖（oracle Top-10 重合率 ≥ 0.95） |
-| 6 | 不破坏逃生舱与正确性 | ✅ S2-T13/T15/T16 覆盖 |
+| 5 | 旧快照可加载 | ✅ S2-T6 覆盖。**oracle 断言是评审后补的**（#14 发现 1）：原实现只断言「topk 非空」，而 §8 对 T6 的口径本就是「与 oracle Top-10 重合率 ≥ 0.95」 |
+| 6 | 不破坏逃生舱与正确性 | ✅ **S2-T7 / T8 / T9**（Brute 忽略图 / 纯 BM25 不写图 / Step 1 删除不复活）+ integration T1/T2 |
 | 7 | 体积与耗时有实测记录 | ✅ 见下表 |
-| 8 | 守门全绿 | ✅ |
+| 8 | 守门全绿 | ✅ fmt / clippy `-D warnings` / **213 测试** / MSRV 1.90 / `RUSTDOCFLAGS="-D warnings" cargo doc` / `--no-default-features` / `--features charabia` / cargo-deny |
+
+> ⚠️ **验收 6 的映射曾写错**（评审 #14 发现 1）：原文标「S2-T13/T15/T16 覆盖」，
+> 但这三条（并行质量 / manifest 版本 / 快照错配）与「逃生舱与正确性」无关，
+> 读者会去找不存在的证据。已改为实际对应的 T7/T8/T9 + integration T1/T2。
 
 ### 体积与耗时（12K）
 
@@ -822,12 +844,12 @@ S2-01~S2-12 全部落地，守门全绿（fmt / clippy `--workspace --all-target
 | 图 `foo.idx.hnsw.graph` | 7.9 MB |
 | 数据 `foo.idx.hnsw.data` | 23.7 MB |
 | manifest | 91 B |
-| **磁盘增量** | **84.1 MB（1.6×）** |
+| **磁盘增量** | **≈84 MB（1.6×）** |
 | 图 sidecar dump 耗时 | **43.5ms**（含 CRC 扫两遍 + manifest 原子发布） |
-| 图 sidecar 加载耗时 | **23.3ms**（含五道先验校验） |
-| 快照加载耗时 | 76.9ms（含位图/字段索引重建） |
-| **完整冷启动** | **≈100ms**（改造前 ≈11.6s，**约 116×**） |
-| 降级路径（图缺失） | 53.3ms + 图重建 **9.96s** |
+| 图 sidecar 加载耗时 | **23~37ms**（含五道先验校验） |
+| 快照加载耗时 | 57~77ms（含位图/字段索引重建） |
+| **完整冷启动** | **≈100ms**（三次实测 82~100ms；改造前 ≈11.6s，**约 116×**） |
+| 降级路径（图缺失） | 56~78ms + 图重建 **≈10~11.5s** |
 
 ### 实施中修正的两处实测预期
 
