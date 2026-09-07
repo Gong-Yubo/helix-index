@@ -18,6 +18,9 @@
 # ---- 索引产物与运行数据 ----
 *.idx
 *.idx.tmp
+# 图 manifest 的 tmp 残留（V2 Step 3 / D-S3-01：追加式命名 foo.idx.hnsw.manifest.tmp）
+# 非 tmp 的图 sidecar（*.hnsw.graph / *.hnsw.data / *.hnsw.manifest）归横切 T7-24（issue #25），此处不越界
+*.manifest.tmp
 
 # ---- 语料与评测数据（大文件，P5 单独管理）----
 # 默认忽略 data/ 下的 jsonl/json；但以下三份**必须入库**：

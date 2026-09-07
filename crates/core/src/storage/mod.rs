@@ -12,6 +12,10 @@
 //! **sidecar 派生缓存**的形式落盘（`graph` 模块 / ADR-A 方案 C）：
 //! 图可随时丢弃，丢弃后降级重建，功能不丢。
 
+/// 原子写原语（V2 Step 3 / D-S3-02）：`snapshot.rs` 与 `graph.rs` 共用。
+/// `pub(crate)`——含故障注入钩子在内**不进公开面**（D-S3-03 方案 C′）。
+pub(crate) mod atomic;
+
 mod codec;
 mod graph;
 mod snapshot;

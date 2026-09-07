@@ -20,11 +20,12 @@
 //! 的地方是 `vector/persist.rs`。
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use super::atomic::{atomic_write, tmp_path};
 use crate::error::{Error, Result};
 
 /// manifest 魔数。变更即视为不兼容格式（读取侧拒绝并降级）。
@@ -228,11 +229,14 @@ pub fn read_manifest(path: &Path) -> Result<Option<GraphManifest>> {
     )
 }
 
-/// 原子写 manifest：tmp → flush → sync_all → rename → **fsync 父目录**（P1-4）。
+/// 原子写 manifest（V2 Step 3 起委托私有原语 `atomic_write`）：
+/// tmp → flush → sync_all → rename → **fsync 父目录**（P1-4）。
 ///
 /// rename 是唯一原子发布点；fsync 父目录保证掉电后 rename 本身持久
-/// （只 fsync 文件不 fsync 目录，rename 可能不落地）。这段机制正是
-/// Step 3 原子快照要复用的。
+/// （只 fsync 文件不 fsync 目录，rename 可能不落地）。Step 3 把这段机制
+/// 抽成 `atomic_write` 通用原语后，manifest 与快照共用一份实现——「共用」
+/// 不是美观诉求：两份独立实现迟早漂移，漂移的那一份就是下一个 Q-C3。
+/// 公开签名不变。
 pub fn write_manifest_atomic(path: &Path, m: &GraphManifest) -> Result<()> {
     let body =
         bincode::serde::encode_to_vec(m, bincode::config::standard()).map_err(Error::Codec)?;
@@ -241,27 +245,16 @@ pub fn write_manifest_atomic(path: &Path, m: &GraphManifest) -> Result<()> {
     hasher.update(&body);
     let crc = hasher.finalize();
 
-    let tmp = path.with_extension("hnsw.manifest.tmp");
-    {
-        let file = File::create(&tmp).map_err(Error::Io)?;
-        let mut w = BufWriter::new(file);
-        w.write_all(MAGIC_GMAN).map_err(Error::Io)?;
-        w.write_all(&MANIFEST_VERSION.to_le_bytes())
-            .map_err(Error::Io)?;
-        w.write_all(&crc.to_le_bytes()).map_err(Error::Io)?;
-        w.write_all(&body).map_err(Error::Io)?;
-        w.flush().map_err(Error::Io)?;
-        w.get_ref().sync_all().map_err(Error::Io)?;
-    }
-    std::fs::rename(&tmp, path).map_err(Error::Io)?;
-
-    // fsync 父目录（P1-4）：让 rename 本身在掉电后仍持久
-    if let Some(dir) = path.parent() {
-        if let Ok(d) = File::open(dir) {
-            let _ = d.sync_all();
-        }
-    }
-    Ok(())
+    // D-S3-01：tmp 名由 `atomic_write` 统一为「目标路径 + .tmp 追加」——
+    // 取代旧 `with_extension("hnsw.manifest.tmp")` 拼出的
+    // `foo.idx.hnsw.hnsw.manifest.tmp`（双 `hnsw`）怪名。
+    atomic_write(path, |w| {
+        w.write_all(MAGIC_GMAN)?;
+        w.write_all(&MANIFEST_VERSION.to_le_bytes())?;
+        w.write_all(&crc.to_le_bytes())?;
+        w.write_all(&body)?;
+        Ok(())
+    })
 }
 
 /// 删除快照旁的全部 sidecar（图 + data + manifest + 可能的 tmp 残留）。
@@ -275,8 +268,10 @@ pub fn remove_sidecars(snapshot: &Path) -> Result<()> {
         data,
         manifest,
     } = graph_paths(snapshot);
-    // tmp 残留（rename 前崩溃）尽力清理，失败不阻塞
-    let tmp = manifest.with_extension("hnsw.manifest.tmp");
+    // tmp 残留（rename 前崩溃）尽力清理，失败不阻塞。
+    // D-S3-01：与写侧 `write_manifest_atomic` 用同一 `tmp_path` 拼法——
+    // 两边必须一次改齐（漏一边 = 清理失效，S3-T8 兜底）。
+    let tmp = tmp_path(&manifest);
     let _ = std::fs::remove_file(&tmp);
     // NotFound 是常态（本就没有 sidecar），忽略之；其他错误（权限等）上抛
     for p in [graph, data, manifest] {

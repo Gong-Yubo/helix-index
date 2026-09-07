@@ -20,6 +20,8 @@ pub use brute::BruteForceIndex;
 pub use hnsw_rs_index::HnswRsIndex;
 pub use persist::{load_graph_checked, validate_graph_description, GraphStats, VectorGraphPersist};
 pub use point::NormalizedVector;
+// R19 panic 边界（V2 Step 3 / D-S3-04）：门面层写图链路必经；pub(crate) 不进公开面
+pub(crate) use persist::dump_graph_caught;
 
 use crate::error::Result;
 use crate::predicate::CandidateFilter;

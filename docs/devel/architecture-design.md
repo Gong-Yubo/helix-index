@@ -4,9 +4,9 @@
 
 | 项目   | 内容                   |
 | ---- | -------------------- |
-| 文档版本 | v1.7                 |
+| 文档版本 | v1.8                 |
 | 创建日期 | 2026-09-02           |
-| 状态   | V2 Step 1 / Step 2 已并入；2026-09-07 V2 计划复审 + 步骤重排同步（Step 4 = compaction，映射见 `plan-v2.md` §附-2） |
+| 状态   | V2 Step 1 / Step 2 / Step 3 已并入；2026-09-07 V2 计划复审 + 步骤重排同步（Step 4 = compaction，映射见 `plan-v2.md` §附-2） |
 | 技术栈  | Rust 1.90+ / 2021 edition |
 | 文件名   | `architecture-design.md` |
 | 配套文档 | `requirements-spec.md`（需求分析说明书） |
@@ -27,6 +27,7 @@
 | v1.5 | 2026-09-05 | 已定稿 | V2 Step 1（向量软删除 + 过滤下推）回写 |
 | v1.6 | 2026-09-06 | 已定稿 | **V2 Step 2（图持久化，ADR-A）回写**：5.4.3 / 7.6.2 / 8.2 / 8.3 / 14.1 |
 | v1.7 | 2026-09-07 | 已定稿 | **V2 计划复审 + 步骤重排同步**（复审结论已并入 `plan-v2.md` §附-3）：① §7.5「物理回收归 Step 5 compaction」→ **Step 4** 并补「compaction 后必须重发 manifest」（否则新图永远匹配不上、冷启动恒走降级重建）；② §14.1 R22 对策同步为 Step 4；③ §14.1 **R18 更新**——低选择度兜底由「V2.1 必须解决」**提前到 V2.0**（D-J9：Step 5 / T7-22，新增 NFR-13）；④ §14.1 **R19 残余归 Step 3（S3-e）**；⑤ **§7.6.2 补记事实**——快照本体至今非原子（`storage/snapshot.rs:88` 直写无 fsync），崩溃即 `SnapshotCorrupted`（索引丢失，不是降级）；⑥ §12.2 注明矩阵仅反映 V1，V2 归属见 `plan-v2.md` §5。编号映射见 `plan-v2.md` §附-2 |
+| v1.8 | 2026-09-07 | 已定稿 | **V2 Step 3（原子快照）落地回写**（依据 `v2-step3-design.md` v0.3，D-S3-01~07 全部拍板）：① §7.6.2 前提段**销账**——快照本体原子性已落地（`storage/atomic.rs` 通用原语：tmp + flush + `sync_all` + rename + fsync 父目录，快照与 manifest 共用一份实现），Q-C3 正确性欠账清零；② §14.1 **R19 写路径残余收敛**——新增 `dump_graph_caught`（`catch_unwind` → `Err(VectorGraph)`，汇入 P0-3 语义链），残余更新为「panic=abort 宿主约束（文档级）/ panic 噪音 / 读路径（C5 边界外）」；③ 12K fsync 代价实测入 `eval-report.md` §8.7（+0.027~0.035s，不触碰任何 NFR） |
 
 ### 1.2 读者
 
@@ -802,13 +803,15 @@ dim 或 platform 不符 / 建图参数漂移 —— 一律降级为加载后重�
 这条把 Q-C3（多文件版本错配）从「正确性事故」降级为「性能退化」，也是 Step 3 只需
 让 `foo.idx` 自己 tmp+rename、图 sidecar 自动跟随的原因。
 
-> ⚠️ **但前提是快照本体自己是原子的**——这一点至今未做：`storage/snapshot.rs:88` 仍是
-> `File::create(path)` 直写 + `flush()`，**既无 tmp+rename 也无 fsync**。快照写一半崩溃
-> ⇒ 半截文件 ⇒ 下次 `load` 得 `Error::SnapshotCorrupted`（**不是降级重建，是索引丢失**）。
-> ⚠️ 这也意味着「Step 3 只需 tmp+rename」的表述**并非范围缩小，而是正确性欠账**：
-> ADR-A 只解决了「图与快照的相对一致性」，没解决「快照自身的绝对原子性」。
-> 落地任务 = `plan-v2.md` Step 3（S3-a~e：抽通用 `atomic_write` / 补 fsync / tmp 孤儿
-> 回收 / `catch_unwind` 故障注入 / 顺带收 R19）。
+> ✅ **前提已落地（V2 Step 3，2026-09-07）**——快照本体原子性此前是本节的正确性欠账
+> （`File::create(path)` 直写 + `flush()`，写一半崩溃 ⇒ 半截文件 ⇒ `SnapshotCorrupted`，
+> **不是降级重建，是索引丢失**）。现由 `storage/atomic.rs` 的通用原语
+> `atomic_write`（tmp → 写入 → flush → `sync_all` → rename → fsync 父目录）补齐：
+> **快照与 manifest 共用一份实现**（两份独立实现迟早漂移，漂移的那一份就是下一个 Q-C3），
+> 快照格式零变化（原子性是写协议变更，不是格式变更，`FORMAT_VERSION` 保持 2）。
+> 崩溃不变式：rename 之前真源从未被触碰 ⇒ 崩溃后要么旧快照要么新快照，`SnapshotCorrupted`
+> 在任何窗口都不可达；fsync 代价实测 +0.027~0.035s（`eval-report.md` §8.7，不触碰任何 NFR）。
+> 设计与故障注入证明见 `v2-step3-design.md`（D-S3-01~07）。
 
 | 被否掉的候选 | 硬伤 |
 | --- | --- |
@@ -1400,7 +1403,7 @@ pub enum Error {
 
 | # | 风险 | 影响 | 应对 | 残余 |
 | --- | --- | --- | --- | --- |
-| **R19** | **`hnsw_rs` 在损坏输入上 panic / `exit(1)`**（C3；读路径 12 处 `assert_eq!`/`unwrap()`，写路径 `DumpInit` 打不开文件即 `panic_any`） | 崩溃恢复场景下进程直接死 | 读：**五道先验**（manifest CRC + 长度 + 维度 + 平台 + `Description` 预校验）全过才交给 `hnsw_rs`；写：前置探测目录可写 + 失败按 P0-3 语义处理 | 校验通过**之后**文件被并发改写仍可能 panic（无并发写同一快照语义，不处理）；写路径 `panic_any` 是 TOCTOU 窗口，**只能缩小不能归零**——`panic_any` 不是 `Err`，调用侧无法 catch。**残余部分归 `plan-v2.md` Step 3（S3-e）顺带收敛**（2026-09-07 复审） |
+| **R19** | **`hnsw_rs` 在损坏输入上 panic / `exit(1)`**（C3；读路径 12 处 `assert_eq!`/`unwrap()`，写路径 `DumpInit` 打不开文件即 `panic_any`） | 崩溃恢复场景下进程直接死 | 读：**五道先验**（manifest CRC + 长度 + 维度 + 平台 + `Description` 预校验）全过才交给 `hnsw_rs`；写：① 前置探测目录可写（第一道防线，管「可预判」）；② **`dump_graph_caught`（V2 Step 3 / S3-e 已落地）**：`catch_unwind` 把写路径 panic 降级为 `Err(VectorGraph)`，汇入 P0-3 语义链（Lenient 警告 + `PersistFailed` / Strict Err + best-effort 清理，D-S3-07），管「TOCTOU 残余」 | **写路径已收敛（2026-09-07）**。残余三条（`v2-step3-design.md` §4.6）：① `panic = "abort"` 构建下 `catch_unwind` 静默失效——本 workspace 由 Cargo.toml 注释钉死；**嵌入宿主是文档级约束**（crate 文档首页 + 本表），无编译期检测手段（库 profile 对宿主不生效）；② panic 先经默认 hook 打印 stderr（库内不 set_hook 污染宿主，接受噪音）；③ 读路径残余（校验后文件被并发改写）**不在收敛范围**——C5「无并发写同一快照」语义的边界，读路径 panic 时快照已加载、不涉及落盘一致性 |
 | **R20** | **距离类型路径被烧进图文件**（C7） | 重命名/移动 `DistDotClamped` 会让旧图全部失效 | 用 `load_hnsw`（**短名**比对）而非 `load_hnsw_with_dist`；manifest 记**自有** `dist_id`，与 Rust 类型路径解耦 | 类型**改名**仍会失效（走降级重建，不丢功能） |
 | **R21** | **平台/端序绑定**（C4）：图文件是裸 f32 + native endian | 快照拷到别的平台 → 图不可用 | manifest 记 `platform` 并校验，不匹配即降级 | 图 sidecar **不可跨平台搬运**是既定事实，需在用户文档声明 |
 | **R22** | **磁盘体积增加约 60%**（C8；`file_dump` 只支持 `DumpMode::Full`，向量必然被复制一份） | 大语料下显著。**12K 实测**：快照 52.3MB + graph 7.9~8.1MB + data 23.7MB ≈ **84MB**（**1.6×**；graph 体积随 HNSW 拓扑在跨进程间有小幅波动，与 R-P5-13 同源） | 先接受并实测；`--no-graph-persist` 逃生舱；**Step 4** compaction 重写图时一并优化（2026-09-07 重排前写作 Step 5） | 未解决，V2.0 接受 |
@@ -1430,3 +1433,5 @@ pub enum Error {
 | v1.4 | 2026-09-04 | 依据 `p6-design.md` v2.0（issue #1 接口重构，决策点 D-I1~D-I8 已拍板）：① 新增**第 10 章「对外接口设计（门面层）」**，原 10~14 章顺延为 11~15；② 新增 ADR-009（门面层 + 共用编排内核）；③ 5.1 `Document` 拆为输入 DTO + `DocRecord`；④ 4.2 补门面层边界；⑤ 11.3 错误类型新增 `ConfigMismatch`；⑥ 阶段表 P6 重定义为接口重构、原 v2 顺延 P7。详细设计见 `p6-design.md`，任务级见 `plan.md` |
 | v1.5 | 2026-09-05 | 依据 `v2-step1-design.md` v0.3（V2 Step 1：向量软删除 + 过滤下推）回写：① 5.4 `VectorIndex` 新增 `search_filtered` 与 `None` 契约，新增 5.4.1 存活单一真源；② 5.5 `Retriever` 的过滤载体从 `Option<&Filter>` 改为 `Option<&dyn CandidateFilter>`，新增 5.5.1；③ **7.5 整节重写**（原 instant-distance + delta 方案已在 D8 移除）；④ 7.6 修正 bincode 版本坑，新增 7.6.1「新增结构不入快照」；⑤ 8.1 去掉失效的 `instant_distance::Search` 复用、新增过滤下推两行；⑥ 新增 8.3 的 `query::Metrics` 三项与其**当前不可观测**的限制、新增 8.4 空结果语义；⑦ 新增 **ADR-010**；⑧ 14 章 R1 标记已消除、新增 R11~R18；⑨ 9.3 决策表补 ADR-010 行 |
 | v1.6 | 2026-09-06 | 依据 `v2-step2-design.md` v0.3（V2 Step 2：图持久化，**ADR-A 方案 C 已拍板**）回写：① 2.2 的 NFR-06 行删去过时论据「seed 固定」（`StdRng::from_os_rng()` 无 seed API，与 8.2 直接冲突），改为「图持久化冻结拓扑」；② 2.3 与 9.4 新增 **ADR-A**（图 = 快照的派生缓存，含实测：完整冷启动 ≈100ms、磁盘 1.6×、dump 43.5ms），并说明 §7.6.1 曾预引用的「ADR-011」已统一为 ADR-A；③ **5.4.3 新增**「图持久化 `VectorGraphPersist`」（basename 铁律 / `ef_search` 是入参 / `Box::leak` 三条结构性约束）；④ 7.6.2 新增「V2 Step 2：图 sidecar（ADR-A）」；⑤ 8.2 NFR-06 口径改为「同快照两次加载逐位一致」；⑥ 8.3 NFR-07 扩「降级可观测」（`GraphStatus`）；⑦ 10.3 补 `graph_status()` / `graph_dump_elapsed()`；⑧ **14.1 新增 R19~R25**（含 12K 实测：R22 体积 1.6×、R25 dump 43.5ms） |
+| v1.7 | 2026-09-07 | **V2 计划复审 + 步骤重排同步**（复审结论已并入 `plan-v2.md` §附-3）：① §7.5「物理回收归 Step 5 compaction」→ **Step 4** 并补「compaction 后必须重发 manifest」；② §14.1 R22 对策同步为 Step 4；③ §14.1 R18 更新——低选择度兜底提前到 V2.0（D-J9：Step 5 / T7-22，新增 NFR-13）；④ §14.1 R19 残余归 Step 3（S3-e）；⑤ §7.6.2 补记事实——快照本体至今非原子（`storage/snapshot.rs:88` 直写无 fsync），崩溃即 `SnapshotCorrupted`；⑥ §12.2 注明矩阵仅反映 V1，V2 归属见 `plan-v2.md` §5 |
+| v1.8 | 2026-09-07 | **V2 Step 3（原子快照）落地回写**（依据 `v2-step3-design.md` v0.3，D-S3-01~07 全部拍板）：① §7.6.2 前提段**销账**——快照本体原子性已落地（`storage/atomic.rs` 通用原语 `atomic_write`：tmp + flush + `sync_all` + rename + fsync 父目录，快照与 manifest 共用一份实现；格式零变化，`FORMAT_VERSION` 保持 2），Q-C3 正确性欠账清零；② §14.1 **R19 写路径残余收敛**——`dump_graph_caught`（`catch_unwind` → `Err(VectorGraph)`，汇入 P0-3 语义链），残余更新为「panic=abort 宿主约束（文档级）/ panic 噪音 / 读路径（C5 边界外）」三条；③ 12K fsync 代价实测入 `eval-report.md` §8.7（+0.027~0.035s，不触碰任何 NFR） |

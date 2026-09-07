@@ -9,6 +9,54 @@
 
 ## [Unreleased]
 
+### V2 Step 3 · 原子快照实现（2026-09-07）
+
+**修复（正确性）**
+
+- **快照落盘原子化（FR-31 / T7-13 / Q-C3）**：`save_with_crc` 改走新通用原语
+  `storage/atomic.rs::atomic_write`（tmp → 写入 → flush → `sync_all` → rename →
+  fsync 父目录）。此前的 `File::create` 直写 + `flush()` 在写入中途崩溃会留下半截
+  `foo.idx`，下次 `load` 得 `Error::SnapshotCorrupted`（索引丢失）。崩溃不变式：
+  **save 序列任一注入点崩溃后，`load` 要么拿到旧快照、要么拿到新快照，绝不损坏**。
+  文件格式零变化（`FORMAT_VERSION` 保持 2，改造前后产物 CRC 逐位一致）。
+- **R19 写路径残余收敛**：`hnsw_rs` 图 dump 期间 panic（`DumpInit` 的 `panic_any`，
+  probe 探测之外的 TOCTOU 窗口）不再杀进程——新增 `dump_graph_caught`（`catch_unwind`
+  → `Err(VectorGraph)`，携带 panic 信息），汇入 Step 2 既有 P0-3 缓存失败语义链；
+  Lenient 下 `save` 仍 Ok + `GraphStatus::PersistFailed`，Strict 下 Err。
+- **Strict 图失败路径补 best-effort sidecar 清理（D-S3-07）**：失败上抛前清掉半截
+  `*.hnsw.graph`/`*.hnsw.data` + 已失效旧 manifest（「失败上抛」≠「失败且留垃圾」）。
+
+**变更**
+
+- **tmp 命名统一为「目标路径 + `.tmp` 追加」（D-S3-01）**：`foo.idx.tmp` /
+  `foo.idx.hnsw.manifest.tmp`；顺带修正 manifest tmp 原先 `with_extension` 拼出的
+  `foo.idx.hnsw.hnsw.manifest.tmp`（双 `hnsw`）怪名。写侧（`write_manifest_atomic`）
+  与清侧（`remove_sidecars`）同 PR 改齐。`.gitignore` 补 `*.manifest.tmp`。
+- **tmp 孤儿回收（D-S3-05）**：快照 tmp——save 靠 `File::create` 截断复用、load 成功后
+  best-effort 删除；manifest tmp 跟随 `remove_sidecars`（仅 save 路径触发，load-only
+  部署保留 manifest tmp 孤儿属已知无害行为）。
+- **save 变慢（fsync，D-S3-06）**：12K 语料 54.5MB 快照实测 **0.034~0.040s →
+  0.067~0.075s**（+0.027~0.035s，本机 NVMe），不触碰任何 NFR；**不提供跳过 fsync
+  的逃生舱**（正确性语义不做选项）。实测入 `eval-report.md` §8.7（新增示例
+  `bench_save_fsync`）。
+- **Cargo.toml**：`[profile.release]` 钉「不得 `panic = "abort"`」注释（`catch_unwind`
+  防线依赖 unwind）；嵌入宿主的对应约束为文档级（架构 R19 残余表 / crate 文档）。
+
+**新增（内部，`pub(crate)`，公开 API 零变化）**
+
+- `storage/atomic.rs`：`atomic_write`（写闭包签名，避免 52MB 整包拷贝）/ `tmp_path` /
+  常驻 `pub(crate)` 故障注入钩子 `fault`（`FAIL_AT == 0` 默认 no-op；注入测试内迁
+  crate 内 `#[cfg(test)]`，Mutex 串行 + guard 复位 + 线程本地 opt-in 三重防互扰）。
+  manifest 与快照共用一份原子写实现（两份独立实现迟早漂移）。
+
+**测试（S3-T1~T9）**：注入测试 T3（cp2 钦定点）/ T4 / T5 / T6（端到端）/ T7（R19）/
+T8（manifest tmp 改名一致性）/ T9（钩子默认关闭）+ 集成层 `tests/atomic_snapshot.rs`
+（无注入：save 原子性外观 / tmp 不残留 / 兼容回归）；既有快照 roundtrip / CRC 系列
+零修改全绿（T2）。
+
+**文档**：架构 v1.8（§7.6.2 前提段销账 / R19 残余更新）/ 需求 v1.8（FR-31 验收注记）/
+`plan-v2.md` v0.5（Step 3 ✅）/ `eval-report.md` §8.7 / 设计文档补「实施结果」段。
+
 ### V2 Step 3 · 详细设计（2026-09-07）
 
 - 新增 `docs/devel/v2-step3-design.md`（**v0.3 拍板版，可开工**）：

@@ -4,7 +4,7 @@
 //! 加载时校验 magic、版本、CRC，**任何一项不符都报错，绝不静默读错**。
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -66,6 +66,14 @@ impl std::fmt::Display for ConfigFingerprint {
 ///
 /// 返回的 CRC 供图 sidecar manifest 的 `snapshot_crc` 填写——它是图的
 /// 「版本锚点」：save 写出新快照后旧图立即失效（CRC 变了 → 降级重建）。
+///
+/// # 原子性（V2 Step 3 / FR-31）
+///
+/// 落盘走私有原语 `atomic_write`：tmp → 写入 → flush → `sync_all` →
+/// rename → fsync 父目录。**rename 之前 `path` 从未被触碰**——崩溃后要么旧快照
+/// 要么新快照，绝不产生半截文件（Q-C3 / `SnapshotCorrupted` 的根因由此消灭）。
+/// 代价是 save 多两次 fsync（D-S3-06：接受、实测入档、不提供跳过开关）。
+/// 文件格式零变化（C3：原子性是写协议变更，不是格式变更）。
 pub fn save_with_crc(
     path: &Path,
     index: &Index,
@@ -85,11 +93,12 @@ pub fn save_with_crc(
     hasher.update(&body);
     let crc = hasher.finalize();
 
-    let file = File::create(path).map_err(Error::Io)?;
-    let mut w = BufWriter::new(file);
-    codec::write_header(&mut w, crc).map_err(Error::Io)?;
-    w.write_all(&body).map_err(Error::Io)?;
-    w.flush().map_err(Error::Io)?;
+    // 闭包而非 `&[u8]`（D-S3-02）：header 与正文各写各的，不拼整包
+    // （52MB 级正文少一次全量拷贝）。
+    super::atomic::atomic_write(path, |w| {
+        codec::write_header(w, crc)?; // 12B header（codec 不动）
+        w.write_all(&body)
+    })?;
     Ok(crc)
 }
 
@@ -131,6 +140,11 @@ pub fn load_with_crc(path: &Path) -> Result<LoadedSnapshotWithCrc> {
     let snapshot: Snapshot = bincode::serde::decode_from_slice(&body, bincode::config::standard())
         .map_err(Error::Decode)
         .map(|(s, _)| s)?;
+
+    // 4. tmp 孤儿回收（V2 Step 3 / D-S3-05）：快照本体已验证完好，
+    // 同名 tmp 必为上次崩溃的孤儿（原子协议下 tmp 永不权威——即便它比
+    // 快照新，也没有任何路径会去读它）。best-effort 删除，失败不影响加载。
+    let _ = std::fs::remove_file(super::atomic::tmp_path(path));
 
     Ok((
         Index::import(snapshot.sections),
@@ -287,5 +301,27 @@ mod tests {
         let c2 = save_with_crc(&path, &index, &v2, &fingerprint()).unwrap();
 
         assert_ne!(c1, c2, "内容不同 CRC 应不同（版本锚点的成立前提）");
+    }
+
+    /// V2 Step 3 / D-S3-05：load 成功后 best-effort 回收快照 tmp 孤儿。
+    /// 这是唯一能回收「最后一次 save 崩溃残留」的时机（那次 save 不会再来了）。
+    #[test]
+    fn load后回收tmp孤儿() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("orphan.idx");
+        let index = build_index();
+        save(&path, &index, &[], &fingerprint()).unwrap();
+
+        // 伪造上次崩溃残留的 tmp 孤儿（内容任意——tmp 永不权威）
+        let tmp = crate::storage::atomic::tmp_path(&path);
+        std::fs::write(&tmp, b"orphan").unwrap();
+
+        load(&path).unwrap(); // 必须成功（孤儿不影响加载）
+        assert!(!tmp.exists(), "load 成功后 tmp 孤儿应被回收");
+
+        // 孤儿不影响 CRC 语义
+        let (_, _, _, crc) = load_with_crc(&path).unwrap();
+        let saved = save_with_crc(&path, &index, &[], &fingerprint()).unwrap();
+        assert_eq!(crc, saved);
     }
 }

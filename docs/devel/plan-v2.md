@@ -5,9 +5,9 @@
 
 | 项 | 内容 |
 | --- | --- |
-| 版本 | **v0.4（已定稿；2026-09-07 复审后重排，Step 3 起重新编号）** |
+| 版本 | **v0.5（已定稿；2026-09-07 Step 3 完成回写）** |
 | 日期 | 2026-09-07 |
-| 状态 | **决策已定案（D-J1~J7 + D-J8~J11）；Step 1 / Step 2 已完成并合并；Step 3 设计已拍板（v0.3，PR #26）；Step 3+ 任务编号按 2026-09-07 复审重排** |
+| 状态 | **决策已定案（D-J1~J7 + D-J8~J11）；Step 1 / Step 2 / Step 3 已完成并合并（Step 3 = 原子快照，实现 PR）；Step 4 起待开工；任务编号按 2026-09-07 复审重排** |
 | 上游 | `requirements-spec.md`（需求定义源）、`architecture-design.md`（架构/ADR）、`eval-report.md`（P5 实测） |
 | 前置 | V1（P0~P6）全部完成，见 `plan.md`（V1 计划，已冻结，不再更新） |
 | 复审 | 2026-09-07 全量复审（7 处调整 A1~A7 + 4 个拍板问题 D1~D4）**结论已全部并入本文**，不另立复审文档；调整项索引与建议执行顺序见 **§附-3** |
@@ -216,7 +216,15 @@
 > ⚠️ **达标依赖图 sidecar 命中**——降级路径仍是 ~10s。这正是 NFR-07「降级不得静默」
 > 的由来：`GraphStatus::Rebuilt(reason)` 必须显式可见，否则 NFR-04 会静默失效而不自知。
 
-#### Step 3 · 可靠性（原子快照）
+#### Step 3 · 可靠性（原子快照）✅ 已完成（2026-09-07）
+
+> **完成记录**：单实现 PR 落地 S3-02~09（设计 `v2-step3-design.md` v0.3，D-S3-01~07 全按建议采纳）。
+> **验收对照**：① 崩溃不变式 ✅——故障注入 cp1/cp2/cp3（S3-T3~T5 单元层 + S3-T6 端到端）
+> 证明 save 序列任一注入点崩溃后 `load` 恒得旧或新快照，`SnapshotCorrupted` 不可达；
+> ② 快照重写后旧图失效 ✅——既有测试零修改回归（S3-T2）；③ tmp 孤儿回收 ✅——快照 tmp
+> save 截断复用 / load best-effort 删除，manifest tmp 由 save 路径回收（S3-T3/T8）；
+> ④ R19 写路径收敛 ✅——`dump_graph_caught`（S3-T7），Lenient 下 save Ok + `PersistFailed`；
+> ⑤ fsync 代价实测入 `eval-report.md` §8.7（+0.027~0.035s，S3-T10）；⑥ 守门清单全绿。
 
 | 任务 | 解决 |
 | --- | --- |
@@ -228,7 +236,7 @@
 
 ⇒ 本步骤是**单文件原子写**，不是多文件事务；原验收里「覆盖图 + 快照双文件」的描述已过时。
 
-**⚠️ 现状事实**：`storage/snapshot.rs:88` 仍是 `File::create(path)` 直写 + `flush()`，
+**⚠️ 现状事实**（✅ 已于 Step 3 消除，以下为开工前事实存档）：`storage/snapshot.rs:88` 仍是 `File::create(path)` 直写 + `flush()`，
 **既无 tmp+rename、也无 fsync** ⇒ 崩溃中途产生半截文件，下次 `load` 得
 `Error::SnapshotCorrupted`——**不是降级重建，是索引丢失**。（对比：图 manifest 已原子，
 `storage/graph.rs:236 write_manifest_atomic()`。）

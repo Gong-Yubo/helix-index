@@ -49,6 +49,11 @@ hnsw_rs          = "0.3.4"
 # ---- CLI ----
 clap = { version = "4.6", features = ["derive"] }
 
+# ⚠️ 不得设置 panic = "abort"（V2 Step 3 / R19）：vector/persist.rs 的
+# dump_graph_caught 依赖 catch_unwind 把 hnsw_rs 写路径的 panic_any 降级为 Err；
+# abort 构建下该防线静默失效。本注释只约束**本 workspace** 的 CLI / 测试构建
+# （库 profile 对嵌入宿主不生效）；嵌入宿主的约束是文档级——见架构文档 R19
+# 残余表与 README（crate 文档首页），无编译期检测手段（v2-step3-design §4.6）。
 [profile.release]
 opt-level = 3
 lto = "thin"
