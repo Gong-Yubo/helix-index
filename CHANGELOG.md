@@ -9,6 +9,26 @@
 
 ## [Unreleased]
 
+### V2 计划复审 + 步骤重排（2026-09-07）
+
+- **新增 `docs/devel/plan-v2-review.md`**：对 `plan-v2.md` 的全量复审，7 处调整（A1~A7）
+  与 4 个待拍板问题（D1~D4），含 `fastembed-6.0.2` / `ort-2.0.0-rc.13` 的源码级核实证据。
+- **D1~D4 已拍板**：① NFR-03 **拆「首次全量 / 增量追加」双口径**；② 低选择度延迟（R18）
+  **从 V2.1 提前到 V2.0**；③ 资源回收**提前**、构建性能顺延；④ `parallel_build` 默认值翻转
+  **走独立 PR**（须同步改 S2-T22）。
+- **Step 3 起重新编号**（映射见 `plan-v2.md` §附-2）：Step 3 可靠性 / **Step 4 资源回收**（原 Step 5）
+  / **Step 5 查询性能与可观测**（新增）/ **Step 6 构建性能**（原 Step 4）/ **Step 7 精排**（原 Step 6）；
+  V2.1 顺延为 Step 8~10。历史设计文档已加编号注记。
+- **Step 3 范围按 ADR-A 重写**：ADR-A 已把多文件原子性收敛为「manifest 唯一发布点」，
+  故 Step 3 只需让 `foo.idx` 自己 tmp+rename。⚠️ 补记事实：快照**本体至今非原子**
+  （`storage/snapshot.rs:88` 直写且无 fsync）⇒ 崩溃即 `SnapshotCorrupted`（不是降级，是索引丢失）。
+- **需求文档升 v1.7**：NFR-03 双口径；**新增 NFR-13**（低选择度过滤延迟，此前不在任何 NFR 口径内）；
+  NFR-11 口径修订（`add` 后需 `commit()` 才可见，原表述与实现不符）；**FR-31 原子快照 Should → Must**。
+- **架构文档升 v1.7**：compaction 归 Step 4，并补「**compaction 重建图后必须重发 manifest**」
+  （否则新图永远匹配不上、冷启动恒走降级重建）。
+- **新增横切任务**：T7-21（`parallel_build` 默认翻转）/ T7-22（低选择度暴力兜底）/
+  T7-23（`query::Metrics` 可观测化）/ T7-24（工程卫生：CI 触发、`.gitignore` 漏掉图 sidecar、分支清理）。
+
 ### V2 Step 2 · 收尾（2026-09-07）
 
 - **并行建图（S2-11 / D-S2-05）收益实测入库**（`eval-report.md` §8.6），新增可复跑的基准

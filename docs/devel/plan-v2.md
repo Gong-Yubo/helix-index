@@ -5,11 +5,16 @@
 
 | 项 | 内容 |
 | --- | --- |
-| 版本 | v0.3（计划草案，已消化评审，待定稿） |
-| 日期 | 2026-09-04 |
-| 状态 | **决策已定案（D-J1~J7）；已吸收 GLM-5.3 评审（H1~H3 / M1~M7 / L1~L5），待定稿** |
+| 版本 | **v0.4（已定稿；2026-09-07 复审后重排，Step 3 起重新编号）** |
+| 日期 | 2026-09-07 |
+| 状态 | **决策已定案（D-J1~J7 + D-J8~J11）；Step 1 / Step 2 已完成并合并；Step 3+ 按 2026-09-07 复审重排** |
 | 上游 | `requirements-spec.md`（需求定义源）、`architecture-design.md`（架构/ADR）、`eval-report.md`（P5 实测） |
 | 前置 | V1（P0~P6）全部完成，见 `plan.md`（V1 计划，已冻结，不再更新） |
+| 复审 | `plan-v2-review.md`（2026-09-07 复审稿，D1~D4 已拍板并回写本文） |
+
+> ⚠️ **编号变更（2026-09-07）**：V2.0 剩余步骤与 V2.1 全部步骤**从 Step 3 起重新编号**。
+> 旧号→新号对照见 §附-2。历史设计文档（`v2-step1-design.md` / `v2-step2-design.md`）中的
+> Step 编号**指重排前**，阅读时请对照映射表。
 
 ---
 
@@ -49,6 +54,15 @@
 | **D-J6** | 量化模型 | ✅ **不引入**；走「并行 + 增量构建」（fastembed 无 `bge-small-zh-v1.5` 量化变体） |
 | **D-J7** | T7-05 改义 | ✅ 由 `plan.md` 原「自研 HNSW / 评估 arroy」改义为「hnsw_rs 能力接入（图持久化 + 并行建图）」——依据 §附 调研：hnsw_rs 0.3.4 已原生支持，自研不必要 |
 
+### 2.3 复审决策（2026-09-07，依据 `plan-v2-review.md`，D1~D4 已拍板）
+
+| 编号 | 决策 | 结论 | 对应复审问题 |
+| --- | --- | --- | --- |
+| **D-J8** | **NFR-03 构建指标口径** | ✅ **拆「首次全量 / 增量追加」双口径**：原单口径「1 万 chunk 含 embedding < 120s」在「不引入量化（D-J6）、不换模型」的前提下**无已识别路径可达**（实测 225.5s，差 1.6×）。新口径见 §4 Step 6 与需求文档 NFR-03 | **D1** |
+| **D-J9** | **低选择度过滤延迟（R18）** | ✅ **从 V2.1 提前到 V2.0**（S 级，方案已明确）；同时**新增 NFR-13** 把「10 万级 + 低选择度」纳入口径，否则它永远在 NFR-02 之外 | **D2** |
+| **D-J10** | **V2.0 剩余步骤顺序** | ✅ 重排为 **Step 3 可靠性 → Step 4 资源回收 → Step 5 查询性能与可观测 → Step 6 构建性能 → Step 7 精排**。即：原 Step 5（资源回收）**提前**，原 Step 4（构建性能）**顺延** | **D3** |
+| **D-J11** | **`parallel_build` 默认值翻转** | ✅ **走独立 PR**，不并入任何 Step：改默认值的同时必须同步改 **S2-T22**（现断言「默认必须串行」） | **D4** |
+
 ---
 
 ## 3. 需求来源（遗留问题清单）
@@ -77,14 +91,15 @@
 | Q-S1 | 无命名空间/会话隔离（依赖 Q-I2） | — | 中 |
 | Q-S2 | 无时间衰减机制 | — | 低 |
 
-> 另有跨快照永续的次生问题：`SearchIndex::remove` 后 `save()` 原样带走已删向量、`load_with` 全量重灌（`search/index.rs` 注释「会被丢弃」实际不成立）——Q-C1/Q-C2 不只在内存、还会**随快照持久化**，Step 5 验收必须覆盖。
+> 另有跨快照永续的次生问题：`SearchIndex::remove` 后 `save()` 原样带走已删向量、`load_with` 全量重灌（`search/index.rs` 注释「会被丢弃」实际不成立）——Q-C1/Q-C2 不只在内存、还会**随快照持久化**，**Step 4**（资源回收）验收必须覆盖。
 
 ---
 
 ## 4. V2 开发步骤
 
 > 步骤按依赖关系与质量属性优先级编排。每步列：任务、依赖、验收、风险、量级。
-> **任务 ID**：T7-01~06 沿用 `plan.md` P7；**T7-07~20 为本计划新增**（T7-10 预留，原「量化评估」因 D-J6 不引入而空出，不启用）。
+> **任务 ID**：T7-01~06 沿用 `plan.md` P7；**T7-07~20 为本计划新增**（T7-10 预留，原「量化评估」因 D-J6 不引入而空出，不启用）；
+> **T7-21~24 为 2026-09-07 复审新增**（T7-21 `parallel_build` 默认值翻转、T7-22 低选择度暴力兜底、T7-23 `Metrics` 可观测化、T7-24 工程卫生）。
 > 量级：S（天级）/ M（周级）/ L（双周+）。
 
 ### 4.0 开工前必须澄清的设计决策（不阻塞 Step 1 启动）
@@ -92,10 +107,13 @@
 | # | 决策点 | 说明 | 归属步骤 |
 | --- | --- | --- | --- |
 | **H1** | 图持久化格式 + **多文件原子性** | hnsw_rs 图落盘是**双文件**（`hnsw.graph` + `hnsw.data`，`HnswIo`/`DumpInit`）。图持久化进入 `save()` 后，「快照」不再是单文件，「临时文件 + rename」无法保证跨文件一致（图新、快照旧版本错配）。**必须二选一**：① 图并入快照 blob（`FORMAT_VERSION` 升版）；② sidecar + manifest/generation 目录级原子替换。Step 2 与 Step 3 **不是无依赖**，需先合出这份 ADR（记为 **ADR-A**）。**→ 已由 `v2-step2-design.md` v0.3 回答（2026-09-06 拍板）**：**方案 C**——sidecar 三件套 + 独立 manifest 作唯一原子发布点（tmp+fsync+rename+fsync 目录），`FORMAT_VERSION` 保持 2；图 = 快照的派生缓存，可随时丢弃（删 manifest/删图/篡改任一字节 → 降级重建，功能不丢）。7 项决策（D-S2-01~07）已获外部评审全部同意；Step 3 的原子快照直接沿用该 manifest 机制 | Step 2 + Step 3 |
-| **H2** | 向量删除的真实语义 | hnsw_rs 0.3.4 **无 remove/delete API**（架构 7.5 早记录「物理删除需 usearch，引入 C++」）。T7-07 实际语义只能是**向量墓碑 + `search_filter` 存活位图**；Q-C1 的「图膨胀」只能**缓解**，真正回收靠 T7-12 重建图。Step 5 的「体积不无界增长」验收**必须显式覆盖向量图 + `raw_vectors` + 快照文件**。**→ 已由 `v2-step1-design.md` §4.3 / §6 D-S1-01 回答**：存活状态只住 `Index.forward`（单一真源），以位图谓词传给向量路，`VectorIndex` 不加 `tombstone`。 | Step 1 + Step 5 |
-| **H3** | 精排候选窗口 | 当前编排 `search_parts` 融合后先 `take(k)` 再进 reranker（`query/searcher.rs:196`），精排只能重排 k 条。要拿像样的 MRR 提升必须放开窗口到 `candidate_k`（3k）或可配 R，这直接决定延迟预算。需**新增精排延迟 NFR**（NFR-12），并在 T7-01 内设计窗口参数。 | Step 6 |
+| **H2** | 向量删除的真实语义 | hnsw_rs 0.3.4 **无 remove/delete API**（架构 7.5 早记录「物理删除需 usearch，引入 C++」）。T7-07 实际语义只能是**向量墓碑 + `search_filter` 存活位图**；Q-C1 的「图膨胀」只能**缓解**，真正回收靠 T7-12 重建图。**Step 4**（原 Step 5）的「体积不无界增长」验收**必须显式覆盖向量图 + `raw_vectors` + 快照文件**。**→ 已由 `v2-step1-design.md` §4.3 / §6 D-S1-01 回答**：存活状态只住 `Index.forward`（单一真源），以位图谓词传给向量路，`VectorIndex` 不加 `tombstone`。 | Step 1 + Step 5 |
+| **H3** | 精排候选窗口 | 当前编排 `search_parts` 融合后先 `take(k)` 再进 reranker（`query/searcher.rs:196`），精排只能重排 k 条。要拿像样的 MRR 提升必须放开窗口到 `candidate_k`（3k）或可配 R，这直接决定延迟预算。需**新增精排延迟 NFR**（NFR-12），并在 T7-01 内设计窗口参数。**⚠️ 至今未决**，是 Step 7 的开工前置。 | Step 7 |
 
-### V2.0 —— 质量与性能夯实 + 精排
+### V2.0 —— 质量与性能夯实 + 精排（Step 1 ~ Step 7）
+
+> **执行顺序（2026-09-07 重排后）**：Step 3 可靠性 → Step 4 资源回收 → Step 5 查询性能与可观测
+> → Step 6 构建性能与多线程 → Step 7 精排。横切任务（T7-21 / T7-24）走独立 PR，不占步骤号。
 
 #### Step 1 · 正确性修复（地基，最先做）
 
@@ -195,55 +213,142 @@
 > ⚠️ **达标依赖图 sidecar 命中**——降级路径仍是 ~10s。这正是 NFR-07「降级不得静默」
 > 的由来：`GraphStatus::Rebuilt(reason)` 必须显式可见，否则 NFR-04 会静默失效而不自知。
 
-#### Step 3 · 可靠性
+#### Step 3 · 可靠性（原子快照）
 
 | 任务 | 解决 |
 | --- | --- |
-| T7-13 原子快照（临时文件 + `rename`，D-J3） | Q-C3 |
+| T7-13 原子快照（tmp + fsync + rename + fsync 父目录，D-J3） | Q-C3 |
 
-- **依赖**：**与 Step 2 共享 ADR-A**（多文件原子性方案落地后实施）。
-- **验收**：中断写入不产生损坏/错配快照（故障注入测试，覆盖图+快照双文件）。
-- **风险**：低。
-- **量级**：S。
+**范围（2026-09-07 复审重写，依据 ADR-A）**：ADR-A 已把「多文件原子性」收敛为
+**manifest 唯一发布点 + 父快照 CRC 版本锚点**，故架构 §7.6.2 明确：
+> 「Step 3 只需让 `foo.idx` 自己 tmp+rename，图 sidecar 自动跟随」
 
-#### Step 4 · 构建性能与多线程
+⇒ 本步骤是**单文件原子写**，不是多文件事务；原验收里「覆盖图 + 快照双文件」的描述已过时。
 
-| 任务 | 解决 |
+**⚠️ 现状事实**：`storage/snapshot.rs:88` 仍是 `File::create(path)` 直写 + `flush()`，
+**既无 tmp+rename、也无 fsync** ⇒ 崩溃中途产生半截文件，下次 `load` 得
+`Error::SnapshotCorrupted`——**不是降级重建，是索引丢失**。（对比：图 manifest 已原子，
+`storage/graph.rs:236 write_manifest_atomic()`。）
+
+| 子任务 | 内容 |
 | --- | --- |
-| T7-09 embed 并行（多 session / 分片锁 + `with_intra_threads`） | Q-P1、Q-M1 |
-| T7-11 增量构建（content_hash → embed 缓存，跳过已 embed 文档） | Q-P1 |
-| T7-17 并发检索压测进 bench（QPS + 正确性，`Searcher` 跨线程） | Q-M2 |
+| S3-a | 从 `write_manifest_atomic` 抽出通用 `atomic_write(path, bytes)`：tmp → flush → `sync_all` → rename → fsync 父目录；快照与 manifest **共用一份实现** |
+| S3-b | `save_with_crc` 改走 `atomic_write`，补上此前完全缺失的 fsync |
+| S3-c | tmp 孤儿回收：save/load 时清理 `*.idx.tmp` 与 `*.idx.hnsw.manifest.tmp`（并补 `.gitignore`） |
+| S3-d | 故障注入测试：`catch_unwind` + 可注入失败点，在「写完 tmp、未 rename」处 panic，断言**原快照完好** |
+| S3-e | 顺带收 **R19**（写路径 `panic_any` 的 TOCTOU 残余）——与 S3-a 属同一处代码边界，合并做最省 |
 
-- **依赖**：T7-11 依赖 **Step 1**（增量构建的自然落点是 content_hash→向量的 embed 缓存，**不必等图持久化**）。
-- **验收**：NFR-03 重测（目标 <120s）；`Searcher` 跨线程并发读有吞吐与正确性数据。
-- **风险**：中（embed 并行内存峰值上升，需重测 NFR-05）。
-- **量级**：M。
+- **依赖**：无（ADR-A 已定案）。
+- **验收**：中断/崩溃后 `load` 要么拿到**旧快照**、要么拿到**新快照**，**绝不出现 `SnapshotCorrupted`**；图 sidecar 因 CRC 锚点自动降级（该行为已被 Step 2 覆盖，不重复验收）。
+- **风险**：低；⚠️ 造「写文件必失败」的测试场景**别用 chmod**（CI 以 root 运行时权限位无效，Step 2 已踩过），让目标位置被**同名目录**占据更稳。
+- **量级**：S。**排在 V2.0 剩余工作最前**——Q-C3 定级为「高（正确性）」。
 
-#### Step 5 · 资源回收
+#### Step 4 · 资源回收（原 Step 5，D-J10 提前）
 
 | 任务 | 解决 |
 | --- | --- |
 | T7-12 墓碑物理回收（compaction，重建向量图 + 回收 `raw_vectors` + 重写快照） | Q-C2 |
 
-- **依赖**：Step 1（软删除语义就位）。
-- **验收**：长期零散写入后，**向量图 + `raw_vectors` + 快照文件**三者体积均不随删改无界增长（覆盖跨快照永续问题）。
+- **依赖**：Step 1（软删除语义就位）；**Step 2 的图 sidecar 机制**（Step 2 之后才成立，见下）。
+- **⚠️ Step 2 引入的新复杂度**：compaction 重建图后**必须重发 manifest**（`nb_point` /
+  `graph_crc` 全变），否则新图永远匹配不上 ⇒ 每次冷启动都走降级重建（≈10s），
+  **白重建一次且 NFR-04 静默失效**。
+- **验收**：长期零散写入后，**向量图 sidecar + `raw_vectors` + 快照正文**三者体积均不随删改
+  无界增长（覆盖跨快照永续问题）；compaction 后 `GraphStatus` 回到 `Loaded`（不是 `Rebuilt`）。
+- **新增**：可复现的「零散写入」workload 脚本（`scripts/` 目前没有；fixture 已齐：
+  `data/synth-100000-corpus.jsonl`）。
 - **风险**：中；**重建图会重新引入拓扑抖动**（NFR-06 不破，但评测可比性需在文档说明）。
 - **量级**：M。
 
-#### Step 6 · 精排（相关性第一刀，V2.0 收尾）
+#### Step 5 · 查询性能与可观测（新增，D-J9）
+
+| 任务 | 解决 |
+| --- | --- |
+| **T7-22** 低选择度暴力兜底（R18，从 V2.1 提前） | Q-I2 次生 / **NFR-13**（新增） |
+| **T7-23** `query::Metrics` 可观测化 | issue #7 遗留 / NFR-10、NFR-11 前置 |
+
+- **T7-22**：10 万级实测，选择度 ≤1% 时 vector P99 达 41~158ms（超 NFR-02 限额 4~16×）。
+  方案已明确且廉价：**`allowed` 小于阈值时绕开 ANN、直接暴力扫描**
+  （10 万级 0.1% 档 `allowed≈100`，代价约 **0.05ms vs 158ms**）。阈值在实现时标定。
+  ⚠️ 该场景此前**不在任何 NFR 口径内**，故同步新增 **NFR-13**。
+- **T7-23**：`query::Metrics` 目前只经 `tracing::info!` 输出——**外部拿不到实例 ⇒ 无法单测、
+  无法被 bench 采集**；而 `vector_shortfall` 正是「V2.1 是否引入 prefilter」的判据，
+  Step 6 的 NFR-10/11 实测也要靠它。需暴露进 `SearchResponse` 或 bench 采集链路。
+  顺带修 `query/metrics.rs:14` 里「见 issue #7」的失效引用（#7 已关闭）。
+- **依赖**：无；**T7-23 是 Step 6 的前置**。
+- **验收**：10 万级 sel-0.1% 档 vector P99 进入 NFR-13 预算；`Metrics` 至少有一条单测 +
+  一处 bench 采集点。
+- **量级**：S。
+
+#### Step 6 · 构建性能与多线程（原 Step 4，D-J10 顺延）
+
+| 任务 | 解决 |
+| --- | --- |
+| T7-09 embed 并行（**先 spike 再定是否投 M 级**） | Q-P1、Q-M1 |
+| T7-11 增量构建（content_hash → embed 缓存，跳过已 embed 文档） | Q-P1 |
+| T7-17 并发检索压测进 bench（QPS + 正确性，`Searcher` 跨线程） | Q-M2 |
+
+- **⚠️ NFR-03 已按 D-J8 拆双口径**，本步骤按新口径验收（不再是「1 万 chunk 全量 <120s」）：
+
+  | 口径 | 目标 | 依据 |
+  | --- | --- | --- |
+  | **首次全量** | 1 万 chunk 含 embedding 构建 **< 240s** | 实测 225.5s（12K）；在「不量化（D-J6）、不换模型」前提下无已识别路径可降到 120s |
+  | **增量追加** | 追加 10% 文档 < 首次全量 × 10% × 1.2 | Agent 场景的真实使用形态是反复追加，T7-11 才是这条口径的落点 |
+
+- **T7-09 的技术前提已被证伪一半**（2026-09-07 复审，源码级核实）：
+  - `fastembed-6.0.2` 的 `InitOptions.intra_threads` 默认 `None` = **用满所有核**
+    （`src/init.rs:30-33`），我们未覆盖 ⇒ 单 session 的 ONNX 推理**已在满核跑**，
+    多 session 大概率是**抢核**；
+  - 批次不是瓶颈：32/64/128/256 → 62.6 / 59.1 / 54.4 / 51.6 条/s（`eval-report.md:147-148`）；
+  - 建图并行只占 4%（225.5s 里 embed 209.9s）。
+  ⇒ **T7-09 先做 S 级 spike，出数据再决定是否投 M 级**：
+
+  | 实验 | 内容 |
+  | --- | --- |
+  | E1 | 单 session 基线（现状） |
+  | E2 | 2~4 session × `intra_threads` 分片 |
+  | E3 | **CPU EP vs CoreML EP**（`ort-2.0.0-rc.13` 有 `coreml` feature，fastembed 暴露 `with_execution_providers`）——macOS aarch64 上**从未评估过**的杠杆 |
+
+  ⚠️ E3 若有效，**向量数值会变** ⇒ 必须同时重测 **NFR-06 确定性**与相关性基线，
+  且 `ConfigFingerprint` 需纳入 execution provider（否则 CoreML 建库 / CPU 加载会静默错配，
+  正是 B1/B2 那类坑）。
+
+- **依赖**：T7-23（Step 5）是 T7-17 的前置；T7-11 依赖 Step 1。
+- **风险**：中（embed 并行内存峰值上升，需重测 NFR-05；E3 改变数值）。
+- **量级**：M（含 S 级 spike）。
+
+#### Step 7 · 精排（相关性第一刀，V2.0 收尾，原 Step 6）
 
 | 任务 | 解决 |
 | --- | --- |
 | T7-01 Reranker 接入（fastembed `TextRerank`，`bge-reranker-v2-m3`，D-J2）+ **精排候选窗口放开到 `candidate_k`/可配 R** | Q-R2 |
 
-- **依赖**：Step 2（性能基线稳定后测精排延迟）；开工前先澄清 H3（窗口参数 + 精排延迟 NFR-12）。
-- **验收**：hybrid MRR@10(1) 相对 P5 基线（0.6922）可测提升；精排延迟有实测（**NFR-12**，独立口径，不并入 NFR-02）。
-- **风险**：中；`bge-reranker-v2-m3` 为 ONNX 外置数据文件（`model.onnx.data`，**GB 级下载**），CI 需沿用 `#[ignore]` 模式 + 本地缓存策略。
+**开工前置三条（2026-09-07 复审新增）**：
+
+1. **先复现基线**：验收写的是「MRR@10(1) 相对 P5 基线 0.6922 可测提升」，但**没人复现过基线**。
+   第一步就用 `scripts/eval_quality.sh` + T2Ranking qrels 跑出当前值**与波动范围**，
+   否则「提升」无法判定（Step 1 已吃过「重合率 0.685~0.948 波动」的亏）。
+2. **模型下载可行性**：API 已核实可用（`TextRerank::try_new(RerankInitOptions)` +
+   `RerankerModel::BGERerankerV2M3` 均存在于 fastembed 6.0.2），但该模型含外置
+   `model.onnx.data`（**GB 级**）⇒ 需先确认下载体积与镜像可达性。
+3. **H3 必须先定**：精排窗口 + NFR-12 至今未决；放开到 `candidate_k`（3k）会让 rerank
+   成为延迟主导项。
+
+- **依赖**：Step 2（性能基线稳定后测精排延迟）；H3 定案。
+- **验收**：hybrid MRR@10(1) 相对**已复现的基线**可测提升；精排延迟有实测（**NFR-12**，独立口径，不并入 NFR-02）。
+- **风险**：中；CI 需沿用 `#[ignore]` 模式 + 本地缓存策略。
 - **量级**：M。
+
+### 横切任务（独立 PR，不属于任何 Step）
+
+| 任务 | 内容 | 决策 |
+| --- | --- | --- |
+| **T7-21** `parallel_build` 默认翻转为「开」 | 12K 真实语料 11.676s → 2.182s（**5.35×**），50K 合成 5.26×，真实语料 oracle 重合率无差异（0.995 / 0.995）。⚠️ 必须同步改 **S2-T22**（现断言「默认必须串行」） | **D-J11 / D4** |
+| **T7-24** 工程卫生 | ① **CI 只在 `branches:[main]` 触发** ⇒ 堆叠 PR 至今跑不到 CI（Step 2 已吃过亏）；② `.gitignore` **未覆盖图 sidecar 与 manifest tmp**（31MB 级误提交风险）；③ 清理 11 条已合并远端分支 | 复审 A4-④ |
 
 ### V2.1 —— 读写并发 + 相关性深化 + 场景机制（后续迭代）
 
-#### Step 7 · 读写并发
+#### Step 8 · 读写并发（原 Step 7）
 
 | 任务 | 解决 |
 | --- | --- |
@@ -254,7 +359,7 @@
 - **风险**：高（跨两棵树合并 BM25 统计量）。
 - **量级**：L。
 
-#### Step 8 · 相关性深化
+#### Step 9 · 相关性深化（原 Step 8）
 
 | 任务 | 解决 |
 | --- | --- |
@@ -262,11 +367,11 @@
 | T7-15 假负例敏感度对照（仅 qrels 语料重建） | Q-R3 |
 | T7-16 Agent query 评测集（LLM 生成 + 多轮 + 自查） | Q-R4 |
 
-- **依赖**：T7-14 依赖 Step 6（Reranker 就位）。
+- **依赖**：T7-14 依赖 **Step 7**（Reranker 就位）。
 - **风险**：高（自适应融合需重测，防过拟合）。
 - **量级**：M。
 
-#### Step 9 · 场景机制（面向知识/记忆）
+#### Step 10 · 场景机制（面向知识/记忆，原 Step 9）
 
 | 任务 | 解决 |
 | --- | --- |
@@ -286,42 +391,48 @@
 
 > 回写纪律：需求文档 §1.3 要求编号唯一。**FR 无「升级」机制**——已存在编号一律**原条目内修订**，不新建同编号条目；新需求才新增编号。
 
+> ⚠️ 「对应步骤」列已于 2026-09-07 按重排后的编号更新（旧号见 §附-2）。
+
 | 编号 | 需求 | 优先级 | 对应步骤 | 与既有需求的关系 |
 | --- | --- | --- | --- | --- |
-| FR-18 | Reranker 接入真实模型（**原条目内修订**：保留单编号，将「第一版只留位」改为「V2.0 接入 bge-reranker-v2-m3」） | Must | Step 6 | 修订 FR-18 |
-| FR-17 | 增量写入（**标注「部分交付」**：V1 已交付主索引增量；「读不阻塞写」完整版 V2.1 Step 7） | Must | Step 7 | 修订 FR-17 交付状态 |
+| FR-18 | Reranker 接入真实模型（**原条目内修订**：保留单编号，将「第一版只留位」改为「V2.0 接入 bge-reranker-v2-m3」） | Must | Step 7 | 修订 FR-18 |
+| FR-17 | 增量写入（**标注「部分交付」**：V1 已交付主索引增量；「读不阻塞写」完整版 V2.1 Step 8） | Must | Step 8 | 修订 FR-17 交付状态 |
 | FR-15 | 幂等 upsert 与删除（**向量删除并入**，删除语义扩展到向量侧） | Must | Step 1 | 修订 FR-15 |
 | FR-16 | 索引二进制快照（**原子性并入**：save 原子替换 + 图持久化格式） | Must | Step 2/3 | 修订 FR-16 |
 | FR-26 | 向量软删除 + 存活过滤 | Must | Step 1 | 强化 FR-15 |
 | FR-27 | 过滤下推 + 字段索引 | Must | Step 1 | 新增 |
-| FR-28 | 增量构建（只 embed 新增） | Should | Step 4 | 新增 |
+| FR-28 | 增量构建（只 embed 新增） | Should | Step 6 | 新增 |
 | FR-29 | 图持久化 | Must | Step 2 | 强化 FR-16 |
-| FR-30 | 墓碑物理回收（compaction） | Should | Step 5 | 强化 FR-15/26 |
-| FR-31 | 原子快照 | Should | Step 3 | 强化 FR-16 |
-| FR-32 | 命名空间隔离 | Should | Step 9 | 新增（≠权限/多租户，见 §2.1 范围外） |
-| FR-33 | 时间衰减打分钩子 | Could | Step 9 | 新增 |
-| FR-21 | 多 query 融合（**收编**进入 V2 范围，原即 Could=v2） | Could | Step 9 | 原有 |
-| FR-24 | MMR 结果去重（收编） | Could | Step 9 | 原有 |
-| FR-25 | token budget 裁剪（收编） | Could | Step 9 | 原有 |
-| NFR-10 | 并发读吞吐 | Should | Step 4 | 新增 |
-| NFR-11 | 增量可见性与写延迟 | Should | Step 4 | 新增 |
-| **NFR-12** | **精排延迟**（rerank P99，独立口径） | Should | Step 6 | 新增（H3） |
+| FR-30 | 墓碑物理回收（compaction） | Should | Step 4 | 强化 FR-15/26 |
+| **FR-31** | 原子快照 | **Must**（2026-09-07 由 Should 升：Q-C3 定级「高（正确性）」且为 V2.0 必做） | Step 3 | 强化 FR-16 |
+| FR-32 | 命名空间隔离 | Should | Step 10 | 新增（≠权限/多租户，见 §2.1 范围外） |
+| FR-33 | 时间衰减打分钩子 | Could | Step 10 | 新增 |
+| FR-21 | 多 query 融合（**收编**进入 V2 范围，原即 Could=v2） | Could | Step 10 | 原有 |
+| FR-24 | MMR 结果去重（收编） | Could | Step 10 | 原有 |
+| FR-25 | token budget 裁剪（收编） | Could | Step 10 | 原有 |
+| NFR-03 | 索引构建（**D-J8 拆双口径**：首次全量 < 240s / 增量追加 < 首次 × 变更比 × 1.2） | Must | Step 6 | 修订口径（原「1 万 chunk <120s」无路径可达） |
+| NFR-10 | 并发读吞吐 | Should | Step 6 | 新增（前置：Step 5 的 T7-23） |
+| NFR-11 | 增量可见性与写延迟（**口径修订**：`add` 后需 `commit()` 才可见 ⇒ 改为「commit 后立即可查；写延迟 = flush 一批耗时」） | Should | Step 6 | 新增 |
+| **NFR-12** | **精排延迟**（rerank P99，独立口径） | Should | Step 7 | 新增（H3） |
+| **NFR-13** | **低选择度过滤延迟**（10 万级 + 低选择度档位的 P99） | Should | Step 5 | 新增（D-J9；此前该场景不在任何 NFR 口径内） |
 
 ---
 
 ## 6. 验收门槛（Gate）
 
-**V2.0 发布门槛**（Step 1~6 全部满足）：
-- [ ] Q-C1 修复有回归测试：删除后三路（含向量/hybrid）不再召回该 doc
-- [ ] 过滤下推后，1 万 chunk 口径单 query 过滤耗时在 NFR-02 预算内；10 万级扩展验证另备 fixture、另录
-- [ ] 图持久化后 12K 冷启动 < 2s，且**同一快照两次加载**结果逐位一致（消 R-P5-13）
-- [ ] 原子快照通过故障注入测试（覆盖图 + 快照双文件）
-- [ ] NFR-03 构建重测达标（<120s），NFR-05 内存重测记录
-- [ ] `Searcher` 跨线程并发读吞吐 + 正确性有数据
-- [ ] Reranker 接入后 MRR@10(1) 提升，精排延迟满足 NFR-12
+**V2.0 发布门槛**（Step 1~7 全部满足；✅ = 已达成）：
+
+- [x] **Step 1**：Q-C1 修复有回归测试——删除后三路（含向量/hybrid）不再召回该 doc（PR #6）
+- [x] **Step 1**：过滤下推后，1 万 chunk 口径单 query 过滤耗时在 NFR-02 预算内；10 万级扩展验证已另测另录（`eval-report.md`）
+- [x] **Step 2**：图持久化后 12K 冷启动 ≈100ms（< 2s），且**同一快照两次加载**结果逐位一致（消 R-P5-13）
+- [ ] **Step 3**：原子快照通过故障注入测试——崩溃后 `load` 要么旧快照、要么新快照，**绝不 `SnapshotCorrupted`**
+- [ ] **Step 4**：compaction 后三个体积（向量图 sidecar / `raw_vectors` / 快照正文）不无界增长，且 `GraphStatus` 回到 `Loaded`
+- [ ] **Step 5**：10 万级低选择度档位 P99 进入 **NFR-13** 预算；`Metrics` 有单测 + bench 采集点
+- [ ] **Step 6**：**NFR-03 按双口径**重测达标（首次全量 < 240s / 增量追加达标）；NFR-05 内存重测记录；`Searcher` 跨线程并发读吞吐 + 正确性有数据
+- [ ] **Step 7**：Reranker 接入后 MRR@10(1) 相对**已复现基线**可测提升；精排延迟满足 NFR-12
 - [ ] `make fmt && make lint && make test && make deny` 全绿；CI 全绿
 
-**V2.1 门槛**：delta 分段读不阻塞写、自适应融合在分桶上优于固定权重、命名空间低选择度过滤召回不回退、MMR/token 有单测与示例。
+**V2.1 门槛**（Step 8~10）：delta 分段读不阻塞写、自适应融合在分桶上优于固定权重、命名空间低选择度过滤召回不回退、MMR/token 有单测与示例。
 
 ---
 
@@ -333,34 +444,39 @@
 | --- | --- | --- |
 | Step 1 | T7-07 向量墓碑 + 存活过滤 | ✅ 已完成（2026-09-05，PR #6 → `61e3dac`） |
 | Step 1 | T7-08 过滤下推 + 字段索引 | ✅ 已完成（2026-09-05，PR #6 → `61e3dac`） |
-| Step 2 | T7-05 图持久化 + 并行建图 | ✅ 已完成（2026-09-07，PR #12/#15/#16/#17 → `68074c9`/`e9ac2b0`/`15c1900`/`1e51156`） |
-| Step 3 | T7-13 原子快照 | ⬜ |
-| Step 4 | T7-09 embed 并行 | ⬜ |
-| Step 4 | T7-11 增量构建 | ⬜ |
-| Step 4 | T7-17 并发检索压测 | ⬜ |
-| Step 5 | T7-12 墓碑物理回收 | ⬜ |
-| Step 6 | T7-01 Reranker 接入（bge-reranker-v2-m3） | ⬜ |
-| Step 7 | T7-06 delta 分段 | ⬜ |
-| Step 7 | T7-18 旧 API deprecated | ⬜ |
-| Step 8 | T7-14 自适应融合 | ⬜ |
-| Step 8 | T7-15 假负例对照 | ⬜ |
-| Step 8 | T7-16 Agent query 评测集 | ⬜ |
-| Step 9 | T7-19 命名空间隔离 | ⬜ |
-| Step 9 | T7-20 时间衰减钩子 | ⬜ |
-| Step 9 | T7-02 MMR 去重 | ⬜ |
-| Step 9 | T7-03 token budget 裁剪 | ⬜ |
-| Step 9 | T7-04 多 query 融合 | ⬜ |
+| Step 2 | T7-05 图持久化 + 并行建图 | ✅ 已完成（2026-09-07，PR #12/#15/#16/#17/#18 → `68074c9`/`e9ac2b0`/`15c1900`/`1e51156`/`9db2c00`） |
+| **Step 3** | T7-13 原子快照（S3-a~e，含 R19） | ⬜ |
+| **Step 4** | T7-12 墓碑物理回收（compaction，含 manifest 重发） | ⬜ |
+| **Step 5** | T7-22 低选择度暴力兜底 | ⬜ |
+| **Step 5** | T7-23 `query::Metrics` 可观测化 | ⬜ |
+| **Step 6** | T7-09 embed 并行（**先 E1/E2/E3 spike**） | ⬜ |
+| **Step 6** | T7-11 增量构建 | ⬜ |
+| **Step 6** | T7-17 并发检索压测 | ⬜ |
+| **Step 7** | T7-01 Reranker 接入（bge-reranker-v2-m3） | ⬜ |
+| Step 8 | T7-06 delta 分段 | ⬜ |
+| Step 8 | T7-18 旧 API deprecated | ⬜ |
+| Step 9 | T7-14 自适应融合 | ⬜ |
+| Step 9 | T7-15 假负例对照 | ⬜ |
+| Step 9 | T7-16 Agent query 评测集 | ⬜ |
+| Step 10 | T7-19 命名空间隔离 | ⬜ |
+| Step 10 | T7-20 时间衰减钩子 | ⬜ |
+| Step 10 | T7-02 MMR 去重 | ⬜ |
+| Step 10 | T7-03 token budget 裁剪 | ⬜ |
+| Step 10 | T7-04 多 query 融合 | ⬜ |
+| **横切** | T7-21 `parallel_build` 默认翻转（独立 PR，含改 S2-T22） | ⬜（已出数据，D-J11） |
+| **横切** | T7-24 工程卫生（CI 触发 / gitignore / 分支清理） | ⬜ |
 
 > T7-10 预留（原「量化评估」，D-J6 决定不引入后空出，不启用）。
 
 ---
 
-## 8. 文档回写计划（本计划评审通过后执行）
+## 8. 文档回写计划（**执行中**：Step 1 / Step 2 已回写）
 
 1. `requirements-spec.md`：
-   - FR-18 原条目内修订（保留单编号）；FR-17 标注「部分交付 / 完整版 V2.1」；FR-15/16 扩展删除与原子性语义。
-   - FR-26~33 / NFR-10~12 正式入表（含与 FR-15/16 的修订关系）。
-   - **NFR-03 备注刷新为 225.5s**（P6 重测值，替换 P5 的 236.7s）；NFR-04 明确「快照 + 图加载」口径。
+   - ✅ FR-18 原条目内修订（保留单编号）；FR-17 标注「部分交付 / 完整版 V2.1」；FR-15/16 扩展删除与原子性语义。
+   - ✅ FR-26~33 / NFR-10~12 正式入表（含与 FR-15/16 的修订关系）。
+   - ✅ **NFR-03 备注刷新为 225.5s**（P6 重测值，替换 P5 的 236.7s）；NFR-04 明确「快照 + 图加载」口径。
+   - 🆕 **2026-09-07 复审回写（本轮）**：NFR-03 拆「首次全量 / 增量」双口径（D-J8）；**新增 NFR-13**（低选择度过滤延迟，D-J9）；NFR-11 口径改为「commit 后立即可查」；FR-31 优先级 Should → **Must**；NFR-10/11/12 的「对应步骤」按重排编号更新。
 2. `architecture-design.md`：
    - 新增 **ADR-A**（图持久化格式 + 多文件原子性）、**ADR-010**（向量软删除 / 过滤下推 / 图持久化的架构决策）。
    - **第 14 章风险表 R1 补「已关闭」状态**（P5 已换 hnsw_rs，instant-distance 移除）；**p5-design 的 D7 结案**（图持久化落地）——**✅ 已由 V2 Step 2 完成**（2026-09-06）：ADR-A 方案 C，12K 完整冷启动 11.57s → ≈100ms，NFR-04 达标；R-P5-13 一并消解（图落盘即冻结拓扑，同快照两次加载逐位一致）。
@@ -370,7 +486,7 @@
 
 ---
 
-## 附：证据清单
+## 附-1：证据清单
 
 - `crates/core/src/index/mod.rs:173` `remove` 只回滚倒排与墓碑，不含向量；`:247` `is_live_chunk` 定义了但未调用
 - `crates/core/src/retriever/vector.rs` 无存活过滤；`vector/mod.rs` trait 无 `remove`
@@ -379,3 +495,30 @@
 - `crates/core/src/search/index.rs` `remove` 后 `save()` 原样带走已删向量、`load_with` 全量重灌（注释「会被丢弃」不成立）
 - `docs/devel/eval-report.md` §8 NFR 实测、§9 数据诚信、§10 残留问题
 - 依赖源码（已核实）：`hnsw_rs-0.3.4` —— `parallel_insert`/`search_filter`/`FilterT`/`load_hnsw` 属实；图落盘为**双文件**（`HnswIo` + `DumpInit`，`hnsw.graph` + `hnsw.data`）；**无 remove/delete API**。`fastembed-6.0.2` —— `TextRerank`/`RerankerModel::BGERerankerV2M3`/`with_intra_threads` 属实；`bge-reranker-v2-m3` 含 `model.onnx.data` 外置数据文件。
+
+- **2026-09-07 复审补充核实**（详见 `plan-v2-review.md` 附）：`fastembed-6.0.2`
+  `src/init.rs:30-33` —— `intra_threads` 默认 `None` = 用满所有核；`src/init.rs:133` —— `with_intra_threads` 存在；
+  `src/text_embedding/impl.rs:373` —— `embed` 单 session 按 `DEFAULT_BATCH_SIZE=256` 串行分块；
+  `src/models/text_embedding.rs` —— **无中文量化变体**（量化仅 `NomicEmbedTextV15Q` / `ParaphraseMLMiniLML12V2Q`）；
+  `src/models/reranking.rs:6-11` —— `RerankerModel::BGERerankerV2M3` 存在且带外置 `model.onnx.data`。
+  `ort-2.0.0-rc.13` `Cargo.toml:145` —— 有 `coreml = ["ort-sys/coreml"]` feature。
+
+---
+
+## 附-2：步骤编号映射（2026-09-07 重排）
+
+> 重排依据：`plan-v2-review.md` 复审 + 用户拍板 D-J8~D-J11。**Step 1 / Step 2 编号不变**。
+
+| 新编号 | 主题 | 旧编号 | 变动原因 |
+| --- | --- | --- | --- |
+| Step 3 | 可靠性（原子快照） | Step 3 | 不变；范围按 ADR-A 重写 |
+| Step 4 | 资源回收（compaction） | **Step 5** | **提前**（D-J10 / D3） |
+| Step 5 | 查询性能与可观测 | —— | **新增**（D-J9 / D2：低选择度兜底提前 + Metrics 可观测） |
+| Step 6 | 构建性能与多线程 | **Step 4** | 顺延（D-J10 / D3）；embed 并行改 spike 制 |
+| Step 7 | 精排 | Step 6 | 顺延 |
+| Step 8 | 读写并发 | Step 7 | 顺延 |
+| Step 9 | 相关性深化 | Step 8 | 顺延 |
+| Step 10 | 场景机制 | Step 9 | 顺延 |
+
+**历史文档的编号**：`v2-step1-design.md` / `v2-step2-design.md` 中的 Step 编号**指重排前**，
+已在各自文档头部加注记；`plan.md`（V1）与 `p0~p6-design.md` 不受影响。

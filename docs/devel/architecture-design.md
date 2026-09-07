@@ -4,9 +4,9 @@
 
 | 项目   | 内容                   |
 | ---- | -------------------- |
-| 文档版本 | v1.5                 |
+| 文档版本 | v1.7                 |
 | 创建日期 | 2026-09-02           |
-| 状态   | V2 Step 1（向量软删除 + 过滤下推）已并入，见 ADR-010 / §5.4 / §5.5 / §7.5 |
+| 状态   | V2 Step 1 / Step 2 已并入；2026-09-07 V2 步骤重排同步（Step 4 = compaction，映射见 `plan-v2.md` §附-2） |
 | 技术栈  | Rust 1.90+ / 2021 edition |
 | 文件名   | `architecture-design.md` |
 | 配套文档 | `requirements-spec.md`（需求分析说明书） |
@@ -26,6 +26,7 @@
 | v1.4 | 2026-09-04 | 已定稿 | `p6-design` 接口重构：新增第 10 章「对外接口设计（门面层）」+ ADR-009，原 10~14 章顺延 |
 | v1.5 | 2026-09-05 | 已定稿 | V2 Step 1（向量软删除 + 过滤下推）回写 |
 | v1.6 | 2026-09-06 | 已定稿 | **V2 Step 2（图持久化，ADR-A）回写**：5.4.3 / 7.6.2 / 8.2 / 8.3 / 14.1 |
+| v1.7 | 2026-09-07 | 已定稿 | **V2 计划复审 + 步骤重排同步**：§7.5「物理回收归 Step 5 compaction」→ **Step 4** 并补「compaction 后必须重发 manifest」（否则新图永远匹配不上、冷启动恒走降级重建）；§14.1 R22 对策同步为 Step 4。编号映射见 `plan-v2.md` §附-2 |
 
 ### 1.2 读者
 
@@ -723,7 +724,7 @@ score(d) = Σ_{lane i}  w_i / (k + rank_i(d))
    重建存活位图，检索期谓词仍会滤掉它
 
 **已知代价**：`remove` 每次全量 `raw_vectors.retain`，批量删 N 篇是 O(N·M)。暂不处理 ——
-物理回收归 **Step 5 compaction**，届时可一并引入 `remove_many(&[DocId])` 批量入口。
+物理回收归 **Step 4 compaction**（2026-09-07 重排前为 Step 5，映射见 `plan-v2.md` §附-2），届时可一并引入 `remove_many(&[DocId])` 批量入口。⚠️ compaction 重建图后**必须重发 manifest**（`nb_point`/`graph_crc` 全变），否则新图永远匹配不上、每次冷启动都走降级重建。
 
 > 若后续需要**物理删除**（而非墓碑），`hnsw_rs` 与 `instant-distance` 都不满足，路径为 `usearch`
 > （Apache-2.0，支持 `add` / `remove` / `filtered_search` / `exact_search`，但经 `cxx` 引入 C++ 依赖）；
@@ -1391,7 +1392,7 @@ pub enum Error {
 | **R19** | **`hnsw_rs` 在损坏输入上 panic / `exit(1)`**（C3；读路径 12 处 `assert_eq!`/`unwrap()`，写路径 `DumpInit` 打不开文件即 `panic_any`） | 崩溃恢复场景下进程直接死 | 读：**五道先验**（manifest CRC + 长度 + 维度 + 平台 + `Description` 预校验）全过才交给 `hnsw_rs`；写：前置探测目录可写 + 失败按 P0-3 语义处理 | 校验通过**之后**文件被并发改写仍可能 panic（无并发写同一快照语义，不处理）；写路径 `panic_any` 是 TOCTOU 窗口，**只能缩小不能归零**——`panic_any` 不是 `Err`，调用侧无法 catch |
 | **R20** | **距离类型路径被烧进图文件**（C7） | 重命名/移动 `DistDotClamped` 会让旧图全部失效 | 用 `load_hnsw`（**短名**比对）而非 `load_hnsw_with_dist`；manifest 记**自有** `dist_id`，与 Rust 类型路径解耦 | 类型**改名**仍会失效（走降级重建，不丢功能） |
 | **R21** | **平台/端序绑定**（C4）：图文件是裸 f32 + native endian | 快照拷到别的平台 → 图不可用 | manifest 记 `platform` 并校验，不匹配即降级 | 图 sidecar **不可跨平台搬运**是既定事实，需在用户文档声明 |
-| **R22** | **磁盘体积增加约 60%**（C8；`file_dump` 只支持 `DumpMode::Full`，向量必然被复制一份） | 大语料下显著。**12K 实测**：快照 52.3MB + graph 7.9~8.1MB + data 23.7MB ≈ **84MB**（**1.6×**；graph 体积随 HNSW 拓扑在跨进程间有小幅波动，与 R-P5-13 同源） | 先接受并实测；`--no-graph-persist` 逃生舱；Step 5 compaction 重写图时一并优化 | 未解决，V2.0 接受 |
+| **R22** | **磁盘体积增加约 60%**（C8；`file_dump` 只支持 `DumpMode::Full`，向量必然被复制一份） | 大语料下显著。**12K 实测**：快照 52.3MB + graph 7.9~8.1MB + data 23.7MB ≈ **84MB**（**1.6×**；graph 体积随 HNSW 拓扑在跨进程间有小幅波动，与 R-P5-13 同源） | 先接受并实测；`--no-graph-persist` 逃生舱；**Step 4** compaction 重写图时一并优化（2026-09-07 重排前写作 Step 5） | 未解决，V2.0 接受 |
 | **R23** | **`HnswIo` 必须比 `Hnsw` 活得长**（`load_hnsw*` 的 `'a: 'b`）⇒ 只能 `Box::leak` | 长生命周期服务反复加载会累积（每次约 200B + 路径串） | leak 后**丢弃句柄、不存字段**（P1-2），避免与 `Hnsw` 内部指向 Mmap 的共享借用形成别名 | 无回收路径；**依赖 `HnswIo: Send + Sync`** —— 已加编译期断言，`hnsw_rs` 升级时需复核 |
 | **R24** | **加载后增量插入的建图参数不同**（C8：重载后 `extend_candidates = true`，`Hnsw::new` 是 `false`） | 长期增量写入后图质量与纯内存建库存在偏差，可能影响召回 | S2-T10 覆盖；实测 oracle 重合率 | **残余应对已修正**：`Hnsw::set_extend_candidates(&mut self, bool)` 是**公开 API**（`hnsw.rs:853`），可在加载后显式对齐回 `false`；真正拿不到 setter 的是 `datamap_opt`（仅 `pub(crate)` getter）。故本项**可修**，待实测偏差决定是否实施 |
 | **R25** | **每次 `save` 全量重 dump 图** | 频繁 save 场景成本高。**12K 实测 43.5ms**（31.6MB 写入 + CRC 扫两遍）——远低于预估，当前**不是**瓶颈 | 先不优化；预留 dirty 标记（`dumped_len == len()` 可跳过）的位置 | 未解决；量级需在 100 万级复核 |
