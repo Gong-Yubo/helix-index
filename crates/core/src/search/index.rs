@@ -25,8 +25,58 @@ pub enum GraphStatus {
     Loaded,
     /// 不适用（Brute 后端 / 纯 BM25 / 无向量）
     NotApplicable,
-    /// 降级重建（含原因：manifest 缺失 / CRC 不符 / 参数漂移 / dump 失败…）
+    /// 降级重建（含原因：manifest 缺失 / CRC 不符 / 参数漂移 / 平台不符…）
+    ///
+    /// 语义：**用了图以外的东西重建**，检索结果仍然正确，只是冷启动慢。
     Rebuilt(String),
+    /// 写侧失败：图**没**落盘（非 Strict 模式下 `save()` 仍返回 Ok，快照完好）。
+    ///
+    /// 与 [`GraphStatus::Rebuilt`] 的区别：这里什么都没重建，也不是「读不到图」，
+    /// 而是「写图失败」——混进 Rebuilt 会让使用者误以为重建已完成（评审 #12 nit）。
+    PersistFailed(String),
+}
+
+/// 写图 sidecar 的完整链路：dump → CRC → manifest 原子发布（v2-step2-design §4.5 步骤 5~7）。
+///
+/// 独立成函数是为了让「失败」有一个**统一的边界**：任一步出错都回到调用方，
+/// 由 `GraphPersistMode` 决定升级为 Err 还是降级为警告。此前只有 `dump_graph`
+/// 被 Lenient 捕获，紧随其后的 CRC / manifest 发布仍会让 `save()` 返回 Err
+/// （评审 #12 发现 2）。
+fn write_graph_sidecar(
+    path: &std::path::Path,
+    g: &dyn VectorGraphPersist,
+    body_crc: u32,
+    dim: u32,
+) -> Result<()> {
+    // 路径必须有文件名，否则 sidecar 会落到凭空捏造的位置（评审 #12 nit）
+    crate::storage::require_file_name(path)?;
+
+    let stats = g.dump_graph(path)?;
+
+    // CRC + 长度（流式）
+    let paths = crate::storage::graph_paths(path);
+    let (graph_crc, graph_len) = crate::storage::file_crc32_len(&paths.graph)?;
+    let (data_crc, data_len) = crate::storage::file_crc32_len(&paths.data)?;
+
+    let m = crate::storage::GraphManifest {
+        manifest_version: crate::storage::MANIFEST_VERSION,
+        producer: format!("helix-core-{}", env!("CARGO_PKG_VERSION")),
+        graph_format: stats.graph_format,
+        dist_id: crate::storage::DIST_ID.to_string(),
+        platform: crate::storage::PLATFORM_FINGERPRINT,
+        max_nb_connection: stats.max_nb_connection,
+        ef_construction: stats.ef_construction,
+        snapshot_crc: body_crc,
+        snapshot_len: std::fs::metadata(path).map(|md| md.len()).unwrap_or(0),
+        dim,
+        nb_point: stats.nb_point,
+        graph_crc,
+        graph_len,
+        data_crc,
+        data_len,
+    };
+    crate::storage::write_manifest_atomic(&paths.manifest, &m)?;
+    Ok(())
 }
 
 /// 尝试从图 sidecar 加载 HNSW 图（v2-step2-design §4.6 的读取序列）。
@@ -52,6 +102,9 @@ fn try_load_graph(
         return Err("图持久化已关闭（--no-graph-persist）".to_string());
     }
 
+    // 路径必须有文件名（与写侧同一约束，评审 #12 nit）
+    crate::storage::require_file_name(snapshot).map_err(|e| e.to_string())?;
+
     // 步骤 3：读 manifest（文件不存在 / header 错 / CRC 错 / 解码错 → 降级）
     let paths = crate::storage::graph_paths(snapshot);
     let m = match crate::storage::read_manifest(&paths.manifest) {
@@ -67,7 +120,7 @@ fn try_load_graph(
     if m.dist_id != crate::storage::DIST_ID {
         return Err(format!("dist_id 不匹配: {}", m.dist_id));
     }
-    if m.platform != crate::storage::PLATFORM_LE64 {
+    if m.platform != crate::storage::PLATFORM_FINGERPRINT {
         return Err(format!("platform 不匹配: {:#x}", m.platform));
     }
     if m.dim != fingerprint.dim {
@@ -442,7 +495,15 @@ impl SearchIndex {
         // 是两个数量级完全不同的成本，混在一起看不出图持久化的真实代价。
         let t_dump = std::time::Instant::now();
         self.graph_dump_elapsed = None;
-        self.graph_status = self.persist_graph(path, &vectors, body_crc)?;
+        match self.persist_graph(path, &vectors, body_crc) {
+            Ok(st) => self.graph_status = st,
+            Err(e) => {
+                // Strict：图失败升级为 Err。快照这会儿**已经落盘**，但状态仍要
+                // 记录下来——调用方手里还有这个 idx，诊断时不能无从查证。
+                self.graph_status = GraphStatus::PersistFailed(format!("{e}"));
+                return Err(e);
+            }
+        }
         if !matches!(self.graph_status, GraphStatus::NotApplicable) {
             self.graph_dump_elapsed = Some(t_dump.elapsed());
         }
@@ -483,44 +544,23 @@ impl SearchIndex {
             return Ok(GraphStatus::NotApplicable);
         };
 
-        let stats = match g.dump_graph(path) {
-            Ok(s) => s,
+        // P0-3（评审 #12 发现 2 修订）：**整个写图链路**都按「缓存」语义处理。
+        // 只把 `dump_graph` 包进 Lenient 是不够的——紧随其后的 CRC 扫描、
+        // manifest 原子发布同样会返回 Err，而此刻快照已完整落盘，
+        // 让 `save()` 失败等于「缓存写坏了把主数据一起否决」。
+        match write_graph_sidecar(path, g, body_crc, self.cfg.fingerprint().dim) {
+            Ok(()) => Ok(GraphStatus::Loaded),
+            Err(e) if self.graph.mode == GraphPersistMode::Strict => Err(e),
             Err(e) => {
-                // P0-3：图是缓存，save 不得因图失败而失败
-                if self.graph.mode == GraphPersistMode::Strict {
-                    return Err(e);
+                // 已发布的旧 manifest 必须删除（否则下次加载会拿到过期图）。
+                // 清理本身失败也只是「残留垃圾」，不升级为 Err。
+                if let Err(ce) = crate::storage::remove_sidecars(path) {
+                    eprintln!("[警告] 图 sidecar 清理失败（残留文件不影响正确性）: {ce}");
                 }
-                // 已发布的旧 manifest 必须删除（否则下次加载会拿到过期图）
-                crate::storage::remove_sidecars(path)?;
                 eprintln!("[警告] 向量图落盘失败，已跳过（缓存，快照本身完好）: {e}");
-                return Ok(GraphStatus::Rebuilt(format!("图落盘失败: {e}")));
+                Ok(GraphStatus::PersistFailed(format!("{e}")))
             }
-        };
-
-        // CRC + 长度（流式）
-        let paths = crate::storage::graph_paths(path);
-        let (graph_crc, graph_len) = crate::storage::file_crc32_len(&paths.graph)?;
-        let (data_crc, data_len) = crate::storage::file_crc32_len(&paths.data)?;
-
-        let m = crate::storage::GraphManifest {
-            manifest_version: crate::storage::MANIFEST_VERSION,
-            producer: format!("helix-core-{}", env!("CARGO_PKG_VERSION")),
-            graph_format: stats.graph_format,
-            dist_id: crate::storage::DIST_ID.to_string(),
-            platform: crate::storage::PLATFORM_LE64,
-            max_nb_connection: stats.max_nb_connection,
-            ef_construction: stats.ef_construction,
-            snapshot_crc: body_crc,
-            snapshot_len: std::fs::metadata(path).map(|md| md.len()).unwrap_or(0),
-            dim: self.cfg.fingerprint().dim,
-            nb_point: stats.nb_point,
-            graph_crc,
-            graph_len,
-            data_crc,
-            data_len,
-        };
-        crate::storage::write_manifest_atomic(&paths.manifest, &m)?;
-        Ok(GraphStatus::Loaded)
+        }
     }
 
     /// 最近一次图 sidecar 的状态（NFR-07 可观测性：降级必须可见）。

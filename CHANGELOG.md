@@ -45,7 +45,13 @@ H1（图持久化格式 + 多文件原子性）结案，Step 3 原子快照直�
 
 #### 验收
 
-- **S2-T1~T17 全部通过**（新增 14 个端到端测试 + 12 个 storage 单测 + 6 个 persist 单测）
+- **`crates/core/tests/graph_persist.rs` 新增 18 个端到端测试**（+ 13 个 storage 单测 + 6 个 persist 单测）
+  - 覆盖 **S2-T1/T2/T4~T12/T15~T21**；**S2-T3**（并行 vs 串行 oracle 质量等价）顺延至
+    S2-11 的 PR（依赖 `parallel_build`），**S2-T13/T14** 亦在该 PR（T13 并行质量、T14 dump 体积）
+  - ⚠️ T3 的意图（图路径与重建路径质量等价）已由 **T6 的 oracle 重合率断言**（≥0.95）
+    与 `persist.rs` roundtrip 的逐位一致断言先行覆盖
+  - 每个「应走快路径」的测试都先断言 `GraphStatus::Loaded`（P0-1：basename 拼错会让
+    所有「能加载」断言照样绿，只有 NFR-04 静默失效）
 - **验收 2（消解 R-P5-13）**：同一快照连续两次加载，200 条 query 的 Top-10 **逐位一致**。
   ⚠️ 测试**必须先断言 `GraphStatus::Loaded`**——basename 拼错时降级路径一切正常、
   所有「能加载」断言都会绿，只有 NFR-04 静默失效

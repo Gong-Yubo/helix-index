@@ -13,7 +13,10 @@ use std::sync::Arc;
 
 use helix_core::embed::Embedder;
 use helix_core::error::Result;
-use helix_core::search::{GraphStatus, SearchIndex, SearchIndexBuilder, VectorBackend};
+use helix_core::search::{
+    GraphPersistMode, GraphStatus, SearchIndex, SearchIndexBuilder, VectorBackend,
+};
+use helix_core::vector::{BruteForceIndex, NormalizedVector, VectorIndex};
 
 // ---------------------------------------------------------------------------
 // 测试用确定性 Embedder（不依赖真实模型，保证跨机器可复现）
@@ -107,6 +110,30 @@ fn topk_searcher(s: &helix_core::search::Searcher, q: &str, k: usize) -> Vec<(u3
         .iter()
         .map(|h| (h.chunk_id, h.score))
         .collect()
+}
+
+/// 用**精确线性扫描**（`BruteForceIndex`）算 oracle Top-K 的 chunk_id 集合。
+///
+/// 测试 embedder 是确定性的，因此可以脱离索引重建同一批向量；HNSW 是近似索引，
+/// 与它比对才有意义（设计文档 §8 对 T3/T6 要求的「重合率 ≥ 0.95」口径）。
+fn oracle_ids(texts: &[String], q: &str, k: usize) -> Vec<u32> {
+    let mut b = BruteForceIndex::new();
+    for (i, t) in texts.iter().enumerate() {
+        b.add(i as u32, NormalizedVector::new(hash_vec(t, DIM)))
+            .unwrap();
+    }
+    let qv = NormalizedVector::new(hash_vec(q, DIM));
+    b.search(&qv, k)
+        .unwrap()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// Top-K 集合重合率（|A∩B| / k），用于与 oracle 比对。
+fn overlap(a: &[u32], b: &[u32]) -> f64 {
+    let sb: std::collections::HashSet<u32> = b.iter().copied().collect();
+    a.iter().filter(|x| sb.contains(x)).count() as f64 / a.len().max(1) as f64
 }
 
 // ---------------------------------------------------------------------------
@@ -322,7 +349,20 @@ fn T6_旧快照无图可加载() {
         matches!(loaded.graph_status(), GraphStatus::Rebuilt(_)),
         "旧快照应降级重建"
     );
-    assert!(!topk(builder().load(&path).unwrap(), "旧文档 7", 10).is_empty());
+
+    // oracle 质量断言（评审 #14 发现 1：原实现只断言「非空」，
+    // 而设计文档 §8 对 T6 要求的口径是「与 oracle Top-10 重合率 ≥ 0.95」）
+    let texts: Vec<String> = (0..200).map(|i| format!("旧文档 {i}")).collect();
+    let got: Vec<u32> = topk(builder().load(&path).unwrap(), "旧文档 7", 10)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(got.len(), 10, "应能取满 10 条");
+    let r = overlap(&got, &oracle_ids(&texts, "旧文档 7", 10));
+    assert!(
+        r >= 0.95,
+        "与 oracle 的 Top-10 重合率应 ≥ 0.95，实测 {r:.3}"
+    );
 }
 
 /// **S2-T7** 逃生舱不破：Brute 后端加载含图快照 → 忽略图。
@@ -398,8 +438,6 @@ fn T9_删除后跨快照不复活() {
         idx.save(&path).unwrap();
     }
 
-    let path_for_check = &path;
-    let _ = path_for_check;
     let loaded = builder().load(&path).unwrap();
     let hits = loaded
         .into_searcher()
@@ -598,4 +636,126 @@ fn T17_建图参数漂移降级() {
         "max_nb_connection 漂移应被 Description 预校验拦下"
     );
     assert_eq!(topk(builder().load(&path).unwrap(), "文档 2", 10).len(), 10);
+}
+
+// ---------------------------------------------------------------------------
+// 开关语义（评审 #12 发现 3：三个新开关此前零测试覆盖）
+// ---------------------------------------------------------------------------
+
+/// 让 `.hnsw.graph` 的位置被一个**目录**占据 ⇒ 写图链路必失败。
+///
+/// 不用 chmod：CI 以 root 运行时权限位无效，`File::create` 撞上同名目录
+/// 才是跨 POSIX / Windows 都稳定的失败方式。
+fn 让写图必失败(path: &std::path::Path) {
+    std::fs::create_dir_all(helix_core::storage::graph_paths(path).graph).unwrap();
+}
+
+/// 建一个 n 篇文档的库（不落盘）。
+fn 内存库(n: usize) -> SearchIndex {
+    let mut idx = builder().build();
+    for i in 0..n {
+        idx.add(format!("文档 {i} 的内容")).unwrap();
+    }
+    idx
+}
+
+/// **S2-T18** `GraphPersistMode::Strict`：写图失败 → `save` 返回 **Err**（且状态已记录）。
+#[test]
+fn T18_strict模式下图失败升级为Err() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.idx");
+    let mut idx = builder().graph_mode(GraphPersistMode::Strict).build();
+    for i in 0..100 {
+        idx.add(format!("文档 {i} 的内容")).unwrap();
+    }
+    让写图必失败(&path);
+
+    let err = idx
+        .save(&path)
+        .expect_err("Strict 模式下图失败必须升级为 Err");
+    assert!(!format!("{err}").is_empty(), "错误信息应可读");
+    assert!(
+        matches!(idx.graph_status(), GraphStatus::PersistFailed(_)),
+        "即便返回 Err 也应记录图状态，实测 {:?}",
+        idx.graph_status()
+    );
+}
+
+/// **S2-T19** 默认（`Lenient`）：写图失败 → **快照照常落盘**，`save` 返回 Ok，
+/// 状态为 `GraphStatus::PersistFailed`（P0-3 的核心语义：缓存坏了不能否决主数据）。
+#[test]
+fn T19_lenient模式下图失败不阻断save() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.idx");
+    let mut idx = 内存库(100);
+    让写图必失败(&path);
+
+    idx.save(&path).expect("图是缓存，写图失败不该让 save 失败");
+    assert!(path.exists(), "快照必须完整落盘");
+    assert!(
+        matches!(idx.graph_status(), GraphStatus::PersistFailed(_)),
+        "应如实记录写图失败（而非伪装成 Rebuilt），实测 {:?}",
+        idx.graph_status()
+    );
+    // 快照本身仍可加载（走降级重建）
+    let loaded = builder().load(&path).unwrap();
+    assert!(matches!(loaded.graph_status(), GraphStatus::Rebuilt(_)));
+    assert_eq!(topk(loaded, "文档 2", 10).len(), 10);
+}
+
+/// **S2-T20** `without_graph_persist()`：写侧不落图、读侧不碰图。
+#[test]
+fn T20_without_graph_persist不落图也不读图() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.idx");
+    let mut idx = builder().without_graph_persist().build();
+    for i in 0..100 {
+        idx.add(format!("文档 {i} 的内容")).unwrap();
+    }
+    idx.save(&path).unwrap();
+
+    let paths = helix_core::storage::graph_paths(&path);
+    assert!(!paths.graph.exists(), "不应落图拓扑");
+    assert!(!paths.manifest.exists(), "不应发布 manifest");
+    assert!(matches!(idx.graph_status(), GraphStatus::NotApplicable));
+    assert_eq!(
+        idx.graph_dump_elapsed(),
+        None,
+        "未发生图落盘 ⇒ 应为 None 而不是 0ms"
+    );
+
+    // 读侧：即便存在一份合法 sidecar 也不该去读，且必须说出原因
+    let with_graph = dir.path().join("g.idx");
+    let mut idx2 = 内存库(100);
+    idx2.save(&with_graph).unwrap();
+    let loaded = builder().without_graph_persist().load(&with_graph).unwrap();
+    assert!(
+        matches!(loaded.graph_status(), GraphStatus::Rebuilt(r) if r.contains("已关闭")),
+        "关闭持久化时读侧应显式说明原因，实测 {:?}",
+        loaded.graph_status()
+    );
+}
+
+/// **S2-T21** `graph_dump_elapsed()`：真的落图时 `Some`，从未落图时 `None`。
+#[test]
+fn T21_graph_dump_elapsed语义() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut idx = 内存库(100);
+    idx.save(&dir.path().join("u.idx")).unwrap();
+    assert!(
+        idx.graph_dump_elapsed().is_some(),
+        "走了图持久化 ⇒ 应为 Some"
+    );
+    assert!(matches!(idx.graph_status(), GraphStatus::Loaded));
+
+    // 纯 BM25（无向量）⇒ 从未发生图落盘
+    let bm25_path = dir.path().join("bm25.idx");
+    let mut b = SearchIndexBuilder::default()
+        .embedder(None)
+        .vector_backend(VectorBackend::Hnsw)
+        .build();
+    b.add("纯文本无向量").unwrap();
+    b.save(&bm25_path).unwrap();
+    assert_eq!(b.graph_dump_elapsed(), None);
+    assert!(matches!(b.graph_status(), GraphStatus::NotApplicable));
 }

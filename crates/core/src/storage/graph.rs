@@ -39,9 +39,24 @@ pub const MANIFEST_VERSION: u32 = 1;
 /// 自有距离标识（C7 / R20）：与 Rust 类型路径解耦，语义变更时显式升版。
 pub const DIST_ID: &str = "dot-clamped-v1";
 
-/// 平台指纹（C4）：裸 f32 + 原生端序 ⇒ 图 sidecar 不可跨平台搬运。
-/// 当前只区分「little-endian / 64-bit 指针宽」一种组合；其他组合读到即降级。
+/// 平台指纹取值之一：**little-endian + 64-bit 指针宽**。
 pub const PLATFORM_LE64: u32 = 0x01;
+/// 平台指纹取值之一：其他组合（大端 / 32-bit 指针宽）。
+pub const PLATFORM_OTHER: u32 = 0x02;
+
+/// 当前构建的平台指纹（C4）：裸 f32 + 原生端序 ⇒ 图 sidecar 不可跨平台搬运。
+///
+/// ⚠️ **必须由构建目标派生，不能硬编码**。`hnsw_rs` 落盘用 `to_ne_bytes()`（原生端序），
+/// 并且用 `from_raw_parts` 裸拷贝 f32，图文件本身就是 native-endian。若这里写死
+/// `PLATFORM_LE64`，大端 / 32-bit 构建**同样写 0x01、同样接受 0x01** ⇒ CRC 全对、
+/// platform 相符，却加载出字节序错误的向量，得到**静默错误的检索结果**——
+/// 正是本 PR 要消灭的失败模式（评审 #12 发现 1：`cfg!` 在 const 上下文可用，代价为零）。
+pub const PLATFORM_FINGERPRINT: u32 =
+    if cfg!(target_endian = "little") && cfg!(target_pointer_width = "64") {
+        PLATFORM_LE64
+    } else {
+        PLATFORM_OTHER
+    };
 
 /// `hnsw_rs` 自行追加的图拓扑文件后缀（仅用于**拼路径**，禁止拼进 basename）。
 pub const GRAPH_SUFFIX: &str = "hnsw.graph";
@@ -65,17 +80,34 @@ pub struct GraphPaths {
 ///
 /// 例：`/data/foo.idx` → `"foo.idx"`（不是 `"foo.idx.hnsw"`！）。
 /// 这是 P0-1 抓到的双后缀 bug 的唯一防线，全 crate 禁止手拼。
-pub fn graph_basename(snapshot: &Path) -> String {
+/// 由快照路径推算 basename（`"foo.idx"`——**不追加任何后缀**，P0-1）。
+///
+/// ⚠️ 调用方必须保证 `snapshot` 有文件名：拿不到时无法凭空造一个，
+/// 否则 sidecar 会写到 `dir/index.idx.hnsw.*` 这种与快照无关的位置。
+/// 两个入口（`SearchIndex::save` / 读侧 `try_load_graph`）已统一拦截。
+pub fn graph_basename(snapshot: &Path) -> Option<String> {
     snapshot
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "index.idx".to_string())
+}
+
+/// 快照路径必须有文件名——否则图 sidecar 无处安放（评审 #12 nit）。
+///
+/// 写侧与读侧共用，避免 `graph_basename` 静默回退成一个拼错的 basename。
+pub fn require_file_name(snapshot: &Path) -> Result<()> {
+    if snapshot.file_name().is_none() {
+        return Err(Error::VectorGraph(format!(
+            "快照路径缺少文件名，无法定位图 sidecar: {}",
+            snapshot.display()
+        )));
+    }
+    Ok(())
 }
 
 /// 由快照路径推算 sidecar 三件套路径。
 pub fn graph_paths(snapshot: &Path) -> GraphPaths {
     let dir = snapshot.parent().unwrap_or_else(|| Path::new("."));
-    let base = graph_basename(snapshot);
+    let base = graph_basename(snapshot).unwrap_or_default();
     GraphPaths {
         graph: dir.join(format!("{base}.{GRAPH_SUFFIX}")),
         data: dir.join(format!("{base}.{DATA_SUFFIX}")),
@@ -167,7 +199,14 @@ pub fn read_manifest(path: &Path) -> Result<Option<GraphManifest>> {
     if &header[0..8] != MAGIC_GMAN {
         return Ok(None);
     }
-    let _version = u32::from_le_bytes(header[8..12].try_into().expect("4 字节"));
+    // header 版本**先比对再解码**（评审 #12 发现 4）：bincode 2 的
+    // `decode_from_slice` 会忽略尾部剩余字节，未来版本若重排/前置字段，
+    // v1 读取方会先解出垃圾再撞上 body 里的 `manifest_version` 检查——
+    // 结果仍是降级，但那是靠运气。header 里就有一份版本，直接用它。
+    let version = u32::from_le_bytes(header[8..12].try_into().expect("4 字节"));
+    if version != MANIFEST_VERSION {
+        return Ok(None);
+    }
     let expected_crc = u32::from_le_bytes(header[12..16].try_into().expect("4 字节"));
 
     // 正文 + CRC 校验（绝不静默读错）
@@ -261,7 +300,7 @@ mod tests {
             producer: "helix-core-test".to_string(),
             graph_format: 4, // N1：读回值（落盘 magic 是 MAGICDESCR_4）
             dist_id: DIST_ID.to_string(),
-            platform: PLATFORM_LE64,
+            platform: PLATFORM_FINGERPRINT,
             max_nb_connection: 32,
             ef_construction: 300,
             snapshot_crc: 0xDEAD_BEEF,
@@ -343,10 +382,24 @@ mod tests {
     /// P0-1 的核心防回归：basename 必须是快照**文件名全名**。
     #[test]
     fn basename是快照全名() {
-        assert_eq!(graph_basename(Path::new("/data/foo.idx")), "foo.idx");
-        assert_eq!(graph_basename(Path::new("foo.idx")), "foo.idx");
+        assert_eq!(
+            graph_basename(Path::new("/data/foo.idx")),
+            Some("foo.idx".to_string())
+        );
+        assert_eq!(
+            graph_basename(Path::new("foo.idx")),
+            Some("foo.idx".to_string())
+        );
         // ⚠️ 绝不能返回 "foo.idx.hnsw"
-        assert_ne!(graph_basename(Path::new("/data/foo.idx")), "foo.idx.hnsw");
+        assert_ne!(
+            graph_basename(Path::new("/data/foo.idx")),
+            Some("foo.idx.hnsw".to_string())
+        );
+        // 无文件名时**不回退**假 basename（评审 #12 nit）——交由入口报错
+        assert_eq!(graph_basename(Path::new("/")), None);
+        assert_eq!(graph_basename(Path::new("..")), None);
+        assert!(require_file_name(Path::new("/")).is_err());
+        assert!(require_file_name(Path::new("/data/foo.idx")).is_ok());
     }
 
     #[test]
@@ -364,7 +417,10 @@ mod tests {
         // 无目录前缀时 parent() 得到空路径，join 后仍是相对名（行为与实现一致）
         let p = graph_paths(Path::new("foo.idx"));
         assert_eq!(p.graph, PathBuf::from("foo.idx.hnsw.graph"));
-        assert_eq!(graph_basename(Path::new("foo.idx")), "foo.idx");
+        assert_eq!(
+            graph_basename(Path::new("foo.idx")),
+            Some("foo.idx".to_string())
+        );
     }
 
     #[test]

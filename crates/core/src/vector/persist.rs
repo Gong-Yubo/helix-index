@@ -87,21 +87,13 @@ pub trait VectorGraphPersist: VectorIndex {
 impl VectorGraphPersist for HnswRsIndex {
     fn dump_graph(&self, base: &Path) -> Result<GraphStats> {
         let dir = base.parent().unwrap_or_else(|| Path::new("."));
-        let basename = graph_basename(base); // "foo.idx"——不追加任何后缀（P0-1）
+        // "foo.idx"——不追加任何后缀（P0-1）。入口已校验路径有文件名。
+        let basename = graph_basename(base)
+            .ok_or_else(|| Error::VectorGraph(format!("快照路径缺少文件名: {}", base.display())))?;
 
-        // N2：load_hnsw 构造的 Hnsw 无条件 datamap_opt=true，file_dump 拒绝
-        // 覆盖旧 .hnsw.data、改写随机后缀文件名。先删旧图文件再 dump。
-        // （图是缓存，删除最坏降级重建；manifest 由调用方随后原子发布。）
-        let paths = graph_paths(base);
-        for p in [&paths.graph, &paths.data] {
-            match std::fs::remove_file(p) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(Error::VectorGraph(e.to_string())),
-            }
-        }
-
-        // 前置：目录存在且可写（缩小 DumpInit::new panic_any 的 TOCTOU 窗口）
+        // 前置：目录存在且可写（缩小 DumpInit::new panic_any 的 TOCTOU 窗口）。
+        // **必须先于删除旧图**（评审 #12 发现 5）：目录只读时若先删，旧缓存已被
+        // 销毁才探测失败，本可命中的缓存白白丢失；先探测则原样保留。
         let probe = dir.join(".helix-graph-dump-probe");
         match std::fs::write(&probe, b"") {
             Ok(()) => {
@@ -112,6 +104,18 @@ impl VectorGraphPersist for HnswRsIndex {
                     "图 dump 目录不可写 {}: {e}",
                     dir.display()
                 )))
+            }
+        }
+
+        // N2：load_hnsw 构造的 Hnsw 无条件 datamap_opt=true，file_dump 拒绝
+        // 覆盖旧 .hnsw.data、改写随机后缀文件名。先删旧图文件再 dump。
+        // （图是缓存，删除最坏降级重建；manifest 由调用方随后原子发布。）
+        let paths = graph_paths(base);
+        for p in [&paths.graph, &paths.data] {
+            match std::fs::remove_file(p) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(Error::VectorGraph(e.to_string())),
             }
         }
 
@@ -137,7 +141,11 @@ impl VectorGraphPersist for HnswRsIndex {
 
     fn load_graph(base: &Path, _m: &GraphManifest, ef_search: usize) -> Result<Self> {
         let dir = base.parent().unwrap_or_else(|| Path::new("."));
-        let basename = graph_basename(base); // 同 dump——不加 .hnsw（P0-1）
+        let basename =
+            graph_basename(base) // 同 dump——不加 .hnsw（P0-1）
+                .ok_or_else(|| {
+                    Error::VectorGraph(format!("快照路径缺少文件名: {}", base.display()))
+                })?;
 
         // 生命周期（C6）：`HnswIo` 必须活得比 `Hnsw` 长，而我们要
         // `Hnsw<'static, ..>` ⇒ 只有 Box::leak 一条路。
@@ -272,7 +280,7 @@ mod tests {
             producer: "test".into(),
             graph_format: stats.graph_format,
             dist_id: crate::storage::DIST_ID.into(),
-            platform: crate::storage::PLATFORM_LE64,
+            platform: crate::storage::PLATFORM_FINGERPRINT,
             max_nb_connection: stats.max_nb_connection,
             ef_construction: stats.ef_construction,
             snapshot_crc: 0,
@@ -312,7 +320,7 @@ mod tests {
             producer: "test".into(),
             graph_format: 4,
             dist_id: crate::storage::DIST_ID.into(),
-            platform: crate::storage::PLATFORM_LE64,
+            platform: crate::storage::PLATFORM_FINGERPRINT,
             max_nb_connection: 32,
             ef_construction: 300,
             snapshot_crc: 0,
@@ -360,7 +368,7 @@ mod tests {
             producer: "test".into(),
             graph_format: 4,
             dist_id: crate::storage::DIST_ID.into(),
-            platform: crate::storage::PLATFORM_LE64,
+            platform: crate::storage::PLATFORM_FINGERPRINT,
             max_nb_connection: 32,
             ef_construction: 300,
             snapshot_crc: 0,
@@ -416,7 +424,7 @@ mod tests {
             producer: "test".into(),
             graph_format: 4,
             dist_id: crate::storage::DIST_ID.into(),
-            platform: crate::storage::PLATFORM_LE64,
+            platform: crate::storage::PLATFORM_FINGERPRINT,
             max_nb_connection: 32,
             ef_construction: 300,
             snapshot_crc: 0,

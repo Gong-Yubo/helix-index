@@ -18,7 +18,8 @@ mod snapshot;
 
 pub use codec::{FORMAT_VERSION, MAGIC};
 pub use graph::{
-    file_crc32_len, graph_basename, graph_paths, read_manifest, remove_sidecars,
-    write_manifest_atomic, GraphManifest, GraphPaths, DIST_ID, MANIFEST_VERSION, PLATFORM_LE64,
+    file_crc32_len, graph_basename, graph_paths, read_manifest, remove_sidecars, require_file_name,
+    write_manifest_atomic, GraphManifest, GraphPaths, DIST_ID, MANIFEST_VERSION,
+    PLATFORM_FINGERPRINT, PLATFORM_LE64, PLATFORM_OTHER,
 };
 pub use snapshot::{load, load_with_crc, save, save_with_crc, ConfigFingerprint};
