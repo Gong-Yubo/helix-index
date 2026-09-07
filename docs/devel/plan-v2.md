@@ -60,7 +60,7 @@
 | --- | --- | --- | --- |
 | Q-C1 | **删除后向量残留（幽灵候选）**：`Index::remove` 不回滚向量索引；`is_live_chunk` 定义了未调用 → 已删 chunk 占 Top-K 名额、召回静默下降、图膨胀 | `index/mod.rs:173`、`vector/mod.rs`、`retriever/vector.rs` | 高（正确性） |
 | Q-C2 | 墓碑 chunk 永久保留，不物理回收 | `index/forward.rs` | 中（资源） |
-| Q-C3 | 快照落盘无原子性，崩溃损坏 | `storage/snapshot.rs` | 中（正确性） |
+| Q-C3 | 快照落盘无原子性，崩溃损坏 | `storage/snapshot.rs` | **高（正确性）** —— ⚠️ V2 Step 2 重新定级（原「中」）：图进入 `save()` 后「快照」由单文件变多文件，多文件间无原子性 ⇒ **图新/快照旧的版本错配**属正确性风险，见 `v2-step2-design.md` §1（Q-C3 部分） |
 | Q-P1 | NFR-03 构建 225.5s 未达标（ort ~51 条/s） | `eval-report.md` 8.2 | 中 |
 | Q-P2 | NFR-04 冷启动图重建 11.57s（图不持久化，D7） | `eval-report.md` 8.3 | 中 → **✅ 已解决**（V2 Step 2 / ADR-A，实测完整冷启动 ≈100ms） |
 | Q-P3 | 图重建抖动 R-P5-13（NDCG 极差 0.0024） | `eval-report.md` 3.4 | 低 → **✅ 已解决**（图落盘即冻结拓扑，同快照两次加载逐位一致） |
@@ -170,10 +170,16 @@
 - **风险**：低（API 已源码核实；开工前复核另发现两项：Description 落盘 magic 实为 4、重载图 datamap_opt=true 拒绝覆盖旧文件——对策均已成文，见设计文档「开工前复核记录」）。
 - **量级**：M。
 
-> **状态（2026-09-06）：实施完成，等待合并。** S2-01~S2-12 全部落地，守门全绿
+> **状态（2026-09-07 更新）：✅ 已完成并合并进 `main`。**
+> main 提交链：`68074c9`（#12 core 图持久化）→ `e9ac2b0`（#15，源自 #13：CLI/bench 接线 + 并行建图）
+> → `15c1900`（#16，源自 #14：文档回写 + 12K 实测入库）→ `1e51156`（#17：S2-T6 oracle 断言改多 query 均值，修 flaky）。
+> `main` 的 CI 全绿，issue #3 已关闭，8 项验收全绿。
+> ⚠️ **踩过的坑**：原 #13/#14 的 base 是各自的堆叠分支，GitHub 显示 `MERGED` 但内容**从未进 main**，
+> 最终靠 cherry-pick 两个 squash 提交、重建 base=main 的 PR 才真正落地 ⇒ **堆叠 PR 的 base 一律设 main**。
+>
+> S2-01~S2-12 全部落地，守门全绿
 > （fmt / clippy `-D warnings` / **213 测试** / MSRV 1.90 / `RUSTDOCFLAGS="-D warnings" cargo doc` / `--no-default-features` /
-> `--features charabia` / cargo-deny）。分三个 PR：#12（core 图持久化）、
-> #13（CLI/bench 接线 + 并行建图）、文档回写。
+> `--features charabia` / cargo-deny）。
 >
 > **12K 实测（`data/t2-corpus.jsonl`，release，macOS aarch64）**：
 >
@@ -325,9 +331,9 @@
 
 | 步骤 | 任务 | 状态 |
 | --- | --- | --- |
-| Step 1 | T7-07 向量墓碑 + 存活过滤 | ⬜ |
-| Step 1 | T7-08 过滤下推 + 字段索引 | ⬜ |
-| Step 2 | T7-05 图持久化 + 并行建图 | ⬜ |
+| Step 1 | T7-07 向量墓碑 + 存活过滤 | ✅ 已完成（2026-09-05，PR #6 → `61e3dac`） |
+| Step 1 | T7-08 过滤下推 + 字段索引 | ✅ 已完成（2026-09-05，PR #6 → `61e3dac`） |
+| Step 2 | T7-05 图持久化 + 并行建图 | ✅ 已完成（2026-09-07，PR #12/#15/#16/#17 → `68074c9`/`e9ac2b0`/`15c1900`/`1e51156`） |
 | Step 3 | T7-13 原子快照 | ⬜ |
 | Step 4 | T7-09 embed 并行 | ⬜ |
 | Step 4 | T7-11 增量构建 | ⬜ |
