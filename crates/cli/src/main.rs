@@ -56,6 +56,10 @@ struct BuildArgs {
     /// 每段落强制单 chunk（评测口径：段落级标注防多 chunk 双计，NFR-03 对齐"1 万 chunk"）
     #[arg(long)]
     single_chunk: bool,
+    /// 不落图 sidecar（V2 Step 2 逃生舱：写库但不持久化 HNSW 图，
+    /// 省约 1.6× 磁盘，代价是下次冷启动重建图 —— 磁盘紧张 / 排查图问题用）
+    #[arg(long)]
+    no_graph_persist: bool,
 }
 
 #[derive(clap::Args)]
@@ -269,6 +273,10 @@ fn build(args: BuildArgs) -> Result<()> {
     if !args.vectors {
         builder = builder.embedder(None);
     }
+    // V2 Step 2：图持久化逃生舱（磁盘紧张 / 排查图问题时不落图）
+    if args.no_graph_persist {
+        builder = builder.without_graph_persist();
+    }
     let mut index = builder.build();
 
     // 读语料 → 批量摄入（倒排 + 写缓冲；向量延后到 commit）
@@ -297,6 +305,7 @@ fn build(args: BuildArgs) -> Result<()> {
         );
     }
 
+    let t_save = std::time::Instant::now();
     index.save(&out)?;
     println!(
         "  快照已写入 {}（{}，{}）耗时 {:?}",
@@ -307,8 +316,38 @@ fn build(args: BuildArgs) -> Result<()> {
             "纯文本"
         },
         humansize(&out),
+        t_save.elapsed()
+    );
+    println!(
+        "  总耗时 {:?}（含 embed / 落盘 / 图 dump）",
         started.elapsed()
     );
+
+    // V2 Step 2：图 sidecar 落盘观测（S2-08；体积增量 / 点数 / dump 耗时，验收 7 数据来源）
+    if let Some(dump) = index.graph_dump_elapsed() {
+        println!("  图 sidecar dump 耗时 {dump:?}（纯落盘，不含 HNSW 建图）");
+    }
+    if args.vectors && !args.no_graph_persist {
+        let paths = helix_core::storage::graph_paths(&out);
+        if let Ok(Some(m)) = helix_core::storage::read_manifest(&paths.manifest) {
+            let graph_bytes = m.graph_len + m.data_len;
+            println!(
+                "  图 sidecar 落盘 {} 点 / {:.1} MB（graph {:.1} MB + data {:.1} MB；\
+                 快照 {:.1} MB，磁盘增量 {:.1}×）",
+                m.nb_point,
+                graph_bytes as f64 / (1024.0 * 1024.0),
+                m.graph_len as f64 / (1024.0 * 1024.0),
+                m.data_len as f64 / (1024.0 * 1024.0),
+                m.snapshot_len as f64 / (1024.0 * 1024.0),
+                (m.snapshot_len + graph_bytes) as f64 / m.snapshot_len.max(1) as f64,
+            );
+        } else {
+            println!(
+                "  图 sidecar 未落盘（纯 BM25 / Brute 后端，或落盘失败——见上方警告；\
+                 下次加载将走降级重建）"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -376,6 +415,22 @@ fn search(args: SearchArgs) -> Result<()> {
             let index = SearchIndex::load(idx_path)
                 .with_context(|| format!("加载快照失败: {}", idx_path.display()))?;
             eprintln!("[快照加载 {} 耗时 {:?}]", idx_path.display(), t.elapsed());
+            // V2 Step 2：图 sidecar 状态（NFR-07 —— 降级不能静默，必须显式可见）
+            match index.graph_status() {
+                helix_core::search::GraphStatus::Loaded => {
+                    eprintln!("[向量图加载：持久化图（快路径）]")
+                }
+                helix_core::search::GraphStatus::Rebuilt(reason) => eprintln!(
+                    "[向量图加载：⚠️ 降级重建（原因：{reason}）—— 冷启动会变慢，\
+                     重建耗时已计入上方「快照加载」]"
+                ),
+                helix_core::search::GraphStatus::NotApplicable => {
+                    eprintln!("[向量图加载：不适用（Brute 后端 / 纯 BM25 / 已关闭持久化）]")
+                }
+                helix_core::search::GraphStatus::PersistFailed(reason) => eprintln!(
+                    "[向量图落盘：⚠️ 失败（原因：{reason}）—— 快照本身完好，下次加载会重建图]"
+                ),
+            }
             index.into_searcher()?
         }
         (None, Some(input)) => {

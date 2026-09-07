@@ -6,13 +6,17 @@
 #
 #   NFR-02 延迟   —— bench 阶段 B（bare embedder，6400 样本/模式）
 #   NFR-03 构建   —— build --vectors --single-chunk 的 embed 分段计时
-#   NFR-04 冷启动 —— 快照加载 与 HNSW 图重建**分别计时**（design 10.2 要求勿混）
+#   NFR-04 冷启动 —— 快照加载 + 图 sidecar 加载（V2 Step 2 起图已持久化），
+#                    与「图重建」降级路径**分别计时**（design 10.2 要求勿混）
 #   NFR-05 内存   —— peak RSS（整进程）与向量分量（推算）**两个口径分开报告**
 #
 # 用法：
 #   ./scripts/eval_perf.sh              # 全流程（含 embed ~230s）
 #   ./scripts/eval_perf.sh --skip-build # 跳过 NFR-03（已有快照时）
 #   NOTES=1 ./scripts/eval_perf.sh      # 打印口径说明
+#
+# 依赖：bash / **python3**（单位换算与浮点比较，共 4 处）/ GNU time 风格的外置
+# `/usr/bin/time -l`（仅 NFR-05 内存口径需要；macOS 自带，Linux 需 time 包）。
 #
 set -euo pipefail
 
@@ -40,8 +44,12 @@ NFR-05 有两个**不同**口径，不可混为一谈：
     实测方式：/usr/bin/time -l helix search --index <含向量快照> --mode hybrid "query"
   - 向量分量（24.6MB）= 12000 × 512 维 × 4B，**由维度推算**，不是进程指标
 
-NFR-04 同样两口径：快照加载（storage::load）与 HNSW 图重建必须分别报，
-因为图不持久化（D7），图重建才是冷启动的大头。
+NFR-04 自 V2 Step 2 起有三个**不同**口径，不可混为一谈：
+  - 快照加载（storage::load）：读 .idx 正文 + 重建位图/字段索引
+  - 图 sidecar 加载（load_graph_checked）：CRC 校验 + 读 .hnsw.graph/.hnsw.data
+    —— 两者相加 =「完整冷启动」，这才是 NFR-04 的达标口径（< 2s）
+  - 图重建（降级路径）：sidecar 缺失/损坏/版本不符时才走，是**未达标**时的兜底数字
+    图持久化之前（D7）它就是冷启动大头（12K 约 11.6s）。
 
 延迟/内存数字在 CI 共享 runner 上不具可引用性，本脚本用于**本地**实测。
 EOF
@@ -88,14 +96,41 @@ fi
 
 # ---------------------------------------------------------------- NFR-04
 echo
-echo "==> [NFR-04] 冷启动（快照加载 / HNSW 图重建 分别计时）"
+echo "==> [NFR-04] 冷启动（快照加载 / 图 sidecar 加载 分别计时）"
 cold=$("$BIN" bench --index "$SNAPSHOT" --queries "$QUERIES" \
         --modes bm25,vector --no-latency 2>&1)
 echo "$cold" | sed 's/^/    /'
-load_line=$(echo "$cold"   | grep -oE '快照加载 耗时 [0-9.]+m?s' || true)
-graph_line=$(echo "$cold"  | grep -oE 'HNSW 图重建 [0-9]+ 条 耗时 [0-9.]+s' || true)
-add "NFR-04|快照加载|${load_line:-n/a}|目标 <2s|$([[ -n "$load_line" ]] && echo 达标 || echo 见上)"
-add "NFR-04|HNSW 图重建|${graph_line:-n/a}|图不持久化（D7）|未达秒级"
+# 三段口径：快照加载 / 图 sidecar 加载（快路径）/ 图重建（降级路径，期望不出现）
+# ⚠️ 单位必须覆盖 µs：`{:?}` 打印 Duration 时，小索引/快机器上就是 µs 级
+#（实测 30 文档库输出 "耗时 591.416µs"）。只写 `m?s` 会**抓不到**，
+# 既把快路径误报成「未走快路径」，又让完整冷启动少算图加载 ⇒ NFR-04 假达标
+#（评审 #13 发现 2）。
+load_line=$(echo "$cold"  | grep -oE '快照加载 耗时 [0-9.]+(ms|s|µs|us)' || true)
+graph_load=$(echo "$cold" | grep -oE '图从 sidecar 加载成功 耗时 [0-9.]+(ms|s|µs|us)' || true)
+graph_rebuild=$(echo "$cold" | grep -oE 'HNSW 图重建 [0-9]+ 条 耗时 [0-9.]+(ms|s|µs|us)' || true)
+
+# 完整冷启动 = 快照加载 + 图加载，单位统一成 ms 后与目标 2000ms 比较
+cold_ms=$(python3 -c "
+import re,sys
+def ms(s):
+    if s is None: return None
+    m = re.search(r'([0-9.]+)(ms|s|µs|us)\$', s.strip())
+    if not m: return None
+    v, u = float(m.group(1)), m.group(2)
+    return v if u == 'ms' else v*1000 if u == 's' else v/1000
+parts = [ms('''${load_line#快照加载 耗时 }'''), ms('''${graph_load#图从 sidecar 加载成功 耗时 }''')]
+parts = [p for p in parts if p is not None]
+print(f'{sum(parts):.1f}' if parts else '')
+")
+if [[ -n "$cold_ms" ]]; then
+    ok=$(python3 -c "print('达标' if float('$cold_ms') < $NFR04_TARGET else '未达标')")
+    add "NFR-04|完整冷启动（快照+图）|${cold_ms}ms|目标 <${NFR04_TARGET}ms|$ok"
+else
+    add "NFR-04|完整冷启动（快照+图）|n/a|目标 <${NFR04_TARGET}ms|见上"
+fi
+add "NFR-04|快照加载|${load_line:-n/a}|目标 <2s|分项"
+add "NFR-04|图 sidecar 加载|${graph_load:-未走快路径}|图已持久化|分项"
+add "NFR-04|图重建（降级）|${graph_rebuild:-未触发（快路径生效）}|仅降级时出现|分项"
 
 # ---------------------------------------------------------------- NFR-02
 echo

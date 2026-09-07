@@ -319,9 +319,11 @@ pub fn run(args: BenchArgs) -> Result<()> {
     for run_i in 1..=runs {
         if run_i > 1 {
             if let Some(backend_slot) = &mut setup.backend {
-                // 重建 HNSW 图：模拟跨进程（hnsw_rs 用 OS 熵，每次图不同）
+                // 重建 HNSW 图：模拟跨进程（hnsw_rs 用 OS 熵，每次图不同）。
+                // **刻意传 None 跳过图 sidecar**：本处就是要制造跨进程差异以观测
+                // R-P5-13 抖动；若读图则每轮结果完全相同，`--runs` 失去意义
                 if matches!(backend_slot, VectorBackend::Hnsw(_)) {
-                    *backend_slot = build_backend(&setup.vectors, &args)?;
+                    *backend_slot = build_backend(&setup.vectors, &args, None)?;
                 }
             }
         }
@@ -544,12 +546,15 @@ fn build_analyzer(args: &BenchArgs) -> Result<Box<dyn Analyzer>> {
 }
 
 fn load_setup(args: &BenchArgs, need_vector: bool) -> Result<Setup> {
+    let mut graph_src: Option<GraphSource> = None;
     let (index, vectors, analyzer) = match (&args.index, &args.input) {
         (Some(path), None) => {
             let t = Instant::now();
-            let (index, vectors, fp) =
-                storage::load(path).with_context(|| format!("加载快照失败: {}", path.display()))?;
+            let (index, vectors, fp, body_crc) = storage::load_with_crc(path)
+                .with_context(|| format!("加载快照失败: {}", path.display()))?;
             println!("[快照加载 耗时 {:?}（NFR-04 口径之一）]", t.elapsed());
+            // 图 sidecar 的来源（V2 Step 2）：图随快照同目录，body_crc 是版本锚点
+            graph_src = Some((path.clone(), body_crc, fp.dim));
             // P11（B1 的 bench 侧修复，评审 P11）：快照记录的 analyzer 指纹与请求的
             // --analyzer 必须一致，不一致报 ConfigMismatch——不再"打印警告并回退 mixed"
             // （回退会让索引/查询两侧分词器不一致，是 R4 正确性事故）。
@@ -613,7 +618,7 @@ fn load_setup(args: &BenchArgs, need_vector: bool) -> Result<Setup> {
     }
 
     let backend = if need_vector {
-        Some(build_backend(&vectors, args)?)
+        Some(build_backend(&vectors, args, graph_src.as_ref())?)
     } else {
         None
     };
@@ -628,14 +633,59 @@ fn load_setup(args: &BenchArgs, need_vector: bool) -> Result<Setup> {
     })
 }
 
-fn build_backend(vectors: &[(ChunkId, Vec<f32>)], args: &BenchArgs) -> Result<VectorBackend> {
+/// 可选的图 sidecar 来源：`(快照路径, 快照正文 CRC, dim)`。
+///
+/// 仅 `--index` 路径有值（图随快照同目录，P1-6）；`--input` 内存直建路径为 `None`
+/// —— bench 关注检索延迟，冷启动已在 S2-T14 单独测，故内存直建维持重建并打印提示。
+type GraphSource = (std::path::PathBuf, u32, u32);
+
+fn build_backend(
+    vectors: &[(ChunkId, Vec<f32>)],
+    args: &BenchArgs,
+    graph_src: Option<&GraphSource>,
+) -> Result<VectorBackend> {
     match args.vector_index.as_str() {
         "hnsw" => {
-            let t = Instant::now();
-            let mut idx = HnswRsIndex::with_capacity(vectors.len().max(1024));
-            if let Some(ef) = args.ef_search {
-                idx = idx.with_ef_search(ef);
+            let ef = args.ef_search.unwrap_or(HnswRsIndex::default_ef_search());
+            // V2 Step 2（D-S2-06）：优先从图 sidecar 加载，失败才重建。
+            // 校验逻辑与门面层共用 `load_graph_checked`（禁止在此复制校验）。
+            if let Some((base, body_crc, dim)) = graph_src {
+                // 图加载**单独计时**：NFR-04 的「完整冷启动」= 快照加载 + 图加载，
+                // 两者都持久化后应远小于图重建。与 10.2「勿混口径」一致。
+                let t = Instant::now();
+                let loaded = helix_core::vector::load_graph_checked(
+                    base,
+                    *body_crc,
+                    *dim,
+                    vectors.len() as u64,
+                    ef,
+                    false, // bench 只读：加载后不继续写入，并行开关无意义
+                );
+                match loaded {
+                    Ok(idx) => {
+                        eprintln!(
+                            "[HNSW 图从 sidecar 加载成功 耗时 {:?}（冷启动快路径；\
+                             NFR-04 口径之二；消 R-P5-13 图抖动）]",
+                            t.elapsed()
+                        );
+                        return Ok(VectorBackend::Hnsw(idx));
+                    }
+                    Err(reason) => {
+                        eprintln!(
+                            "[HNSW 图 sidecar 不可用（{reason}），降级重建（冷启动会变慢）；\
+                             校验耗时 {:?}]",
+                            t.elapsed()
+                        )
+                    }
+                }
+            } else {
+                eprintln!(
+                    "[HNSW 图：内存直建路径（--input）无快照可绑图，走重建；\
+                     如需测持久化图的冷启动请用 --index]"
+                );
             }
+            let t = Instant::now();
+            let mut idx = HnswRsIndex::with_capacity(vectors.len().max(1024)).with_ef_search(ef);
             for (id, v) in vectors {
                 idx.add(*id, NormalizedVector::new(v.clone()))?;
             }
