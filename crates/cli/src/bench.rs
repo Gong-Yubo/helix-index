@@ -659,6 +659,7 @@ fn build_backend(
                     *dim,
                     vectors.len() as u64,
                     ef,
+                    false, // bench 只读：加载后不继续写入，并行开关无意义
                 );
                 match loaded {
                     Ok(idx) => {

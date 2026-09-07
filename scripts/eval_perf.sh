@@ -15,6 +15,9 @@
 #   ./scripts/eval_perf.sh --skip-build # 跳过 NFR-03（已有快照时）
 #   NOTES=1 ./scripts/eval_perf.sh      # 打印口径说明
 #
+# 依赖：bash / **python3**（单位换算与浮点比较，共 4 处）/ GNU time 风格的外置
+# `/usr/bin/time -l`（仅 NFR-05 内存口径需要；macOS 自带，Linux 需 time 包）。
+#
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -98,9 +101,13 @@ cold=$("$BIN" bench --index "$SNAPSHOT" --queries "$QUERIES" \
         --modes bm25,vector --no-latency 2>&1)
 echo "$cold" | sed 's/^/    /'
 # 三段口径：快照加载 / 图 sidecar 加载（快路径）/ 图重建（降级路径，期望不出现）
-load_line=$(echo "$cold"  | grep -oE '快照加载 耗时 [0-9.]+m?s' || true)
-graph_load=$(echo "$cold" | grep -oE '图从 sidecar 加载成功 耗时 [0-9.]+m?s' || true)
-graph_rebuild=$(echo "$cold" | grep -oE 'HNSW 图重建 [0-9]+ 条 耗时 [0-9.]+s' || true)
+# ⚠️ 单位必须覆盖 µs：`{:?}` 打印 Duration 时，小索引/快机器上就是 µs 级
+#（实测 30 文档库输出 "耗时 591.416µs"）。只写 `m?s` 会**抓不到**，
+# 既把快路径误报成「未走快路径」，又让完整冷启动少算图加载 ⇒ NFR-04 假达标
+#（评审 #13 发现 2）。
+load_line=$(echo "$cold"  | grep -oE '快照加载 耗时 [0-9.]+(ms|s|µs|us)' || true)
+graph_load=$(echo "$cold" | grep -oE '图从 sidecar 加载成功 耗时 [0-9.]+(ms|s|µs|us)' || true)
+graph_rebuild=$(echo "$cold" | grep -oE 'HNSW 图重建 [0-9]+ 条 耗时 [0-9.]+(ms|s|µs|us)' || true)
 
 # 完整冷启动 = 快照加载 + 图加载，单位统一成 ms 后与目标 2000ms 比较
 cold_ms=$(python3 -c "

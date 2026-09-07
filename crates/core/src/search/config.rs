@@ -231,6 +231,11 @@ impl SearchIndexBuilder {
     /// **建图拓扑不可复现**（C8）。图落盘后即被冻结，故「同快照两次加载」
     /// 仍逐位一致；但「同一批向量两次建库」不再一致，与 P5/P6 基线的可比性
     /// 会受影响。建议只在基准实测（S2-11 / T13）时打开。
+    ///
+    /// ⚠️ **必须配合 `batch_size >= 1000`**（并行阈值）才真的生效：
+    /// 默认 `batch_size = 64` 时每次 `add_batch` 只有 64 条，会静默回落串行，
+    /// 而「并行 vs 串行质量等价」的测试会退化成「串行 vs 串行」还全绿
+    /// （评审 #13 发现 1）。`HnswRsIndex::parallel_inserts()` 可观测实际分派。
     pub fn parallel_build(mut self, parallel_build: bool) -> Self {
         self.parallel_build = parallel_build;
         self

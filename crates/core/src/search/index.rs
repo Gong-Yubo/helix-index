@@ -11,7 +11,9 @@ use crate::document::{content_hash, DocRecord, Document};
 use crate::error::{Error, Result};
 use crate::index::Index;
 use crate::types::{ChunkId, DocId};
-use crate::vector::{BruteForceIndex, HnswRsIndex, NormalizedVector, VectorIndex};
+use crate::vector::{
+    BruteForceIndex, HnswRsIndex, NormalizedVector, VectorGraphPersist, VectorIndex,
+};
 
 use super::config::{Config, GraphPersistMode, SearchIndexBuilder, VectorBackend};
 
@@ -93,6 +95,7 @@ fn try_load_graph(
     raw_vectors: &[(ChunkId, Vec<f32>)],
     graph: super::config::GraphOpts,
     ef_search: usize,
+    parallel_build: bool,
 ) -> std::result::Result<HnswRsIndex, String> {
     // 逃生舱：--no-graph-persist 时不碰图
     if !graph.persist {
@@ -107,6 +110,7 @@ fn try_load_graph(
         fingerprint.dim,
         raw_vectors.len() as u64,
         ef_search,
+        parallel_build,
     )
 }
 
@@ -580,6 +584,7 @@ impl SearchIndex {
                         &raw_vectors,
                         graph,
                         ef_search,
+                        cfg.parallel_build,
                     ) {
                         Ok(loaded) => {
                             graph_status = GraphStatus::Loaded;
@@ -589,11 +594,18 @@ impl SearchIndex {
                             // 降级：图是缓存，丢弃只影响冷启动耗时
                             warn_graph_degraded(&reason, graph.mode)?;
                             graph_status = GraphStatus::Rebuilt(reason);
+                            // 与 `flush()` 走同一条 `add_batch`：批量路径带
+                            // 并行/串行判定，逐条 add 会绕过它（评审 #13 小项）。
+                            // `parallel_build` 也一并对齐——读端继续写入时
+                            // 的行为必须与写端一致（评审 #13 发现 3）。
                             let mut vi = HnswRsIndex::with_capacity(raw_vectors.len().max(1024))
-                                .with_ef_search(ef_search);
-                            for (id, v) in &raw_vectors {
-                                vi.add(*id, NormalizedVector::new(v.clone()))?;
-                            }
+                                .with_ef_search(ef_search)
+                                .with_parallel_build(cfg.parallel_build);
+                            let entries: Vec<(ChunkId, NormalizedVector)> = raw_vectors
+                                .iter()
+                                .map(|(id, v)| (*id, NormalizedVector::new(v.clone())))
+                                .collect();
+                            vi.add_batch(&entries)?;
                             Box::new(vi) as Box<dyn VectorIndex>
                         }
                     }

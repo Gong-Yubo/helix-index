@@ -427,6 +427,9 @@ fn search(args: SearchArgs) -> Result<()> {
                 helix_core::search::GraphStatus::NotApplicable => {
                     eprintln!("[向量图加载：不适用（Brute 后端 / 纯 BM25 / 已关闭持久化）]")
                 }
+                helix_core::search::GraphStatus::PersistFailed(reason) => eprintln!(
+                    "[向量图落盘：⚠️ 失败（原因：{reason}）—— 快照本身完好，下次加载会重建图]"
+                ),
             }
             index.into_searcher()?
         }

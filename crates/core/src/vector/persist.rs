@@ -79,7 +79,14 @@ pub trait VectorGraphPersist: VectorIndex {
     /// `ef_search` 是**入参**（P0-5）：全 crate 无 `set_ef*`，只能由
     /// `HnswRsIndex` 字段承载。值来自 `SearchIndexBuilder::with_ef_search`
     /// 或默认 `EF_SEARCH = 200`。
-    fn load_graph(base: &Path, m: &GraphManifest, ef_search: usize) -> Result<Self>
+    /// `parallel_build` 是**配置**而非图的属性：图里没有它，但它决定加载后
+    /// 继续写入时 `add_batch` 走不走 rayon，故必须由调用方补齐。
+    fn load_graph(
+        base: &Path,
+        m: &GraphManifest,
+        ef_search: usize,
+        parallel_build: bool,
+    ) -> Result<Self>
     where
         Self: Sized;
 }
@@ -139,7 +146,12 @@ impl VectorGraphPersist for HnswRsIndex {
         })
     }
 
-    fn load_graph(base: &Path, _m: &GraphManifest, ef_search: usize) -> Result<Self> {
+    fn load_graph(
+        base: &Path,
+        _m: &GraphManifest,
+        ef_search: usize,
+        parallel_build: bool,
+    ) -> Result<Self> {
         let dir = base.parent().unwrap_or_else(|| Path::new("."));
         let basename =
             graph_basename(base) // 同 dump——不加 .hnsw（P0-1）
@@ -163,8 +175,11 @@ impl VectorGraphPersist for HnswRsIndex {
             .map_err(|e| Error::VectorGraph(format!("图加载失败: {e}")))?;
 
         // ef_search 由入参带入（P0-5），from_loaded 是字段对兄弟模块可见的
-        // 唯一构造通道（P0-5 后半：字面量构造在 persist.rs 编译不过）
-        Ok(HnswRsIndex::from_loaded(hnsw, ef_search))
+        // 唯一构造通道（P0-5 后半：字面量构造在 persist.rs 编译不过）。
+        // `parallel_build` 同样必须由入参带入：加载后继续 add + flush 走的是
+        // 同一条 `add_batch`，读端若默认 false 会与写端行为不一致
+        // （评审 #13 发现 3）。
+        Ok(HnswRsIndex::from_loaded(hnsw, ef_search, parallel_build))
     }
 }
 
@@ -177,16 +192,20 @@ impl VectorGraphPersist for HnswRsIndex {
 /// - `dim`：`ConfigFingerprint.dim`
 /// - `nb_vectors`：快照中的向量条数（图中点数因墓碑恒 >= 它）
 /// - `ef_search`：加载后回填（P0-5：全 crate 无 `set_ef*`）
+/// - `parallel_build`：加载后继续写入时是否走并行（评审 #13 发现 3）
 ///
 /// 返回 `Err(reason)` 表示应降级重建（图是缓存，丢弃不丢功能）。
-#[allow(clippy::too_many_arguments)]
 pub fn load_graph_checked(
     snapshot: &Path,
     body_crc: u32,
     dim: u32,
     nb_vectors: u64,
     ef_search: usize,
+    parallel_build: bool,
 ) -> std::result::Result<HnswRsIndex, String> {
+    // 步骤 0：路径必须有文件名（评审 #12 nit；读侧与写侧同一约束）
+    crate::storage::require_file_name(snapshot).map_err(|e| e.to_string())?;
+
     // 步骤 3：读 manifest（缺失 / header 错 / CRC 错 / 解码错 → 降级）
     let paths = graph_paths(snapshot);
     let m = match crate::storage::read_manifest(&paths.manifest) {
@@ -202,7 +221,7 @@ pub fn load_graph_checked(
     if m.dist_id != crate::storage::DIST_ID {
         return Err(format!("dist_id 不匹配: {}", m.dist_id));
     }
-    if m.platform != crate::storage::PLATFORM_LE64 {
+    if m.platform != crate::storage::PLATFORM_FINGERPRINT {
         return Err(format!("platform 不匹配: {:#x}", m.platform));
     }
     if m.dim != dim {
@@ -236,8 +255,9 @@ pub fn load_graph_checked(
     validate_graph_description(snapshot, &m).map_err(|e| e.to_string())?;
 
     // 步骤 5：加载（此刻文件已过五道先验）
-    let loaded = <HnswRsIndex as VectorGraphPersist>::load_graph(snapshot, &m, ef_search)
-        .map_err(|e| format!("图加载失败: {e}"))?;
+    let loaded =
+        <HnswRsIndex as VectorGraphPersist>::load_graph(snapshot, &m, ef_search, parallel_build)
+            .map_err(|e| format!("图加载失败: {e}"))?;
 
     // 步骤 6：图中点数恒 >= 原始向量条数（墓碑摘不掉，§4.6）
     if (loaded.len() as u64) < nb_vectors {
@@ -376,7 +396,8 @@ mod tests {
 
         // 预校验 + load
         validate_graph_description(&base, &m).unwrap();
-        let loaded = <HnswRsIndex as VectorGraphPersist>::load_graph(&base, &m, 200).unwrap();
+        let loaded =
+            <HnswRsIndex as VectorGraphPersist>::load_graph(&base, &m, 200, false).unwrap();
         assert_eq!(loaded.len(), 300);
 
         // 同一张图：加载结果的检索必须逐位一致（验收 2 的最小化验证）
@@ -413,7 +434,8 @@ mod tests {
             data_crc: 0,
             data_len: 0,
         };
-        let loaded = <HnswRsIndex as VectorGraphPersist>::load_graph(&base, &m, 200).unwrap();
+        let loaded =
+            <HnswRsIndex as VectorGraphPersist>::load_graph(&base, &m, 200, false).unwrap();
 
         // 关键动作：重载图直接再 dump（模拟 load → add → save）
         loaded.dump_graph(&base).unwrap();
@@ -462,9 +484,9 @@ mod tests {
             data_len: 0,
         };
 
-        let a = <HnswRsIndex as VectorGraphPersist>::load_graph(&base, &m, 50).unwrap();
-        let b = <HnswRsIndex as VectorGraphPersist>::load_graph(&base, &m, 50).unwrap();
-        let c = <HnswRsIndex as VectorGraphPersist>::load_graph(&base, &m, 500).unwrap();
+        let a = <HnswRsIndex as VectorGraphPersist>::load_graph(&base, &m, 50, false).unwrap();
+        let b = <HnswRsIndex as VectorGraphPersist>::load_graph(&base, &m, 50, false).unwrap();
+        let c = <HnswRsIndex as VectorGraphPersist>::load_graph(&base, &m, 500, false).unwrap();
 
         let q = NormalizedVector::new(random_vec(&mut seed));
         assert_eq!(a.search(&q, 10).unwrap(), b.search(&q, 10).unwrap());

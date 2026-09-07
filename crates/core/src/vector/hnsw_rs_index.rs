@@ -63,6 +63,13 @@ pub struct HnswRsIndex {
     ef_search: usize,
     /// 批量插入是否走 `parallel_insert_slice`（D-S2-05：默认关，保确定性）
     parallel_build: bool,
+    /// 实际走 `parallel_insert_slice` 的次数（**可观测性**）。
+    ///
+    /// ⚠️ 光把 `parallel_build` 打开**不代表走了并行**：`add_batch` 每次最多收到
+    /// `batch_size` 条（默认 64），而并行阈值是 1000，两者耦合。没有这个计数，
+    /// 「并行 vs 串行质量等价」的测试会退化成「串行 vs 串行」还全绿
+    /// （评审 #13 发现 1）。
+    parallel_inserts: usize,
 }
 
 impl HnswRsIndex {
@@ -79,6 +86,7 @@ impl HnswRsIndex {
             hnsw,
             ef_search: EF_SEARCH,
             parallel_build: false,
+            parallel_inserts: 0,
         }
     }
 
@@ -98,11 +106,16 @@ impl HnswRsIndex {
     /// 字段对兄弟模块（`vector/persist.rs`）不可见，字面量构造编译不过——
     /// 本构造器是**唯一**通道。`ef_search` 必须由调用方带入：全 crate 无
     /// `set_ef*`，本字段是 ef 的唯一载体。
-    pub(crate) fn from_loaded(hnsw: Hnsw<'static, f32, DistDotClamped>, ef_search: usize) -> Self {
+    pub(crate) fn from_loaded(
+        hnsw: Hnsw<'static, f32, DistDotClamped>,
+        ef_search: usize,
+        parallel_build: bool,
+    ) -> Self {
         Self {
             hnsw,
             ef_search,
-            parallel_build: false,
+            parallel_build,
+            parallel_inserts: 0,
         }
     }
 
@@ -114,6 +127,11 @@ impl HnswRsIndex {
     pub fn with_parallel_build(mut self, parallel_build: bool) -> Self {
         self.parallel_build = parallel_build;
         self
+    }
+
+    /// 实际走 `parallel_insert_slice` 的次数（可观测性：验证并行真的生效）。
+    pub fn parallel_inserts(&self) -> usize {
+        self.parallel_inserts
     }
 
     /// 内部 `Hnsw` 的只读访问（`vector/persist.rs` dump 统计用）。
@@ -161,6 +179,7 @@ impl VectorIndex for HnswRsIndex {
             .map(|(id, v)| (v.as_slice(), *id as usize))
             .collect();
         self.hnsw.parallel_insert_slice(&refs);
+        self.parallel_inserts += 1;
         Ok(())
     }
 
