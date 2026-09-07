@@ -18,7 +18,7 @@ mod point;
 
 pub use brute::BruteForceIndex;
 pub use hnsw_rs_index::HnswRsIndex;
-pub use persist::{validate_graph_description, GraphStats, VectorGraphPersist};
+pub use persist::{load_graph_checked, validate_graph_description, GraphStats, VectorGraphPersist};
 pub use point::NormalizedVector;
 
 use crate::error::Result;

@@ -52,11 +52,24 @@ impl Distance<f32> for DistDotClamped {
     }
 }
 
+/// 并行建图的最小批量（D-S2-05）：低于此值回落串行——任务拆分开销大于收益，
+/// 且小批量下「插入顺序不确定」换不来可观加速。
+const PARALLEL_INSERT_THRESHOLD: usize = 1000;
+
 /// hnsw_rs 实现的向量索引：支持原生增量插入。
 pub struct HnswRsIndex {
     hnsw: Hnsw<'static, f32, DistDotClamped>,
     /// 查询时动态候选列表宽度（P5 前硬编码 200 从未校准；8.6 最小校准注入口）
     ef_search: usize,
+    /// 批量插入是否走 `parallel_insert_slice`（D-S2-05：默认关，保确定性）
+    parallel_build: bool,
+    /// 实际走 `parallel_insert_slice` 的次数（**可观测性**）。
+    ///
+    /// ⚠️ 光把 `parallel_build` 打开**不代表走了并行**：`add_batch` 每次最多收到
+    /// `batch_size` 条（默认 64），而并行阈值是 1000，两者耦合。没有这个计数，
+    /// 「并行 vs 串行质量等价」的测试会退化成「串行 vs 串行」还全绿
+    /// （评审 #13 发现 1）。
+    parallel_inserts: usize,
 }
 
 impl HnswRsIndex {
@@ -72,6 +85,8 @@ impl HnswRsIndex {
         Self {
             hnsw,
             ef_search: EF_SEARCH,
+            parallel_build: false,
+            parallel_inserts: 0,
         }
     }
 
@@ -91,8 +106,32 @@ impl HnswRsIndex {
     /// 字段对兄弟模块（`vector/persist.rs`）不可见，字面量构造编译不过——
     /// 本构造器是**唯一**通道。`ef_search` 必须由调用方带入：全 crate 无
     /// `set_ef*`，本字段是 ef 的唯一载体。
-    pub(crate) fn from_loaded(hnsw: Hnsw<'static, f32, DistDotClamped>, ef_search: usize) -> Self {
-        Self { hnsw, ef_search }
+    pub(crate) fn from_loaded(
+        hnsw: Hnsw<'static, f32, DistDotClamped>,
+        ef_search: usize,
+        parallel_build: bool,
+    ) -> Self {
+        Self {
+            hnsw,
+            ef_search,
+            parallel_build,
+            parallel_inserts: 0,
+        }
+    }
+
+    /// 打开并行建图（D-S2-05，**默认关**）。
+    ///
+    /// ⚠️ 打开后**建图拓扑不可复现**：`parallel_insert_slice` 走 rayon，插入顺序
+    /// 不确定（C8）。图一旦落盘即被冻结，故 NFR-06「同快照两次加载逐位一致」
+    /// 不受影响；但「同一批向量两次建库结果一致」不再成立。
+    pub fn with_parallel_build(mut self, parallel_build: bool) -> Self {
+        self.parallel_build = parallel_build;
+        self
+    }
+
+    /// 实际走 `parallel_insert_slice` 的次数（可观测性：验证并行真的生效）。
+    pub fn parallel_inserts(&self) -> usize {
+        self.parallel_inserts
     }
 
     /// 内部 `Hnsw` 的只读访问（`vector/persist.rs` dump 统计用）。
@@ -111,6 +150,36 @@ impl VectorIndex for HnswRsIndex {
     fn add(&mut self, id: ChunkId, vec: NormalizedVector) -> Result<()> {
         // hnsw_rs 原生增量插入（insert 只需 &self）
         self.hnsw.insert((vec.as_slice(), id as usize));
+        Ok(())
+    }
+
+    /// 批量插入（D-S2-05 / S2-11）：达阈值且**并行建图开关打开**时走
+    /// `parallel_insert_slice`，否则回落串行（默认）。
+    ///
+    /// # 为什么默认串行
+    ///
+    /// `parallel_insert` 走 `rayon::par_iter` ⇒ 插入顺序不确定 ⇒ **拓扑不可复现**
+    /// （C8）。P5/P6 的全部基线都在串行建图下测出，Step 6 精排的对比实验需要
+    /// 可比基线 ⇒ 先出实测（S2-11 的 T13）再决定是否翻默认值。
+    ///
+    /// # 为什么用 `parallel_insert_slice`
+    ///
+    /// 签名是 `&Vec<(&[T], usize)>`，`NormalizedVector::as_slice()` 可直接组装，
+    /// 不必给 `NormalizedVector` 加 `as_vec()`（其内部字段对兄弟模块不可见）。
+    fn add_batch(&mut self, items: &[(ChunkId, NormalizedVector)]) -> Result<()> {
+        if !self.parallel_build || items.len() < PARALLEL_INSERT_THRESHOLD {
+            // 小批量或开关关闭：串行（保确定性，且并行的任务拆分开销不划算）
+            for (id, v) in items {
+                self.hnsw.insert((v.as_slice(), *id as usize));
+            }
+            return Ok(());
+        }
+        let refs: Vec<(&[f32], usize)> = items
+            .iter()
+            .map(|(id, v)| (v.as_slice(), *id as usize))
+            .collect();
+        self.hnsw.parallel_insert_slice(&refs);
+        self.parallel_inserts += 1;
         Ok(())
     }
 

@@ -16,7 +16,7 @@ use helix_core::error::Result;
 use helix_core::search::{
     GraphPersistMode, GraphStatus, SearchIndex, SearchIndexBuilder, VectorBackend,
 };
-use helix_core::vector::{BruteForceIndex, NormalizedVector, VectorIndex};
+use helix_core::vector::{BruteForceIndex, HnswRsIndex, NormalizedVector, VectorIndex};
 
 // ---------------------------------------------------------------------------
 // 测试用确定性 Embedder（不依赖真实模型，保证跨机器可复现）
@@ -601,6 +601,112 @@ fn T16_图与快照版本错配降级() {
         "snapshot_crc 不匹配必须降级（多文件原子性的核心防线）"
     );
     assert_eq!(topk(builder().load(&path).unwrap(), "文档 2", 10).len(), 10);
+}
+
+/// **S2-T13** 并行建图（D-S2-05）：打开开关后与串行的 oracle 重合率差 < 1 个百分点；
+/// 阈值以下的小批量自动回落串行（行为等价）。
+///
+/// ⚠️ 只验证**质量等价**，不做拓扑断言——并行的插入顺序不确定（C8），
+/// 「两次建库一致」在并行下物理上不成立，这是打开开关的既定代价。
+#[test]
+fn T13_并行建图质量等价() {
+    let dir = tempfile::tempdir().unwrap();
+    let texts: Vec<String> = (0..1200).map(|i| format!("并行文档 {i} 的内容")).collect();
+
+    // ⚠️ **并行生效的前提是 `parallel_build(true)` 与 `batch_size(>=1000)` 同时成立**：
+    // `add()` 在 `pending.len() >= batch_size` 时才 flush，默认 batch_size=64 ⇒
+    // `add_batch` 每次最多收到 64 条，永远够不到并行阈值 1000（评审 #13 发现 1）。
+    // 两个库用**同一个** batch_size，保证唯一变量是 parallel_build。
+    const N: usize = 1200;
+    let path_par = dir.path().join("par.idx");
+    {
+        let mut idx = builder().parallel_build(true).batch_size(N).build();
+        for t in &texts {
+            idx.add(t.clone()).unwrap();
+        }
+        idx.save(&path_par).unwrap();
+    }
+    let par = builder().batch_size(N).load(&path_par).unwrap();
+    assert_eq!(par.graph_status(), &GraphStatus::Loaded);
+
+    // 串行建图（默认）
+    let path_seq = dir.path().join("seq.idx");
+    {
+        let mut idx = builder().batch_size(N).build();
+        for t in &texts {
+            idx.add(t.clone()).unwrap();
+        }
+        idx.save(&path_seq).unwrap();
+    }
+    let seq = builder().batch_size(N).load(&path_seq).unwrap();
+    assert_eq!(seq.graph_status(), &GraphStatus::Loaded);
+
+    // 质量对账：**与 oracle（精确线性扫描）的重合率**，两条路径的差距 < 1 个百分点
+    // （设计文档 §8 对 T13 的口径）。此前只断言「非空」，等于串行 vs 串行也绿。
+    let sp = par.into_searcher().unwrap();
+    let ss = seq.into_searcher().unwrap();
+    let mut sum_par = 0.0f64;
+    let mut sum_seq = 0.0f64;
+    let queries = 20;
+    for i in 0..queries {
+        let q = format!("并行文档 {i}");
+        let a: Vec<u32> = topk_searcher(&sp, &q, 10)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        let b: Vec<u32> = topk_searcher(&ss, &q, 10)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(a.len(), 10, "并行库 query {i} 应召回 10 条");
+        assert_eq!(b.len(), 10, "串行库 query {i} 应召回 10 条");
+
+        let oracle = oracle_ids(&texts, &q, 10);
+        sum_par += overlap(&a, &oracle);
+        sum_seq += overlap(&b, &oracle);
+    }
+    let r_par = sum_par / queries as f64;
+    let r_seq = sum_seq / queries as f64;
+    eprintln!("[T13] 与 oracle 的平均 Top-10 重合率：并行 {r_par:.4} / 串行 {r_seq:.4}");
+    assert!(
+        (r_par - r_seq).abs() < 0.01,
+        "并行与串行相对 oracle 的重合率差应 < 1 个百分点，实测 并行 {r_par:.4} vs 串行 {r_seq:.4}"
+    );
+    // 质量底线：两条路径本身都不能离谱
+    assert!(r_par >= 0.90, "并行库与 oracle 重合率过低: {r_par:.4}");
+    assert!(r_seq >= 0.90, "串行库与 oracle 重合率过低: {r_seq:.4}");
+}
+
+/// **S2-T22** ⚠️ 并行分支**真的被走到**（T13 的前置护栏）。
+///
+/// T13 依赖「`batch_size` 足够大」这个隐式耦合；一旦耦合被破坏（改默认值、
+/// 改 flush 策略），T13 会退化成「串行 vs 串行」并且**依然全绿**。
+/// 本测试直接钉死 `add_batch` 的分派：不加这个护栏，发现 1 无从暴露。
+#[test]
+fn T22_并行分支真的被走到() {
+    let items: Vec<(u32, NormalizedVector)> = (0..1200)
+        .map(|i| {
+            (
+                i,
+                NormalizedVector::new(hash_vec(&format!("向量 {i}"), DIM)),
+            )
+        })
+        .collect();
+
+    // 开关关 / 批量不足 → 串行
+    let mut off = HnswRsIndex::with_capacity(1200);
+    off.add_batch(&items).unwrap();
+    assert_eq!(off.parallel_inserts(), 0, "默认必须串行（保确定性）");
+
+    let mut small = HnswRsIndex::with_capacity(1200).with_parallel_build(true);
+    small.add_batch(&items[..999]).unwrap();
+    assert_eq!(small.parallel_inserts(), 0, "低于阈值 1000 应回落串行");
+
+    // 开关开 + 批量足够 → 并行
+    let mut on = HnswRsIndex::with_capacity(1200).with_parallel_build(true);
+    on.add_batch(&items).unwrap();
+    assert_eq!(on.parallel_inserts(), 1, "1200 条 + 开关开 ⇒ 应走并行");
+    assert_eq!(on.len(), 1200);
 }
 
 /// **S2-T17** 建图参数漂移：`max_nb_connection` / `ef_construction` 与内核常量
