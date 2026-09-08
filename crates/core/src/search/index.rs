@@ -424,7 +424,7 @@ impl SearchIndex {
 
         // 顺带摘除原始向量（O(len)，与 `Index::remove` 的 O(N) 同量级）：
         // 这既缩小快照体积，也断掉「删除 → save → load → 幽灵候选复活」的路径。
-        // 内存中的 HNSW 图仍需靠存活位图过滤（物理回收归 V2.0 Step 5 的 compaction）。
+        // 内存中的 HNSW 图仍需靠存活位图过滤（物理回收归 Step 4 的 compaction，S4-03~S4-07）。
         let Inner {
             index, raw_vectors, ..
         } = &mut self.inner;

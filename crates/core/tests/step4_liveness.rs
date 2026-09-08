@@ -159,6 +159,19 @@ fn T5_remove早于flush的向量不残留() {
             h.text
         );
     }
+
+    // 图侧断言：本场景幽灵向量**从未进图**（remove 先于 flush，被 S4-01 过滤），
+    // 故 `nb_point == 快照向量条数 == 2` 恒成立——与设计 T5 的「快照 vectors **与图中**
+    // 不含该 chunk」口径完全对齐。（对比 T5b：那里 remove 后于 flush，墓碑已进图，
+    // compaction 前 `nb_point` 不归位，故只断 `>=`；两条路径互补。）
+    let paths = helix_core::storage::graph_paths(&path);
+    let m = helix_core::storage::read_manifest(&paths.manifest)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        m.nb_point, 2,
+        "被删 chunk 的向量未进图，图中应恰好 2 个存活点"
+    );
 }
 
 /// T5 的对照：**flush 之后再 remove**（架构 §7.5.2 防线①的路径——`remove` 的
