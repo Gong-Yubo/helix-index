@@ -54,6 +54,13 @@ T8（manifest tmp 改名一致性）/ T9（钩子默认关闭）+ 集成层 `tes
 （无注入：save 原子性外观 / tmp 不残留 / 兼容回归）；既有快照 roundtrip / CRC 系列
 零修改全绿（T2）。
 
+**测试补强（2026-09-08 评审回应，`a474d86` + `dc31b3f`）**：补 S3-T8 单测（manifest
+写失败 → tmp 残留 → `remove_sidecars` 回收）；T9 断言前取 `InjectionGuard`（消除与
+并行注入测试的 flaky 窗口）；集成层补 **S3-TI1~TI5**——tmp 孤儿回收 load/save 两侧
+终态、半截快照公开错误面（`SnapshotCorrupted` / `Io`，绝不 panic）、图三件套命名对齐
+（目录清单级）、Strict 失败完整生命周期（失败不丢索引 + 清障恢复）；fsync_dir 平台
+注释按实测修正（**macOS/APFS rustc 1.90 目录 fd `sync_all` 实测 Ok**）。
+
 **文档**：架构 v1.8（§7.6.2 前提段销账 / R19 残余更新）/ 需求 v1.8（FR-31 验收注记）/
 `plan-v2.md` v0.5（Step 3 ✅）/ `eval-report.md` §8.7 / 设计文档补「实施结果」段。
 

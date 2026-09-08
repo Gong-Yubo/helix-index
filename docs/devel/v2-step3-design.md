@@ -683,3 +683,28 @@ pub(crate) fn dump_graph_caught(
 12K 语料 54,476,915 字节（≈54.5MB）：改造前 0.034~0.040s → 改造后 0.067~0.075s
 （+0.027~0.035s，本机 NVMe，3 轮 min~max）。**两版产物 CRC 逐位一致**（`0x576e065f`）
 ——「格式零变化」（C3）得到字节级实测印证。不触碰任何 NFR。
+
+### 10.4 评审回应与集成测试补强（2026-09-08，`a474d86` + `dc31b3f`）
+
+**评审（3 条 inline，均非阻塞）**：① S3-T8 标 ✅ 但测试缺失 → 已补
+`manifest写失败后remove_sidecars清掉tmp_T8`（目录占据落点 → Err 且 tmp 残留 →
+清侧回收；ⓘ `remove_file` 对目录是 EPERM/EISDIR 非 NotFound，但 tmp 删在
+三件套循环**之前**，清理顺序保证 tmp 必被清掉）；② T9 首行断言 flaky 窗口 →
+断言前先取 `InjectionGuard`；③ fsync_dir 平台注释 → **实测核实 macOS/APFS
+（rustc 1.90）目录 fd `sync_all` 返回 Ok**（F_FULLFSYNC，`/tmp` 与 `$TMPDIR`
+双点），评审「通常 EINVAL」前提在实测机不成立，注释仍按平台分列补全、
+eval-report §8.7 补平台口径注记。
+
+**集成测试 S3-TI1~TI5**（`tests/atomic_snapshot.rs`，与 S3-T 单元层互补——
+注入类受 C′ 约束留在 crate 内，无注入可观测的终态在集成层钉死）：
+
+| # | 覆盖 |
+| --- | --- |
+| TI1 | load 回收快照 tmp 孤儿（D-S3-05 load 侧终态：孤儿可伪造，回收必须发生） |
+| TI2 | save 截断复用 tmp 孤儿（save 侧：`File::create` 天然截断 → rename 消费） |
+| TI3 | 半截快照公开错误面：正文截断 → `SnapshotCorrupted`（CRC 失配）/ 头部截断 → `Io`；一律干净 Err 绝不 panic |
+| TI4 | 图三件套命名对齐（D-S3-01 集成级）：目录恰好 = 快照 + 3 sidecar、零 `.tmp`；manifest tmp 孤儿被下一次 save 截断复用 |
+| TI5 | Strict 失败完整生命周期（D-S3-07 用户可见后果）：save Err → 快照已落盘且可加载（残留旧 manifest CRC 锚失配 → Rebuilt，绝不假快路径）→ 清障 → 再 save 回 Loaded |
+
+实现期实证：dump 的 N2 前置删除只删 graph/data，manifest tmp 由
+`write_manifest_atomic` 的截断复用消费——两条回收路径口径不同但都闭环。
