@@ -9,6 +9,35 @@
 
 ## [Unreleased]
 
+### V2 Step 4 · CLI `helix compact` + churn workload（S4-08 + S4-09，2026-09-08）
+
+**新增（用户可用闭环 + 验收 1/2 实测）**
+
+- **CLI `helix compact`（S4-08）**：墓碑物理回收入口。
+  `helix compact --index <快照> [--output <新>] [--dry-run] [--json]`。
+  - 默认**原地**写同路径（复用 Step 3 `atomic_write`，崩溃安全）；`--output` 另存（A/B
+    对比体积）；`--dry-run` 只打印 `TombstoneStats` + 预估回收，**不写任何文件**。
+  - 打印 before → after 条数、三体积（`CompactionReport.bytes_before/after`，dry-run 时
+    CLI 自 `fs::metadata`）、图重建 / 总耗时、重建后 `graph_status`；`--json` 机器可读
+    （含 `remapped`，A/B 脚本透传）。
+  - ⚠️ load 走配置指纹校验 ⇒ 需匹配建库 embedder（默认装配 bge）；`remapped=true` 提示
+    ID 已重编号（D-S4-01/09 的对外声明落地到 CLI）。
+  - `docs/user-guide.md` 新增 §1.5 compact 参数（含「已知坑」：ID 重编号、需配 embedder）。
+- **churn workload example `churn_bench`（S4-09）**：`crates/core/examples/churn_bench.rs`。
+  内置**确定性合成 Embedder**（LCG + L2 归一化，dim=512，id=`synth-512`，D-S4-06）；
+  强制单 chunk ⇒ doc == chunk == 1 向量点 ⇒ `nb_point` 口径退化为 == 存活数。
+  每轮随机删 `churn×N` + 追加等量新 doc → `save` → 记录（快照/graph/data 字节、
+  `raw_vectors`、图点数、`GraphStatus`）；末轮 `compact_and_save` → 再记录。
+  输出 CSV + 判定（J1 图回收 / J2 不累积 / J3 reload `Loaded` → `VERDICT`）。
+- **`scripts/eval_churn.sh`（S4-09）**：编排多档 churn 实测，结果入
+  `docs/devel/eval-report.md` **§8.8（新增）**。
+- **实测（10K 合成语料，验收 1/2 全 PASS）**：
+  - churn 0.1 × 5 轮：`graph+data` 随轮次 **37.2→50.9MB**（问题真实存在）→ compact 后
+    回落 **33.8MB**；`nb_point` 11000→15000 → **10000 == 存活数**；snapshot 稳定（不累积）。
+  - churn 0.3 × 5 轮（60% 墓碑）：`graph+data` **43.9→84.6MB** → compact 后 **33.7MB**
+    （省 60%）；`nb_point` 13000→25000 → **10000**。两档 compact 后 reload 均 `Loaded`
+    （铁律），冷启动 **91~99ms**；`save` 墓碑告警（D-S4-02）如期出现。
+
 ### V2 Step 4 · 墓碑物理回收 compaction（核心，S4-03~S4-07，D-S4-01/03/06/10，2026-09-08）
 
 **新增（资源回收）**

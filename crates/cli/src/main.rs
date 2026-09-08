@@ -4,6 +4,7 @@
 //! - `build`：摄入语料并**落盘快照**（`--vectors` 同时保存向量）
 //! - `search --mode {bm25|vector|hybrid}`：`--input` 重建 或 `--index` 从快照加载
 //! - `compare`：三路同屏对比
+//! - `compact`（V2 Step 4 / S4-08）：墓碑物理回收，`--dry-run` 只读预览
 //!
 //! P6 起经门面层（`SearchIndex` / `Searcher`）组装；快照加载校验配置指纹（B1）。
 
@@ -20,7 +21,7 @@ use helix_core::embed::{Embedder, LocalEmbedder};
 use helix_core::index::Index;
 use helix_core::query::{EmptyReason, Hit, SearchMode, SearchResponse};
 use helix_core::schema::Filter;
-use helix_core::search::SearchIndex;
+use helix_core::search::{GraphStatus, SearchIndex};
 use helix_core::types::ChunkId;
 
 #[derive(Parser)]
@@ -38,6 +39,8 @@ enum Command {
     Search(SearchArgs),
     /// 三种模式同屏对比（调试主入口）
     Compare(CompareArgs),
+    /// 墓碑物理回收（V2 Step 4：compaction 重新物化 + ID 重编号）
+    Compact(CompactArgs),
     /// 效果评测（P5 实现）
     Bench(bench::BenchArgs),
 }
@@ -97,6 +100,22 @@ struct CompareArgs {
     query: String,
 }
 
+#[derive(clap::Args)]
+struct CompactArgs {
+    /// 要 compact 的快照路径
+    #[arg(long)]
+    index: PathBuf,
+    /// 另存到新路径（不写则**原地**覆盖 `--index`；用于 A/B 对比体积）
+    #[arg(long)]
+    output: Option<PathBuf>,
+    /// 只打印墓碑统计与预估回收，**不写任何文件**（只读）
+    #[arg(long)]
+    dry_run: bool,
+    /// 机器可读 JSON 输出（A/B 脚本透传）
+    #[arg(long)]
+    json: bool,
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -107,6 +126,7 @@ fn main() -> Result<()> {
         Command::Build(args) => build(args),
         Command::Search(args) => search(args),
         Command::Compare(args) => compare(args),
+        Command::Compact(args) => compact(args),
         Command::Bench(args) => bench::run(args),
     }
 }
@@ -489,6 +509,212 @@ fn compare(args: CompareArgs) -> Result<()> {
             .hits,
     );
     Ok(())
+}
+
+/// V2 Step 4 / S4-08：墓碑物理回收（compaction 重新物化 + ID 重编号）。
+///
+/// - 默认装配 `SearchIndex::load`（配置指纹校验）⇒ 含向量快照需匹配 embedder；
+///   load 会加载模型（首次下载几秒），但**不**调 embed（§4.8 已知代价）。
+/// - 默认**原地**写 `--index`（`atomic_write` 崩溃安全）；`--output` 另存。
+/// - `--dry-run` 只读：打印墓碑统计与预估回收，不写任何文件。
+/// - ⚠️ compaction 会重编号 `doc_id` / `chunk_id`（D-S4-01）——跨 compact 的持久
+///   引用请用 `source` / `content_hash`（rustdoc 亦已注明）。
+fn compact(args: CompactArgs) -> Result<()> {
+    let t0 = std::time::Instant::now();
+    let idx_path = &args.index;
+
+    // load（门面层默认装配；指纹不符或纯 BM25 快照由装配自动降级处理）
+    let mut index = SearchIndex::load(idx_path).with_context(|| {
+        format!(
+            "加载快照失败（可能需与建库相同的 embedder）: {}",
+            idx_path.display()
+        )
+    })?;
+
+    if args.dry_run {
+        // 只读预览：墓碑统计 + 磁盘三体积 + 预估回收，不写任何文件
+        let stats = index.tombstone_stats();
+        let sizes = on_disk_sizes(idx_path);
+        if args.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "dry_run": true,
+                    "chunks_total": stats.chunks_total,
+                    "chunks_alive": stats.chunks_alive,
+                    "docs_total": stats.docs_total,
+                    "docs_alive": stats.docs_alive,
+                    "graph_points": stats.graph_points,
+                    "raw_vectors": stats.raw_vectors,
+                    "tombstone_ratio": stats.tombstone_ratio,
+                    "reclaimable_chunks": stats.chunks_total - stats.chunks_alive,
+                    "reclaimable_docs": stats.docs_total - stats.docs_alive,
+                    "bytes": {
+                        "snapshot": sizes.0,
+                        "graph": sizes.1,
+                        "data": sizes.2,
+                    },
+                })
+            );
+        } else {
+            println!(
+                "墓碑统计（{}，--dry-run 只读，不写文件）:",
+                idx_path.display()
+            );
+            print_tombstone(&stats);
+            println!(
+                "磁盘三体积: 快照 {} / graph {} / data {}",
+                humansize_bytes(sizes.0),
+                humansize_bytes(sizes.1),
+                humansize_bytes(sizes.2)
+            );
+            println!(
+                "预估可回收: {} 墓碑 chunk / {} 墓碑 doc / 图中 {} 墓碑点",
+                stats.chunks_total - stats.chunks_alive,
+                stats.docs_total - stats.docs_alive,
+                stats.graph_points.saturating_sub(stats.chunks_alive),
+            );
+            if stats.chunks_total > stats.chunks_alive {
+                println!(
+                    "提示: 运行 `helix compact --index {}` 执行回收（无 --dry-run）",
+                    idx_path.display()
+                );
+            } else {
+                println!("无墓碑，无需 compact。");
+            }
+        }
+        return Ok(());
+    }
+
+    // 真正回收：compact_and_save 到目标路径（原地 or 另存；atomic_write 崩溃安全）
+    let out_path = args.output.as_ref().unwrap_or(idx_path);
+    let rep = index
+        .compact_and_save(out_path)
+        .with_context(|| format!("compaction 失败: {}", out_path.display()))?;
+
+    let elapsed = t0.elapsed();
+    if args.json {
+        let before = rep.before;
+        let after = rep.after;
+        println!(
+            "{}",
+            serde_json::json!({
+                "remapped": rep.remapped,
+                "before": {
+                    "chunks_total": before.chunks_total,
+                    "chunks_alive": before.chunks_alive,
+                    "docs_total": before.docs_total,
+                    "docs_alive": before.docs_alive,
+                    "graph_points": before.graph_points,
+                    "raw_vectors": before.raw_vectors,
+                },
+                "after": {
+                    "chunks_total": after.chunks_total,
+                    "chunks_alive": after.chunks_alive,
+                    "docs_total": after.docs_total,
+                    "docs_alive": after.docs_alive,
+                    "graph_points": after.graph_points,
+                    "raw_vectors": after.raw_vectors,
+                },
+                "reclaimed_chunks": rep.reclaimed_chunks,
+                "reclaimed_docs": rep.reclaimed_docs,
+                "reclaimed_terms": rep.reclaimed_terms,
+                "reclaimed_graph_points": rep.reclaimed_graph_points,
+                "bytes_before": size_json(rep.bytes_before),
+                "bytes_after": size_json(rep.bytes_after),
+                "vector_rebuild_ms": rep.vector_rebuild_ms,
+                "total_ms": elapsed.as_millis(),
+                "graph_status": graph_status_label(&rep.graph_status),
+            })
+        );
+        return Ok(());
+    }
+
+    // 人类可读输出
+    println!("墓碑物理回收: {}", idx_path.display());
+    print!("  before: ");
+    print_tombstone(&rep.before);
+    print!("  after : ");
+    print_tombstone(&rep.after);
+    println!(
+        "  回收: {} chunk / {} doc / {} term / 图中 {} 墓碑点",
+        rep.reclaimed_chunks, rep.reclaimed_docs, rep.reclaimed_terms, rep.reclaimed_graph_points
+    );
+    if let Some(b) = rep.bytes_before {
+        if let Some(a) = rep.bytes_after {
+            println!(
+                "  体积: 快照 {} → {}；graph {} → {}；data {} → {}",
+                humansize_bytes(b.snapshot),
+                humansize_bytes(a.snapshot),
+                humansize_bytes(b.graph),
+                humansize_bytes(a.graph),
+                humansize_bytes(b.data),
+                humansize_bytes(a.data),
+            );
+        }
+    }
+    println!(
+        "  图重建 {} ms；总耗时 {:.2}s",
+        rep.vector_rebuild_ms,
+        elapsed.as_secs_f64()
+    );
+    println!("  graph_status = {}", graph_status_label(&rep.graph_status));
+    if rep.remapped {
+        println!("  ⚠️ 已重编号 doc_id/chunk_id（D-S4-01）：跨 compaction 的持久引用请用 source/content_hash");
+    } else {
+        println!("  无墓碑，本次为 no-op（ID 未变）");
+    }
+    Ok(())
+}
+
+fn print_tombstone(s: &helix_core::search::TombstoneStats) {
+    println!(
+        "chunks {}/{} ｜ docs {}/{} ｜ 图 {} 点 ｜ raw {} 条 ｜ 墓碑占比 {:.1}%",
+        s.chunks_alive,
+        s.chunks_total,
+        s.docs_alive,
+        s.docs_total,
+        s.graph_points,
+        s.raw_vectors,
+        s.tombstone_ratio * 100.0
+    );
+}
+
+fn humansize_bytes(b: u64) -> String {
+    if b > 1024 * 1024 {
+        format!("{:.1} MB", b as f64 / (1024.0 * 1024.0))
+    } else if b > 1024 {
+        format!("{:.1} KB", b as f64 / 1024.0)
+    } else {
+        format!("{b} B")
+    }
+}
+
+fn size_json(s: Option<helix_core::search::SizeBytes>) -> serde_json::Value {
+    match s {
+        Some(x) => serde_json::json!({"snapshot": x.snapshot, "graph": x.graph, "data": x.data}),
+        None => serde_json::Value::Null,
+    }
+}
+
+fn graph_status_label(s: &GraphStatus) -> &'static str {
+    match s {
+        GraphStatus::Loaded => "Loaded",
+        GraphStatus::Rebuilt(_) => "Rebuilt",
+        GraphStatus::NotApplicable => "NotApplicable",
+        GraphStatus::PersistFailed(_) => "PersistFailed",
+    }
+}
+
+/// 磁盘三体积（快照 / graph / data）。文件缺失时该字节数为 0。
+fn on_disk_sizes(path: &Path) -> (u64, u64, u64) {
+    let paths = helix_core::storage::graph_paths(path);
+    let snap = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let graph = std::fs::metadata(&paths.graph)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let data = std::fs::metadata(&paths.data).map(|m| m.len()).unwrap_or(0);
+    (snap, graph, data)
 }
 
 fn print_response(resp: &SearchResponse, query: &str, explain: bool) {
