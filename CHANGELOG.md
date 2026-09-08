@@ -9,6 +9,72 @@
 
 ## [Unreleased]
 
+### V2 Step 4 · 墓碑物理回收 compaction（核心，S4-03~S4-07，D-S4-01/03/06/10，2026-09-08）
+
+**新增（资源回收）**
+
+- **`SearchIndex::compact()` / `compact_and_save()`（D-S4-01 / 设计 §4）**：按存活集
+  **重新物化 + `ChunkId`/`DocId` 重编号**的墓碑物理回收入口。
+  - **D-S4-10：`compact()` 第一步即 `self.commit()?`**（`compact_and_save` 的隐式
+    `save()` 链也随之先 commit）——把 `pending` 写缓冲先 flush，杜绝「未 flush 的
+    stale id 被灌进 `raw_vectors` 与图」后再重编号（`add()` 在入 `pending` 前就已
+    分配真实 `chunk_id`）。
+  - **I5 原子替换**：全部在 locals 里构建新 `Index` / `raw_vectors` / `vector_index`，
+    全部成功后才一次性替换 `self.inner`；任一步失败不污染旧索引。
+  - **`remapped: bool`**：无墓碑时为 no-op（`remapped == false`，ID 一个没变，验收 T11）；
+    有墓碑时为 true。
+- **重编号细节（D-S4-01）**：`Index::compacted` 按**旧 id 升序**把存活 doc/chunk 映射到
+  新稠密 id ⇒ **相对顺序不变** ⇒ BM25 排序 `(score desc, chunk_id asc)` 的全序保持，
+  检索输出逐位一致（验收 T3）。`chunk_lens` / `content_hashes` 同步按 remap 收敛；
+  `stats` 原样复制（纯增量计数器，与稠密化无耦合）。
+- **dead term 摘除（D-S4-04 / 设计 D-S4-03）**：`InvertedIndex::compact` 依存活集把
+  墓碑 chunk 的 postings 过滤掉，**空词链整条丢弃**（此前 `remove` 只摘 posting 不摘
+  term，死词残留），并给幸存词**重编号 `TermId`**；返回 `reclaimed_terms` 计数。
+  全程按旧 `TermId` 升序遍历，幸存词间相对序不变。
+- **向量索引重建（S4-05）**：新增共享 helper `rebuild_vector_index`——把
+  `hnsw_rs` 无 remove 留下的图墓碑点清掉，产出与新 `raw_vectors` 一一对应的稠密图。
+  原「加载降级重建」路径（Brute / Hnsw Err 降级）改用同一 helper，去重收敛。
+- **墓碑可观测（S4-06 / NFR-07）**：`tombstone_stats()` + `TombstoneStats` / `SizeBytes` /
+  `CompactionReport` 公开结构。报告含 before/after 双统计、三体积（`.idx`/`.hnsw.graph`/
+  `.hnsw.data`）、回收计数（chunks/docs/terms/graph_points）、`vector_rebuild_ms`、
+  `total_ms`、`remapped`、`graph_status`。
+  - **内存-only vs 落盘的口径**：`compact()` 是内存-only，`bytes_after` 恒为 `None`
+    （磁盘没变，填任何值都是撒谎）、`graph_status` 报磁盘旧值（不冒充 Loaded）；
+    `compact_and_save()` 落盘后才填三体积与最终 `graph_status`。`index` 被移除的「本
+    索引无图」的 `brute`/`hnsw` 区分由 `TombstoneStats` 承载。**重新物化后产物是更稠密的
+    正常快照，`FORMAT_VERSION` 不变、不引入新崩溃一致性机制**。
+- **save 墓碑阈值告警（D-S4-02）**：`save()` 在 `chunks_total ≥ 1024 && tombstone_ratio
+  ≥ 0.2` 时 `eprintln` 提示「索引墓碑多，建议 `helix compact`」。工程卫生，不改变行为。
+- **测试**：Index 层单元 T1/T2/T11（`src/index/mod.rs`）+ 门面层集成
+  T3/T7/T11/T12/T13（`tests/step4_compaction.rs`）；共享确定性 Embedder / 装配收敛到
+  `tests/common/mod.rs`（`step4_liveness.rs` 同步迁移，评审建议 #2）。
+  - T3 BM25 检索**逐位一致**（compaction 前后结果二进制相同，验收位元不变式 I3）；
+    T7 compaction + reload 后 `GraphStatus::Loaded`；T11 无墓碑 no-op ID 不变；
+    T12 纯 BM25 与 Brute 后端均可 compact；T13 D-S4-10 的 pending 存活 chunk 不丢向量。
+
+**评审回应（2026-09-08，PR #30 评审）**
+
+- **修复（发现 1，必改）全删 → compact → 写路径砖死**：`compact_with_bytes` 步骤 5
+  曾用 `if !raw.is_empty()` guard——全删后存活向量为空时落到 `_ => None`，把**仍有
+  embedder 装配**的向量 lane 丢成 `vector_index = None`；此后 `add → commit` 的
+  `flush()` 对 `vector_index == None` 误报 `Err(NoEmbedder)`（embedder 明明已配），
+  `save` / `compact` / `into_searcher` 全失败，索引不可恢复（CLI：清空 collection 后
+  继续写入即踩中）。修法：判定维度改为「是否有向量能力」（`had_vectors`），**与存活
+  向量是否为空无关**，全删后保留**空**向量索引（`rebuild_vector_index` 对空 raw 天然
+  安全），与设计 §4.5 的无条件重建一致。**load_with 同款对齐**：快照向量已删空
+  （全删后 compact_and_save）再 load，装配有 embedder 时同样保留空向量索引，不再因
+  `raw_vectors.is_empty()` 落 `None`。新增回归集成测试
+  `R_发现1_全删compact后仍可写入检索`（Hnsw，全删→compact→add→commit→save→load→检索）。
+- **采纳（建议 2）无墓碑 `compact()` 早退**：旧实现 `remapped == false` 只保证 ID 不变，
+  仍重物化 + 重建整图（10~100s 级纯浪费；D-S4-02 刚引导用户跑 compact）。无墓碑时
+  early-return `before == after` 的空 report（跳过重建，成本接近 0）；`compact_and_save`
+  仍幂等落盘。
+- **采纳（建议 3）`compact_and_save` 失败语义 rustdoc 注明**：`save` 失败（Strict 下图
+  dump 升级 Err）返回 `Err` 但**内存已压实**（I5 已原子替换）、磁盘仍旧档——设计内
+  行为（compaction 核心价值是内存压实，落盘失败不回滚）；重试 `save` 续写即可。
+- **采纳（建议 4）首存 `bytes_before` 为 `None`**：目标文件不存在时诚实表达「此前无
+  快照」，而非 `Some(0,0,0)`（`snapshot_bytes` 对缺失文件 `unwrap_or(0)` 永不报错）。
+
 ### V2 Step 4 · S4-01 flush 幽灵向量防线（2026-09-08，D-S4-05 / §2.3 / T5）
 
 **修复（资源回收）**
