@@ -133,6 +133,47 @@ fn warn_graph_degraded(reason: &str, mode: GraphPersistMode) -> Result<()> {
     }
 }
 
+/// 从原始向量**重建向量索引**（V2 Step 4 / S4-06，D-S4-07）。
+///
+/// 与 `load_with` 的降级分支、`flush` 走同一条 `add_batch` 路径，行为一致。
+/// 重建**不需要 embedder**（向量来自 `raw_vectors` 真源），纯 BM25 装配也可用
+/// （此时不会走到本函数）。Brute 用 `from_entries`（O(N) 拷贝）；Hnsw 用
+/// `with_capacity + add_batch`（沿用 ef_search / parallel_build 装配）。
+fn rebuild_vector_index(
+    backend: VectorBackend,
+    raw: &[(ChunkId, Vec<f32>)],
+    ef_search: Option<usize>,
+    parallel_build: bool,
+) -> Result<Box<dyn VectorIndex>> {
+    let entries: Vec<(ChunkId, NormalizedVector)> = raw
+        .iter()
+        .map(|(id, v)| (*id, NormalizedVector::new(v.clone())))
+        .collect();
+    Ok(match backend {
+        VectorBackend::Brute => {
+            Box::new(BruteForceIndex::from_entries(entries)) as Box<dyn VectorIndex>
+        }
+        VectorBackend::Hnsw => {
+            let ef = ef_search.unwrap_or(HnswRsIndex::default_ef_search());
+            let mut vi = HnswRsIndex::with_capacity(raw.len().max(1024))
+                .with_ef_search(ef)
+                .with_parallel_build(parallel_build);
+            vi.add_batch(&entries)?;
+            Box::new(vi) as Box<dyn VectorIndex>
+        }
+    })
+}
+
+/// 统计某落盘快照的三个 sidecar 文件的字节体积（`fs::metadata`）。
+fn snapshot_bytes(path: &std::path::Path) -> std::io::Result<SizeBytes> {
+    let g = crate::storage::graph_paths(path);
+    Ok(SizeBytes {
+        snapshot: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+        graph: std::fs::metadata(&g.graph).map(|m| m.len()).unwrap_or(0),
+        data: std::fs::metadata(&g.data).map(|m| m.len()).unwrap_or(0),
+    })
+}
+
 /// 已提交状态（`Arc` 共享：`into_searcher` 零拷贝移交给读端）。
 pub(crate) struct Inner {
     /// 倒排 + 正排 + 统计量
@@ -162,6 +203,72 @@ pub struct AddOutcome {
     pub deduped: bool,
 }
 
+// ---------------------------------------------------------------------------
+// compaction（V2 Step 4）的可观测结构与报告
+// ---------------------------------------------------------------------------
+
+/// 三个落盘文件的字节体积（`.idx` / `.hnsw.graph` / `.hnsw.data`）。
+///
+/// compaction 验收 1 的判据就是三体积；`--json` 消费者（A/B 脚本）直接透传，不自己猜文件名。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SizeBytes {
+    /// 快照正文字节数（`.idx`）
+    pub snapshot: u64,
+    /// HNSW 图文件字节数（`.hnsw.graph`）
+    pub graph: u64,
+    /// HNSW 数据文件字节数（`.hnsw.data`）
+    pub data: u64,
+}
+
+/// 墓碑统计（compaction 前的决策依据，NFR-07 可观测）。
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TombstoneStats {
+    /// 正排分片槽位总数（含墓碑）
+    pub chunks_total: usize,
+    /// 存活分片数
+    pub chunks_alive: usize,
+    /// 正排文档槽位总数（含墓碑）
+    pub docs_total: usize,
+    /// 存活文档数
+    pub docs_alive: usize,
+    /// 向量索引中的点数（含墓碑；hnsw_rs 无 remove，墓碑留图）
+    pub graph_points: usize,
+    /// `raw_vectors` 原始向量条数
+    pub raw_vectors: usize,
+    /// 墓碑占比（chunk 口径）`1 - alive/total`
+    pub tombstone_ratio: f64,
+}
+
+/// 一次 compaction 的结果报告。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompactionReport {
+    /// compact 前的墓碑统计
+    pub before: TombstoneStats,
+    /// compact 后的墓碑统计
+    pub after: TombstoneStats,
+    /// 三体积（字节）。**内存-only `compact()` 下 `bytes_after` 恒为 `None`**——
+    /// 磁盘此时还没变，填任何值都是撒谎；`compact_and_save` 才填。
+    pub bytes_before: Option<SizeBytes>,
+    /// compact 落盘后的三体积（仅 `compact_and_save` 填写）
+    pub bytes_after: Option<SizeBytes>,
+    /// 回收的墓碑分片数
+    pub reclaimed_chunks: usize,
+    /// 回收的墓碑文档数
+    pub reclaimed_docs: usize,
+    /// 摘除的死词数
+    pub reclaimed_terms: usize,
+    /// 回收的图中墓碑点数
+    pub reclaimed_graph_points: usize,
+    /// 向量索引重建耗时（毫秒）
+    pub vector_rebuild_ms: u128,
+    /// 本次 compaction 总耗时（毫秒）
+    pub total_ms: u128,
+    /// `false` = 无墓碑，本次是 no-op（`doc_id` / `chunk_id` 一个都没变，验收 T11）
+    pub remapped: bool,
+    /// 落盘后的最终图状态；内存-only 时为磁盘旧值（§4.6）
+    pub graph_status: GraphStatus,
+}
+
 /// 写端门面（拥有型）。持有 analyzer / chunker / embedder / fusion / reranker /
 /// 倒排 / 向量索引 / 写缓冲，暴露 `add(doc)` / `commit()` / `into_searcher()`。
 ///
@@ -189,6 +296,8 @@ pub struct SearchIndex {
     /// 最近一次 `save` 中图 sidecar 落盘（dump + CRC + manifest 发布）的耗时。
     /// `None` = 本次 `save` 未走图持久化（验收 7：dump 耗时要有实测记录）。
     pub(crate) graph_dump_elapsed: Option<std::time::Duration>,
+    /// 向量后端（V2 Step 4：compaction 重建向量索引需按后端重建同类型，故留档）
+    pub(crate) backend: VectorBackend,
 }
 
 impl SearchIndex {
@@ -231,6 +340,7 @@ impl SearchIndex {
             graph,
             graph_status: GraphStatus::NotApplicable,
             graph_dump_elapsed: None,
+            backend,
         }
     }
 
@@ -400,6 +510,7 @@ impl SearchIndex {
             inner: Arc::new(self.inner),
             graph: self.graph,
             graph_status: self.graph_status,
+            backend: self.backend,
         })
     }
 
@@ -470,6 +581,17 @@ impl SearchIndex {
         }
         if !matches!(self.graph_status, GraphStatus::NotApplicable) {
             self.graph_dump_elapsed = Some(t_dump.elapsed());
+        }
+        // D-S4-02（触发方式）：`save` 只告警、不自动 compaction——把 10~100s 的重建
+        // 塞进写路径会让耗时不可预测。墓碑占比 ≥ 阈值且总量足够时才提示。
+        let stats = self.tombstone_stats();
+        if stats.chunks_total >= 1024 && stats.tombstone_ratio >= 0.2 {
+            eprintln!(
+                "[提示] 墓碑占比 {:.1}%，建议运行 helix compact 回收（chunks {}/{}）",
+                stats.tombstone_ratio * 100.0,
+                stats.chunks_total - stats.chunks_alive,
+                stats.chunks_total
+            );
         }
         Ok(())
     }
@@ -542,6 +664,152 @@ impl SearchIndex {
         &self.graph_status
     }
 
+    // ---- compaction（V2 Step 4 / T7-12 / FR-30，墓碑物理回收）----
+
+    /// 墓碑统计（**只读、无副作用**）。`helix compact --dry-run` 的决策依据。
+    ///
+    /// `graph_points` 是向量索引中的点数（含墓碑——hnsw_rs 无 remove，墓碑留图，
+    /// 由存活位图在检索期挡掉）；`raw_vectors` 已由 `remove` 的 `retain` 摘除墓碑。
+    pub fn tombstone_stats(&self) -> TombstoneStats {
+        let index = &self.inner.index;
+        let chunks_total = index.total_chunks();
+        let chunks_alive = index.alive_count();
+        TombstoneStats {
+            chunks_total,
+            chunks_alive,
+            docs_total: index.total_docs(),
+            docs_alive: index.num_docs(),
+            graph_points: self
+                .inner
+                .vector_index
+                .as_ref()
+                .map(|v| v.len())
+                .unwrap_or(0),
+            raw_vectors: self
+                .inner
+                .raw_vectors
+                .as_ref()
+                .map(|v| v.len())
+                .unwrap_or(0),
+            tombstone_ratio: if chunks_total == 0 {
+                0.0
+            } else {
+                1.0 - chunks_alive as f64 / chunks_total as f64
+            },
+        }
+    }
+
+    /// 在**内存**里按存活集重新物化一次并重建向量图。**不落盘**。
+    ///
+    /// - 内部第一步是 `self.commit()?`（D-S4-10）：先把写缓冲 flush 掉再重编号，
+    ///   否则 `pending` 中的旧 `chunk_id` 会污染 `raw_vectors` 与新建的图（幽灵点）。
+    /// - 不变式（§4.9）：I1 存活集不变、I2 BM25 统计量不变、I3 BM25 逐位一致、
+    ///   I5 失败不留半压实（三者一起原子替换）、I7 `raw_vectors.len() ≤ 存活数`、
+    ///   I8 返回时 `pending` 为空。
+    /// - **`graph_status` 保持磁盘旧值**（描述的是 sidecar 状态，磁盘尚未更新，§4.6）。
+    /// - ⚠️ **ID 可能变更**（D-S4-01 重编号）：跨 compaction 的持久引用请用
+    ///   `source` / `content_hash`，不要用 `doc_id` / `chunk_id`。
+    /// - `bytes_before` / `bytes_after` 均为 `None`（无路径可 stat）；要持久化请用
+    ///   [`Self::compact_and_save`]。
+    pub fn compact(&mut self) -> Result<CompactionReport> {
+        self.compact_with_bytes(None)
+    }
+
+    /// `compact()` + 既有 `save()`——**落盘的唯一入口**。
+    ///
+    /// `save()` 内部 commit（此时已 no-op）→ `save_with_crc`（atomic_write）→
+    /// dump 新图 → CRC → 发布新 manifest——架构 §7.5.2 的「重建图后必须重发 manifest」
+    /// 铁律由这条既有链路**自动满足**（§4.6），本方法不另开落盘路径。
+    ///
+    /// 落盘成功后 `graph_status` 更新为实际状态（`Loaded` / `PersistFailed`），
+    /// `bytes_before` / `bytes_after` 为落盘前后的三体积。
+    pub fn compact_and_save(&mut self, path: &std::path::Path) -> Result<CompactionReport> {
+        let bytes_before = snapshot_bytes(path).ok();
+        let mut report = self.compact_with_bytes(bytes_before)?;
+        let t_save = std::time::Instant::now();
+        // 落盘（隐含 commit → no-op；dump 新图 + 重发 manifest）
+        self.save(path)?;
+        // 落盘后补全：三体积 + 图状态 + after 统计 + 总耗时（含 save）
+        report.bytes_after = snapshot_bytes(path).ok();
+        report.graph_status = self.graph_status.clone();
+        report.after = self.tombstone_stats();
+        report.total_ms += t_save.elapsed().as_millis();
+        Ok(report)
+    }
+
+    /// compaction 的实现主体（§4.1 步骤 0~5 + I5 原子替换）。
+    fn compact_with_bytes(&mut self, bytes_before: Option<SizeBytes>) -> Result<CompactionReport> {
+        let t0 = std::time::Instant::now();
+
+        // 步骤 0（D-S4-10 / I8）：先清空写缓冲，再谈重编号
+        self.commit()?;
+
+        let before = self.tombstone_stats();
+        let has_tombstones = before.chunks_total > before.chunks_alive;
+
+        // 步骤 1~2：取存活集 + 建 ID 映射（重编号，D-S4-01）
+        let remap = self.inner.index.build_remap();
+
+        // 步骤 3：Index 重新物化（返回新实例，self.inner.index 未动 → I5）
+        let (new_index, reclaimed_terms) = self.inner.index.compacted(&remap);
+
+        // 步骤 4：raw_vectors 过滤死 chunk + remap（I7）
+        let new_raw = self.inner.raw_vectors.as_ref().map(|raw| {
+            let mut out: Vec<(ChunkId, Vec<f32>)> = Vec::with_capacity(raw.len());
+            for (old, v) in raw.iter() {
+                if let Some(new_id) = remap.chunk.get(*old as usize).copied().flatten() {
+                    out.push((new_id, v.clone()));
+                }
+            }
+            out.sort_by_key(|(id, _)| *id); // 与插入顺序对齐（chunk_id 升序）
+            out
+        });
+
+        // 步骤 5：向量索引重建（§4.5 / S4-06，与 load 降级同源）
+        let had_vectors = self.inner.vector_index.is_some();
+        let t_vec = std::time::Instant::now();
+        let new_vi = match (&new_raw, had_vectors) {
+            (Some(raw), true) if !raw.is_empty() => Some(rebuild_vector_index(
+                self.backend,
+                raw,
+                self.cfg.ef_search,
+                self.cfg.parallel_build,
+            )?),
+            _ => None,
+        };
+        let vector_rebuild_ms = t_vec.elapsed().as_millis();
+
+        // 全部构建成功 → 一次性原子替换（I5：任一 Err 都已 return，旧状态未动）
+        self.inner = Inner {
+            index: new_index,
+            raw_vectors: new_raw,
+            vector_index: new_vi,
+        };
+
+        let after = self.tombstone_stats();
+
+        Ok(CompactionReport {
+            reclaimed_chunks: before.chunks_total.saturating_sub(after.chunks_total),
+            reclaimed_docs: before.docs_total.saturating_sub(after.docs_total),
+            reclaimed_terms,
+            reclaimed_graph_points: before.graph_points.saturating_sub(
+                self.inner
+                    .vector_index
+                    .as_ref()
+                    .map(|v| v.len())
+                    .unwrap_or(0),
+            ),
+            vector_rebuild_ms,
+            total_ms: t0.elapsed().as_millis(),
+            remapped: has_tombstones,
+            graph_status: self.graph_status.clone(),
+            bytes_before,
+            bytes_after: None,
+            before,
+            after,
+        })
+    }
+
     /// 从快照加载（默认装配）。
     ///
     /// - 快照存**原始数据 + 原始向量**（D1），加载后重建倒排 + 向量索引
@@ -592,12 +860,9 @@ impl SearchIndex {
         let vector_index = match (cfg.embedder.as_ref(), raw_vectors.is_empty()) {
             (Some(_), false) => Some(match backend {
                 VectorBackend::Brute => {
-                    // Brute 逃生舱：忽略图（精确扫描是确定性的，无需缓存）
-                    let entries: Vec<(ChunkId, NormalizedVector)> = raw_vectors
-                        .iter()
-                        .map(|(id, v)| (*id, NormalizedVector::new(v.clone())))
-                        .collect();
-                    Box::new(BruteForceIndex::from_entries(entries)) as Box<dyn VectorIndex>
+                    // Brute 逃生舱：忽略图（精确扫描是确定性的，无需缓存）。
+                    // V2 Step 4（S4-06）：与 Hnsw 降级重建共用 `rebuild_vector_index`。
+                    rebuild_vector_index(backend, &raw_vectors, None, cfg.parallel_build)?
                 }
                 VectorBackend::Hnsw => {
                     let ef_search = graph.ef_search.unwrap_or(HnswRsIndex::default_ef_search());
@@ -618,19 +883,12 @@ impl SearchIndex {
                             // 降级：图是缓存，丢弃只影响冷启动耗时
                             warn_graph_degraded(&reason, graph.mode)?;
                             graph_status = GraphStatus::Rebuilt(reason);
-                            // 与 `flush()` 走同一条 `add_batch`：批量路径带
-                            // 并行/串行判定，逐条 add 会绕过它（评审 #13 小项）。
-                            // `parallel_build` 也一并对齐——读端继续写入时
-                            // 的行为必须与写端一致（评审 #13 发现 3）。
-                            let mut vi = HnswRsIndex::with_capacity(raw_vectors.len().max(1024))
-                                .with_ef_search(ef_search)
-                                .with_parallel_build(cfg.parallel_build);
-                            let entries: Vec<(ChunkId, NormalizedVector)> = raw_vectors
-                                .iter()
-                                .map(|(id, v)| (*id, NormalizedVector::new(v.clone())))
-                                .collect();
-                            vi.add_batch(&entries)?;
-                            Box::new(vi) as Box<dyn VectorIndex>
+                            rebuild_vector_index(
+                                backend,
+                                &raw_vectors,
+                                Some(ef_search),
+                                cfg.parallel_build,
+                            )?
                         }
                     }
                 }
@@ -650,6 +908,7 @@ impl SearchIndex {
             graph,
             graph_status,
             graph_dump_elapsed: None,
+            backend,
         })
     }
 }

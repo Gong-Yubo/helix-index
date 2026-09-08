@@ -50,6 +50,18 @@ pub struct Index {
     field_index: FieldIndex,
 }
 
+/// compaction 用的 ID 重映射表（D-S4-01：重编号）。
+///
+/// - `chunk[old_id] = Some(new_id)`：该 chunk 存活且被重编号；`None` = 墓碑。
+/// - `doc[old_id] = Some(new_id)`：同上（doc 级）。
+///
+/// 由 [`Index::build_remap`] 从存活位图生成，**按旧 id 升序遍历分配 new id** ⇒ 相对顺序
+/// 保持（这是 §4.9 中「BM25 逐位一致 I3」的基石：postings 链保序 + remap 单调）。
+pub(crate) struct IdRemap {
+    pub chunk: Vec<Option<ChunkId>>,
+    pub doc: Vec<Option<DocId>>,
+}
+
 /// 快照的索引部分（storage 序列化的数据源）。
 ///
 /// `term_dict` **按 TermId 升序**、`content_hashes` **按 hash 升序**导出，
@@ -361,6 +373,125 @@ impl Index {
         self.forward.live_docs()
     }
 
+    /// 正排分片槽位总数（含墓碑 `None` 槽）。compaction 墓碑统计用。
+    pub fn total_chunks(&self) -> usize {
+        self.forward.chunks_slots()
+    }
+
+    /// 正排文档槽位总数（含墓碑 `None` 槽）。compaction 墓碑统计用。
+    pub fn total_docs(&self) -> usize {
+        self.forward.docs_slots()
+    }
+
+    // ---- compaction（V2 Step 4 / D-S4-01，pub(crate)：结构重建，门面层编排）----
+
+    /// 从存活集生成 ID 重映射表（按旧 id 升序遍历 ⇒ 稠密、保序）。
+    ///
+    /// 存活真源是 `forward` 的 `Some`/`None`（与 `alive` 位图同源），直接遍历
+    /// `export()` 的结果：凡 `Some` 即分配新 id。doc 与 chunk 各自独立编号。
+    pub(crate) fn build_remap(&self) -> IdRemap {
+        let (docs, chunks) = self.forward.export();
+        let mut doc = vec![None; docs.len()];
+        let mut doc_cnt = 0usize;
+        for (i, d) in docs.iter().enumerate() {
+            if d.is_some() {
+                doc[i] = Some(doc_cnt as DocId);
+                doc_cnt += 1;
+            }
+        }
+        let mut chunk = vec![None; chunks.len()];
+        let mut chunk_cnt = 0usize;
+        for (i, c) in chunks.iter().enumerate() {
+            if c.is_some() {
+                chunk[i] = Some(chunk_cnt as ChunkId);
+                chunk_cnt += 1;
+            }
+        }
+        IdRemap { chunk, doc }
+    }
+
+    /// 按存活集**重新物化**（compaction，D-S4-01 重编号 / §4.3）。
+    ///
+    /// **不就地改 `self`**（I5）：在局部构造一份新的、已压实的 `Index` 并返回，
+    /// 由门面层与新的 `raw_vectors` / 向量索引一起原子替换。返回（新 Index，摘除的死词数）。
+    ///
+    /// 六步（§4.3）：①正排稠密化 + id 改写 → `ForwardStore::import`（自动 rebuild
+    /// `alive`/`doc_chunk_count`，全活）；②倒排 `filter_map` + 摘死词 + TermId 重排；
+    /// ③`chunk_lens` 搬移（dl 不变 ⇒ BM25 不变）；④`content_hashes` remap；
+    /// ⑤`field_index` 全量 rebuild（保留自定义阈值，与 import 语义一致）；
+    /// ⑥`stats` 原样拷贝（本就是活计数 ⇒ `avgdl` 不变，I2）。
+    pub(crate) fn compacted(&self, remap: &IdRemap) -> (Index, usize) {
+        let (old_docs, old_chunks) = self.forward.export();
+
+        // ① 正排稠密化：只留存活 doc/chunk，改写 id（按旧升序 ⇒ 新升序）
+        let mut dense_docs: Vec<Option<DocRecord>> = Vec::with_capacity(remap.doc.len());
+        for (old, slot) in old_docs.iter().enumerate() {
+            let Some(new_id) = remap.doc.get(old).copied().flatten() else {
+                continue;
+            };
+            let Some(mut rec) = slot.clone() else {
+                continue;
+            };
+            rec.doc_id = new_id;
+            dense_docs.push(Some(rec));
+        }
+        let mut dense_chunks: Vec<Option<Chunk>> = Vec::with_capacity(remap.chunk.len());
+        for (old, slot) in old_chunks.iter().enumerate() {
+            let Some(new_cid) = remap.chunk.get(old).copied().flatten() else {
+                continue;
+            };
+            let Some(mut c) = slot.clone() else {
+                continue;
+            };
+            c.chunk_id = new_cid;
+            c.doc_id = remap
+                .doc
+                .get(c.doc_id as usize)
+                .copied()
+                .flatten()
+                .expect("存活 chunk 的所属 doc 必存活");
+            dense_chunks.push(Some(c));
+        }
+
+        // ② 倒排：remap + 摘死词 + TermId 重排
+        let (inverted, reclaimed_terms) = self.inverted.compact(&remap.chunk);
+
+        // ③ chunk_lens：按 remap 搬移（值不变）
+        let new_chunk_count = dense_chunks.len();
+        let mut chunk_lens = vec![0u32; new_chunk_count];
+        for (old, map) in remap.chunk.iter().enumerate() {
+            if let Some(new) = map {
+                chunk_lens[*new as usize] = self.chunk_lens.get(old).copied().unwrap_or(0);
+            }
+        }
+
+        // ④ content_hashes：hash → new doc_id（墓碑 doc 已被 `remove` 摘除，此处防御性过滤）
+        let mut content_hashes: HashMap<u64, DocId> =
+            HashMap::with_capacity(self.content_hashes.len());
+        for (&h, &old_doc) in &self.content_hashes {
+            if let Some(new) = remap.doc.get(old_doc as usize).copied().flatten() {
+                content_hashes.insert(h, new);
+            }
+        }
+
+        // ⑤ field_index：全量 rebuild（保留自定义基数阈值）
+        let mut field_index = FieldIndex::with_max_values(self.field_index.max_values_per_field());
+        field_index.rebuild(&dense_docs);
+
+        // ForwardStore::import 内部 rebuild（alive 全活 / doc_chunk_count 重算）
+        let forward = ForwardStore::import(dense_docs, dense_chunks);
+
+        let new_index = Index {
+            inverted,
+            forward,
+            stats: self.stats, // 活计数 ⇒ 原样保留
+            chunk_lens,
+            content_hashes,
+            field_index,
+        };
+        (new_index, reclaimed_terms)
+    }
+
     // ---- 快照导出 / 导入（T4-02，供 storage 模块序列化）----
 
     /// 导出为快照所需的结构化分区（供 storage 序列化）。
@@ -635,5 +766,171 @@ mod tests {
             assert!(fi.eq_bits("tag", "python").unwrap().is_empty());
             assert_eq!(fi.range_bits("year", 0.0, 3000.0).unwrap().count_ones(), 2);
         }
+    }
+
+    // ---- compaction（V2 Step 4 / T1 / T2 / T11，Index 层）----
+
+    /// 强制单 chunk 的分块器（一个 doc == 一个 chunk_id，便于断言）。
+    fn single_chunker() -> Chunker {
+        Chunker::new(200_000, 0)
+    }
+
+    /// 构造一个「有墓碑 + 有死词」的索引：
+    /// - A「苹果 香蕉 樱桃」、B「苹果 榴莲」、C「葡萄 苹果 樱桃」
+    /// - 删除 B ⇒ B 的 doc/chunk 变墓碑；「榴莲」只出现在 B ⇒ 成死词（链空、词留字典）
+    fn tombstoned_index() -> (Index, DocId, Vec<(DocId, &'static str)>) {
+        let analyzer = MixedAnalyzer::new();
+        let mut index = Index::new();
+        let mut keep = Vec::new();
+        let mut b_id = 0;
+        for (i, text) in ["苹果 香蕉 樱桃", "苹果 榴莲", "葡萄 苹果 樱桃"]
+            .iter()
+            .enumerate()
+        {
+            let doc = DocRecord {
+                doc_id: 0,
+                source: format!("s{i}"),
+                metadata: serde_json::json!({}),
+                content_hash: content_hash(text),
+            };
+            let (d, _) = index
+                .add(doc, single_chunker().chunk(0, text), &analyzer)
+                .unwrap();
+            if i == 1 {
+                b_id = d;
+            } else {
+                keep.push((d, *text));
+            }
+        }
+        index.remove(b_id, &analyzer).unwrap();
+        (index, b_id, keep)
+    }
+
+    /// T1：compaction 后正排无 `None` 槽、chunk_lens 长度 = 存活数、统计量不变、alive 不变。
+    #[test]
+    fn T1_compaction稠密化且统计量不变() {
+        let (index, _, _) = tombstoned_index();
+        assert!(
+            index.total_chunks() > index.alive_count(),
+            "构造前提：应有墓碑"
+        );
+        assert!(
+            index.total_docs() > index.num_docs(),
+            "构造前提：应有墓碑 doc"
+        );
+
+        let remap = index.build_remap();
+        let (new_idx, _reclaimed) = index.compacted(&remap);
+
+        // 正排无空洞：槽位总数 == 存活数
+        assert_eq!(new_idx.total_chunks(), new_idx.alive_count(), "无墓碑槽");
+        assert_eq!(new_idx.total_docs(), new_idx.num_docs(), "无墓碑 doc");
+        // chunk_lens 长度 == 存活数
+        assert_eq!(new_idx.chunk_lens.len(), new_idx.alive_count());
+        // 统计量不变（活计数）
+        assert_eq!(new_idx.num_chunks(), index.num_chunks());
+        assert_eq!(new_idx.total_len(), index.total_len());
+        assert_eq!(new_idx.avgdl(), index.avgdl());
+        // 存活 chunk 集合不变（I1：按 source+text）
+        let collect_docs = |idx: &Index| {
+            let mut v: Vec<String> = idx
+                .iter_live_docs()
+                .map(|(_, r)| r.source.clone())
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(collect_docs(&new_idx), collect_docs(&index), "存活集不变");
+        // 存活 chunk 的 text 集合不变（I1）
+        let chunk_texts = |idx: &Index| {
+            let mut v: Vec<String> = idx.live_chunks().map(|c| c.text.clone()).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            chunk_texts(&new_idx),
+            chunk_texts(&index),
+            "存活 chunk 内容不变"
+        );
+    }
+
+    /// T2：compaction 摘除死词 + df 不变 + 重建确定性（同一状态两次 compact 字节一致）。
+    #[test]
+    fn T2_compaction摘死词并保持df与重建确定() {
+        let (index, _, _) = tombstoned_index();
+        // 构造前提：死词「榴莲」在 compact 前仍在字典（链已空）
+        assert!(
+            index.term_id("榴莲").is_some(),
+            "死词在 compact 前应残留字典"
+        );
+        assert_eq!(index.doc_freq("榴莲"), 0, "死词 df 应为 0（链已空）");
+
+        // 记录 compact 前存活词的 df
+        let df_before: Vec<(&str, u32)> = ["苹果", "香蕉", "樱桃", "葡萄"]
+            .iter()
+            .map(|t| (*t, index.doc_freq(t)))
+            .collect();
+
+        let remap = index.build_remap();
+        let (new_a, reclaimed) = index.compacted(&remap);
+        // 死词「榴莲」被摘除
+        assert_eq!(new_a.term_id("榴莲"), None, "死词应被摘除");
+        // 摘除死词数 >= 1
+        assert!(reclaimed >= 1, "应回收至少 1 个死词，实为 {reclaimed}");
+        // 存活词的 df 不变（I2）
+        for (t, df) in &df_before {
+            assert_eq!(new_a.doc_freq(t), *df, "词 {t} 的 df 在 compact 后应不变");
+        }
+        // 词表无空链：每个词都 df>0
+        assert!(new_a.doc_freq("榴莲") == 0, "死词已摘");
+
+        // 重建确定性：对同一状态 compact 两次 → export 关键字段一致
+        let (new_b, _) = index.compacted(&remap);
+        assert_eq!(new_a.export().term_dict, new_b.export().term_dict);
+        assert_eq!(new_a.export().postings, new_b.export().postings);
+        assert_eq!(new_a.export().chunk_lens, new_b.export().chunk_lens);
+        assert_eq!(new_a.export().stats, new_b.export().stats);
+        assert_eq!(new_a.export().docs.len(), new_b.export().docs.len());
+        assert_eq!(new_a.export().chunks.len(), new_b.export().chunks.len());
+    }
+
+    /// T11（Index 层）：无墓碑时 compact 是 no-op——所有存活 id 原样不变、无回收。
+    #[test]
+    fn T11_无墓碑时compaction为no_op_id不变() {
+        let analyzer = MixedAnalyzer::new();
+        let mut index = Index::new();
+        let mut ids = Vec::new();
+        for (i, text) in ["苹果 香蕉", "葡萄 苹果"].iter().enumerate() {
+            let doc = DocRecord {
+                doc_id: 0,
+                source: format!("s{i}"),
+                metadata: serde_json::json!({}),
+                content_hash: content_hash(text),
+            };
+            let (d, chunks) = index
+                .add(doc, single_chunker().chunk(0, text), &analyzer)
+                .unwrap();
+            ids.push((d, chunks[0]));
+        }
+
+        let remap = index.build_remap();
+        let (new_idx, reclaimed) = index.compacted(&remap);
+        assert_eq!(reclaimed, 0, "无死词应不回收");
+        // ID 一个都不变（T11 的 no-op 保证）：doc/chunk 都保持原值
+        for (d, c) in &ids {
+            assert_eq!(
+                new_idx.doc(*d).map(|r| r.doc_id),
+                Some(*d),
+                "doc {d} id 应不变"
+            );
+            assert_eq!(
+                new_idx.chunk(*c).map(|ch| ch.chunk_id),
+                Some(*c),
+                "chunk {c} id 应不变"
+            );
+            assert!(new_idx.is_live_chunk(*c));
+        }
+        // 无墓碑槽（构造本就无）
+        assert_eq!(new_idx.total_chunks(), new_idx.alive_count());
     }
 }

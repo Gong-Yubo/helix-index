@@ -29,6 +29,8 @@ pub struct Searcher {
     pub(crate) graph: crate::search::config::GraphOpts,
     /// 最近一次图 sidecar 状态（NFR-07 可观测性，读端也能查）
     pub(crate) graph_status: crate::search::index::GraphStatus,
+    /// 向量后端（V2 Step 4：`into_index` 往返时保留，供 compaction 重建同类型）
+    pub(crate) backend: crate::search::config::VectorBackend,
 }
 
 impl Searcher {
@@ -103,6 +105,7 @@ impl Searcher {
                 embed_elapsed: std::time::Duration::ZERO,
                 graph: self.graph,
                 graph_status: self.graph_status,
+                backend: self.backend,
                 // 读端从未执行过 save，图 dump 耗时无意义（不是 0，是「未发生」）
                 graph_dump_elapsed: None,
             }),

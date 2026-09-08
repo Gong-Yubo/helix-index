@@ -129,6 +129,58 @@ impl InvertedIndex {
         );
         Self { terms, postings }
     }
+
+    /// compaction（Step 4 / D-S4-03）：把每条 postings 链的 `chunk_id` 按 `chunk_map`
+    /// 重映射，并把**空链的词整条摘除**（死词，`remove` 只删 posting 不摘 term 的残留），
+    /// 存活词的 TermId 按旧 TermId 升序重排。
+    ///
+    /// 倒排的 posting 在 `Index::remove` 时已**物理摘除**（墓碑 chunk 不在倒排里），
+    /// 因此这里 `chunk_map[posting.chunk_id]` 命中应恒为 `Some`——`filter_map` 只是
+    /// 防御性兜底；真正动作是「摘空链 + 重排 TermId + 改写 chunk_id」。
+    ///
+    /// 返回（新倒排，摘除的死词数）。**重建确定性**：遍历按旧 TermId 升序（`postings`
+    /// 按下标即此序），新 TermId 亦升序分配，故两次对同一状态 compact 产出字节一致。
+    pub(crate) fn compact(&self, chunk_map: &[Option<ChunkId>]) -> (Self, usize) {
+        // 旧 TermId → term 串（terms 是 HashMap 无序，需按下标对齐）
+        let mut by_id: Vec<(TermId, &SmolStr)> =
+            self.terms.iter().map(|(t, &id)| (id, t)).collect();
+        by_id.sort_unstable_by_key(|(tid, _)| *tid);
+
+        let mut new_terms: HashMap<SmolStr, TermId> = HashMap::with_capacity(self.terms.len());
+        let mut new_postings: Vec<Vec<Posting>> = Vec::with_capacity(self.postings.len());
+        let mut reclaimed = 0usize;
+        for (old_tid, list) in self.postings.iter().enumerate() {
+            let remapped: Vec<Posting> = list
+                .iter()
+                .filter_map(|p| {
+                    chunk_map
+                        .get(p.chunk_id as usize)
+                        .copied()
+                        .flatten()
+                        .map(|new_id| {
+                            let mut np = p.clone();
+                            np.chunk_id = new_id;
+                            np
+                        })
+                })
+                .collect();
+            if remapped.is_empty() {
+                // 死词：所有 posting 都被删光，整条摘除并重排 TermId
+                reclaimed += 1;
+                continue;
+            }
+            let new_tid = new_postings.len() as TermId;
+            new_terms.insert(by_id[old_tid].1.clone(), new_tid);
+            new_postings.push(remapped);
+        }
+        (
+            Self {
+                terms: new_terms,
+                postings: new_postings,
+            },
+            reclaimed,
+        )
+    }
 }
 
 #[cfg(test)]

@@ -1,78 +1,15 @@
 //! V2 Step 4 的资源回收测试（S4 系列）。
 //!
 //! 当前只含 **S4-01 / T5**（flush 侧幽灵向量防线，D-S4-05 / §2.3）。
-//! 后续核心 PR（S4-03~S4-07）的 T1~T4 / T7 / T11 / T12 / T13 会追加到此文件，
-//! 因此这里建立与 `graph_persist.rs` 平行、但独立于 Step 2 主题的 helper 集。
+//! 后续核心 PR（S4-03~S4-07）的 T1~T4 / T7 / T11 / T12 / T13 追加在
+//! `step4_compaction.rs`（门面层）与 `src/index/mod.rs`（Index 层单元）。
+//! 共享 helper（确定性 Embedder）收敛在 `tests/common/`（评审建议）。
 
 #![allow(non_snake_case)]
 
-use std::sync::Arc;
+mod common;
 
-use helix_core::chunk::Chunker;
-use helix_core::embed::Embedder;
-use helix_core::error::Result;
-use helix_core::search::{SearchIndexBuilder, VectorBackend};
-
-// ---------------------------------------------------------------------------
-// 测试用确定性 Embedder（不依赖真实模型，跨机器可复现；复制自 graph_persist.rs，
-// 集成测试间无法共享私有 item）
-// ---------------------------------------------------------------------------
-
-struct TestEmbedder {
-    dim: usize,
-}
-
-impl Embedder for TestEmbedder {
-    fn dim(&self) -> usize {
-        self.dim
-    }
-
-    fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        Ok(texts.iter().map(|t| hash_vec(t, self.dim)).collect())
-    }
-
-    fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
-        Ok(hash_vec(text, self.dim))
-    }
-
-    fn id(&self) -> &'static str {
-        "test-embedder-step4-v1"
-    }
-}
-
-/// 文本 → 确定性向量（LCG，跨进程可复现）。
-fn hash_vec(text: &str, dim: usize) -> Vec<f32> {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in text.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x100_0000_01b3);
-    }
-    let mut next = || {
-        h ^= h << 13;
-        h ^= h >> 7;
-        h ^= h << 17;
-        ((h >> 11) as u32 as f32 / u32::MAX as f32) * 2.0 - 1.0
-    };
-    (0..dim).map(|_| next()).collect()
-}
-
-// ---------------------------------------------------------------------------
-// 辅助
-// ---------------------------------------------------------------------------
-
-const DIM: usize = 64;
-
-/// 装配：测试 embedder + Hnsw 后端 + **强制单 chunk**（`Chunker::new(200_000, 0)`）
-/// ——让「一个 doc == 一个 chunk_id」，便于断言具体 chunk 是否残留。
-fn builder() -> SearchIndexBuilder {
-    SearchIndexBuilder::default()
-        .embedder(Some(Arc::new(TestEmbedder { dim: DIM })))
-        .vector_backend(VectorBackend::Hnsw)
-        .chunker(Chunker::new(200_000, 0))
-        // 显式调大写缓冲阈值：T5 需要在「pending 未满」时保持未 flush 状态，
-        // 默认 batch_size=64 时只要 doc 数 < 64 即可，此处放大以免疫未来改默认值。
-        .batch_size(1024)
-}
+use common::builder_hnsw;
 
 /// 读回快照正文里的原始向量列表（不触发图加载，纯粹读快照正文）。
 fn snapshot_vectors(path: &std::path::Path) -> Vec<(u32, Vec<f32>)> {
@@ -96,7 +33,7 @@ fn T5_remove早于flush的向量不残留() {
 
     // 构造：2 个存活 doc + 1 个将被删除的 doc。强制单 chunk ⇒ 每 doc 恰 1 个 chunk_id。
     let (target_chunk, target_doc) = {
-        let mut idx = builder().build();
+        let mut idx = builder_hnsw().build();
         idx.add("存活文档 AAAAA").unwrap();
         idx.add("存活文档 BBBBB").unwrap();
         let out = idx.add("将被删除的独特文档 ZZZDELETE").unwrap();
@@ -111,7 +48,7 @@ fn T5_remove早于flush的向量不残留() {
     };
 
     {
-        let mut idx = builder().build();
+        let mut idx = builder_hnsw().build();
         // 重新灌入同样的 3 个 doc（本测试不跨空索引持久化状态，直接内存构造）
         idx.add("存活文档 AAAAA").unwrap();
         idx.add("存活文档 BBBBB").unwrap();
@@ -146,7 +83,7 @@ fn T5_remove早于flush的向量不残留() {
     );
 
     // 检索确认删除语义未被破坏（FR-26：删除的永远不回来）。
-    let loaded = builder().load(&path).unwrap();
+    let loaded = builder_hnsw().load(&path).unwrap();
     let hits = loaded
         .into_searcher()
         .unwrap()
@@ -187,7 +124,7 @@ fn T5b_remove在flush后raw_vectors被retain摘净() {
     let path = dir.path().join("clean.idx");
 
     let (target_chunk, target_doc) = {
-        let mut idx = builder().build();
+        let mut idx = builder_hnsw().build();
         for i in 0..20 {
             idx.add(format!("存活文档 {i} AAA")).unwrap();
         }
@@ -200,7 +137,7 @@ fn T5b_remove在flush后raw_vectors被retain摘净() {
 
     // remove → save：remove 的 retain 把 raw_vectors 里的 target 摘掉。
     {
-        let mut idx = builder().load(&path).unwrap();
+        let mut idx = builder_hnsw().load(&path).unwrap();
         idx.remove(target_doc).unwrap();
         idx.save(&path).unwrap();
     }
@@ -227,7 +164,7 @@ fn T5b_remove在flush后raw_vectors被retain摘净() {
     );
 
     // 检索：已删不可召回。
-    let loaded = builder().load(&path).unwrap();
+    let loaded = builder_hnsw().load(&path).unwrap();
     let hits = loaded
         .into_searcher()
         .unwrap()

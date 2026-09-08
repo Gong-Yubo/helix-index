@@ -16,5 +16,7 @@ mod index;
 mod searcher;
 
 pub use config::{GraphPersistMode, SearchIndexBuilder, VectorBackend};
-pub use index::{AddOutcome, GraphStatus, SearchIndex};
+pub use index::{
+    AddOutcome, CompactionReport, GraphStatus, SearchIndex, SizeBytes, TombstoneStats,
+};
 pub use searcher::{SearchRequest, Searcher};

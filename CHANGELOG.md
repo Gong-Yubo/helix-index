@@ -9,6 +9,49 @@
 
 ## [Unreleased]
 
+### V2 Step 4 · 墓碑物理回收 compaction（核心，S4-03~S4-07，D-S4-01/03/06/10，2026-09-08）
+
+**新增（资源回收）**
+
+- **`SearchIndex::compact()` / `compact_and_save()`（D-S4-01 / 设计 §4）**：按存活集
+  **重新物化 + `ChunkId`/`DocId` 重编号**的墓碑物理回收入口。
+  - **D-S4-10：`compact()` 第一步即 `self.commit()?`**（`compact_and_save` 的隐式
+    `save()` 链也随之先 commit）——把 `pending` 写缓冲先 flush，杜绝「未 flush 的
+    stale id 被灌进 `raw_vectors` 与图」后再重编号（`add()` 在入 `pending` 前就已
+    分配真实 `chunk_id`）。
+  - **I5 原子替换**：全部在 locals 里构建新 `Index` / `raw_vectors` / `vector_index`，
+    全部成功后才一次性替换 `self.inner`；任一步失败不污染旧索引。
+  - **`remapped: bool`**：无墓碑时为 no-op（`remapped == false`，ID 一个没变，验收 T11）；
+    有墓碑时为 true。
+- **重编号细节（D-S4-01）**：`Index::compacted` 按**旧 id 升序**把存活 doc/chunk 映射到
+  新稠密 id ⇒ **相对顺序不变** ⇒ BM25 排序 `(score desc, chunk_id asc)` 的全序保持，
+  检索输出逐位一致（验收 T3）。`chunk_lens` / `content_hashes` 同步按 remap 收敛；
+  `stats` 原样复制（纯增量计数器，与稠密化无耦合）。
+- **dead term 摘除（D-S4-04 / 设计 D-S4-03）**：`InvertedIndex::compact` 依存活集把
+  墓碑 chunk 的 postings 过滤掉，**空词链整条丢弃**（此前 `remove` 只摘 posting 不摘
+  term，死词残留），并给幸存词**重编号 `TermId`**；返回 `reclaimed_terms` 计数。
+  全程按旧 `TermId` 升序遍历，幸存词间相对序不变。
+- **向量索引重建（S4-05）**：新增共享 helper `rebuild_vector_index`——把
+  `hnsw_rs` 无 remove 留下的图墓碑点清掉，产出与新 `raw_vectors` 一一对应的稠密图。
+  原「加载降级重建」路径（Brute / Hnsw Err 降级）改用同一 helper，去重收敛。
+- **墓碑可观测（S4-06 / NFR-07）**：`tombstone_stats()` + `TombstoneStats` / `SizeBytes` /
+  `CompactionReport` 公开结构。报告含 before/after 双统计、三体积（`.idx`/`.hnsw.graph`/
+  `.hnsw.data`）、回收计数（chunks/docs/terms/graph_points）、`vector_rebuild_ms`、
+  `total_ms`、`remapped`、`graph_status`。
+  - **内存-only vs 落盘的口径**：`compact()` 是内存-only，`bytes_after` 恒为 `None`
+    （磁盘没变，填任何值都是撒谎）、`graph_status` 报磁盘旧值（不冒充 Loaded）；
+    `compact_and_save()` 落盘后才填三体积与最终 `graph_status`。`index` 被移除的「本
+    索引无图」的 `brute`/`hnsw` 区分由 `TombstoneStats` 承载。**重新物化后产物是更稠密的
+    正常快照，`FORMAT_VERSION` 不变、不引入新崩溃一致性机制**。
+- **save 墓碑阈值告警（D-S4-02）**：`save()` 在 `chunks_total ≥ 1024 && tombstone_ratio
+  ≥ 0.2` 时 `eprintln` 提示「索引墓碑多，建议 `helix compact`」。工程卫生，不改变行为。
+- **测试**：Index 层单元 T1/T2/T11（`src/index/mod.rs`）+ 门面层集成
+  T3/T7/T11/T12/T13（`tests/step4_compaction.rs`）；共享确定性 Embedder / 装配收敛到
+  `tests/common/mod.rs`（`step4_liveness.rs` 同步迁移，评审建议 #2）。
+  - T3 BM25 检索**逐位一致**（compaction 前后结果二进制相同，验收位元不变式 I3）；
+    T7 compaction + reload 后 `GraphStatus::Loaded`；T11 无墓碑 no-op ID 不变；
+    T12 纯 BM25 与 Brute 后端均可 compact；T13 D-S4-10 的 pending 存活 chunk 不丢向量。
+
 ### V2 Step 4 · S4-01 flush 幽灵向量防线（2026-09-08，D-S4-05 / §2.3 / T5）
 
 **修复（资源回收）**

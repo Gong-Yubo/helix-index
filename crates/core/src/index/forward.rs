@@ -143,6 +143,16 @@ impl ForwardStore {
         self.docs.iter().filter(|d| d.is_some()).count()
     }
 
+    /// 文档槽位总数（含墓碑 `None` 槽）。compaction 的墓碑统计用。
+    pub fn docs_slots(&self) -> usize {
+        self.docs.len()
+    }
+
+    /// 分片槽位总数（含墓碑 `None` 槽）。compaction 的墓碑统计用。
+    pub fn chunks_slots(&self) -> usize {
+        self.chunks.len()
+    }
+
     /// 迭代所有活分片（确定性顺序，用于"全量重建"对照）。
     pub fn iter_live_chunks(&self) -> impl Iterator<Item = &Chunk> {
         self.chunks.iter().filter_map(|c| c.as_ref())
