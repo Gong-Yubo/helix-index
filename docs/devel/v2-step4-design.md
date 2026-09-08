@@ -6,19 +6,20 @@
 
 | 项 | 内容 |
 | --- | --- |
-| 版本 | **v0.1（待评审；D-S4-01~09 待拍板）** |
+| 版本 | **v0.2（评审回应版；D-S4-01~10 待拍板）** |
 | 日期 | 2026-09-08 |
-| 状态 | 待评审（Step 3 已于 `ed25d5c` 合并进 main，本步骤解除阻塞） |
-| 修订记录 | v0.1 首版：三条膨胀路径逐行盘点 + 重新物化方案 + 9 个待拍板决策 |
+| 状态 | 评审中（Step 3 已于 `ed25d5c` 合并进 main，本步骤解除阻塞） |
+| 修订记录 | v0.1 首版：三条膨胀路径逐行盘点 + 重新物化方案 + 9 个待拍板决策。<br>**v0.2（PR #28 评审回应）**：新增 **D-S4-10 `compact()` 与写缓冲 `pending` 的交互**（评审 P0：不先 flush 会让 stale chunk_id 污染 `raw_vectors` 与新图，采纳「先 `commit()`」修法，见 §4.1.1 / I8 / T13）；验收 3 的 `nb_point` 口径改为「存活**且有向量**」（§1.3）；D-S4-04 理由重写 + `graph_status` 语义补齐（§4.6 / 附录 A）；§4.3 明确六步作用于**新 `Index` 实例**（对齐 I5）；§4.4 「≤/≥」两层比较分开写；D-S4-03 的确定性改称「**重建确定性**」（独立于 NFR-06）；`CompactionReport` 并入字节级三体积（§4.7） |
 | 上游 | `plan-v2.md` §4 Step 4（原 Step 5，D-J10 提前）/ issue #21 / `requirements-spec.md` v1.9（FR-30 Should）/ `architecture-design.md` §7.5、§14.1（R22、R25）/ `v2-step1-design.md`（D-S1-01 存活单一真源）/ `v2-step2-design.md`（ADR-A 方案 C）/ `v2-step3-design.md`（`atomic_write`） |
 | 范围 | T7-12 墓碑物理回收（重建向量图 + 回收 `raw_vectors` + 重写快照）+ 零散写入 workload 脚本 + CLI/bench 观测入口 |
 | 非范围 | 真·物理删除 API（`usearch`，架构 §7.5 已排除）；读写并发下在线 compaction（**Step 8**）；低选择度兜底与 `Metrics` 可观测（**Step 5**）；`parallel_build` 默认值翻转（横切 **T7-21**）；R22「图体积 1.6×」本身（本 Step 只回收墓碑，不压缩存活数据） |
 
 ---
 
-## 评审速读：9 个待拍板决策
+## 评审速读：10 个待拍板决策
 
 > 评审者时间有限时先看这张表。每条在 §5 有完整取舍与证据。
+> **v0.2 新增 D-S4-10**（评审 P0）：`compact()` 与写缓冲的交互，未定稿前不能动 S4-03~S4-07。
 
 | # | 决策 | 建议 | 阻塞谁 |
 | --- | --- | --- | --- |
@@ -31,6 +32,7 @@
 | **D-S4-07** | 重建图时是否沿用装配的 `parallel_build` | **沿用**（默认串行）。与 `load` 降级重建走同一条 `add_batch`，行为一致；compaction 是低频操作，不值得为此引入非确定性拓扑 | 阻塞 S4-06 |
 | **D-S4-08** | 顺带做 `remove_many(&[DocId])`（架构 §7.5.2 已预留） | **可选**（S4-02，timebox 内）。价值是把「批量删 N 篇 O(N·M)」降到 O(N+M)；与本 Step 主题相邻但非必需 | 无 |
 | **D-S4-09** | ID 变更如何对外声明 | **三处**：`CompactionReport` 字段 + `user-guide.md`「已知坑」一节 + `SearchIndex::compact` 的 rustdoc 显式写「跨 compaction 的持久引用请用 `source` / `content_hash`，不要用 `doc_id` / `chunk_id`」 | 阻塞 S4-10 |
+| **D-S4-10** | `compact()` 与写缓冲 `pending` 的交互（**v0.2 新增，评审 P0**） | **`compact()` 开头先 `self.commit()?`**。否则 `pending` 里仍是旧 chunk_id，紧随的 `save()` → `flush()` 会把 stale id 灌进 `raw_vectors` 与新图。三种修法中它最干净：纯 BM25 下 `pending` 恒空 ⇒ flush 是 no-op；与 S4-01 的 liveness 过滤天然衔接；`save` 的隐式 commit 变 no-op | **阻塞 S4-03~S4-07** |
 
 ---
 
@@ -71,8 +73,12 @@ Step 1 补上了**正确性**（存活位图谓词挡掉幽灵候选，FR-26 达
    - **第 k 轮 compaction 后的体积与第 1 轮无显著差异**（证明不累积，而非只是变慢）。
 2. **compaction 后 `GraphStatus::Loaded`，不是 `Rebuilt`**——必须**重新 `load` 后**断言
    （铁律验收点，架构 §7.5.2）。
-3. **图点数归位**：新 manifest 的 `nb_point` **等于**快照存活 chunk 数（不再是「≥」，
-   `load_graph_checked` 步骤 6 的不等式对 compaction 产物退化为等号）。
+3. **图点数归位**：新 manifest 的 `nb_point` **等于**快照中「**存活且有向量**」的 chunk 数
+   （不再是「≥」；`load_graph_checked` 步骤 6 的不等式对 compaction 产物退化为等号）。
+   ⚠️ **v0.2 修正口径**：不能直接写「== 存活 chunk 数」——§4.4 明确不要求 `raw_vectors`
+   覆盖全部存活 chunk，缺向量的存活 chunk 在重建图时缺席，此时 `nb_point` **小于**存活数。
+   两层比较见 §4.4。**§4.8 的 churn workload 保证全部存活 chunk 都有向量** ⇒ 在该 workload 下
+   本条退化为「`nb_point` == 存活 chunk 数」。（对齐验收 5 的「有向量时」限定。）
 4. **检索语义不变**：compaction 前后，同一组 query 的
    - BM25 路 Top-K `(source, text, score)` 序列**逐位一致**（§4.9 有证明骨架）；
    - 向量 / hybrid 路 oracle 重合率 **≥ 0.99**（Step 2 T13 同口径，允许 HNSW 重建的拓扑抖动）。
@@ -183,6 +189,7 @@ CLI 逐条 `add` 后删除就是这条路径），已删 chunk 的向量会进 `
 
 ```
 SearchIndex::compact()
+  ├─ 0. self.commit()?  ← 【v0.2 新增，D-S4-10】必须先清空写缓冲（见 §4.1.1）
   ├─ 1. 取存活集：Index.alive_chunks()（唯一真源）
   ├─ 2. 建 ID 映射：old_chunk → new_chunk（稠密、保序）、old_doc → new_doc
   ├─ 3. Index::compact()：正排稠密化 + 倒排 remap + 词表压实 + chunk_lens/content_hashes/字段索引
@@ -191,7 +198,8 @@ SearchIndex::compact()
   └─ 6. 返回 CompactionReport（before/after 条数、耗时、回收量）
 
 SearchIndex::compact_and_save(path) = compact() + 既有 save()
-  └─ save() 内：save_with_crc（atomic_write）→ dump 新图 → CRC → 发布新 manifest  ← 铁律自动满足
+  └─ save() 内：commit()（no-op，pending 已空）→ save_with_crc（atomic_write）
+                → dump 新图 → CRC → 发布新 manifest  ← 铁律自动满足
 ```
 
 **三条设计论点**（先立论，再展开）：
@@ -205,6 +213,51 @@ SearchIndex::compact_and_save(path) = compact() + 既有 save()
 3. **不引入 `usearch`**。「物理删除」的需求由「重建图」满足，代价是 O(存活数) 的重建时间
    （12K 实测建图 ≈10~11.5s ⇒ 约 0.85 ms/点；**100K 预估 60~100s，待实测**），
    换来的是零新依赖、零格式变更。
+
+### 4.1.1 【P0】`compact()` 必须先 `commit()`（D-S4-10）
+
+**问题**：`add()` 在把 chunk 压入 `pending` **之前**就已经通过 `Index::add` → `forward.insert_chunk`
+分配了真实 `chunk_id`（`search/index.rs:243-290`）；`pending` 只在有 embedder 时填充，攒到
+`batch_size`（默认 64）才 flush。若 `compact()` 一上来就重编号，`self.pending: Vec<PendingChunk>`
+里存的仍是**旧 chunk_id**；紧接着 `compact_and_save` 调用的 `save()` 第一步就是 `self.commit()?`
+→ `flush()`（`search/index.rs:349-351` / `307-343`），会把这些**旧 id 的向量**灌进 `raw_vectors`
+与新图——而这些 id 在新 forward 里要么不存在、要么错位指向别的 chunk ⇒ **幽灵点**，且
+`raw_vectors.len()` / `nb_point` 口径全乱（直接打穿验收 3 与 I7）。
+
+**修法（采纳第一种）**：`compact()` 的**第一条语句**是 `self.commit()?`。
+
+```rust
+pub fn compact(&mut self) -> Result<CompactionReport> {
+    self.commit()?;   // ← 先把 pending 落进 raw_vectors / 图，再谈重编号
+    // ... 步骤 1~6
+}
+```
+
+**为什么是它**：
+
+1. **与 S4-01 天然衔接**：先 flush 时，已删 chunk 的向量在 flush 侧就被 liveness 过滤掉了
+   （D-S4-05）；compact 第 4 步再过滤一遍只是防御性兜底。两条防线叠加而非互相掩盖。
+2. **纯 BM25 下无副作用**：`flush()` 在 `pending.is_empty()` 时直接 `return Ok(())`
+   （`search/index.rs:308-310`）；无 embedder 时 `pending` 恒空 ⇒ `commit()` 是 no-op。
+3. **语义自洽**：`pending` 非空 ⇒ 一定有 embedder（只有 embedder 存在时 `add` 才 push）
+   ⇒ 「compact 前先 flush」所需的条件自动满足，不需要额外判空或返回错误。
+4. **`save()` 的隐式 commit 变成 no-op** ⇒ 步骤 0 之后 `compact_and_save` 里不存在第二次 flush，
+   时序只有一条，推理成本低。
+
+> ⚠️ **对 §4.5 论点 2 的修正**：原文写「重建**不需要 embedder**」，仍成立，但要加限定——
+> **compact 过程本身**不需要 embedder（向量来自 `raw_vectors` 真源），
+> 但「compact 前的 flush」需要 embedder；而需要 flush 的前提是 `pending` 非空，
+> `pending` 非空的前提又是有 embedder ⇒ 不产生新约束。
+
+**被否决的两种修法**（记录以免重复讨论）：
+
+- *让 `Index::compact()` 顺带 remap `pending`*：可行，但要把门面层的写缓冲概念下沉到
+  `Index` 层，破坏「`Index` 只管正排/倒排」的分层 ⇒ 不采纳。
+- *`pending` 非空时 `compact()` 返回 `Err`*：把状态管理推给调用方。CLI 路径安全
+  （`load` 后 `pending` 恒空），但库 API 会让调用方踩坑，且错误原因不直观 ⇒ 不采纳。
+
+**不变式化**：见 §4.9 **I8**（`compact()` 返回时 `pending` 必然为空）。
+**测试**：见 §7 **T13**。
 
 ### 4.2 ID 重编号与两张映射表
 
@@ -237,6 +290,19 @@ impl Index {
 }
 ```
 
+⚠️ **执行模型（对齐 §4.9 I5，v0.2 明确）**：下列六步**全部作用于一个新构造的 `Index` 实例**，
+**不是**就地修改 `self`。实现上先在临时变量里把新 `Index` 建好（复用 `import` 路径），
+六步全部成功后才**整体替换** `self` 的字段；任一步返回 `Err` 就直接 `return`，`self` 未被触碰
+⇒ 不存在「就地改到一半再回滚」的中间态。下表的「搬移」= 从 `self` 读、往新实例写。
+
+替换时序（门面层 `SearchIndex::compact` 侧，三者**一起换**，顺序固定）：
+
+```
+新 Index ─┐
+新 raw_vectors ─┼─► 全部构建成功 ─► 一次性 self.inner = { index, raw_vectors, vector_index }
+新 vector_index ─┘                    （失败 ⇒ 三者全部丢弃，旧状态原样保留）
+```
+
 | 步 | 动作 | 关键点 |
 | --- | --- | --- |
 | 1 | 建 `IdRemap`（§4.2） | 顺序 = old id 升序 |
@@ -263,7 +329,15 @@ new_raw.sort_by_key(|(id, _)| *id);  // 与插入顺序对齐（chunk_id 升序�
 ⚠️ **规则（防止过度假设）**：**不要求** `raw_vectors` 覆盖全部存活 chunk。
 历史快照可能存在「存活 chunk 缺向量」的情况（纯 BM25 快照、embedder 装配变化）。
 compaction 只做**过滤**，不补、不造；缺向量的存活 chunk 在重建图时自然缺席，
-与 `load` 降级重建的语义完全一致（图点数 ≤ 存活 chunk 数，回到 `load_graph_checked` 的「≤」口径）。
+与 `load` 降级重建的语义完全一致。
+
+**这里有两层比较，别混**（v0.2 修正，评审 P2）：
+
+- **图点数 vs 存活 chunk 数**：**≤**（缺向量的存活 chunk 在图里缺席）。
+- **图点数 vs 快照向量条数**：仍满足 **≥**——缺向量的 chunk 在「向量条数」与「图点数」两边
+  同时缺席，故该不等式对 compaction 产物退化为**等号**。
+  这与 `load_graph_checked` 步骤 6 的「图中点数 ≥ 快照向量条数」（`persist.rs:310-316`，
+  因图含墓碑）**口径一致、不冲突**：它比较的对象是「向量条数」而非「存活 chunk 数」。
 
 ### 4.5 向量索引重建
 
@@ -277,7 +351,10 @@ vi.add_batch(&entries)?;                     // 与 load 降级重建同一条�
 - 与 `load_with` 的降级分支（`search/index.rs:616-623`）**逐行同源** ⇒ 行为一致、只需抽一个
   `rebuild_vector_index(raw_vectors, ef_search, parallel_build)` 供两处复用；
 - 重建**不需要 embedder**（向量来自 `raw_vectors` 真源）⇒ 纯 BM25 装配也能 compact
-  （此时 `vector_index = None`，跳过第 5 步）；
+  （此时 `vector_index = None`，跳过第 5 步）。
+  ⚠️ **v0.2 限定**：指 compact **过程本身**不需要 embedder；`compact()` 的
+  **步骤 0 `commit()`** 需要 flush 时才用得上 embedder，而 flush 只在 `pending` 非空时发生、
+  `pending` 非空又蕴含「有 embedder」⇒ 不构成新约束（§4.1.1）。
 - Brute 后端：同样走 `BruteForceIndex::from_entries`（重建是 O(N) 拷贝，成本可忽略）。
 
 ### 4.6 `compact_and_save`：铁律如何被既有链路自动满足
@@ -295,8 +372,23 @@ save()（既有，search/index.rs:438）
 ```
 
 唯一要钉死的约束是：**compaction 之后不能「只 dump 图」而不走 `save()`**。
-所以对外只暴露 `compact_and_save()` 作为落盘入口，`Index::compact` 与 `SearchIndex::compact`
-都不落盘（D-S4-04）。
+`Index::compact` 定 `pub(crate)`，`SearchIndex::compact` 是**有意保留**的内存路径（D-S4-04），
+但**落盘的唯一入口是 `compact_and_save()`**。
+
+#### `graph_status` 在内存 compact 后的语义（v0.2 补充）
+
+`GraphStatus` 描述的是**磁盘 sidecar 的状态**（`Loaded` / `Rebuilt` / `PersistFailed` /
+`NotApplicable`），不是内存图的状态。因此：
+
+- **内存-only `compact()` 不改变 `graph_status`**——此时磁盘 manifest 仍指向旧图，
+  字段保持 load 时的原值才如实。⚠️ 实现时**不要**顺手改成 `Loaded`，那会让「磁盘已就位」
+  的断言在磁盘尚未跟上时误绿。
+- 检索期用的是**重建后的内存图**（已剔除墓碑点）⇒ 与 `graph_status` 的旧值并存不矛盾：
+  前者是内存态，后者是磁盘态。
+- **落盘后由 `persist_graph` 更新**为 `Loaded`（图 dump + manifest 重发成功），
+  这正是验收 2 的断言点（T7）。
+- 推论：内存 compact 后若**不** `save` 就进程退出，下次 `load` 拿到的是旧快照 + 旧图——
+  二者互相匹配，安全（图是缓存，Step 2 ADR-A），只是回收收益丢失。
 
 ⚠️ **旧 manifest 的处理**：`save` 会写新 manifest 覆盖旧的；若 `save` 中途失败，
 Lenient 下 `remove_sidecars` 已清理（Step 2 P0-3 + Step 3 D-S3-07）⇒ 不会留下「指向旧图的僵尸 manifest」。
@@ -315,10 +407,22 @@ pub struct TombstoneStats {
     pub tombstone_ratio: f64,  // 1 - alive/total（chunk 口径）
 }
 
+/// 三体积（字节）：`.idx` / `.hnsw.graph` / `.hnsw.data`
+#[derive(Clone, Copy, Default)]
+pub struct SizeBytes {
+    pub snapshot: u64,
+    pub graph: u64,
+    pub data: u64,
+}
+
 /// 一次 compaction 的结果报告
 pub struct CompactionReport {
     pub before: TombstoneStats,
     pub after: TombstoneStats,
+    /// 三体积（字节）。**内存-only `compact()` 下 `bytes_after` 恒为 `None`**
+    /// ——磁盘此时还没变，填任何值都是撒谎；CLI `--json` 消费者据此自行 `fs::metadata`。
+    pub bytes_before: Option<SizeBytes>,   // 读当前（或指定）idx 路径的 fs::metadata
+    pub bytes_after: Option<SizeBytes>,    // 仅 compact_and_save 填写
     pub reclaimed_chunks: usize,
     pub reclaimed_docs: usize,
     pub reclaimed_terms: usize,       // 摘除的死词数
@@ -326,13 +430,16 @@ pub struct CompactionReport {
     pub vector_rebuild_ms: u128,
     pub total_ms: u128,
     pub remapped: bool,               // false = 无墓碑，本次是 no-op（ID 未变）
+    pub graph_status: GraphStatus,    // v0.2：落盘后的最终状态；内存-only 时为「磁盘旧值」
 }
 ```
 
 - `SearchIndex::tombstone_stats()` → `TombstoneStats`（**只读、无副作用**），CLI `--dry-run` 用它；
-- `save()` 在 `tombstone_ratio ≥ 阈值（建议 0.2）且 `chunks_total ≥ 1024` 时
-  `eprintln!("[提示] 墓碑占比 {:.1}%，建议运行 helix compact", ...)`（D-S4-02：只告警，不自动执行）；
-- `CompactionReport.remapped == false` 时，`doc_id` / `chunk_id` **一个都没变**（no-op 保证，验收 T11）。
+- `save()` 在墓碑占比 ≥ 阈值（建议 `tombstone_ratio ≥ 0.2` 且 `chunks_total ≥ 1024`）时打印一行
+  告警 `[提示] 墓碑占比 {:.1}%，建议运行 helix compact`（D-S4-02：**只告警，不自动执行**）；
+- `CompactionReport.remapped == false` 时，`doc_id` / `chunk_id` **一个都没变**（no-op 保证，验收 T11）；
+- **字节体积进 report 的理由**：验收 1 的判据就是三体积，`--json` 消费者（A/B 脚本）不该再自己
+  调 `fs::metadata` 去猜三个文件名——库返回自包含数据，CLI 直接透传（v0.2 采纳评审建议）。
 
 ### 4.8 CLI、example 与 workload 脚本
 
@@ -344,8 +451,8 @@ helix compact --index data/foo.idx [--output data/foo-c.idx] [--dry-run] [--json
 
 - 默认**原地**写同路径（`atomic_write` 保证崩溃安全）；`--output` 另存（用于 A/B 对比体积）；
 - `--dry-run`：只打印 `TombstoneStats` 与预估回收量，**不写任何文件**；
-- 打印：`before → after` 条数、三体积（快照 / graph / data，读 `fs::metadata`）、
-  耗时、重建后 `graph_status`；
+- 打印：`before → after` 条数、三体积（取自 `CompactionReport.bytes_before/after`，
+  §4.7；`--dry-run` 时 CLI 自己 `fs::metadata`）、耗时、重建后 `graph_status`；
 - ⚠️ 已知代价：`load` 会按配置指纹校验 ⇒ **需要装配同一个 embedder**（模型加载几秒，
   但**不会**调 embed）。这点要写进 `user-guide.md`。
 
@@ -379,10 +486,11 @@ cargo run --release -p helix-core --example churn_bench -- \
 | **I5** | **重建失败 ⇒ 索引保持 compaction 前的完整状态**（不留半压实） | 实现顺序：先在**临时变量**里建好新 `Index` / 新 `raw_vectors` / 新向量索引，**全部成功后**才整体替换 `self.inner`。任何一步 `Err` 都原样返回，旧状态未被动过 |
 | **I6** | compaction 后**磁盘**要么旧快照要么新快照 | 落盘复用 `atomic_write`（Step 3）；`compact()` 本身不碰磁盘 |
 | **I7** | `raw_vectors.len() ≤ 存活 chunk 数`，且每条都是存活 chunk | §4.4 的过滤规则（不补不造） |
+| **I8** | **`compact()` 返回时 `self.pending` 必为空**，且 `raw_vectors` / 图中**不含 stale（旧）chunk_id** | D-S4-10：步骤 0 先 `commit()` ⇒ 重编号时缓冲已空；后续 `save()` 的隐式 `commit()` 退化为 no-op（T13 断言） |
 
 ---
 
-## 5. 决策记录（D-S4-01 ~ D-S4-09）
+## 5. 决策记录（D-S4-01 ~ D-S4-10）
 
 ### D-S4-01 是否重编号 `ChunkId` / `DocId`
 
@@ -413,13 +521,44 @@ TermId 是内部编号（快照里 `term_dict` 与 `postings` 一起导出/导�
 **不出现在任何公开 API**（`Index::term_id` 返回 TermId，但调用方只用它取 postings，
 且 compaction 后 in-memory 一致）⇒ remap 安全。**建议压实**。
 
-⚠️ 实现约束：TermId 重排必须**按旧 TermId 升序**遍历，保证 `export` 的确定性（NFR-06 的字节级口径）。
+⚠️ **实现约束**：TermId 重排必须**按旧 TermId 升序**遍历，保证 `export` 的**重建确定性**
+（v0.2 更名，见下方注记）。
+
+> **「重建确定性」≠ NFR-06**（v0.2 修正，评审 P2）：NFR-06 是「**同一快照两次加载**逐位一致」，
+> 约束的是**加载**路径；这里要的是「**同一逻辑状态两次 compact 产出字节一致**」，约束的是
+> **重建**路径。两者是不同性质，混称会让读者误以为 NFR-06 覆盖了 compact（§6 又写
+> 「NFR-06 不受影响，compaction 不是加载路径」，口径会打架）。本文统一称后者为
+> **重建确定性**，T2 / T11 的断言也按此口径写。
 
 ### D-S4-04 compaction 与 `save` 的关系
 
-见 §4.6。`Index::compact` 定 `pub(crate)`：公开它相当于允许「只 compact 不 save」，
-会得到「内存已压实、磁盘仍是旧快照」的组合——虽然安全（图是缓存），但会制造困惑，
-且给未来「自动 compaction」留下错误的接入点。
+见 §4.6。**结论：保留门面层的内存版 `compact()`，但落盘入口唯一。**
+
+> **v0.2 重写理由**（原表述「公开 `Index::compact` 等于允许只 compact 不 save」自相矛盾——
+> 门面层的 `SearchIndex::compact` 本身就是公开的内存版入口，困惑只是从 `Index` 层挪到了门面层）。
+
+- **`Index::compact` 取 `pub(crate)`**：`Index` 是低层内部结构，暴露它等于开放了
+  「绕过门面的一致性约定」；且它与 `raw_vectors` / 向量索引的替换必须原子发生（I5 / §4.3），
+  单独调用它必然得到不一致状态 ⇒ 这是**结构性的**理由，不是「怕人误用」。
+- **`SearchIndex::compact` 公开且是「有意的内存路径」**：语义在 rustdoc 里显式声明——
+  「只在内存重建，**不落盘**；`graph_status` 保持磁盘旧值（§4.6）；要持久化请用
+  `compact_and_save`」。它的用途是**先试后存**（`--dry-run` 的库级等价物）与**纯内存索引**
+  （从不 `save` 的用法也要能回收墓碑）。
+- **`compact_and_save(path)` 是落盘的唯一入口** ⇒ 「compaction 后必须重发 manifest」这条铁律
+  在公开面上不可能被绕过。
+
+### D-S4-10 `compact()` 与写缓冲 `pending` 的交互（v0.2 新增，评审 P0）
+
+完整论证见 **§4.1.1**。一句话：`add()` 在入 `pending` 之前就分配了 `chunk_id`，
+不先 flush 就重编号 ⇒ 旧 id 会在紧随的 `save()` 里被灌进 `raw_vectors` 与新图（幽灵点）。
+
+| 修法 | 评价 |
+| --- | --- |
+| **A `compact()` 开头先 `self.commit()?`（采纳）** | 与 S4-01 的 liveness 过滤衔接；纯 BM25 下 no-op；`save` 的隐式 commit 退化为 no-op；`pending` 非空 ⇒ 必有 embedder，语义自洽 |
+| B `Index::compact()` 顺带 remap `pending` | 可行，但把门面层写缓冲概念下沉进 `Index`，破坏分层 ⇒ 否决 |
+| C `pending` 非空时返回 `Err` | 把状态管理推给调用方，库 API 易踩 ⇒ 否决 |
+
+**阻塞范围**：S4-03 ~ S4-07（核心实现）动工前必须定稿。不变式 I8、测试 T13 与之绑定。
 
 ### D-S4-05 flush 侧幽灵向量（§2.3）
 
@@ -454,10 +593,10 @@ TermId 是内部编号（快照里 `term_dict` 与 `postings` 一起导出/导�
 | 面 | 影响 |
 | --- | --- |
 | **快照格式** | **零变更**。`FORMAT_VERSION` 保持 2；compaction 产物是普通快照，旧版本可加载（chunk_id 数值不同但结构一致） |
-| **公开 API** | **新增**：`SearchIndex::compact` / `compact_and_save` / `tombstone_stats`、`TombstoneStats`、`CompactionReport`（+ 可选 `remove_many`）。**无破坏性变更**：`Index::compact` 取 `pub(crate)` |
+| **公开 API** | **新增**：`SearchIndex::compact`（内存，不落盘）/ `compact_and_save` / `tombstone_stats`、`TombstoneStats`、`CompactionReport`、`SizeBytes`（+ 可选 `remove_many`）。**无破坏性变更**：`Index::compact` 取 `pub(crate)`。**落盘入口唯一** = `compact_and_save`（D-S4-04） |
 | **ID 语义** | **变更**（D-S4-01）：compaction 后 `doc_id` / `chunk_id` 可被重编号。需 D-S4-09 三处声明 |
 | **NFR-04（冷启动 <2s）** | 正向：compaction 后图命中 ⇒ `Loaded`；若漏发 manifest 则退回 ≈10s（铁律已由 §4.6 结构性排除） |
-| **NFR-06（同快照两次加载逐位一致）** | 不受影响（compaction 不是加载路径） |
+| **NFR-06（同快照两次加载逐位一致）** | 不受影响（compaction 不是加载路径）。⚠️ 另有**重建确定性**（同一逻辑状态两次 compact 产出字节一致，D-S4-03）——独立于 NFR-06 的强性质，勿混称 |
 | **NFR-03（构建耗时）** | 不受影响：compaction 是显式运维操作，不在构建口径内 |
 | **CLI** | 新增 `helix compact` 子命令（不改动既有子命令） |
 | **故障注入 / 崩溃** | 复用 Step 3 的 `atomic_write`；不新增注入点（compaction 的落盘就是 `save`） |
@@ -465,22 +604,29 @@ TermId 是内部编号（快照里 `term_dict` 与 `postings` 一起导出/导�
 
 ---
 
-## 7. 测试计划（S4-T1 ~ S4-T12）
+## 7. 测试计划（S4-T1 ~ S4-T13）
 
 | # | 测试 | 层 | 断言要点 |
 | --- | --- | --- | --- |
 | **T1** | `Index::compact` 稠密化 | 单元 | `docs` / `chunks` 无 `None`；`chunk_lens.len()` == 存活数；`num_chunks` 不变；`alive_count` 不变 |
-| **T2** | 倒排 remap + 死词摘除 | 单元 | 每个词的 `df` 与 compact 前一致；`postings` 链内 `chunk_id` 升序；无空链；`term_id(term)` 仍可用 |
+| **T2** | 倒排 remap + 死词摘除 + **重建确定性** | 单元 | 每个词的 `df` 与 compact 前一致；`postings` 链内 `chunk_id` 升序；无空链；`term_id(term)` 仍可用；**同一状态两次 `compact()` 的 `export` 字节完全一致**（D-S4-03 的重建确定性口径，独立于 NFR-06） |
 | **T3** | **BM25 逐位一致（I3）** | 单元/集成 | 20 组 query 的 Top-10 `(source, text, score)` 序列与 compact 前**完全相同**（`f32` 逐位） |
 | **T4** | 向量路 oracle 重合率 ≥0.99（I4） | 集成 | 复用 Step 2 T13 口径（真实语料 12K，串行建图） |
 | **T5** | **幽灵向量防线（D-S4-05）** | 集成 | `add(d)` → `remove(d)`（未 flush）→ `commit` → `save` → `load`：快照 `vectors` 与图中**不含**该 chunk（T5 在 S4-01 落地后即绿） |
-| **T6** | 图 sidecar 回收 | 集成 | churn N 轮后 `compact_and_save`：`.hnsw.data` + `.hnsw.graph` 字节数回落到存活集规模 ±10%；`nb_point` == 存活 chunk 数（验收 3） |
+| **T6** | 图 sidecar 回收 | 集成 | churn N 轮后 `compact_and_save`：`.hnsw.data` + `.hnsw.graph` 字节数回落到存活集规模 ±10%；`nb_point` == **存活且有向量**的 chunk 数（验收 3；本 workload 下即存活数） |
 | **T7** | **manifest 重发 / 铁律（验收 2）** | 集成 | compaction 并 `save` 后**重新 `load`** ⇒ `graph_status == GraphStatus::Loaded`（不是 `Rebuilt`）；冷启动 <2s |
 | **T8** | 快照正文回收 | 集成 | churn 前后正文字节数对比；`docs` / `chunks` 无 `None`；`chunk_lens.len()` == 存活数 |
 | **T9** | **跨快照不累积（验收 1 第三条）** | 集成 | 3 轮「load → remove 10% → add 10% → save → compact」：第 3 轮 compaction 后体积与第 1 轮差异 <10% |
 | **T10** | 崩溃安全（I6） | 集成 | 复用 S3-T6 骨架：compact 落盘期间注入崩溃 ⇒ `load` 得旧或新，绝不 `SnapshotCorrupted` |
 | **T11** | no-op 保证 | 单元 | 无墓碑时 `compact()` 返回 `remapped == false`，且**所有 `chunk_id` / `doc_id` 原样不变**（保护「误调用也不改变 ID」） |
 | **T12** | 无向量 / Brute 后端 | 单元 | 纯 BM25（`vector_index = None`）与 `Brute` 后端下 `compact()` 正常（跳过第 5 步 / 走 `from_entries`） |
+| **T13** | **写缓冲交互（I8 / D-S4-10）** | 集成 | `add(d)` → **不 flush**（`pending` 非空）→ `compact_and_save` → `load`：① 快照 `vectors` 与图中**不含 stale 旧 chunk_id**；② 该 chunk 的**向量与正文都在**（没有被 flush 漏掉、也没有错位）；③ `raw_vectors.len()` == `nb_point` == 存活且有向量的 chunk 数；④ 对照：`remove(d)` 后再走同路径，该 chunk **完全不出现**（与 T5 互补，T5 测 flush 侧、T13 测 compact 侧） |
+
+> **T13 的构造要点**：默认 `batch_size = 64`，所以必须**显式控制在 64 条以内**
+> （或临时把 `batch_size` 调大）才能保证进入 compact 时 `pending` 非空；
+> 否则测试会退化成「pending 已空」的平凡情形还照样全绿（Step 2 的
+> `PARALLEL_INSERT_THRESHOLD` 教训：隐式耦合会让测试静默失效）。建议给
+> `SearchIndexBuilder` 加 `batch_size`，并在 T13 里**先断言 `pending` 非空**再 compact。
 
 > ⚠️ 沿 Step 2 教训：**所有体积断言除「<2s」类硬判定外一律给范围**（实测单次波动 ±10~15%）；
 > 体积判据统一写「±10%」而非定值。
@@ -497,13 +643,13 @@ TermId 是内部编号（快照里 `term_dict` 与 `postings` 一起导出/导�
 | **S4-04** | `Index::compact`：倒排 remap + 死词摘除 + `chunk_lens` / `content_hashes` / 字段索引 | T1、T2 | M |
 | **S4-05** | raw_vectors 过滤 + remap（I7） | `search/index.rs` | S |
 | **S4-06** | 向量索引重建（D-S4-07）+ `rebuild_vector_index` 与 `load` 降级路径复用 | T12 | M |
-| **S4-07** | 门面层：`compact` / `compact_and_save` / `tombstone_stats` + `TombstoneStats` / `CompactionReport` + `save` 阈值告警（D-S4-02） | T7、T11 | M |
+| **S4-07** | 门面层：`compact`（**含步骤 0 `commit()`**，D-S4-10）/ `compact_and_save` / `tombstone_stats` + `TombstoneStats` / `CompactionReport`（含字节三体积）+ `save` 阈值告警（D-S4-02） | T7、T11、**T13** | M |
 | **S4-08** | CLI `helix compact`（`--dry-run` / `--output` / `--json`） | CLI + `user-guide.md` | S |
 | **S4-09** | workload：example `churn_bench` + `scripts/eval_churn.sh` + 实测入 `eval-report.md` §8.8 | T6、T8、T9、T10 | M |
 | **S4-10** | 文档回写：架构 §7.5.3（新增 compaction 小节）+ 风险 R26~R30、需求 FR-30 验收注记、plan-v2 进度、CHANGELOG、README 索引 | 文档 | S |
 
 > **建议 PR 切分**（沿用 Step 3 教训：base 一律 `main`，一个 PR 一个主题）：
-> ① S4-01（小，先合）→ ② S4-03~S4-07（核心，单 PR，含 T1~T4/T7/T11/T12）→
+> ① S4-01（小，先合）→ ② S4-03~S4-07（核心，单 PR，含 T1~T4/T7/T11/T12/**T13**）→
 > ③ S4-08 + S4-09（CLI + workload + 实测）→ ④ S4-10（文档回写）。
 
 ---
@@ -529,6 +675,8 @@ TermId 是内部编号（快照里 `term_dict` 与 `postings` 一起导出/导�
 - **Q5**：`flush` 能否**先过滤再 embed**（§2.3）？需先实测 `fastembed` 的 batch 组成无关性。
 - **Q6**：compaction 要不要顺带把 `content_hashes` 里指向墓碑 doc 的残留清掉？
   （现状 `Index::remove` 已摘 `content_hash`，理论上无残留 ⇒ 只需 T1 断言，不需要额外代码）
+- **Q7**（v0.2 新增）：D-S4-10 的「`compact()` 开头先 `commit()`」是否被接受？
+  （阻塞 S4-03~S4-07；若不接受，需从 §4.1.1 的 B / C 中另选）
 
 ---
 
@@ -538,14 +686,26 @@ TermId 是内部编号（快照里 `term_dict` 与 `postings` 一起导出/导�
 // crates/core/src/search/index.rs（公开）
 impl SearchIndex {
     pub fn tombstone_stats(&self) -> TombstoneStats;
-    pub fn compact(&mut self) -> Result<CompactionReport>;                  // 仅内存，不落盘
-    pub fn compact_and_save(&mut self, path: &Path) -> Result<CompactionReport>; // compact + save
+
+    /// 在**内存**里按存活集重新物化一次并重建向量图。**不落盘**。
+    ///
+    /// - 内部第一步是 `self.commit()?`（D-S4-10）：先把写缓冲 flush 掉再重编号，
+    ///   否则 `pending` 中的旧 `chunk_id` 会污染 `raw_vectors` 与新建的图。
+    /// - **`graph_status` 保持磁盘旧值**（描述的是 sidecar 状态，此时磁盘尚未更新）。
+    /// - ⚠️ **ID 可能变更**：跨 compaction 的持久引用请用 `source` / `content_hash`，
+    ///   不要用 `doc_id` / `chunk_id`（D-S4-09）。
+    pub fn compact(&mut self) -> Result<CompactionReport>;
+
+    /// `compact()` + 既有 `save()`——**落盘的唯一入口**，manifest 重发由 `save` 链路保证。
+    pub fn compact_and_save(&mut self, path: &Path) -> Result<CompactionReport>;
+
     // 可选（D-S4-08）
     pub fn remove_many(&mut self, doc_ids: &[DocId]) -> Result<()>;
 }
 
 pub struct TombstoneStats { /* 见 §4.7 */ }
-pub struct CompactionReport { /* 见 §4.7 */ }
+pub struct CompactionReport { /* 见 §4.7；含 bytes_before/bytes_after/graph_status */ }
+pub struct SizeBytes { /* 见 §4.7 */ }
 
 // crates/core/src/index/mod.rs（pub(crate)，D-S4-04）
 impl Index {
@@ -560,7 +720,8 @@ pub(crate) fn rebuild_vector_index(
 ) -> Result<Box<dyn VectorIndex>>;
 ```
 
-**公开面增量**：3 个方法 + 2 个结构体（+1 个可选方法）。**无破坏性变更**。
+**公开面增量**：3 个方法 + 3 个结构体（`TombstoneStats` / `CompactionReport` / `SizeBytes`）
+（+1 个可选方法）。**无破坏性变更**。
 
 ## 附录 B：churn workload 的执行脚本（草案）
 
@@ -587,6 +748,9 @@ cargo run --release -p helix-core --example churn_bench -- \
 | `VectorIndex` 无 remove API | `crates/core/src/vector/mod.rs:31-83`；`vector/hnsw_rs_index.rs:149-175` |
 | 图 dump 写全量点（含墓碑） | `crates/core/src/vector/persist.rs:143-195`（`file_dump`） |
 | `nb_point` 含墓碑、加载侧按「≥」校验 | `storage/graph.rs:154`；`vector/persist.rs:310-316` |
+| **v0.2 新增：`add()` 在入 `pending` 前已分配 `chunk_id`（P0 的根源）** | `search/index.rs:243-290`（`Index::add` 分配 → 之后才 `pending.push`） |
+| **v0.2 新增：`commit() == flush()`，且 `flush` 对空 `pending` 是 no-op** | `search/index.rs:307-310`（早退）、`:349-351`（`commit` 转发 `flush`） |
+| **v0.2 新增：`save()` 第一步即 `self.commit()?`** | `search/index.rs:438-441`（p6-design 6.2：不允许带未刷缓冲落盘） |
 | `remove` 已摘 `raw_vectors`，但 `flush` 无 liveness 检查 | `search/index.rs:419-424` vs `search/index.rs:328-339` |
 | `chunk_lens` push-only | `index/mod.rs:193`（push）、`:344`（读）、`:409`（import） |
 | `InvertedIndex::remove` 不摘 term | `index/inverted.rs:61-72` |

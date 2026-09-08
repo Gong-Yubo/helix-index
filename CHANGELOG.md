@@ -89,6 +89,13 @@ NFR-03 补首次全量实测落点）/ `plan-v2.md` v0.6（**状态校正：Step
     （`--dry-run`）、example `churn_bench` + `scripts/eval_churn.sh` 零散写入 workload。
   - 9 个待拍板决策 **D-S4-01~09**、测试计划 **S4-T1~T12**、任务拆分 **S4-01~10**
     （建议 PR 切分：S4-01 先合 → 核心单 PR → CLI/workload → 文档回写）、风险 **R26~R30**。
+  - **v0.2（2026-09-08 PR #28 评审回应）**：新增 **D-S4-10「`compact()` 与写缓冲 `pending`
+    的交互」**（评审 P0）——`add()` 在入 `pending` 前已分配 `chunk_id`，不先 flush 就重编号
+    会让 stale id 被紧随的 `save()` 灌进 `raw_vectors` 与新图 ⇒ 采纳「`compact()` 开头先
+    `commit()`」，配不变式 **I8** 与测试 **T13**；验收 3 的 `nb_point` 口径改为
+    「存活**且有向量**」（与 §4.4 对齐）；D-S4-04 理由重写（保留公开内存版，落盘入口唯一）
+    并补齐内存 compact 后 `graph_status` 的语义；§4.3 明确六步作用于**新 `Index` 实例**
+    （对齐 I5）；「重建确定性」从 NFR-06 口径中独立命名；`CompactionReport` 并入字节级三体积。
 - `plan-v2.md` v0.7：Step 3 状态校正为「✅ 已合并 `ed25d5c`」（验收门槛同步勾选）、
   Step 4 补详细设计状态与 S4-01 条目；`docs/README.md` 补设计文档索引行。
 
