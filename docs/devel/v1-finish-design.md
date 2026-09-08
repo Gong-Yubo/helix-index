@@ -82,7 +82,8 @@ P5 结束时项目在**技术验证**上已闭环，但在**工程可用性**上
 - 典型工作流：建库落盘 → 秒级检索 → 元数据过滤 → `--explain` → `compare` → `bench`
   （含 `--grid` / `--runs` / `--vector-index brute` 诊断开关用法）
 - 数据格式约定：语料 JSONL（`source`/`text`/`metadata`）、judgments 格式
-- **已知坑**：`--single-chunk` 评测口径、构建耗时（NFR-03 未达标）、冷启动图重建（D7）、
+- **已知坑**（写于 V1 时期；现状：NFR-03 拆双口径后首次全量已达标、D7 已由 V2 Step 2 结案——
+  见 `requirements-spec.md` v1.9 与 `plan-v2.md`）：`--single-chunk` 评测口径、构建耗时（NFR-03 未达标）、冷启动图重建（D7）、
   **`--rrf-weights` 默认值语义**（修完 V1-14 后此条可删）
 
 **Part 2 —— 库接入方**
