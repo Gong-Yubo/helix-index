@@ -70,6 +70,39 @@ NFR-03 补首次全量实测落点）/ `plan-v2.md` v0.6（**状态校正：Step
 此前误写「已合并」）/ `p5-design.md` D7 与 R-P5-10/13 结案注记 / user-guide
 性能预期（构建口径、save 原子写代价）。
 
+### V2 Step 4 · 详细设计（2026-09-08）
+
+- 新增 `docs/devel/v2-step4-design.md`（**v0.1，待评审**）：**墓碑物理回收（compaction，
+  T7-12 / FR-30 / Q-C2）**的详细设计。
+  - **现状盘点**：三条膨胀路径逐行定位——图 sidecar（≈2.6 KB/点，12K 实测外推）、
+    `raw_vectors`（已由 `remove` 回收）、快照正文（`None` 槽 1 B + `chunk_lens` 4 B
+    push-only + 词表死词，≈6 B/chunk）；量级约 **440:1**，图是绝对大头但正文也必须堵。
+  - **设计期新发现**：`flush()` 灌 `raw_vectors` 时**无 liveness 检查** ⇒
+    `add → remove → commit`（默认 `batch_size=64` 下的常见时序）会让已删 chunk 的向量
+    入库并跨快照永续。属资源问题（存活位图仍在检索期兜底，FR-26 不破），已列 **S4-01**
+    独立小 PR。
+  - **方案**：按存活集**重新物化**（正排稠密化 + 倒排 remap + 死词摘除 + 图重建）
+    + **ID 重编号**（不重编号则快照正文空洞无法消除 ⇒ 验收不可达；free list 因「旧引用
+    静默指向新文档」被否决）；落盘复用 Step 3 `atomic_write`，**不引入新的崩溃一致性机制**，
+    `FORMAT_VERSION` 保持 2；**manifest 重发铁律**由既有 `save` 链路自动满足。
+  - **可观测 / 可复现**：`TombstoneStats` / `CompactionReport`、CLI `helix compact`
+    （`--dry-run`）、example `churn_bench` + `scripts/eval_churn.sh` 零散写入 workload。
+  - 9 个待拍板决策 **D-S4-01~09**、测试计划 **S4-T1~T12**、任务拆分 **S4-01~10**
+    （建议 PR 切分：S4-01 先合 → 核心单 PR → CLI/workload → 文档回写）、风险 **R26~R30**。
+  - **v0.2（2026-09-08 PR #28 评审回应）**：新增 **D-S4-10「`compact()` 与写缓冲 `pending`
+    的交互」**（评审 P0）——`add()` 在入 `pending` 前已分配 `chunk_id`，不先 flush 就重编号
+    会让 stale id 被紧随的 `save()` 灌进 `raw_vectors` 与新图 ⇒ 采纳「`compact()` 开头先
+    `commit()`」，配不变式 **I8** 与测试 **T13**；验收 3 的 `nb_point` 口径改为
+    「存活**且有向量**」（与 §4.4 对齐）；D-S4-04 理由重写（保留公开内存版，落盘入口唯一）
+    并补齐内存 compact 后 `graph_status` 的语义；§4.3 明确六步作用于**新 `Index` 实例**
+    （对齐 I5）；「重建确定性」从 NFR-06 口径中独立命名；`CompactionReport` 并入字节级三体积。
+  - **v0.3（2026-09-08 决策拍板）**：**D-S4-01 = 重编号（方案 B）**、**D-S4-10 =
+    `compact()` 开头先 `self.commit()?`（修法 A）** 两项正式拍板 ⇒ 全 Step 阻塞解除，
+    **核心实现（S4-01 + S4-03~S4-07）可开工**；D-S4-09 的三处 ID 变更声明由「可选」升级为
+    **必做项**；§9.2 的 Q1 / Q7 结案。其余 D-S4-02~09 评审无异议，按设计建议执行。
+- `plan-v2.md` v0.8：Step 3 状态校正为「✅ 已合并 `ed25d5c`」（验收门槛同步勾选）、
+  Step 4 状态改「🟩 设计 v0.3 已拍板，核心实现可开工」；`docs/README.md` 索引行同步。
+
 ### V2 Step 3 · 详细设计（2026-09-07）
 
 - 新增 `docs/devel/v2-step3-design.md`（**v0.3 拍板版，可开工**）：
