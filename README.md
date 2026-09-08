@@ -77,8 +77,24 @@ embed ──► vector（向量存储与近邻检索）────────�
 - **BM25 正确性**：对 tantivy 基线 NDCG@10 相对差 **0.31%**，Top-10 重叠率 97%。
 - **分词对照**：charabia（jieba 底层 + kvariants 简繁归一化）全面落后自研链（NDCG −5.9%），保留自研。
 - **性能**（release，macOS）：BM25 P99 3.9ms / 向量 8.4ms / 混合 8.7ms ✅；
-  构建 12K chunk 含 embedding **236.7s 未达标**（ort CPU 推理吞吐 ~51 条/s）；
-  快照加载 53~107ms ✅，但 HNSW 图重建 11.6s（图不持久化）。
+  **完整冷启动 ≈100ms** ✅（V2 Step 2 图持久化后，此前 ≈11.6s；图 sidecar 缺失时
+  降级重建仍 ~10s，显式可观测）；
+  构建 12K chunk 含 embedding **225.5~236.7s ✅**（落在 NFR-03「首次全量 <240s」
+  双口径内；原单口径 <120s 经评审拍板不可达，增量追加口径 Step 6 交付）。
+
+## 当前进展（V2 路线图）
+
+V1 内核（P0~P6）全部完成。V2 进行中（任务级清单见
+[`docs/devel/plan-v2.md`](docs/devel/plan-v2.md)）：
+
+- **Step 1 · 向量软删除 + 过滤下推** ✅ 已合并
+- **Step 2 · 图持久化 + 并行建图** ✅ 已合并——完整冷启动 ≈11.6s → **≈100ms**（NFR-04 达标），
+  同快照两次加载结果逐位一致（NFR-06）
+- **Step 3 · 原子快照（崩溃一致性）** ✅ 实现完成（[PR #27](https://github.com/Gong-Yubo/helix-index/pull/27) 待合并）——
+  save 走 tmp + fsync + rename，崩溃后 load 要么旧快照要么新快照、绝不半截文件；
+  故障注入测试证明不变式；fsync 代价实测 +0.027~0.035s
+- **待开工**：Step 4 资源回收（compaction）→ Step 5 查询性能与可观测 →
+  Step 6 构建性能（embed 并行 spike / 增量构建）→ Step 7 精排；V2.1 = Step 8~10
 
 ## 数据来源与引用
 
@@ -89,8 +105,11 @@ embed ──► vector（向量存储与近邻检索）────────�
 
 ## 已知局限
 
-- **冷启动**：HNSW 图不持久化，加载快照后需重建（12K 段约 11.6s），万级冷启动不达秒级（D7，交 P6）。
-- **构建吞吐**：本地 CPU embedding 构建 12K chunk 需 236.7s，未达 120s 目标（NFR-03）。
+- **降级路径冷启动**：图 sidecar 缺失 / 损坏 / 版本错配时，加载快照后需重建 HNSW 图
+  （12K 段约 10s）——降级**显式可观测**（`GraphStatus` / NFR-07），绝不静默。
+- **图持久化的磁盘代价**：sidecar 三件套使磁盘占用 1.6×（52.3MB → ≈84MB，R22）。
+- **构建吞吐**：embedding 主导（ort CPU ~51 条/s）；首次全量 <240s 口径已达标，
+  **增量追加**口径（NFR-03 第二口径）待 Step 6 交付。
 - **评测代理**：T2Ranking 查询来自人类搜索日志，作为 Agent 生成 query 的代理存在分布差异；
   12K 子集任务难度低于 230 万全库，绝对指标不可与论文基线直接对比，仅量级对照。
 - 详见 `docs/devel/eval-report.md` 第 9 节「数据诚信声明」。
@@ -105,7 +124,8 @@ make report CHECK=--check                         # 报告数字逐格对账
 ```
 
 - 使用文档：[`docs/user-guide.md`](docs/user-guide.md)
-- 开发文档索引：[`docs/README.md`](docs/README.md)，开工前先读 `docs/devel/plan.md`
+- 开发文档索引：[`docs/README.md`](docs/README.md)；开工前先读
+  [`docs/devel/plan-v2.md`](docs/devel/plan-v2.md)（V2 进行中，`plan.md` 已冻结为 V1 计划）
 
 ## 评测语料（可选）
 
