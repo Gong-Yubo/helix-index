@@ -723,8 +723,21 @@ impl SearchIndex {
     ///
     /// 落盘成功后 `graph_status` 更新为实际状态（`Loaded` / `PersistFailed`），
     /// `bytes_before` / `bytes_after` 为落盘前后的三体积。
+    ///
+    /// **失败语义（评审建议 3）**：`save` 失败（如 Strict 下图 dump 升级为 Err）时本方法
+    /// 返回 `Err`，但**内存已在 `compact()` 阶段压实（I5 已原子替换 `self.inner`）**——
+    /// 返回的 `Err` 与内存状态不一致，磁盘仍是旧档。这是设计内行为：compaction 的核心
+    /// 价值就是内存压实，落盘失败不回滚内存（I5 无 undo 路径）；调用方拿到 `Err` 后
+    /// 可对同一 `path` 重试 `save()` 续写，不必重跑 `compact()`。
     pub fn compact_and_save(&mut self, path: &std::path::Path) -> Result<CompactionReport> {
-        let bytes_before = snapshot_bytes(path).ok();
+        // 首次落盘（目标文件尚不存在）时 `bytes_before` 应为 `None`（诚实表达「此前无
+        // 快照」），而非 `Some(0,0,0)`——`snapshot_bytes` 对缺失文件 `unwrap_or(0)` 永不
+        // 出错（评审建议 4）。
+        let bytes_before = if path.exists() {
+            snapshot_bytes(path).ok()
+        } else {
+            None
+        };
         let mut report = self.compact_with_bytes(bytes_before)?;
         let t_save = std::time::Instant::now();
         // 落盘（隐含 commit → no-op；dump 新图 + 重发 manifest）
@@ -747,6 +760,28 @@ impl SearchIndex {
         let before = self.tombstone_stats();
         let has_tombstones = before.chunks_total > before.chunks_alive;
 
+        // 无墓碑早退（评审建议 2）：`compact` 的全部价值都在物理回收，没有墓碑就
+        // **没有可回收物**——此时重物化 + 重建整张图（10~100s 级）是纯浪费
+        // （`remapped=false` 只保证 ID 不变，旧实现仍全量重建）。D-S4-02 刚在 `save`
+        // 里引导用户跑 compact，无墓碑时务必早退。返回 `before == after` 的空 report
+        //（语义与正常无墓碑一致，ID 一个不变）；`compact_and_save` 仍会幂等落盘。
+        if !has_tombstones {
+            return Ok(CompactionReport {
+                reclaimed_chunks: 0,
+                reclaimed_docs: 0,
+                reclaimed_terms: 0,
+                reclaimed_graph_points: 0,
+                vector_rebuild_ms: 0,
+                total_ms: t0.elapsed().as_millis(),
+                remapped: false,
+                graph_status: self.graph_status.clone(),
+                bytes_before,
+                bytes_after: None,
+                before,
+                after: before,
+            });
+        }
+
         // 步骤 1~2：取存活集 + 建 ID 映射（重编号，D-S4-01）
         let remap = self.inner.index.build_remap();
 
@@ -765,11 +800,17 @@ impl SearchIndex {
             out
         });
 
-        // 步骤 5：向量索引重建（§4.5 / S4-06，与 load 降级同源）
+        // 步骤 5：向量索引重建（§4.5 / S4-06，与 load 降级同源）。
+        // 判定维度是「是否有向量能力」（`had_vectors`），**与存活向量是否为空无关**
+        // （D-S4-07 评审发现 1）：全删后 raw 为空，但只要装配有向量 lane（embedder 仍
+        // 在配置里），就必须保留一个**空的**向量索引供后续 flush 灌入——否则落到
+        // `vector_index = None`，flush 会误报 `NoEmbedder` 而砖死（索引不可恢复）。
+        // `rebuild_vector_index` 对空 raw 天然安全（Hnsw `add_batch(&[])` no-op /
+        // Brute `from_entries(&[])` 空索引），与设计 §4.5 的「无条件重建」一致。
         let had_vectors = self.inner.vector_index.is_some();
         let t_vec = std::time::Instant::now();
         let new_vi = match (&new_raw, had_vectors) {
-            (Some(raw), true) if !raw.is_empty() => Some(rebuild_vector_index(
+            (Some(raw), true) => Some(rebuild_vector_index(
                 self.backend,
                 raw,
                 self.cfg.ef_search,
@@ -801,7 +842,8 @@ impl SearchIndex {
             ),
             vector_rebuild_ms,
             total_ms: t0.elapsed().as_millis(),
-            remapped: has_tombstones,
+            // 能走到这里必有墓碑（无墓碑已被上方 early-return 分流）
+            remapped: true,
             graph_status: self.graph_status.clone(),
             bytes_before,
             bytes_after: None,
@@ -855,10 +897,16 @@ impl SearchIndex {
             });
         }
 
-        // 重建向量索引（V2 Step 2：优先从图 sidecar 加载，失败则降级重建）
+        // 重建向量索引（V2 Step 2：优先从图 sidecar 加载，失败则降级重建）。
+        //
+        // 判定维度是「装配是否有向量能力」（`cfg.embedder`），**与快照向量是否为空
+        // 无关**（评审发现 1 的 load 侧对齐）：装配配了 embedder 时，即使快照向量已
+        // 删空（如全删后 compact_and_save），也必须保留**空**向量索引供后续写入——
+        // 否则落 `vector_index = None`，flush 误报 `NoEmbedder` 砖死。重建对空向量
+        // 天然安全（Hnsw `add_batch(&[])` no-op / Brute `from_entries(&[])` 空索引）。
         let mut graph_status = GraphStatus::NotApplicable;
-        let vector_index = match (cfg.embedder.as_ref(), raw_vectors.is_empty()) {
-            (Some(_), false) => Some(match backend {
+        let vector_index = match cfg.embedder.as_ref() {
+            Some(_) => Some(match backend {
                 VectorBackend::Brute => {
                     // Brute 逃生舱：忽略图（精确扫描是确定性的，无需缓存）。
                     // V2 Step 4（S4-06）：与 Hnsw 降级重建共用 `rebuild_vector_index`。
@@ -893,7 +941,9 @@ impl SearchIndex {
                     }
                 }
             }),
-            _ => None,
+            // 纯 BM25 装配（无 embedder）：快照即便带向量也无从检索，向量 lane 保持
+            // None（与 flush 421 行 embedder None 短路一致）。
+            None => None,
         };
 
         Ok(Self {

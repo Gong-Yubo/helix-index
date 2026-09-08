@@ -304,3 +304,59 @@ fn T13_compact前先commit_pending存活chunk不丢向量() {
         assert!(!h.text.contains("ZZZDELETE"), "已删不应被召回");
     }
 }
+
+// ---------------------------------------------------------------------------
+// 评审发现 1（回归）：全删 → compact → 空向量索引砖死
+// ---------------------------------------------------------------------------
+
+/// 全库删空后 `compact()` 曾把 `vector_index` 置 `None`（`if !raw.is_empty()` guard
+/// 对空 raw 落到 `_ => None`），但 embedder 仍在装配里——此后 `add → commit` 的
+/// `flush()` 对 `vector_index == None` 误报 `Err(NoEmbedder)`，`save` / `compact` /
+/// `into_searcher` 全数失败，索引**永久砖死**只能重建。CLI 场景：清空 collection 后
+/// 继续写入即踩中。
+///
+/// 修复：判定维度是「是否有向量能力」而非「存活向量是否为空」，全删后保留**空**向量
+/// 索引（`rebuild_vector_index` 对空 raw 天然安全）。此测试走完整闭环
+/// 全删 → compact → add → commit → save → load → 检索。
+#[test]
+fn R_发现1_全删compact后仍可写入检索() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("r1.idx");
+
+    // 建 2 个 doc 并落盘（先有向量 lane + graph sidecar）
+    let mut idx = builder_hnsw().build();
+    let a = idx.add("初始文档 AAAA").unwrap().doc_id;
+    let b = idx.add("初始文档 BBBB").unwrap().doc_id;
+    let doc_ids = vec![a, b];
+    idx.save(&path).unwrap();
+    assert_eq!(idx.num_chunks(), 2);
+
+    // 全删 → compact_and_save（raw 变空；修复前 vector_index 落 None）
+    for d in doc_ids {
+        idx.remove(d).unwrap();
+    }
+    let rep = idx.compact_and_save(&path).unwrap();
+    assert!(rep.remapped, "全删应有重编号");
+    assert_eq!(rep.reclaimed_chunks, 2, "回收 2 个墓碑");
+    assert_eq!(idx.num_chunks(), 0, "compact 后应 0 存活");
+
+    // 继续写入：add → commit 不得报 NoEmbedder（修复前在此砖死）
+    idx.add("新写入文档 CCCC").unwrap();
+    idx.commit()
+        .expect("全删 compact 后 commit 不得误报 NoEmbedder");
+    assert_eq!(idx.num_chunks(), 1, "新 doc 已可见");
+
+    // save → reload（走 load_with：快照向量可能为空，不得落 None）→ 检索命中
+    idx.save(&path).unwrap();
+    let loaded = builder_hnsw().load(&path).unwrap();
+    assert_eq!(loaded.num_chunks(), 1, "reload 应看到 1 个存活 doc");
+    let hits = loaded
+        .into_searcher()
+        .unwrap()
+        .search("新写入文档 CCCC")
+        .unwrap();
+    assert!(
+        hits.hits.iter().any(|h| h.text.contains("CCCC")),
+        "全删 compact 后新写入的 doc 应可被检索（FR-26/可用性）"
+    );
+}

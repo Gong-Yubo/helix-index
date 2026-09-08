@@ -52,6 +52,29 @@
     T7 compaction + reload 后 `GraphStatus::Loaded`；T11 无墓碑 no-op ID 不变；
     T12 纯 BM25 与 Brute 后端均可 compact；T13 D-S4-10 的 pending 存活 chunk 不丢向量。
 
+**评审回应（2026-09-08，PR #30 评审）**
+
+- **修复（发现 1，必改）全删 → compact → 写路径砖死**：`compact_with_bytes` 步骤 5
+  曾用 `if !raw.is_empty()` guard——全删后存活向量为空时落到 `_ => None`，把**仍有
+  embedder 装配**的向量 lane 丢成 `vector_index = None`；此后 `add → commit` 的
+  `flush()` 对 `vector_index == None` 误报 `Err(NoEmbedder)`（embedder 明明已配），
+  `save` / `compact` / `into_searcher` 全失败，索引不可恢复（CLI：清空 collection 后
+  继续写入即踩中）。修法：判定维度改为「是否有向量能力」（`had_vectors`），**与存活
+  向量是否为空无关**，全删后保留**空**向量索引（`rebuild_vector_index` 对空 raw 天然
+  安全），与设计 §4.5 的无条件重建一致。**load_with 同款对齐**：快照向量已删空
+  （全删后 compact_and_save）再 load，装配有 embedder 时同样保留空向量索引，不再因
+  `raw_vectors.is_empty()` 落 `None`。新增回归集成测试
+  `R_发现1_全删compact后仍可写入检索`（Hnsw，全删→compact→add→commit→save→load→检索）。
+- **采纳（建议 2）无墓碑 `compact()` 早退**：旧实现 `remapped == false` 只保证 ID 不变，
+  仍重物化 + 重建整图（10~100s 级纯浪费；D-S4-02 刚引导用户跑 compact）。无墓碑时
+  early-return `before == after` 的空 report（跳过重建，成本接近 0）；`compact_and_save`
+  仍幂等落盘。
+- **采纳（建议 3）`compact_and_save` 失败语义 rustdoc 注明**：`save` 失败（Strict 下图
+  dump 升级 Err）返回 `Err` 但**内存已压实**（I5 已原子替换）、磁盘仍旧档——设计内
+  行为（compaction 核心价值是内存压实，落盘失败不回滚）；重试 `save` 续写即可。
+- **采纳（建议 4）首存 `bytes_before` 为 `None`**：目标文件不存在时诚实表达「此前无
+  快照」，而非 `Some(0,0,0)`（`snapshot_bytes` 对缺失文件 `unwrap_or(0)` 永不报错）。
+
 ### V2 Step 4 · S4-01 flush 幽灵向量防线（2026-09-08，D-S4-05 / §2.3 / T5）
 
 **修复（资源回收）**
