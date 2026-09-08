@@ -9,6 +9,23 @@
 
 ## [Unreleased]
 
+### V2 Step 4 · S4-01 flush 幽灵向量防线（2026-09-08，D-S4-05 / §2.3 / T5）
+
+**修复（资源回收）**
+
+- **`flush()` 灌原始向量前按 liveness 过滤（D-S4-05 / §2.3 / T5）**：此前
+  `SearchIndex::flush` 把 `pending` 全部灌进 `raw_vectors` 与 HNSW 图，**全程无存活
+  检查**；而 `add()` 在入 `pending` 前就分配了真实 `chunk_id`，`remove()` 只墓碑化
+  正排/倒排、**不摘 pending**。于是 `add → remove → commit`（默认 `batch_size=64`
+  下的常见时序，CLI 逐条 add 后删除即此路径）会让已删 chunk 的向量入库并随
+  `save()` **跨快照永续**（资源问题；存活位图仍在检索期兜底，FR-26 不破）。
+  修法：`flush()` **整批 embed 之后、入库之前**按 `Index::is_live_chunk` 过滤，
+  墓碑 chunk 的向量丢弃（不落 `raw_vectors`、不进图）。刻意不改 `embed_documents`
+  入参组成（fastembed batch 组成无关性未实测，避免「赌」）。
+- **新增集成测试 `T5` / `T5b`**（`crates/core/tests/step4_liveness.rs`）：
+  T5 验证「remove 早于 flush」的幽灵向量不入快照；T5b 验证「flush 后 remove」的
+  `raw_vectors` retain 路径本就摘净。两者互补覆盖架构 §7.5.2 防线的时序缺口。
+
 ### V2 Step 3 · 原子快照实现（2026-09-07）
 
 **修复（正确性）**

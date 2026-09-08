@@ -324,19 +324,28 @@ impl SearchIndex {
         // V2 Step 2：改用 `add_batch`——达阈值且开了并行建图开关时由实现走
         // `parallel_insert_slice`，否则串行（默认，保确定性）。小批量下批量路径
         // 与逐条 add 行为等价，故无需分支。
+        //
+        // V2 Step 4 / S4-01（D-S4-05 / §2.3 / T5）：**整批 embed 之后、入库之前**按
+        // liveness 过滤。`add(d)` 在入 `pending` 前就分配了真实 chunk_id，而 `remove(d)`
+        // 只墓碑化正排/倒排、不摘 pending；于是 `add → remove → commit`（默认
+        // `batch_size = 64` 下的常见时序，CLI 逐条 add 后删除即此路径）会让已删 chunk
+        // 仍留在 pending 里，若不滤掉，其向量会被灌进 `raw_vectors` 与图并跨快照永续。
+        //
+        // 刻意**先整批 embed、再过滤**（不改变 `embed_documents` 入参组成）：fastembed
+        // 推理是否受 batch 组成影响未经实测（Step 2 教训是「别赌」），「白算一条 embed」
+        // 的代价只是时间；若后续实测证明组成无关，可再改「先过滤再 embed」（见设计 §9 Q5）。
         let vi = self.inner.vector_index.as_mut().ok_or(Error::NoEmbedder)?;
-        let items: Vec<(ChunkId, NormalizedVector)> = self
-            .pending
-            .iter()
-            .zip(vecs)
-            .map(|(pending, v)| {
-                let nv = NormalizedVector::new(v);
-                if let Some(raw) = self.inner.raw_vectors.as_mut() {
-                    raw.push((pending.chunk_id, nv.as_slice().to_vec()));
-                }
-                (pending.chunk_id, nv)
-            })
-            .collect();
+        let mut items: Vec<(ChunkId, NormalizedVector)> = Vec::new();
+        for (pending, v) in self.pending.iter().zip(vecs) {
+            if !self.inner.index.is_live_chunk(pending.chunk_id) {
+                continue; // 墓碑 chunk：向量丢弃，不落 raw_vectors、不进图
+            }
+            let nv = NormalizedVector::new(v);
+            if let Some(raw) = self.inner.raw_vectors.as_mut() {
+                raw.push((pending.chunk_id, nv.as_slice().to_vec()));
+            }
+            items.push((pending.chunk_id, nv));
+        }
         vi.add_batch(&items)?;
         self.pending.clear();
         Ok(())
@@ -415,7 +424,7 @@ impl SearchIndex {
 
         // 顺带摘除原始向量（O(len)，与 `Index::remove` 的 O(N) 同量级）：
         // 这既缩小快照体积，也断掉「删除 → save → load → 幽灵候选复活」的路径。
-        // 内存中的 HNSW 图仍需靠存活位图过滤（物理回收归 V2.0 Step 5 的 compaction）。
+        // 内存中的 HNSW 图仍需靠存活位图过滤（物理回收归 Step 4 的 compaction，S4-03~S4-07）。
         let Inner {
             index, raw_vectors, ..
         } = &mut self.inner;
