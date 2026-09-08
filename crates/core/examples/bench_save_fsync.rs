@@ -11,6 +11,9 @@
 //!
 //! 同一示例在改造前（main，直写）/ 改造后（V2 Step 3，tmp+fsync+rename）各跑
 //! 一轮，结果入 eval-report §8.7（给范围不给单点值，单次波动可达 ±15%）。
+//!
+//! ⚠️ 产物**仅供计时**：快照带合成向量但 fingerprint 是空 embedder（dim=0），
+//! 任何真实装配都 load 不出它——不得当作兼容性样例文件使用。
 
 use std::path::Path;
 use std::time::Instant;

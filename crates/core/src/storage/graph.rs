@@ -374,6 +374,31 @@ mod tests {
         assert_eq!(entries.len(), 1, "目录里只应有 manifest 一个文件");
     }
 
+    /// S3-T8：**写侧与清侧 tmp 命名一次改齐**的测试兜底（D-S3-01 命门）。
+    ///
+    /// 手法同 C7（CI root 下 chmod 无效）：manifest 落点被**同名目录**占据令
+    /// `write_manifest_atomic` 失败 → tmp 残留 → `remove_sidecars`（清侧）必须用
+    /// 同一 `tmp_path` 拼法才能清掉它。若未来任一侧改了拼法而另一侧没跟上，
+    /// 本测试必红——而不是静默留下永远清不掉的孤儿。
+    #[test]
+    fn manifest写失败后remove_sidecars清掉tmp_T8() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap = dir.path().join("t8.idx");
+        let manifest = graph_paths(&snap).manifest;
+        std::fs::create_dir(&manifest).unwrap(); // 同名目录占据 rename 落点
+
+        let r = write_manifest_atomic(&manifest, &sample());
+        assert!(r.is_err(), "rename 到目录上必须失败");
+        let tmp = tmp_path(&manifest);
+        assert!(tmp.exists(), "写失败时 manifest tmp 应残留（回收对象）");
+
+        // 清理顺序保证：tmp 在三件套循环**之前**删——即便 manifest 位被目录占据
+        // 使 remove_file 上抛（macOS EPERM / Linux EISDIR，异常态如实报错），
+        // tmp 也已被清掉。故这里容忍 Err、只断言 tmp 消失（本测试只兜命名对齐）。
+        let _ = remove_sidecars(&snap);
+        assert!(!tmp.exists(), "清侧必须用同一 tmp_path 拼法，否则清理失效");
+    }
+
     /// P0-1 的核心防回归：basename 必须是快照**文件名全名**。
     #[test]
     fn basename是快照全名() {

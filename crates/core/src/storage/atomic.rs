@@ -84,9 +84,16 @@ pub(crate) fn atomic_write(
 
 /// fsync 父目录，best-effort（错误吞掉）。
 ///
-/// POSIX 上 `fsync` 目录需要 `File::open(dir)` + `sync_all`；Windows 上
-/// `File::open` 目录会失败 → 静默跳过（C6，现状 `write_manifest_atomic` 同款）。
-/// 目录 fsync 是尽力而为的加固，失败不构成 `save` 失败。
+/// POSIX 上 `fsync` 目录需要 `File::open(dir)` + `sync_all`。平台差异（评审 #27-3
+/// 核实）：
+/// - **Windows**：`File::open` 目录直接失败 → 静默跳过（C6，旧 manifest 实现同款）；
+/// - **macOS（APFS，实测机）**：`sync_all` 走 `fcntl(F_FULLFSYNC)`，对目录 fd
+///   **实测成功返回**（rustc 1.90 实证，含 `/tmp` 与 `$TMPDIR` 所在 APFS 卷）——
+///   评审前提「目录 fd 通常返回 EINVAL」在实测机不成立，S3-08 的目录 fsync
+///   代价是真实发生的；
+/// - 其他平台 / 文件系统（网络卷、部分 BSD）：可能失败，一律吞掉——
+///   目录 fsync 是尽力而为的加固，失败不构成 `save` 失败（rename 已发布，
+///   报 Err 反而会让调用方误以为快照没写成）。
 fn fsync_dir(dir: Option<&Path>) {
     if let Some(dir) = dir {
         if let Ok(d) = File::open(dir) {
@@ -221,7 +228,13 @@ mod tests {
     /// S3-T9：`FAIL_AT == 0`（默认）时行为与 T1 完全一致——防钩子泄漏进生产语义。
     #[test]
     fn 默认不注入行为一致_T9() {
+        // 断言前先取注入锁：`FAIL_AT` 是**进程级全局**，cargo 单测默认多线程并行，
+        // T3~T6 任一持锁 arm 期间本测试若恰好读它会被误判（窗口小但非零）。
+        // 持锁期间其余注入测试无法 arm；Drop 保证复位后断言必为 0（§4.5）。
+        // 后续的 atomic_write 不需要锁：本线程未 arm，线程本地 opt-in 挡住他人注入。
+        let g = fault::InjectionGuard::acquire();
         assert_eq!(fault::FAIL_AT.load(std::sync::atomic::Ordering::Relaxed), 0);
+        drop(g);
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t9.idx");
