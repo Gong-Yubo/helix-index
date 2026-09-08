@@ -652,3 +652,59 @@ pub(crate) fn dump_graph_caught(
 | `remove_sidecars` 仅 save 路径调用 | `crates/core/src/search/index.rs:484,488,493,507`（load 路径零调用点，v0.2 评审核实） |
 | storage 子模块私有 + 选择性 `pub use` | `crates/core/src/storage/mod.rs:15-25`（v0.2 评审核实：私有 `mod atomic` 内的钩子对 `tests/` 不可达） |
 | S3-a~e 子任务定义 | `docs/devel/plan-v2.md` §4 Step 3 |
+
+---
+
+## 10. 实施结果（S3-02~09，2026-09-07 落地）
+
+> 单实现 PR（S3-02~09 代码 + 测试 + 文档回写同 PR），分支 `feat/v2-step3-atomic-snapshot`。
+
+### 10.1 落地清单与设计偏差
+
+| 任务 | 结果 |
+| --- | --- |
+| S3-02 | ✅ `storage/atomic.rs`：`atomic_write`（写闭包）/ `tmp_path` / `fsync_dir` / `fault` 钩子；T1/T9 单测就位 |
+| S3-03 | ✅ `write_manifest_atomic` 改走 `atomic_write`（签名不变）；`remove_sidecars` 同步换 `tmp_path`（T8） |
+| S3-04 | ✅ `save_with_crc` 接线（签名不变）；`load_with_crc` 成功后 best-effort 回收 tmp 孤儿；既有测试零修改回归（T2） |
+| S3-05 | ✅ T3/T4/T5/T9 在 `storage/atomic.rs` 单测；T6 端到端在 `search/index.rs` 单测；`tests/atomic_snapshot.rs` 无注入集成测试 |
+| S3-06 | ✅ `dump_graph_caught`（**入参收窄为闭包**，§9 预留的实现期决策采纳：mock 面更小）接入 `write_graph_sidecar`；Strict 失败路径补 best-effort `remove_sidecars`（D-S3-07）；Cargo.toml 钉 panic=abort 注释；T7 单测 |
+| S3-07 | ✅ `.gitignore` 补 `*.manifest.tmp`（附 T7-24 边界声明注释） |
+| S3-08 | ✅ fsync 代价实测入 `eval-report.md` §8.7（见下） |
+| S3-09 | ✅ 架构 v1.8 / 需求 v1.8 / `plan-v2.md` v0.5 / CHANGELOG / docs README 索引 / 本节 |
+
+### 10.2 实现期决策与增强（不改变设计语义）
+
+1. **`dump_graph_caught` 收窄为闭包入参**（§9 预留项，采建议）：`impl FnOnce() -> Result<GraphStats>`——测试只需一个会 panic 的闭包，不必实现整个 `VectorIndex` trait。
+2. **注入互扰防护加固（§4.5 的落地形态）**：Mutex 串行 + guard 复位之外，`checkpoint` 增加**线程本地 opt-in**（`ARMED`）——`FAIL_AT` 是进程级全局，同二进制里**不持锁**的其他单测（快照 roundtrip、manifest 系列都会路过 checkpoint）撞上持有期的非零值会被误杀；opt-in 后无辜线程绝不可能被误杀，互扰彻底归零。生产路径代价不变（`FAIL_AT` 恒 0 短路，`ARMED` 永不被触碰）。
+3. **panic payload 的 `&Box<dyn Any>` deref 强转坑（实测踩到）**：`&payload` 强转 `&(dyn Any + Send)` 会把 **Box 自身**当作 trait 对象 unsize（具体类型成了 `Box<&str>`），文本 downcast 全部落空。`panic_message` 收 `Box` 值并对其自动解引用调用 `downcast_ref` 才落在内层。已在 `panic_message` 文档注释钉死。
+
+### 10.3 fsync 代价实测（详见 eval-report §8.7）
+
+12K 语料 54,476,915 字节（≈54.5MB）：改造前 0.034~0.040s → 改造后 0.067~0.075s
+（+0.027~0.035s，本机 NVMe，3 轮 min~max）。**两版产物 CRC 逐位一致**（`0x576e065f`）
+——「格式零变化」（C3）得到字节级实测印证。不触碰任何 NFR。
+
+### 10.4 评审回应与集成测试补强（2026-09-08，`a474d86` + `dc31b3f`）
+
+**评审（3 条 inline，均非阻塞）**：① S3-T8 标 ✅ 但测试缺失 → 已补
+`manifest写失败后remove_sidecars清掉tmp_T8`（目录占据落点 → Err 且 tmp 残留 →
+清侧回收；ⓘ `remove_file` 对目录是 EPERM/EISDIR 非 NotFound，但 tmp 删在
+三件套循环**之前**，清理顺序保证 tmp 必被清掉）；② T9 首行断言 flaky 窗口 →
+断言前先取 `InjectionGuard`；③ fsync_dir 平台注释 → **实测核实 macOS/APFS
+（rustc 1.90）目录 fd `sync_all` 返回 Ok**（F_FULLFSYNC，`/tmp` 与 `$TMPDIR`
+双点），评审「通常 EINVAL」前提在实测机不成立，注释仍按平台分列补全、
+eval-report §8.7 补平台口径注记。
+
+**集成测试 S3-TI1~TI5**（`tests/atomic_snapshot.rs`，与 S3-T 单元层互补——
+注入类受 C′ 约束留在 crate 内，无注入可观测的终态在集成层钉死）：
+
+| # | 覆盖 |
+| --- | --- |
+| TI1 | load 回收快照 tmp 孤儿（D-S3-05 load 侧终态：孤儿可伪造，回收必须发生） |
+| TI2 | save 截断复用 tmp 孤儿（save 侧：`File::create` 天然截断 → rename 消费） |
+| TI3 | 半截快照公开错误面：正文截断 → `SnapshotCorrupted`（CRC 失配）/ 头部截断 → `Io`；一律干净 Err 绝不 panic |
+| TI4 | 图三件套命名对齐（D-S3-01 集成级）：目录恰好 = 快照 + 3 sidecar、零 `.tmp`；manifest tmp 孤儿被下一次 save 截断复用 |
+| TI5 | Strict 失败完整生命周期（D-S3-07 用户可见后果）：save Err → 快照已落盘且可加载（残留旧 manifest CRC 锚失配 → Rebuilt，绝不假快路径）→ 清障 → 再 save 回 Loaded |
+
+实现期实证：dump 的 N2 前置删除只删 graph/data，manifest tmp 由
+`write_manifest_atomic` 的截断复用消费——两条回收路径口径不同但都闭环。

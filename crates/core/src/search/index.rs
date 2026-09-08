@@ -35,12 +35,17 @@ pub enum GraphStatus {
     PersistFailed(String),
 }
 
-/// 写图 sidecar 的完整链路：dump → CRC → manifest 原子发布（v2-step2-design §4.5 步骤 5~7）。
+/// 写图 sidecar 的完整链路：dump（R19 panic 边界内）→ CRC → manifest 原子发布
+/// （v2-step2-design §4.5 步骤 5~7）。
 ///
 /// 独立成函数是为了让「失败」有一个**统一的边界**：任一步出错都回到调用方，
 /// 由 `GraphPersistMode` 决定升级为 Err 还是降级为警告。此前只有 `dump_graph`
 /// 被 Lenient 捕获，紧随其后的 CRC / manifest 发布仍会让 `save()` 返回 Err
 /// （评审 #12 发现 2）。
+///
+/// V2 Step 3（D-S3-04）：dump 经 [`crate::vector::dump_graph_caught`] 的 panic
+/// 边界——`hnsw_rs` 写路径的 `panic_any`（R19 TOCTOU 残余）降级为
+/// `Err(VectorGraph)`，汇入本函数既有的失败语义链。
 fn write_graph_sidecar(
     path: &std::path::Path,
     g: &dyn VectorGraphPersist,
@@ -50,7 +55,7 @@ fn write_graph_sidecar(
     // 路径必须有文件名，否则 sidecar 会落到凭空捏造的位置（评审 #12 nit）
     crate::storage::require_file_name(path)?;
 
-    let stats = g.dump_graph(path)?;
+    let stats = crate::vector::dump_graph_caught(|| g.dump_graph(path))?;
 
     // CRC + 长度（流式）
     let paths = crate::storage::graph_paths(path);
@@ -500,7 +505,17 @@ impl SearchIndex {
         // 让 `save()` 失败等于「缓存写坏了把主数据一起否决」。
         match write_graph_sidecar(path, g, body_crc, self.cfg.fingerprint().dim) {
             Ok(()) => Ok(GraphStatus::Loaded),
-            Err(e) if self.graph.mode == GraphPersistMode::Strict => Err(e),
+            Err(e) if self.graph.mode == GraphPersistMode::Strict => {
+                // D-S3-07（拍板）：Strict 返回 Err 前也补 best-effort 清理——
+                // 「失败上抛」不等于「失败且留垃圾」：此刻 dump 可能已删旧图，
+                // 残留半截 `*.hnsw.graph`/`*.hnsw.data` + 已失效的旧 manifest
+                // （其 CRC 锚已不匹配新快照，load 必降级重建——功能安全但目录
+                // 留尸体）。被删的都是垃圾；清理自身失败不升级、不改 Err 语义。
+                if let Err(ce) = crate::storage::remove_sidecars(path) {
+                    eprintln!("[警告] 图 sidecar 清理失败（残留文件不影响正确性）: {ce}");
+                }
+                Err(e)
+            }
             Err(e) => {
                 // 已发布的旧 manifest 必须删除（否则下次加载会拿到过期图）。
                 // 清理本身失败也只是「残留垃圾」，不升级为 Err。
@@ -772,5 +787,68 @@ mod tests {
             matches!(err, Error::ConfigMismatch { .. }),
             "应为 ConfigMismatch，得到 {err:?}"
         );
+    }
+
+    /// S3-T6 ⚠️（验收 1 的直接对应）：在 `save` 的快照写窗口各注入点崩溃后，
+    /// `load` 要么拿到旧快照、要么拿到新快照，**绝不 `SnapshotCorrupted`**。
+    ///
+    /// 判定口径（附录 B）：旧/新以 chunk 数区分（2 篇旧文档 = 2 chunks，
+    /// 追加第 3 篇 = 3 chunks）——不依赖分词细节。cp1/cp2（rename 前）真源
+    /// 必为旧快照且 tmp 孤儿残留、被 load 回收；cp3（rename 后）真源必为新
+    /// 快照且无 tmp（进程崩溃态；掉电回滚态见设计 §4.3 注 1，等价于 cp1/cp2）。
+    ///
+    /// 注入范围声明（设计 §7）：`FAIL_AT` 单发命中，只覆盖快照写窗口
+    /// （save 内首次 `atomic_write`）；图 dump / manifest 窗口是 Step 2
+    /// 已覆盖的性能退化窗口，不重复注入。
+    #[test]
+    fn save崩溃注入后load恒可用_T6() {
+        use crate::storage::atomic::fault::InjectionGuard;
+
+        for cp in [1u8, 2, 3] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("t6.idx");
+
+            // v1：两篇旧文档，先正常落盘
+            let mut idx = bm25_index();
+            idx.add("BM25 是经典关键词检索算法").unwrap();
+            idx.add("向量检索计算余弦相似度").unwrap();
+            idx.save(&path).unwrap();
+
+            // v2：追加一篇新文档后重写，注入崩溃
+            idx.add("崩溃注入新增文档").unwrap();
+            let g = InjectionGuard::acquire();
+            g.arm(cp);
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| idx.save(&path)));
+            drop(g); // 无论成败都复位
+
+            assert!(r.is_err(), "cp{cp} 注入应 panic");
+            let tmp = crate::storage::atomic::tmp_path(&path);
+            if cp < 3 {
+                assert!(tmp.exists(), "cp{cp}: rename 未发生，应残留 tmp 孤儿");
+            } else {
+                assert!(!tmp.exists(), "cp3: rename 已消费本 save 的 tmp");
+            }
+
+            // 核心不变式：要么旧要么新，绝不 SnapshotCorrupted
+            let loaded = SearchIndexBuilder::default()
+                .embedder(None)
+                .load(&path)
+                .unwrap_or_else(|e| panic!("cp{cp}: load 必须成功，得到 {e:?}"));
+            match cp {
+                1 | 2 => assert_eq!(
+                    loaded.num_chunks(),
+                    2,
+                    "cp{cp}: rename 前崩溃，load 必须得到旧快照"
+                ),
+                _ => assert_eq!(
+                    loaded.num_chunks(),
+                    3,
+                    "cp3: rename 后崩溃，load 必须得到新快照"
+                ),
+            }
+
+            // 验收 3（快照 tmp 口径）：load 成功后孤儿被回收
+            assert!(!tmp.exists(), "cp{cp}: load 成功后 tmp 孤儿应被回收");
+        }
     }
 }

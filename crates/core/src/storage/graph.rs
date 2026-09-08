@@ -20,11 +20,12 @@
 //! 的地方是 `vector/persist.rs`。
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use super::atomic::{atomic_write, tmp_path};
 use crate::error::{Error, Result};
 
 /// manifest 魔数。变更即视为不兼容格式（读取侧拒绝并降级）。
@@ -228,11 +229,14 @@ pub fn read_manifest(path: &Path) -> Result<Option<GraphManifest>> {
     )
 }
 
-/// 原子写 manifest：tmp → flush → sync_all → rename → **fsync 父目录**（P1-4）。
+/// 原子写 manifest（V2 Step 3 起委托私有原语 `atomic_write`）：
+/// tmp → flush → sync_all → rename → **fsync 父目录**（P1-4）。
 ///
 /// rename 是唯一原子发布点；fsync 父目录保证掉电后 rename 本身持久
-/// （只 fsync 文件不 fsync 目录，rename 可能不落地）。这段机制正是
-/// Step 3 原子快照要复用的。
+/// （只 fsync 文件不 fsync 目录，rename 可能不落地）。Step 3 把这段机制
+/// 抽成 `atomic_write` 通用原语后，manifest 与快照共用一份实现——「共用」
+/// 不是美观诉求：两份独立实现迟早漂移，漂移的那一份就是下一个 Q-C3。
+/// 公开签名不变。
 pub fn write_manifest_atomic(path: &Path, m: &GraphManifest) -> Result<()> {
     let body =
         bincode::serde::encode_to_vec(m, bincode::config::standard()).map_err(Error::Codec)?;
@@ -241,27 +245,16 @@ pub fn write_manifest_atomic(path: &Path, m: &GraphManifest) -> Result<()> {
     hasher.update(&body);
     let crc = hasher.finalize();
 
-    let tmp = path.with_extension("hnsw.manifest.tmp");
-    {
-        let file = File::create(&tmp).map_err(Error::Io)?;
-        let mut w = BufWriter::new(file);
-        w.write_all(MAGIC_GMAN).map_err(Error::Io)?;
-        w.write_all(&MANIFEST_VERSION.to_le_bytes())
-            .map_err(Error::Io)?;
-        w.write_all(&crc.to_le_bytes()).map_err(Error::Io)?;
-        w.write_all(&body).map_err(Error::Io)?;
-        w.flush().map_err(Error::Io)?;
-        w.get_ref().sync_all().map_err(Error::Io)?;
-    }
-    std::fs::rename(&tmp, path).map_err(Error::Io)?;
-
-    // fsync 父目录（P1-4）：让 rename 本身在掉电后仍持久
-    if let Some(dir) = path.parent() {
-        if let Ok(d) = File::open(dir) {
-            let _ = d.sync_all();
-        }
-    }
-    Ok(())
+    // D-S3-01：tmp 名由 `atomic_write` 统一为「目标路径 + .tmp 追加」——
+    // 取代旧 `with_extension("hnsw.manifest.tmp")` 拼出的
+    // `foo.idx.hnsw.hnsw.manifest.tmp`（双 `hnsw`）怪名。
+    atomic_write(path, |w| {
+        w.write_all(MAGIC_GMAN)?;
+        w.write_all(&MANIFEST_VERSION.to_le_bytes())?;
+        w.write_all(&crc.to_le_bytes())?;
+        w.write_all(&body)?;
+        Ok(())
+    })
 }
 
 /// 删除快照旁的全部 sidecar（图 + data + manifest + 可能的 tmp 残留）。
@@ -275,8 +268,10 @@ pub fn remove_sidecars(snapshot: &Path) -> Result<()> {
         data,
         manifest,
     } = graph_paths(snapshot);
-    // tmp 残留（rename 前崩溃）尽力清理，失败不阻塞
-    let tmp = manifest.with_extension("hnsw.manifest.tmp");
+    // tmp 残留（rename 前崩溃）尽力清理，失败不阻塞。
+    // D-S3-01：与写侧 `write_manifest_atomic` 用同一 `tmp_path` 拼法——
+    // 两边必须一次改齐（漏一边 = 清理失效，S3-T8 兜底）。
+    let tmp = tmp_path(&manifest);
     let _ = std::fs::remove_file(&tmp);
     // NotFound 是常态（本就没有 sidecar），忽略之；其他错误（权限等）上抛
     for p in [graph, data, manifest] {
@@ -377,6 +372,31 @@ mod tests {
 
         let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
         assert_eq!(entries.len(), 1, "目录里只应有 manifest 一个文件");
+    }
+
+    /// S3-T8：**写侧与清侧 tmp 命名一次改齐**的测试兜底（D-S3-01 命门）。
+    ///
+    /// 手法同 C7（CI root 下 chmod 无效）：manifest 落点被**同名目录**占据令
+    /// `write_manifest_atomic` 失败 → tmp 残留 → `remove_sidecars`（清侧）必须用
+    /// 同一 `tmp_path` 拼法才能清掉它。若未来任一侧改了拼法而另一侧没跟上，
+    /// 本测试必红——而不是静默留下永远清不掉的孤儿。
+    #[test]
+    fn manifest写失败后remove_sidecars清掉tmp_T8() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap = dir.path().join("t8.idx");
+        let manifest = graph_paths(&snap).manifest;
+        std::fs::create_dir(&manifest).unwrap(); // 同名目录占据 rename 落点
+
+        let r = write_manifest_atomic(&manifest, &sample());
+        assert!(r.is_err(), "rename 到目录上必须失败");
+        let tmp = tmp_path(&manifest);
+        assert!(tmp.exists(), "写失败时 manifest tmp 应残留（回收对象）");
+
+        // 清理顺序保证：tmp 在三件套循环**之前**删——即便 manifest 位被目录占据
+        // 使 remove_file 上抛（macOS EPERM / Linux EISDIR，异常态如实报错），
+        // tmp 也已被清掉。故这里容忍 Err、只断言 tmp 消失（本测试只兜命名对齐）。
+        let _ = remove_sidecars(&snap);
+        assert!(!tmp.exists(), "清侧必须用同一 tmp_path 拼法，否则清理失效");
     }
 
     /// P0-1 的核心防回归：basename 必须是快照**文件名全名**。

@@ -60,6 +60,54 @@ pub struct GraphStats {
     pub ef_construction: u32,
 }
 
+/// `dump_graph` 的 panic 边界（R19 写路径残余收敛，S3-e / D-S3-04）。
+///
+/// `hnsw_rs` 的 `DumpInit::new` 打不开输出文件时 **panic_any**（hnswio.rs:208/226），
+/// 不是 `Err`，`?` 接不住——probe 探测（第一道防线）之外的 TOCTOU 窗口
+/// （探测通过后磁盘满、配额、并发删目录）由此兜底。
+///
+/// panic 在此降级为 `Err(VectorGraph)`，**汇入 Step 2 既有的 P0-3 缓存失败
+/// 语义链**，不新增状态机：Lenient → 警告 + `GraphStatus::PersistFailed` +
+/// save 仍 Ok；Strict → Err（返回前补 best-effort sidecar 清理，D-S3-07）。
+///
+/// 入参收窄为闭包（设计 §9 实现期决策）：比 `&dyn VectorGraphPersist` 更窄的
+/// mock 面——测试只需一个会 panic 的闭包，不必实现整个 `VectorIndex` trait。
+///
+/// # 已知残余（设计 §4.6，如实声明）
+///
+/// - `panic = "abort"` 构建下 `catch_unwind` 静默失效：库 profile 对嵌入宿主
+///   无效，本 workspace 由 Cargo.toml 注释钉死，宿主侧是文档级约束（架构 R19
+///   残余表 / README）；无编译期检测手段。
+/// - panic 先经默认 hook 打印到 stderr，再进入我们的警告输出（库内不宜全局
+///   `set_hook` 污染宿主，接受噪音）。
+/// - 读路径残余不在本 Step 范围（C5「无并发写同一快照」语义的边界）。
+pub(crate) fn dump_graph_caught(op: impl FnOnce() -> Result<GraphStats>) -> Result<GraphStats> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(op)) {
+        Ok(r) => r,
+        Err(payload) => Err(Error::VectorGraph(format!(
+            "hnsw_rs 图 dump panic（R19）：{}",
+            panic_message(payload)
+        ))),
+    }
+}
+
+/// panic payload → 文本（`&str` / `String` downcast，其余给占位符）。
+///
+/// ⚠️ 入参收 `Box<dyn Any + Send>` 并对其**自动解引用**调用 `downcast_ref`
+/// （落在内层 `dyn Any + Send` 上）。不得经 `&payload` 强转
+/// `&(dyn Any + Send)`——那会把 Box **本身**当作 trait 对象 unsize
+/// （具体类型成了 `Box<&str>`），所有文本 downcast 全部落空，panic 信息
+/// 永远变成 `<非文本 payload>`（S3-T7 实测踩坑）。
+fn panic_message(payload: std::boxed::Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<非文本 payload>".to_string()
+    }
+}
+
 /// 向量图持久化能力（D-S2-03）：「Brute 无图」是类型事实，不是运行时 if。
 ///
 /// dump 是 `&self` 方法 → 对象安全；load 是关联函数 → `where Self: Sized`，
@@ -560,5 +608,40 @@ mod tests {
 
         let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
         assert!(entries.is_empty(), "sidecar 应全部删除");
+    }
+
+    /// S3-T7 ⚠️（R19 收敛 / 验收 4）：dump 期间 panic 不杀进程——
+    /// `dump_graph_caught` 把 panic 降级为 `Err(VectorGraph)` 且**携带 panic 信息**
+    /// （NFR-07：`PersistFailed(reason)` 能承载原因）。接入门面层后的 Lenient
+    /// 语义（save Ok + `PersistFailed`）由 `search/index.rs` 的既有 S2-T19 断言覆盖。
+    #[test]
+    fn dump_panic降级为err_T7() {
+        // 文本 payload（&str）
+        let r = dump_graph_caught(|| panic!("hnsw_rs DumpInit: 磁盘满"));
+        match r {
+            Err(Error::VectorGraph(msg)) => {
+                assert!(msg.contains("R19"), "应标注 R19 来源: {msg}");
+                assert!(msg.contains("磁盘满"), "应携带 panic 信息: {msg}");
+            }
+            other => panic!("应得 Err(VectorGraph)，得到 {other:?}"),
+        }
+
+        // String payload
+        let r = dump_graph_caught(|| panic!("{}", "字符串 payload"));
+        assert!(matches!(r, Err(Error::VectorGraph(ref m)) if m.contains("字符串 payload")));
+
+        // 非 payload 文本（Box<dyn Any> 不可 downcast 成 str）
+        let r = dump_graph_caught(|| std::panic::panic_any(42u8));
+        assert!(matches!(r, Err(Error::VectorGraph(ref m)) if m.contains("<非文本 payload>")));
+
+        // 正常路径直通：Ok 原样返回
+        let stats = GraphStats {
+            nb_point: 1,
+            dim: 2,
+            graph_format: 4,
+            max_nb_connection: 32,
+            ef_construction: 300,
+        };
+        assert_eq!(dump_graph_caught(|| Ok(stats)).unwrap(), stats);
     }
 }
