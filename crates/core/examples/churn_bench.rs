@@ -21,10 +21,10 @@
 //! - 追加文档的 `text` 带唯一后缀（churn 轮次 + 序号）⇒ `content_hash` 唯一，
 //!   不被幂等 dedupe（FR-15）误吞。
 //!
-//! 运行（release，否则体积/耗时无意义）：
+//! 运行（release，否则体积/耗时无意义；语料路径相对进程 cwd——repo root）：
 //! ```
 //! cargo run --release -p helix-core --example churn_bench -- \
-//!     --corpus ../../data/synth-10000-corpus.jsonl --size 10000 \
+//!     --corpus data/synth-10000-corpus.jsonl --size 10000 \
 //!     --rounds 5 --churn 0.1 --out /tmp/churn.csv
 //! ```
 //! 输出 CSV（`round,snapshot_bytes,graph_bytes,data_bytes,raw_vectors,nb_point,
@@ -44,8 +44,12 @@ use helix_core::search::{GraphStatus, SearchIndexBuilder};
 
 /// 确定性合成 Embedder（LCG + L2 归一化，dim=512）。
 ///
-/// `id = "synth-512"` 固定 ⇒ 快照指纹含它；`eval_churn.sh` / `helix compact` 用同一
-/// SynthEmbedder 装配即可 load 出本工具产出的快照（配置指纹一致）。
+/// `id = "synth-512"` 固定 ⇒ 快照指纹含它；`eval_churn.sh`（churn_bench 自测闭环）
+/// 用同一 SynthEmbedder 装配即可 load 出本工具产出的快照（配置指纹一致）。
+///
+/// ⚠️ 不要混淆 `helix compact` CLI：它走**默认装配**，对 `synth-512` 快照
+/// （embedder_id 非空 ⇒ 严格校验）必然 `ConfigMismatch`、无法 load——CLI 只能
+/// compact 用默认装配（bge）建的库（见 user-guide §1.5）。
 struct SynthEmbedder {
     dim: usize,
 }
@@ -195,17 +199,20 @@ fn main() -> anyhow::Result<()> {
     let (c_s, c_g, c_d) = on_disk(&snap);
     let c_stats = idx.tombstone_stats();
     let c_nb = graph_nb(&snap);
-    rows.push(format!(
-        "compact,{c_s},{c_g},{c_d},{},{c_nb},0,{}",
-        c_stats.raw_vectors,
-        gs_label(idx.graph_status())
-    ));
 
     // ---- 验收 2：重新 load（同 SynthEmbedder 装配）→ 冷启动 + Loaded ----
     let lstart = Instant::now();
     let reloaded = synth_builder(a.dim).load(&snap)?;
     let coldstart_ms = lstart.elapsed().as_millis();
     let loaded_ok = matches!(reloaded.graph_status(), GraphStatus::Loaded);
+
+    // compact 行（CSV）：`coldstart_ms` 填 reload 实测值、`graph_status` 填 reload 后
+    // 的最终状态（Loaded = 快路径）；不再像旧版对普通行那样占位填 0（评审建议 3）。
+    rows.push(format!(
+        "compact,{c_s},{c_g},{c_d},{},{c_nb},{coldstart_ms},{}",
+        c_stats.raw_vectors,
+        gs_label(reloaded.graph_status())
+    ));
 
     // ---- 判定行（验收 1 三条判据 + 验收 2；eval_churn.sh 据此 PASS/FAIL）----
     // J1（回收发生）：末轮 compact 后图 sidecar 回落（< compact 前那一轮）——本行即

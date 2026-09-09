@@ -38,6 +38,24 @@
     （省 60%）；`nb_point` 13000→25000 → **10000**。两档 compact 后 reload 均 `Loaded`
     （铁律），冷启动 **91~99ms**；`save` 墓碑告警（D-S4-02）如期出现。
 
+**评审响应（PR #31 · 6 条非阻塞全处理）**
+- **load 侧去噪（建议 6）**：默认装配（embedder=Some + Hnsw）加载**无向量快照**
+  （纯 BM25 / 全删后 compact）时，`raw_vectors` 为空 ⇒ save 侧本就清 sidecar 落
+  `NotApplicable`（`persist_graph`）⇒ load 侧此前却走 `try_load_graph → 失败 →
+  打「[警告] 降级重建」噪音 → 重建空图`。现**静默**建空向量 lane（`graph_status =
+  NotApplicable`），保留 PR30「装配有 embedder ⇒ 保留空 lane 供后续写入」不变式。
+  回归测试 `R_建议6`。
+- **CLI `--output` A/B 体积对比（建议 5）**：新增 `bytes_source`（compact **前**源
+  `--index` 三体积）；`--output` 另存时 `bytes_before`（对目标路径 stat）恒 null，回收
+  以 `bytes_source` vs `bytes_after` 判定。人类输出恒打「源→新」两态。JSON 耗时口径
+  拆分 `load_ms` / `compact_ms`（core `total_ms`，纯 compact+save）。
+- **churn_bench CSV `coldstart_ms`（建议 3）**：compact 行改填 reload 实测冷启动值
+  （不再恒 0）、`graph_status` 改取 reload 后状态。
+- **`scripts/eval_churn.sh`**：语料缺失自动调 `gen_synth_corpus.py` 生成（确定性，建议 1）；
+  汇总表 4 列标签/值对齐修正（建议 2，含消除 `$VAR，` 在 bash 3.2 下误并名的坑）。
+- **文档（建议 4）**：`SynthEmbedder` 注释澄清 CLI compact 只支持默认装配建的库；
+  `churn_bench` 运行示例语料路径改 `data/...`；user-guide §1.5 补 `--json` 字段说明。
+
 ### V2 Step 4 · 墓碑物理回收 compaction（核心，S4-03~S4-07，D-S4-01/03/06/10，2026-09-08）
 
 **新增（资源回收）**

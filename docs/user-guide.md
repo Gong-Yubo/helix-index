@@ -131,7 +131,7 @@ helix compact --index <快照> [--output <新快照>] [--dry-run] [--json]
 | `--index` | （必填） | 要 compact 的快照路径 |
 | `--output` | 无 | 另存到新路径（`atomic_write` 崩溃安全）。不写则**原地**覆盖 `--index` |
 | `--dry-run` | 关 | 只打印墓碑统计 + 预估回收量，**不写任何文件** |
-| `--json` | 关 | 机器可读输出（A/B 脚本透传；含 before/after、三体积、`remapped`、`graph_status`） |
+| `--json` | 关 | 机器可读输出（A/B 脚本透传；含 before/after、`remapped`、`graph_status`、体积与耗时，见下） |
 
 > ⚠️ **load 会做配置指纹校验**：`helix compact` 用**默认装配**加载（含 bge embedder），
 > 因此只能 compact「用默认装配建的库」——`build` 加过 `--vectors` 的库可以；
@@ -147,6 +147,14 @@ helix compact --index <快照> [--output <新快照>] [--dry-run] [--json]
 
 > ⚠️ 已知代价：load 需装配同款 embedder ⇒ 首次会加载模型（几秒到 ~49s 下载），但
 > **不会**调 embed（只取模型建装配），不产生向量推理开销。
+
+`--json` 输出要点（A/B 脚本判据）：
+- `bytes_source`：compact **前**源 `--index` 的三体积（体积回收的「原」）。
+- `bytes_after`：结果路径落盘后的三体积（原地 = 覆盖后的 `--index`；`--output` = 新文件）。
+- `bytes_before`：core 对**目标路径**落盘前的 stat——`--output` 另存时目标原本不存在，
+  故为 `null`；看回收请以 `bytes_source` vs `bytes_after` 为准。
+- 耗时口径分开：`load_ms`（含模型/指纹加载）与 `compact_ms`（core 的 `CompactionReport.total_ms`，
+  纯 compact+save，不含 load）。
 
 ## 1.6 bench 参数
 

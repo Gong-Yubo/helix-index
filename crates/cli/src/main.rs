@@ -516,12 +516,16 @@ fn compare(args: CompareArgs) -> Result<()> {
 /// - 默认装配 `SearchIndex::load`（配置指纹校验）⇒ 含向量快照需匹配 embedder；
 ///   load 会加载模型（首次下载几秒），但**不**调 embed（§4.8 已知代价）。
 /// - 默认**原地**写 `--index`（`atomic_write` 崩溃安全）；`--output` 另存。
+/// - 体积对比恒报「源 `--index` → 结果」两态：原地时源 = 覆盖前，`--output` 时
+///   源/新分属两文件，`bytes_before`（对目标路径 stat）此时恒 null，回收看
+///   `bytes_source` vs `bytes_after`（A/B）。
 /// - `--dry-run` 只读：打印墓碑统计与预估回收，不写任何文件。
 /// - ⚠️ compaction 会重编号 `doc_id` / `chunk_id`（D-S4-01）——跨 compact 的持久
 ///   引用请用 `source` / `content_hash`（rustdoc 亦已注明）。
 fn compact(args: CompactArgs) -> Result<()> {
     let t0 = std::time::Instant::now();
     let idx_path = &args.index;
+    let out_path = args.output.as_ref().unwrap_or(idx_path);
 
     // load（门面层默认装配；指纹不符或纯 BM25 快照由装配自动降级处理）
     let mut index = SearchIndex::load(idx_path).with_context(|| {
@@ -530,6 +534,11 @@ fn compact(args: CompactArgs) -> Result<()> {
             idx_path.display()
         )
     })?;
+    let load_ms = t0.elapsed().as_millis();
+
+    // 源索引三体积（A/B 判据的核心「原」）。须在 compact 落盘**前**采：
+    // 原地模式（--output 缺省）下 compact 会覆盖 idx_path，事后采到的是新体积。
+    let source_bytes = on_disk_sizes(idx_path);
 
     if args.dry_run {
         // 只读预览：墓碑统计 + 磁盘三体积 + 预估回收，不写任何文件
@@ -587,12 +596,10 @@ fn compact(args: CompactArgs) -> Result<()> {
     }
 
     // 真正回收：compact_and_save 到目标路径（原地 or 另存；atomic_write 崩溃安全）
-    let out_path = args.output.as_ref().unwrap_or(idx_path);
     let rep = index
         .compact_and_save(out_path)
         .with_context(|| format!("compaction 失败: {}", out_path.display()))?;
 
-    let elapsed = t0.elapsed();
     if args.json {
         let before = rep.before;
         let after = rep.after;
@@ -620,17 +627,26 @@ fn compact(args: CompactArgs) -> Result<()> {
                 "reclaimed_docs": rep.reclaimed_docs,
                 "reclaimed_terms": rep.reclaimed_terms,
                 "reclaimed_graph_points": rep.reclaimed_graph_points,
+                // A/B 体积判据：`bytes_source` 恒为 compact **前**的源 `--index` 三体积
+                //（原地 / --output 都准确）；`bytes_before`/`bytes_after` 是 core 对
+                // **目标路径**落盘前后的诚实 stat——`--output` 另存时目标文件原本
+                // 不存在故 `bytes_before` 为 null，看回收请以 `bytes_source` 对比。
+                "bytes_source": size_json(Some(to_size_bytes(source_bytes))),
                 "bytes_before": size_json(rep.bytes_before),
                 "bytes_after": size_json(rep.bytes_after),
                 "vector_rebuild_ms": rep.vector_rebuild_ms,
-                "total_ms": elapsed.as_millis(),
+                // 口径分开：`load_ms` 含模型/指纹加载；`compact_ms` = core 的
+                // CompactionReport.total_ms（纯 compact+save，不含 load）。
+                "load_ms": load_ms,
+                "compact_ms": rep.total_ms,
                 "graph_status": graph_status_label(&rep.graph_status),
             })
         );
         return Ok(());
     }
 
-    // 人类可读输出
+    // 人类可读输出：体积对比恒打「源索引 → 结果」两态（A/B 需要的正是这条）。
+    // 原地模式 source_bytes == 落盘前 idx_path 体积；--output 模式则分源/新两文件。
     println!("墓碑物理回收: {}", idx_path.display());
     print!("  before: ");
     print_tombstone(&rep.before);
@@ -640,23 +656,33 @@ fn compact(args: CompactArgs) -> Result<()> {
         "  回收: {} chunk / {} doc / {} term / 图中 {} 墓碑点",
         rep.reclaimed_chunks, rep.reclaimed_docs, rep.reclaimed_terms, rep.reclaimed_graph_points
     );
-    if let Some(b) = rep.bytes_before {
-        if let Some(a) = rep.bytes_after {
+    if let Some(a) = rep.bytes_after {
+        println!(
+            "  体积(源→新): 快照 {} → {}；graph {} → {}；data {} → {}",
+            humansize_bytes(source_bytes.0),
+            humansize_bytes(a.snapshot),
+            humansize_bytes(source_bytes.1),
+            humansize_bytes(a.graph),
+            humansize_bytes(source_bytes.2),
+            humansize_bytes(a.data),
+        );
+        if args.output.is_some() {
             println!(
-                "  体积: 快照 {} → {}；graph {} → {}；data {} → {}",
-                humansize_bytes(b.snapshot),
-                humansize_bytes(a.snapshot),
-                humansize_bytes(b.graph),
-                humansize_bytes(a.graph),
-                humansize_bytes(b.data),
-                humansize_bytes(a.data),
+                "    （--output 另存：上表「源」是原 --index 文件体积，结果写入 {}）",
+                out_path.display()
             );
         }
+    } else {
+        println!(
+            "  体积: 源快照 {}（落盘后体积暂不可读）",
+            humansize_bytes(source_bytes.0)
+        );
     }
     println!(
-        "  图重建 {} ms；总耗时 {:.2}s",
-        rep.vector_rebuild_ms,
-        elapsed.as_secs_f64()
+        "  加载 {:.2}s；compact+save {:.2}s；图重建 {} ms",
+        load_ms as f64 / 1000.0,
+        rep.total_ms as f64 / 1000.0,
+        rep.vector_rebuild_ms
     );
     println!("  graph_status = {}", graph_status_label(&rep.graph_status));
     if rep.remapped {
@@ -694,6 +720,15 @@ fn size_json(s: Option<helix_core::search::SizeBytes>) -> serde_json::Value {
     match s {
         Some(x) => serde_json::json!({"snapshot": x.snapshot, "graph": x.graph, "data": x.data}),
         None => serde_json::Value::Null,
+    }
+}
+
+/// 磁盘三体积元组 `(snapshot, graph, data)` → core 的 `SizeBytes`（JSON 序列化用）。
+fn to_size_bytes((snapshot, graph, data): (u64, u64, u64)) -> helix_core::search::SizeBytes {
+    helix_core::search::SizeBytes {
+        snapshot,
+        graph,
+        data,
     }
 }
 

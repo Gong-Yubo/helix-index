@@ -241,6 +241,50 @@ fn T12_纯BM25与Brute后端均可compact() {
 }
 
 // ---------------------------------------------------------------------------
+// 评审建议 6（回归）：带 embedder 的装配加载**纯 BM25 快照**（raw_vectors 空）
+//      不得走「try_load_graph → 失败 → 打印降级警告 → 重建空图」的噪音路径。
+// ---------------------------------------------------------------------------
+
+/// 默认装配（embedder=Some + Hnsw）加载无向量快照时，raw_vectors 为空 ⇒
+/// save 侧对空 vectors 本就清 sidecar 落 NotApplicable（persist_graph 623 行），
+/// 故 load 侧应**静默**建空向量 lane：graph_status 为 NotApplicable（非 Rebuilt）、
+/// 不触发降级警告（CLI `search --index <纯BM25快照>` 的每次加载都会踩到这条噪音）。
+#[test]
+fn R_建议6_默认装配加载纯BM25快照静默不降级() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("r6.idx");
+
+    // 用与 CLI `helix build`（不加 --vectors）相同的装配建纯 BM25 快照：
+    // embedder=None + Hnsw backend（默认）、同 chunker/analyzer ⇒ 指纹可过。
+    let mut bm25 = SearchIndexBuilder::default()
+        .embedder(None) // 纯 BM25：无向量 lane、无 raw_vectors
+        .vector_backend(VectorBackend::Hnsw)
+        .chunker(helix_core::chunk::Chunker::new(200_000, 0))
+        .batch_size(1024)
+        .build();
+    bm25.add("纯 BM25 文档 甲").unwrap();
+    bm25.add("纯 BM25 文档 乙").unwrap();
+    bm25.save(&path).unwrap();
+
+    // 带 embedder 的装配（等价 CLI `helix search --index` 的默认 load）重新加载。
+    // embedder_id 为空 ⇒ 指纹跳过 embedder 严格校验；raw_vectors 为空 ⇒ 走静默空 lane。
+    let loaded = builder_hnsw().load(&path).unwrap();
+    assert_eq!(loaded.num_chunks(), 2, "纯 BM25 正文完整可读");
+    assert_eq!(
+        loaded.graph_status(),
+        &GraphStatus::NotApplicable,
+        "无向量快照无图可载：应静默落 NotApplicable，而非 Rebuilt + 降级警告"
+    );
+
+    // 载体后续仍能写入向量（PR30 不变式：装配有 embedder ⇒ 保留空向量 lane）
+    let mut w = builder_hnsw().load(&path).unwrap();
+    w.add("追加向量文档 CCC").unwrap();
+    w.commit()
+        .expect("纯 BM25 快照用带 embedder 装配加载后 commit 不得误报 NoEmbedder");
+    assert_eq!(w.num_chunks(), 3, "追加 doc 已可见，向量 lane 可用");
+}
+
+// ---------------------------------------------------------------------------
 // T13：写缓冲交互（I8 / D-S4-10）——compact 必须先 commit，pending 里的存活 chunk
 //      不丢向量、不错位
 // ---------------------------------------------------------------------------
