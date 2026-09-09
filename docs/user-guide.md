@@ -13,10 +13,11 @@
   - [1.2 build 参数](#12-build-参数)
   - [1.3 search 参数](#13-search-参数)
   - [1.4 compare 参数](#14-compare-参数)
-  - [1.5 bench 参数](#15-bench-参数)
-  - [1.6 典型工作流](#16-典型工作流)
-  - [1.7 数据格式约定](#17-数据格式约定)
-  - [1.8 已知坑与性能预期](#18-已知坑与性能预期)
+  - [1.5 compact 参数](#15-compact-参数)
+  - [1.6 bench 参数](#16-bench-参数)
+  - [1.7 典型工作流](#17-典型工作流)
+  - [1.8 数据格式约定](#18-数据格式约定)
+  - [1.9 已知坑与性能预期](#19-已知坑与性能预期)
 - [Part 2 — 库接入](#part-2--库接入)
   - [2.1 最小闭环](#21-最小闭环)
   - [2.2 六 trait 替换矩阵](#22-六-trait-替换矩阵)
@@ -34,6 +35,7 @@
 | `build` | 摄入语料并落盘快照 | 建库（一次性 / 定期重建） |
 | `search` | 单次检索（`--input` 重建 或 `--index` 加载快照） | 日常使用、调试 |
 | `compare` | 三路同屏对比 | 调试"为什么某条没召回" |
+| `compact` | 墓碑物理回收（compaction 重新物化 + ID 重编号） | 删除累积后回收磁盘 / 图体积 |
 | `bench` | 效果与性能评测 | 调参、回归验证 |
 
 > **短参约定**：`-i` = `--input`（语料），`--index`（快照）**没有短参**。
@@ -114,7 +116,47 @@ helix compare --input <语料> [-k N] <查询>
 三路（bm25 / vector / hybrid）同屏对比，调试主入口。只接受 `--input`（每次重建），
 不支持快照。
 
-## 1.5 bench 参数
+## 1.5 compact 参数
+
+```
+helix compact --index <快照> [--output <新快照>] [--dry-run] [--json]
+```
+
+墓碑物理回收（V2 Step 4）：把删除累积留下的**墓碑**（快照 `None` 槽、倒排死词、
+`hnsw_rs` 无 remove 留下的图墓碑点）按存活集**重新物化 + 重编号**清掉，产出更紧凑的
+普通快照。
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `--index` | （必填） | 要 compact 的快照路径 |
+| `--output` | 无 | 另存到新路径（`atomic_write` 崩溃安全）。不写则**原地**覆盖 `--index` |
+| `--dry-run` | 关 | 只打印墓碑统计 + 预估回收量，**不写任何文件** |
+| `--json` | 关 | 机器可读输出（A/B 脚本透传；含 before/after、`remapped`、`graph_status`、体积与耗时，见下） |
+
+> ⚠️ **load 会做配置指纹校验**：`helix compact` 用**默认装配**加载（含 bge embedder），
+> 因此只能 compact「用默认装配建的库」——`build` 加过 `--vectors` 的库可以；
+> 用自定义 analyzer / embedder 建的库会报 `ConfigMismatch`，需走库 API
+> `SearchIndexBuilder::load`（装配好同款组件）再 `compact_and_save`。
+> 纯 BM25 快照（无向量）也可 compact。
+
+> ⚠️ **compaction 会重编号 `doc_id` / `chunk_id`（D-S4-01）**：跨 compact 的持久引用
+> 会失效。检索本身不受影响（`Hit` 带 `source`/`text`/`metadata`）；但**任何以
+> `doc_id`/`chunk_id` 为键的外部状态**（如你自己的增量删除记录）在 compact 后需用
+> `source` / `content_hash` 重建。`remapped` 字段（或人类输出的"已重编号"提示）可观测
+> 是否发生了重编号。
+
+> ⚠️ 已知代价：load 需装配同款 embedder ⇒ 首次会加载模型（几秒到 ~49s 下载），但
+> **不会**调 embed（只取模型建装配），不产生向量推理开销。
+
+`--json` 输出要点（A/B 脚本判据）：
+- `bytes_source`：compact **前**源 `--index` 的三体积（体积回收的「原」）。
+- `bytes_after`：结果路径落盘后的三体积（原地 = 覆盖后的 `--index`；`--output` = 新文件）。
+- `bytes_before`：core 对**目标路径**落盘前的 stat——`--output` 另存时目标原本不存在，
+  故为 `null`；看回收请以 `bytes_source` vs `bytes_after` 为准。
+- 耗时口径分开：`load_ms`（含模型/指纹加载）与 `compact_ms`（core 的 `CompactionReport.total_ms`，
+  纯 compact+save，不含 load）。
+
+## 1.6 bench 参数
 
 ```
 helix bench [--input <语料> | --index <快照>] [--queries <judgments>] [选项...]
@@ -151,7 +193,7 @@ make eval-perf                                      # NFR 实测
 make report CHECK=--check                           # 与 eval-report 逐格对账
 ```
 
-## 1.6 典型工作流
+## 1.7 典型工作流
 
 ### 建库 → 秒级检索（推荐生产用法）
 
@@ -195,7 +237,7 @@ helix compare --input data/corpus.jsonl -k 5 "为什么这条没召回"
 make eval-quality
 ```
 
-## 1.7 数据格式约定
+## 1.8 数据格式约定
 
 **语料 JSONL**（每行一个文档）：
 
@@ -219,7 +261,7 @@ make eval-quality
 - `relevance[].grade`：0~3 的分级标注（0 = 已判定负例）
 - `type`：分桶标签（mixed / natural / exact / paraphrase），用于分桶统计
 
-## 1.8 已知坑与性能预期
+## 1.9 已知坑与性能预期
 
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |

@@ -9,6 +9,68 @@
 
 ## [Unreleased]
 
+### V2 Step 4 · CLI `helix compact` + churn workload（S4-08 + S4-09，2026-09-08）
+
+**新增（用户可用闭环 + 验收 1/2 实测）**
+
+- **CLI `helix compact`（S4-08）**：墓碑物理回收入口。
+  `helix compact --index <快照> [--output <新>] [--dry-run] [--json]`。
+  - 默认**原地**写同路径（复用 Step 3 `atomic_write`，崩溃安全）；`--output` 另存（A/B
+    对比体积）；`--dry-run` 只打印 `TombstoneStats` + 预估回收，**不写任何文件**。
+  - 打印 before → after 条数、三体积（`CompactionReport.bytes_before/after`，dry-run 时
+    CLI 自 `fs::metadata`）、图重建 / 总耗时、重建后 `graph_status`；`--json` 机器可读
+    （含 `remapped`，A/B 脚本透传）。
+  - ⚠️ load 走配置指纹校验 ⇒ 需匹配建库 embedder（默认装配 bge）；`remapped=true` 提示
+    ID 已重编号（D-S4-01/09 的对外声明落地到 CLI）。
+  - `docs/user-guide.md` 新增 §1.5 compact 参数（含「已知坑」：ID 重编号、需配 embedder）。
+- **churn workload example `churn_bench`（S4-09）**：`crates/core/examples/churn_bench.rs`。
+  内置**确定性合成 Embedder**（LCG + L2 归一化，dim=512，id=`synth-512`，D-S4-06）；
+  强制单 chunk ⇒ doc == chunk == 1 向量点 ⇒ `nb_point` 口径退化为 == 存活数。
+  每轮随机删 `churn×N` + 追加等量新 doc → `save` → 记录（快照/graph/data 字节、
+  `raw_vectors`、图点数、`GraphStatus`）；末轮 `compact_and_save` → 再记录。
+  输出 CSV + 判定（J1 图回收 / J2 不累积 / J3 reload `Loaded` → `VERDICT`）。
+- **`scripts/eval_churn.sh`（S4-09）**：编排多档 churn 实测，结果入
+  `docs/devel/eval-report.md` **§8.8（新增）**。
+- **实测（10K 合成语料，验收 1/2 全 PASS）**：
+  - churn 0.1 × 5 轮：`graph+data` 随轮次 **37.2→50.9MB**（问题真实存在）→ compact 后
+    回落 **33.8MB**；`nb_point` 11000→15000 → **10000 == 存活数**；snapshot 稳定（不累积）。
+  - churn 0.3 × 5 轮（60% 墓碑）：`graph+data` **43.9→84.6MB** → compact 后 **33.7MB**
+    （省 60%）；`nb_point` 13000→25000 → **10000**。两档 compact 后 reload 均 `Loaded`
+    （铁律），冷启动 **91~99ms**；`save` 墓碑告警（D-S4-02）如期出现。
+
+**评审响应（PR #31 · 6 条非阻塞全处理）**
+- **load 侧去噪（建议 6）**：默认装配（embedder=Some + Hnsw）加载**无向量快照**
+  （纯 BM25 / 全删后 compact）时，`raw_vectors` 为空 ⇒ save 侧本就清 sidecar 落
+  `NotApplicable`（`persist_graph`）⇒ load 侧此前却走 `try_load_graph → 失败 →
+  打「[警告] 降级重建」噪音 → 重建空图`。现**静默**建空向量 lane（`graph_status =
+  NotApplicable`），保留 PR30「装配有 embedder ⇒ 保留空 lane 供后续写入」不变式。
+  回归测试 `R_建议6`。
+- **CLI `--output` A/B 体积对比（建议 5）**：新增 `bytes_source`（compact **前**源
+  `--index` 三体积）；`--output` 另存时 `bytes_before`（对目标路径 stat）恒 null，回收
+  以 `bytes_source` vs `bytes_after` 判定。人类输出恒打「源→新」两态。JSON 耗时口径
+  拆分 `load_ms` / `compact_ms`（core `total_ms`，纯 compact+save）。
+- **churn_bench CSV `coldstart_ms`（建议 3）**：compact 行改填 reload 实测冷启动值
+  （不再恒 0）、`graph_status` 改取 reload 后状态。
+- **`scripts/eval_churn.sh`**：语料缺失自动调 `gen_synth_corpus.py` 生成（确定性，建议 1）；
+  汇总表 4 列标签/值对齐修正（建议 2，含消除 `$VAR，` 在 bash 3.2 下误并名的坑）。
+- **文档（建议 4）**：`SynthEmbedder` 注释澄清 CLI compact 只支持默认装配建的库；
+  `churn_bench` 运行示例语料路径改 `data/...`；user-guide §1.5 补 `--json` 字段说明。
+
+**集成测试补充（2026-09-09）**
+- **门面层等效复刻 CLI `compact` 语义**：新增 `tests/compaction_cli_semantics.rs`（5 例，
+  CLI-1~CLI-5）。背景：CLI `compact` 是薄门面，但真实二进制自动化测受两硬约束——① CLI 无
+  `remove` 子命令造不出墓碑（只能测 no-op）；② `--index` 走默认装配实例化 `LocalEmbedder`
+  （下载 bge 约 49s）。故用确定性 TestEmbedder + 门面层 API，按 CLI 完全相同的调用序列锁
+  行为契约：CLI-1 `--dry-run` 只读（`tombstone_stats()` 后磁盘字节/文件清单分毫不变）；
+  CLI-2 无墓碑 no-op（`remapped=false`、reload `Loaded`）；CLI-3 原地回收（图 sidecar 与总
+  体积回落、reload 检索不含墓碑）；CLI-4 `--output` A/B（源不被覆盖、`bytes_before=None`
+  诚实语义）；CLI-5 纯 BM25 no-op + reload 可检索。
+- **core 层补 3 个 compaction 集成场景**（`tests/step4_compaction.rs` +3 = 10 例）：
+  T14 外部持久引用 `source` 跨 compact 稳定（D-S4-09：内部 id 全变但 source 检索一一对齐，
+  被删 source 专属词零命中）；T15 ID 重编号后存活向量 id 连续无洞 `0..alive`（D-S4-01，
+  复用 `snapshot_vectors` 读回）；T16 三轮 churn 墓碑**不累积**（J2/NFR-07：每轮 compact 后
+  `chunks_total` 回落到存活数、`tombstone_ratio` 归零、图中无残留墓碑点）。
+
 ### V2 Step 4 · 墓碑物理回收 compaction（核心，S4-03~S4-07，D-S4-01/03/06/10，2026-09-08）
 
 **新增（资源回收）**

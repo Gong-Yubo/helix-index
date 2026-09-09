@@ -914,29 +914,45 @@ impl SearchIndex {
                 }
                 VectorBackend::Hnsw => {
                     let ef_search = graph.ef_search.unwrap_or(HnswRsIndex::default_ef_search());
-                    match try_load_graph(
-                        path,
-                        &body_crc,
-                        &fingerprint,
-                        &raw_vectors,
-                        graph,
-                        ef_search,
-                        cfg.parallel_build,
-                    ) {
-                        Ok(loaded) => {
-                            graph_status = GraphStatus::Loaded;
-                            Box::new(loaded) as Box<dyn VectorIndex>
-                        }
-                        Err(reason) => {
-                            // 降级：图是缓存，丢弃只影响冷启动耗时
-                            warn_graph_degraded(&reason, graph.mode)?;
-                            graph_status = GraphStatus::Rebuilt(reason);
-                            rebuild_vector_index(
-                                backend,
-                                &raw_vectors,
-                                Some(ef_search),
-                                cfg.parallel_build,
-                            )?
+                    if raw_vectors.is_empty() {
+                        // 快照**无向量**（纯 BM25，或全删后 compact）——save 侧对空
+                        // vectors 会清 sidecar 并落 `NotApplicable`（persist_graph 623 行），
+                        // 故此处 try_load_graph 必然失败；直接静默建**空**向量 lane（评审
+                        // 建议 6）：不 try_load_graph、不 warn_graph_degraded（无图可读，
+                        // 不是「降级」）。PR30 不变式保留：装配有 embedder ⇒ 仍建
+                        // `Some(空)` 向量索引供后续 flush 灌入，不落 None。
+                        graph_status = GraphStatus::NotApplicable;
+                        rebuild_vector_index(
+                            backend,
+                            &raw_vectors,
+                            Some(ef_search),
+                            cfg.parallel_build,
+                        )?
+                    } else {
+                        match try_load_graph(
+                            path,
+                            &body_crc,
+                            &fingerprint,
+                            &raw_vectors,
+                            graph,
+                            ef_search,
+                            cfg.parallel_build,
+                        ) {
+                            Ok(loaded) => {
+                                graph_status = GraphStatus::Loaded;
+                                Box::new(loaded) as Box<dyn VectorIndex>
+                            }
+                            Err(reason) => {
+                                // 降级：图是缓存，丢弃只影响冷启动耗时
+                                warn_graph_degraded(&reason, graph.mode)?;
+                                graph_status = GraphStatus::Rebuilt(reason);
+                                rebuild_vector_index(
+                                    backend,
+                                    &raw_vectors,
+                                    Some(ef_search),
+                                    cfg.parallel_build,
+                                )?
+                            }
                         }
                     }
                 }
