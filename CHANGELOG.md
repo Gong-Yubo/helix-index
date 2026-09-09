@@ -56,6 +56,21 @@
 - **文档（建议 4）**：`SynthEmbedder` 注释澄清 CLI compact 只支持默认装配建的库；
   `churn_bench` 运行示例语料路径改 `data/...`；user-guide §1.5 补 `--json` 字段说明。
 
+**集成测试补充（2026-09-09）**
+- **门面层等效复刻 CLI `compact` 语义**：新增 `tests/compaction_cli_semantics.rs`（5 例，
+  CLI-1~CLI-5）。背景：CLI `compact` 是薄门面，但真实二进制自动化测受两硬约束——① CLI 无
+  `remove` 子命令造不出墓碑（只能测 no-op）；② `--index` 走默认装配实例化 `LocalEmbedder`
+  （下载 bge 约 49s）。故用确定性 TestEmbedder + 门面层 API，按 CLI 完全相同的调用序列锁
+  行为契约：CLI-1 `--dry-run` 只读（`tombstone_stats()` 后磁盘字节/文件清单分毫不变）；
+  CLI-2 无墓碑 no-op（`remapped=false`、reload `Loaded`）；CLI-3 原地回收（图 sidecar 与总
+  体积回落、reload 检索不含墓碑）；CLI-4 `--output` A/B（源不被覆盖、`bytes_before=None`
+  诚实语义）；CLI-5 纯 BM25 no-op + reload 可检索。
+- **core 层补 3 个 compaction 集成场景**（`tests/step4_compaction.rs` +3 = 10 例）：
+  T14 外部持久引用 `source` 跨 compact 稳定（D-S4-09：内部 id 全变但 source 检索一一对齐，
+  被删 source 专属词零命中）；T15 ID 重编号后存活向量 id 连续无洞 `0..alive`（D-S4-01，
+  复用 `snapshot_vectors` 读回）；T16 三轮 churn 墓碑**不累积**（J2/NFR-07：每轮 compact 后
+  `chunks_total` 回落到存活数、`tombstone_ratio` 归零、图中无残留墓碑点）。
+
 ### V2 Step 4 · 墓碑物理回收 compaction（核心，S4-03~S4-07，D-S4-01/03/06/10，2026-09-08）
 
 **新增（资源回收）**

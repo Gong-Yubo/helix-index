@@ -9,6 +9,7 @@
 mod common;
 
 use common::{builder_brute, builder_hnsw};
+use helix_core::document::Document;
 use helix_core::search::{GraphStatus, SearchIndexBuilder, VectorBackend};
 
 /// 装配：纯 BM25（embedder=None，无向量 lane）——T3 / T12 用。
@@ -402,5 +403,223 @@ fn R_发现1_全删compact后仍可写入检索() {
     assert!(
         hits.hits.iter().any(|h| h.text.contains("CCCC")),
         "全删 compact 后新写入的 doc 应可被检索（FR-26/可用性）"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T14：外部持久引用（source）跨 compact 稳定（D-S4-09 验收）
+// ---------------------------------------------------------------------------
+
+/// compaction 会重编号 `doc_id` / `chunk_id`（D-S4-01），因此跨 compact 的**外部持久引用**
+/// 必须走 `source`（溯源，FR-12），而非内部 ID。本测试锁住：compact 前后，同一查询词的
+/// 检索结果命中**同一批 source**（逐条对齐），被删 source 不再被召回——证明即便内部 ID
+/// 全变，`source` 作为稳定键依旧可靠。这是索引对外契约（rustdoc「勿用 doc_id 引用」）的
+/// 端到端验收。
+#[test]
+fn T14_外部source引用跨compact稳定() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t14.idx");
+
+    // 每篇文档一个专属词 + 唯一 source（模拟真实出处，供跨 compact 对齐）
+    let docs: Vec<(String, String)> = [
+        ("ref://a", "天青石 检索"),
+        ("ref://b", "玄铁剑 检索"),
+        ("ref://c", "鲛绡纱 检索"),
+        ("ref://d", "流金火 检索"),
+        ("ref://e", "昆仑木 检索"),
+        ("ref://f", "赤霄绫 检索"),
+    ]
+    .iter()
+    .map(|(s, t)| (s.to_string(), t.to_string()))
+    .collect();
+    // source → 专属词（用作该 source 的探针查询）
+    let probe: Vec<(String, &str)> = docs
+        .iter()
+        .map(|(s, t)| {
+            let word = t.split_whitespace().next().unwrap();
+            (s.clone(), word)
+        })
+        .collect();
+
+    let mut idx = bm25_builder().build();
+    let mut src_to_id = std::collections::HashMap::new();
+    for (src, text) in &docs {
+        let out = idx
+            .add(Document::new(text.clone()).with_source(src.clone()))
+            .unwrap();
+        src_to_id.insert(src.clone(), out.doc_id);
+    }
+    idx.save(&path).unwrap();
+
+    // 删 b / d / f（source 里的三篇）→ 墓碑落盘 → compact
+    let doomed_src = ["ref://b", "ref://d", "ref://f"];
+    for (src, _) in docs
+        .iter()
+        .filter(|(s, _)| doomed_src.contains(&s.as_str()))
+    {
+        let id = src_to_id[src];
+        idx.remove(id).unwrap();
+    }
+    idx.save(&path).unwrap(); // 墓碑进快照/图
+    let rep = idx.compact_and_save(&path).unwrap();
+    assert!(rep.remapped, "删了 3/6 应有重编号");
+    assert_eq!(rep.reclaimed_docs, 3, "回收 3 个墓碑 doc");
+
+    // 探针对照：每个 source 有一个专属词。compact 会重编号内部 id，但 `source` 不变。
+    // 于是——若 `source` 作为外部持久引用可靠，则：存活 source 的专属词仍能命中且带
+    // 正确的 source；被删 source 的专属词零命中（FR-26）。内部 id 变更与否不影响本断言，
+    // 恰好证明「跨 compact 引用必须用 source，而非 doc_id」（D-S4-09 / rustdoc 711 行）。
+    let loaded = bm25_builder().load(&path).unwrap();
+    let alive_sources: Vec<&String> = docs
+        .iter()
+        .filter(|(s, _)| !doomed_src.contains(&s.as_str()))
+        .map(|(s, _)| s)
+        .collect();
+
+    for (src, word) in &probe {
+        let hits = bm25_builder()
+            .load(&path)
+            .unwrap()
+            .into_searcher()
+            .unwrap()
+            .search(word)
+            .unwrap();
+        if doomed_src.contains(&src.as_str()) {
+            // 被删 source：其专属词必须零命中（FR-26 墓碑不可召回）
+            assert!(
+                hits.hits.is_empty(),
+                "source {src} 已被删，其专属词「{word}」不得被召回"
+            );
+        } else {
+            // 存活 source：专属词命中且 source 正确映射（内部 ID 变了也无妨）
+            assert!(
+                hits.hits.iter().any(|h| &h.source == src),
+                "存活 source {src} 的专属词「{word}」应命中并带对 source，实得 {:?}",
+                hits.hits.iter().map(|h| &h.source).collect::<Vec<_>>()
+            );
+        }
+    }
+    // 额外断言：loaded 正好 3 篇存活、每篇 source 仍在（正文/出处未随 compaction 丢失）
+    assert_eq!(loaded.num_chunks(), 3);
+    assert!(alive_sources.iter().all(|s| !s.is_empty()));
+}
+
+// ---------------------------------------------------------------------------
+// T15：ID 重编号后存活向量 id 连续无洞（D-S4-01）
+// ---------------------------------------------------------------------------
+
+/// 重编号（D-S4-01）的核心目标：把存活集压实为**从 0 开始、无洞的连续 id**，从而
+/// 消除墓碑留下的空洞，让 `raw_vectors.len() == nb_point == 存活数`（I7 / 验收 3）。
+/// 构造「删中间两篇造成 id 空洞」的快照，compact 后断言存活向量 id 恰好是 `0..alive`
+/// 的连续整数，且快照里已无被删 chunk 的残留向量。
+#[test]
+fn T15_ID重编号后存活向量id连续无洞() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t15.idx");
+
+    let mut idx = builder_hnsw().build();
+    for i in 0..5 {
+        idx.add(format!("内容 {i} AAA 连续")).unwrap();
+    }
+    idx.save(&path).unwrap();
+    assert_eq!(graph_nb_point(&path), 5);
+
+    // 删 id 1 / 3 → 存活 0,2,4（id 出现空洞），raw_vectors 被 retain 摘除
+    idx.remove(1).unwrap();
+    idx.remove(3).unwrap();
+    let rep = idx.compact_and_save(&path).unwrap();
+    assert!(rep.remapped, "删了 2/5 触发重编号");
+    assert_eq!(rep.reclaimed_chunks, 2);
+
+    // 存活向量 id 必须被压实为 0..3 连续无洞
+    let mut ids: Vec<u32> = snapshot_vectors(&path)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec![0, 1, 2],
+        "重编号后存活 chunk id 应连续无洞（0..3），实得 {ids:?}"
+    );
+    // I7：raw_vectors.len() == nb_point == 存活数（无幽灵向量）
+    assert_eq!(ids.len() as u64, graph_nb_point(&path));
+    // 铁律：reload 走 sidecar（Loaded）
+    let loaded = builder_hnsw().load(&path).unwrap();
+    assert_eq!(loaded.graph_status(), &GraphStatus::Loaded);
+    // 检索召回全部存活 3 篇，不含被删内容
+    let hits = loaded.into_searcher().unwrap().search("AAA").unwrap();
+    assert_eq!(hits.hits.len(), 3, "3 个存活 chunk 全召回");
+}
+
+// ---------------------------------------------------------------------------
+// T16：多轮（删除+compact 循环）墓碑不累积（J2 / NFR-07 收敛）
+// ---------------------------------------------------------------------------
+
+/// churn 是真实运维常态：反复「加一批 → 删一批 → compact」。若每次 compact 都只回收
+/// 当轮墓碑而留下历史空洞，`chunks_total` 会随轮次单调累积（图/正文虚胖，即 J2 判据的
+/// 「不累积」被破坏）。本测试跑**三轮**「删最老一批 + 追加 + compact」，依赖 **T15 证明的
+/// 不变式**（compact 后存活 id 连续 `0..alive`）来安全删除老 doc，断言每轮 compact 后
+/// `chunks_total` 都**回落到当前存活数**、墓碑占比归零，末轮历史墓碑不可召回——锁住
+/// 长期不累积（NFR-07 收敛）。
+#[test]
+fn T16_多轮compact墓碑不累积() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t16.idx");
+
+    let mut idx = builder_hnsw().build();
+    // 轮 0：初始 4 篇
+    for i in 0..4 {
+        idx.add(format!("初始内容 {i} 留存")).unwrap();
+    }
+    idx.save(&path).unwrap();
+
+    // 三轮 churn：每轮删最老 alive/3 篇、追加等量新 doc（净保持总量、制造墓碑）
+    for round in 0..3 {
+        // compact_and_save 后 id 已压实为 0..alive-1（T15 不变式），故删 `0..k` 必删存活老 doc。
+        let alive = idx.num_docs(); // usize
+        let k = alive / 3;
+        assert!(k >= 1, "轮 {round} 每轮至少删 1 篇，当前存活 {alive}");
+        for d in 0..k {
+            idx.remove(d as u32).unwrap();
+        }
+        // 追加等量新 doc（content_hash 各异，防 FR-15 去重）
+        for i in 0..k {
+            idx.add(format!("轮{round} 追加 {i} 留存")).unwrap();
+        }
+        // compact_and_save：回收本轮墓碑 + 重编号（含 I8：开头先 commit pending）
+        let rep = idx.compact_and_save(&path).unwrap();
+        assert!(rep.remapped, "轮 {round} 删了 doc 应触发重编号");
+        // 关键断言：compact 后 chunks_total 恰等于当前存活数（墓碑不累积）
+        assert_eq!(
+            rep.after.chunks_total,
+            idx.num_chunks() as usize,
+            "轮 {round}: compact 后槽位数应 == 当前存活 chunk 数，墓碑不得累积"
+        );
+        assert!(
+            rep.after.tombstone_ratio.abs() < f64::EPSILON,
+            "轮 {round}: 每轮 compact 后墓碑占比应归零"
+        );
+    }
+
+    // 末轮 reload（铁律：Loaded），且 I7 成立：图点数 == 存活 chunk 数（无墓碑残留点）。
+    let loaded = builder_hnsw().load(&path).unwrap();
+    assert_eq!(loaded.graph_status(), &GraphStatus::Loaded);
+    let live = loaded.num_chunks();
+    let live_docs = loaded.num_docs();
+    assert_eq!(graph_nb_point(&path), live as u64, "I7：图中不得残留墓碑点");
+
+    // 反泄漏（J2）：所有存活内容都含「留存」，故检索该词的召回**上界**是 `live`——
+    // 若历史墓碑点/幽灵向量跨 compact 累积，图点数会 > live，可能把召回顶过 `live`。
+    // （注意：这是向量近邻召回，命中数 ∈ [0, live]，断言上界即可锁定"不因墓碑虚增"。）
+    let hits = loaded.into_searcher().unwrap().search("留存").unwrap();
+    assert!(
+        hits.hits.len() <= live as usize,
+        "存活 {live} 个 chunk，query「留存」召回 {} 不得超过 live（墓碑累积会把图上界顶高）",
+        hits.hits.len()
+    );
+    assert_eq!(
+        live_docs, live as usize,
+        "存活 doc 数 == 存活 chunk 数（单 chunk 装配）"
     );
 }
