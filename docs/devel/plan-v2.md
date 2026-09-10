@@ -5,9 +5,9 @@
 
 | 项 | 内容 |
 | --- | --- |
-| 版本 | **v0.10（2026-09-10：Step 5 详细设计出稿——`v2-step5-design.md` v0.2 评审响应版待二次评审；T7-22 精确兜底 + T7-23 `Metrics` 可观测化）** |
+| 版本 | **v0.11（2026-09-10：Step 5 设计定稿——`v2-step5-design.md` v0.3 二次评审响应版，**D-S5-01~09 全部拍板**，S5-01~04 可开工；T7-22 精确兜底 + T7-23 `Metrics` 可观测化）** |
 | 日期 | 2026-09-10 |
-| 状态 | **决策已定案（D-J1~J7 + D-J8~J11）；Step 1 / Step 2 / Step 3 / Step 4 均已完成并合并进 `main`（Step 3 = `ed25d5c`；Step 4 = S4-01 `1efc128` + 核心 `6f34ef2` + CLI/workload `ac9fcbe` + 文档回写 `9e2211e`）；Step 5 设计已出稿（`v2-step5-design.md` v0.2，含 PR #33 评审响应；D-S5-01~09 待评审/待标定）；Step 6~7 待做。任务编号按 2026-09-07 复审重排** |
+| 状态 | **决策已定案（D-J1~J7 + D-J8~J11）；Step 1 / Step 2 / Step 3 / Step 4 均已完成并合并进 `main`（Step 3 = `ed25d5c`；Step 4 = S4-01 `1efc128` + 核心 `6f34ef2` + CLI/workload `ac9fcbe` + 文档回写 `9e2211e`）；Step 5 设计已定稿（`v2-step5-design.md` v0.3，**D-S5-01~09 全部拍板**，S5-01~04 可开工）；Step 6~7 待做。任务编号按 2026-09-07 复审重排** |
 | 上游 | `requirements-spec.md`（需求定义源）、`architecture-design.md`（架构/ADR）、`eval-report.md`（P5 实测） |
 | 前置 | V1（P0~P6）全部完成，见 `plan.md`（V1 计划，已冻结，不再更新） |
 | 复审 | 2026-09-07 全量复审（7 处调整 A1~A7 + 4 个拍板问题 D1~D4）**结论已全部并入本文**，不另立复审文档；调整项索引与建议执行顺序见 **§附-3** |
@@ -308,7 +308,8 @@
   无法被 bench 采集**；而 `vector_shortfall` 正是「V2.1 是否引入 prefilter」的判据，
   Step 6 的 NFR-10/11 实测也要靠它。需暴露进 `SearchResponse` 或 bench 采集链路。
   顺带修 `query/metrics.rs:14` 里「见 issue #7」的失效引用（#7 已关闭）。
-- **详细设计**：🟩 **已出稿，评审响应版待二次评审**（`docs/devel/v2-step5-design.md` **v0.2**，2026-09-10）。
+- **详细设计**：🟩 **已定稿，决策全部拍板**（`docs/devel/v2-step5-design.md` **v0.3**，2026-09-10；
+  经 PR #33 两轮评审）。
   主线：向量路扩为**三条路径**（A 热路径 / B `filtered-ANN` 不变 / **C 精确扫描**），
   **策略归后端**（`VectorIndex::search_exact_filtered` 必选 + `prefers_exact` 默认钩子）、
   **分派与记账归编排层**（`Metrics.vector_route`）；候选来源取**方案 A 遍历向量存储**
@@ -316,8 +317,9 @@
   \+ `Point::get_v()` 零拷贝，源码核实 + 实测见设计文档 §3.1/附录 C；
   ⚠️ **不是 `get_layer_iterator(0)`**，那只走 layer 0，会漏掉 level ≥ 1 的点约 3%，
   该误判已在 v0.2 纠正）；
-  `Metrics` 进 `SearchResponse` + 补 per-lane 耗时。9 个决策 D-S5-01~09
-  （D-S5-01/03/05 阻塞开工；D-S5-02/04 的数值待标定），任务拆分 S5-01~08
+  `Metrics` 进 `SearchResponse` + 补 per-lane 耗时。9 个决策 **D-S5-01~09 已全部拍板**
+  （二次评审对 D-S5-01/03/05 无异议 ⇒ **阻塞解除**；D-S5-02/04 仅数值待 S5-04 标定，
+  形态与口径已定、**不阻塞实现**），任务拆分 S5-01~08
   （PR 切分：兜底 / 可观测 / 文档回写）。**阈值与 NFR-13 预算数值仍待 S5-04 标定回填**。
 - **⚠️ 设计期新发现**：`searcher.rs:99-104`（`index_is_empty`）与 `:125-127`（过滤排空）
   **两条**早退路径漏设 `metrics.took` ⇒ 日志 `took_ms=0` 而响应 `took` 为真值
