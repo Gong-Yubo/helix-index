@@ -9,6 +9,98 @@
 
 ## [Unreleased]
 
+### V2 Step 5 · 详细设计（2026-09-10）
+
+- 新增 `docs/devel/v2-step5-design.md`（**v0.3，二次评审响应版；D-S5-01~09 全部拍板**）：**查询性能与可观测
+  （T7-22 / T7-23 / NFR-13 / R18）**的详细设计。
+  - **现状源码级定位**：R18 的机理（带 filter 时 `hnsw.rs:983-992` **无 fast-return**，
+    且 `:1019` 在 `return_points.len() < ef` 时**距离剪枝全程关闭** ⇒ 堆填不满即整图遍历；
+    默认 `k=10 → candidate_k=30 → ef=120` 就是**分水岭**，`allowed` 远小于它时遍历全图）；
+    `Metrics` **四处断链**（输出只剩 `tracing` / `SearchResponse` 无字段 / `query` 模块无再导出 /
+    bench 只能另算一个口径不同的 `mean_shortfall`，`bench.rs:190-193` 注释自陈"拿不到"）。
+  - **设计期新发现**：**两条**早退路径漏设 `metrics.took`——`searcher.rs:99-104`（`index_is_empty`，
+    连 `metrics.log` 都不调，故 grep 该符号**结构上找不到它**）与 `:125-127`（过滤排空）。
+    两条的响应 `took` 都是真值（`empty_response` 内取 `started.elapsed()`）
+    ⇒ 日志 `took_ms=0` 与响应 `took` 各说一套（同类第三处 `:212-213` 反而设了）
+    ⇒ 列 **D-S5-08** 随 T7-23 一起修。
+  - **关键技术前提（源码核实 + 实测）**：`hnsw_rs` 0.3.4 **可以零拷贝遍历已入库向量**——
+    全量遍历 = **`&PointIndexation` 的 `IntoIterator`**（从 layer 0 逐层升到 `entry_point_level`，
+    **每点恰 yield 一次、零重复**）+ `Point::get_v() -> &[T]`（零拷贝切片）+
+    `Point::get_origin_id() -> usize`（**就是 `ChunkId`**）。
+    ⚠️ **`get_layer_iterator(0)` 不是全量**——点只被推入**它自己那一层**（`hnsw.rs:511`，无回填低层），
+    `P(level ≥ 1) = 1/M`（本项目 M=32 ⇒ **约 3.1% 的点不在 layer 0**），实测 N=5000 时
+    `get_layer_iterator(0).count()=4813`（缺 187 = 3.74%）而 `into_iter().count()=5000`。
+    `get_point_data(&PointId)` 存在但**是克隆**，且库**无 `origin_id → PointId` 映射**
+    ⇒ 方案 B 需自建。核实记录见设计文档附录 C（含 v0.1 误判的反面记录）。
+  - **方案**：向量路从两条路径扩为**三条**——A 热路径（不变）/ B `filtered-ANN`（不变）/
+    **C 精确扫描**（`allowed ≤ 阈值` 时绕开 ANN）。**策略归后端**（新增必选方法
+    `VectorIndex::search_exact_filtered` + 默认钩子 `prefers_exact`），**分派与记账归编排层**
+    ⇒ 零 plumbing，门面 / 逃生舱 / bench 三条入口自动一致。
+  - **成本分解（修正 D-J9 的"0.05ms"读法）**：该数字只覆盖"对 ~100 个候选算距离"一段；
+    完整成本 = `O(N)` 谓词判定（定位候选，1~10ms 待标定）+ `O(allowed)` 距离（≈0.02ms）。
+    关键洞察：**路径 B 与 C 同为 `O(N)`，差别是每个点做什么**（512 维距离 ≈100ns vs
+    位图判定 ≈5~20ns ⇒ 5~20× 常数差），这正是"1~10ms vs 41~158ms"的来源。
+  - **可观测**：`Metrics` 进 `SearchResponse`（+ `query` 模块再导出），新增
+    `vector_route: {None, Ann, Exact}`（T7-22 的 A/B 判据）、`bm25_elapsed` / `vector_elapsed`
+    （Hybrid 并行下 `took` 无法归因）；`tracing` 通道保留；bench 两套 shortfall 口径**并列**
+    并在 JSON / 汇总表补列；新增 `--brute-fallback <N|off>` 作为 A/B 唯一开关。
+  - **必须一并声明的副作用**：精确路径下 `vector_shortfall` **结构性归零** ⇒
+    「0 缺口」不再等于「无 prefilter 需求」，判读须**连看 `vector_route`**；
+    R11/R13/R17 在低选择度档位只能标"**子集已绕过**"而非"已解决"。
+  - 9 个决策 **D-S5-01~09**（**均已拍板**；D-S5-02 / 04 仅**数值**待 S5-04 标定，不阻塞实现）、
+    测试计划 **S5-T1~T13**、任务拆分 **S5-01~08**（PR 切分为兜底 / 可观测 / 文档回写三支）、
+    风险 **R31~R35**（含 R34：精确扫描全程持 `points_by_layer` 读锁 ⇒ **Step 8 必须复核**）、
+    未决 Q1~Q5（评审项 Q3 / Q4 已结案，余实测项）。
+  - **v0.3 修订（二次评审响应，2026-09-10）**：
+    ① **D-S5-01~09 全部拍板**——评审对 D-S5-01 / 03 / 05 **无异议** ⇒ **阻塞解除，S5-01~04 可开工**；
+    D-S5-02 / 04 的数值同意留待 S5-04 标定回填（形态与口径已定）。
+    ② `docs/README.md` 索引行**同步纠正** v0.2 已推翻的遍历 API 结论（发现面漂移；
+    `docs/README.md` 自己的「修改规则」要求两边不复制对方内容以避免漂移）。
+    ③ §4.2.2 的 NaN 论证改为**强制前提**——精确路径加 `debug_assert!(d.is_finite())`，
+    并把 `brute.rs:53-57` 的排序统一为 `total_cmp`（与 §4.2.5 让 `distance_sq` 转发
+    `distance_to_slice` 是同一手法：**把断言变结构**）；顺带修 §3.1 的 API 标签笔误
+    （`get_layer_iterator` 在 `PointIndexation` 上，`Hnsw` 上没有）。
+    ④ 附录 C 复现片段补「**演示用、勿抄进测试**」注记（`assert_ne!` 断言的是 bug 存在，
+    理论可 flaky），并收录评审方在**落盘重载路径**上的独立复验（`from_loaded` 生产路径
+    同样成立：`into_iter().count()==get_nb_point()`、未访问 origin_id = 0；漏点率
+    2.66% / 3.04% / 3.08% / 3.74% 抖动，围绕理论值 3.125%）。
+- `plan-v2.md` 升 **v0.9 → v0.10**（Step 5 行补设计状态、文件头状态行重写、并加"0.05ms"读法
+  修正注记；**实现进度勾选仍留待实现完成后回写**）；`docs/README.md` 索引新增 Step 5 设计行，
+  并把「技术风险（R1~R25）」校正为 **R1~R30；Step 5 拟增 R31~R35**。
+- **PR #33 评审响应（v0.1 → v0.2）**：① **纠正关键技术前提**——全量遍历 API 由误写的
+  `get_layer_iterator(0)` 改为 `&PointIndexation` 的 `IntoIterator`（v0.1 把两个遍历 API 的
+  安危判断**写反了**，照原设计实现会让精确扫描**静默漏掉约 3% 的向量**，是错答而非变慢）；
+  ② D-S5-08 由"一条早退路径"扩为**两条**（`:99-104` + `:125-127`）；③ `distance_sq` 改为
+  **转发** `distance_to_slice`，把 I4「与 Brute 逐位一致」从巧合变**结构**；④ 修正 R11~R18
+  的架构引用（在 §14 **章级主表** `:1449-1456`，而非 §14.1 的 Step 2 风险表）；
+  ⑤ 新增**"高层点自查询"定向用例**（`from_os_rng` 使漏点集每次建图都变，随机 Top-K 会 flaky）。
+- **PR #33 二次评审响应（v0.2 → v0.3）**：① **D-S5-01~09 全部拍板**——评审对
+  D-S5-01 / 03 / 05 **无异议** ⇒ **阻塞解除，S5-01~04 可开工**；D-S5-02 / 04 仅数值待 S5-04 标定。
+  ② `docs/README.md` 索引行**同步纠正**遍历 API 结论与状态（v0.2 漏了这处发现面）。
+  ③ §4.2.2 的 NaN 论证改为**强制前提**（`debug_assert!(d.is_finite())` + `brute.rs` 排序统一
+  `total_cmp`）+ 修 §3.1 的 `get_layer_iterator` 归属笔误。④ 附录 C 补「勿抄进测试」注记，
+  并收录评审方在**落盘重载路径**上的独立复验。
+- `plan-v2.md` 升 **v0.10 → v0.11**（Step 5 设计定稿、D-S5-01~09 全部拍板、S5-01~04 可开工）。
+- **相关文档同步回写（2026-09-10，随本 PR 一并落地）**：Step 5 的决策与口径**不只落在设计文档里**，
+  三处「定义面」一并刷新——
+  - `requirements-spec.md` 升 **v1.9 → v1.10**：**NFR-13** 补「**端到端 P99（含过滤求值）**」
+    口径 + 预算拟 **≤ 20ms**（数值待 S5-04 标定），并做**成本口径修正**——D-J9 的「约 0.05ms」
+    只覆盖「对 ~100 个候选算距离」一段，**不含 `O(N)` 遍历定位候选**（1~10ms，方案 A 的主要成本）；
+    **NFR-07** 补本 Step 的落地路径（`Metrics` 进响应 / per-lane / `vector_route` / 修两条早退 `took`）。
+    ⚠️ 同时**补记 V2 Step 4 漏掉的版本行**（`#32` 改了 FR-30 行但未升版本）⇒ 本次一并入 v1.10。
+  - `architecture-design.md` 升 **v1.8 → v1.9**：**§5.4** `VectorIndex` 补两个新方法
+    （`search_exact_filtered` **必选** + `prefers_exact` 默认钩子）+ `vector_shortfall` 判读注记、
+    **§5.8** `SearchResponse` 补 `metrics: Metrics` 字段（**破坏性**，R35）；**§8.3** 新增「Step 5 补外部可见」块，
+    并把「⚠️ 当前限制（已知，待排期）」改写为「设计已承接、待实现」；**§14 章级主表 R18 补 ④**
+    ——口径修正 + 三路径对策 + ⚠️ **「只覆盖低选择度子集」的边界声明**（`allowed >` 阈值时仍回
+    路径 B ⇒ **R11/R13/R17/R18 不得标「已解决」**，只能标「低选择度子集已绕过」）；
+    **§14.3 新增 R31~R35**（设计文档 §9.1 原就写明「拟写入架构 §14.3」）；§14 导读补指引。
+    ⚠️ 同样**补记 Step 4 的 §7.5.3 / §14.2 版本行**。
+  - `docs/README.md`：风险范围行由「R1~R30；Step 5 **拟增** R31~R35」改为 **R1~R35**，
+    Step 5 索引行标注「风险 R31~R35（**已写入架构 §14.3**）」。
+  - `plan-v2.md` 升 **v0.11 → v0.12**：Step 5 段补「文档回写」子项；
+    **Step 2 提交链的「本 PR 尚未合并，合并后补 hash」注记回填为 `01e01eb`**（#35 已并入 `main`）。
+
 ### Changed · S2-T6 质量门：不可归因的**数值门**换成可归因的**不变式**（issue #34，2026-09-10）
 
 **问题**
@@ -70,7 +162,8 @@ panicked at tests/graph_persist.rs: 平均 Top-10 重合率应 ≥ 0.90，实测
 **同步**：`docs/devel/v2-step2-design.md` §1.3 验收 5 判据（原文仍写「≥ 0.95（S2-T3 口径）」，
 与本次修改**互相矛盾**，一并改掉）/ §8 S2-T3 行（该编号已重定义，标注新承接者）/ §8 S2-T6 行 /
 状态表验收 5 / P0-7 共五处；**`CHANGELOG` 自身的 P1 条目**里「T3 的意图已由 T6 的 oracle 重合率断言
-覆盖」这条**授权链已断**，改指新承接者；`docs/devel/plan-v2.md` Step 2 提交链标注「本 PR 待合并」。
+覆盖」这条**授权链已断**，改指新承接者；`docs/devel/plan-v2.md` Step 2 提交链标注「本 PR 待合并」
+（**本 PR 已并入 `main` 为 `01e01eb`**，该注记已在 PR #33 中回填为提交 hash）。
 **不改任何产品代码。**
 
 ### V2 Step 4 · CLI `helix compact` + churn workload（S4-08 + S4-09，2026-09-08）
