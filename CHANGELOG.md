@@ -9,6 +9,45 @@
 
 ## [Unreleased]
 
+### V2 Step 5 · 详细设计（2026-09-10）
+
+- 新增 `docs/devel/v2-step5-design.md`（**v0.1，待评审**）：**查询性能与可观测
+  （T7-22 / T7-23 / NFR-13 / R18）**的详细设计。
+  - **现状源码级定位**：R18 的机理（带 filter 时 `hnsw.rs:983-992` **无 fast-return**，
+    且 `:1019` 在 `return_points.len() < ef` 时**距离剪枝全程关闭** ⇒ 堆填不满即整图遍历；
+    默认 `k=10 → candidate_k=30 → ef=120` 就是**分水岭**，`allowed` 远小于它时遍历全图）；
+    `Metrics` **四处断链**（输出只剩 `tracing` / `SearchResponse` 无字段 / `query` 模块无再导出 /
+    bench 只能另算一个口径不同的 `mean_shortfall`，`bench.rs:190-193` 注释自陈"拿不到"）。
+  - **设计期新发现**：`searcher.rs:125-127`（过滤排空早退）**设了 `filter_eval` 就 `log`，
+    漏设 `metrics.took`** ⇒ 日志 `took_ms=0` 与响应 `took` 各说一套（同类第二处 `:212-213` 反而设了）
+    ⇒ 列 **D-S5-08** 随 T7-23 一起修。
+  - **关键技术前提（新增源码核实）**：`hnsw_rs` 0.3.4 **可以零拷贝遍历已入库向量**——
+    `get_layer_iterator(0)`（每点恰一次）+ `Point::get_v() -> &[T]`（零拷贝切片）+
+    `Point::get_origin_id() -> usize`（**就是 `ChunkId`**）；⚠️ `PointIndexation::into_iter()`
+    **跨层遍历会重复 yield**，不可用；`get_point_data(&PointId)` 存在但**是克隆**且
+    库**无 `origin_id → PointId` 映射** ⇒ 方案 B 需自建。核实记录见设计文档附录 C。
+  - **方案**：向量路从两条路径扩为**三条**——A 热路径（不变）/ B `filtered-ANN`（不变）/
+    **C 精确扫描**（`allowed ≤ 阈值` 时绕开 ANN）。**策略归后端**（新增必选方法
+    `VectorIndex::search_exact_filtered` + 默认钩子 `prefers_exact`），**分派与记账归编排层**
+    ⇒ 零 plumbing，门面 / 逃生舱 / bench 三条入口自动一致。
+  - **成本分解（修正 D-J9 的"0.05ms"读法）**：该数字只覆盖"对 ~100 个候选算距离"一段；
+    完整成本 = `O(N)` 谓词判定（定位候选，1~10ms 待标定）+ `O(allowed)` 距离（≈0.02ms）。
+    关键洞察：**路径 B 与 C 同为 `O(N)`，差别是每个点做什么**（512 维距离 ≈100ns vs
+    位图判定 ≈5~20ns ⇒ 5~20× 常数差），这正是"1~10ms vs 41~158ms"的来源。
+  - **可观测**：`Metrics` 进 `SearchResponse`（+ `query` 模块再导出），新增
+    `vector_route: {None, Ann, Exact}`（T7-22 的 A/B 判据）、`bm25_elapsed` / `vector_elapsed`
+    （Hybrid 并行下 `took` 无法归因）；`tracing` 通道保留；bench 两套 shortfall 口径**并列**
+    并在 JSON / 汇总表补列；新增 `--brute-fallback <N|off>` 作为 A/B 唯一开关。
+  - **必须一并声明的副作用**：精确路径下 `vector_shortfall` **结构性归零** ⇒
+    「0 缺口」不再等于「无 prefilter 需求」，判读须**连看 `vector_route`**；
+    R11/R13/R17 在低选择度档位只能标"**子集已绕过**"而非"已解决"。
+  - 9 个决策 **D-S5-01~09**（D-S5-01/03/05 阻塞开工；D-S5-02/04 数值待标定）、
+    测试计划 **S5-T1~T13**、任务拆分 **S5-01~08**（PR 切分为兜底 / 可观测 / 文档回写三支）、
+    风险 **R31~R35**（含 R34：精确扫描全程持 `points_by_layer` 读锁 ⇒ **Step 8 必须复核**）、
+    未决 **Q1~Q5**。
+- `plan-v2.md` 未改动（进度勾选留待实现完成后回写）；`docs/README.md` 索引新增 Step 5 设计行，
+  并把「技术风险（R1~R25）」校正为 **R1~R30；Step 5 拟增 R31~R35**。
+
 ### V2 Step 4 · CLI `helix compact` + churn workload（S4-08 + S4-09，2026-09-08）
 
 **新增（用户可用闭环 + 验收 1/2 实测）**

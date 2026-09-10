@@ -5,9 +5,9 @@
 
 | 项 | 内容 |
 | --- | --- |
-| 版本 | **v0.9（2026-09-10：Step 4 完成——compaction 实现 + CLI `helix compact` + churn workload 实测 + 文档回写；10K churn 0.3 实测图+data 84.6→33.7MB，三体积与 `GraphStatus::Loaded` 验收全过）** |
+| 版本 | **v0.10（2026-09-10：Step 5 详细设计出稿——`v2-step5-design.md` v0.1 待评审；T7-22 精确兜底 + T7-23 `Metrics` 可观测化）** |
 | 日期 | 2026-09-10 |
-| 状态 | **决策已定案（D-J1~J7 + D-J8~J11）；Step 1 / Step 2 / Step 3 / Step 4 均已完成并合并进 `main`（Step 3 = `ed25d5c`；Step 4 = S4-01 `1efc128` + 核心 `6f34ef2` + CLI/workload `ac9fcbe`）；Step 5~7 待做。任务编号按 2026-09-07 复审重排** |
+| 状态 | **决策已定案（D-J1~J7 + D-J8~J11）；Step 1 / Step 2 / Step 3 / Step 4 均已完成并合并进 `main`（Step 3 = `ed25d5c`；Step 4 = S4-01 `1efc128` + 核心 `6f34ef2` + CLI/workload `ac9fcbe` + 文档回写 `9e2211e`）；Step 5 设计已出稿（`v2-step5-design.md` v0.1，D-S5-01~09 待评审/待标定）；Step 6~7 待做。任务编号按 2026-09-07 复审重排** |
 | 上游 | `requirements-spec.md`（需求定义源）、`architecture-design.md`（架构/ADR）、`eval-report.md`（P5 实测） |
 | 前置 | V1（P0~P6）全部完成，见 `plan.md`（V1 计划，已冻结，不再更新） |
 | 复审 | 2026-09-07 全量复审（7 处调整 A1~A7 + 4 个拍板问题 D1~D4）**结论已全部并入本文**，不另立复审文档；调整项索引与建议执行顺序见 **§附-3** |
@@ -302,13 +302,26 @@
   方案已明确且廉价：**`allowed` 小于阈值时绕开 ANN、直接暴力扫描**
   （10 万级 0.1% 档 `allowed≈100`，代价约 **0.05ms vs 158ms**）。阈值在实现时标定。
   ⚠️ 该场景此前**不在任何 NFR 口径内**，故同步新增 **NFR-13**。
+  ⚠️ **设计期修正（v0.10）**：「0.05ms」只覆盖"对 ~100 个候选算距离"一段，
+  **不含定位候选**的 `O(N)` 遍历成本（1~10ms，待标定）——完整分解见设计文档 §4.2.4。
 - **T7-23**：`query::Metrics` 目前只经 `tracing::info!` 输出——**外部拿不到实例 ⇒ 无法单测、
   无法被 bench 采集**；而 `vector_shortfall` 正是「V2.1 是否引入 prefilter」的判据，
   Step 6 的 NFR-10/11 实测也要靠它。需暴露进 `SearchResponse` 或 bench 采集链路。
   顺带修 `query/metrics.rs:14` 里「见 issue #7」的失效引用（#7 已关闭）。
+- **详细设计**：🟩 **已出稿待评审**（`docs/devel/v2-step5-design.md` **v0.1**，2026-09-10）。
+  主线：向量路扩为**三条路径**（A 热路径 / B `filtered-ANN` 不变 / **C 精确扫描**），
+  **策略归后端**（`VectorIndex::search_exact_filtered` 必选 + `prefers_exact` 默认钩子）、
+  **分派与记账归编排层**（`Metrics.vector_route`）；候选来源取**方案 A 遍历向量存储**
+  （`hnsw_rs` 的 `get_layer_iterator(0)` + `Point::get_v()` 零拷贝，源码已核实）；
+  `Metrics` 进 `SearchResponse` + 补 per-lane 耗时。9 个决策 D-S5-01~09
+  （D-S5-01/03/05 阻塞开工；D-S5-02/04 的数值待标定），任务拆分 S5-01~08
+  （PR 切分：兜底 / 可观测 / 文档回写）。**阈值与 NFR-13 预算数值仍待 S5-04 标定回填**。
+- **⚠️ 设计期新发现**：`searcher.rs:125-127`（过滤排空早退）漏设 `metrics.took` ⇒
+  日志 `took_ms=0` 而响应 `took` 为真值（同类第二处 `:212-213` 反而设了）⇒ 列 D-S5-08 随 T7-23 修。
 - **依赖**：无；**T7-23 是 Step 6 的前置**。
-- **验收**：10 万级 sel-0.1% 档 vector P99 进入 NFR-13 预算；`Metrics` 至少有一条单测 +
-  一处 bench 采集点。
+- **验收**：10 万级 sel-0.1% 档 vector P99 进入 NFR-13 预算（口径 = **端到端 P99**，
+  含过滤求值；降级字段档位的 ~8ms 全扫已在 Step 1 接受 ⇒ 必须计入，D-S5-09）；
+  `Metrics` 至少有一条单测 + 一处 bench 采集点。
 - **量级**：S。
 
 #### Step 6 · 构建性能与多线程（原 Step 4，D-J10 顺延）

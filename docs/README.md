@@ -28,6 +28,7 @@
 | [`devel/v2-step2-design.md`](./devel/v2-step2-design.md)（V2 Step 2 设计） | **图持久化 + 并行建图（ADR-A 方案 C）**：`hnsw_rs` 图 IO 源码级三条硬事实、manifest 唯一原子发布点、五道先验校验、降级可观测、S2-01~12 任务拆分、风险表 R19~R25、12K 实测（完整冷启动 ≈100ms） | 实现者、评审者（Step 2 已完成并合并，main `9db2c00`） |
 | [`devel/v2-step3-design.md`](./devel/v2-step3-design.md)（V2 Step 3 设计） | **原子快照（崩溃一致性）**：`atomic_write` 通用原语（快照与 manifest 共用）、save 全序列崩溃窗口矩阵、tmp 孤儿回收、故障注入测试钩子（C′：`pub(crate)` 不进公开面）、R19 写路径残余收敛（`catch_unwind`）、D-S3-01~07 决策（**已全部拍板**）、S3-T1~T10 测试计划；**§10「实施结果」含评审回应与 S3-TI1~TI5 集成补强记录** | 实现者、评审者（**实现完成**：PR #27 含评审回应，CI 全绿，待合并） |
 | [`devel/v2-step4-design.md`](./devel/v2-step4-design.md)（V2 Step 4 设计） | **墓碑物理回收（compaction，T7-12 / FR-30 / Q-C2）**：三条膨胀路径逐行盘点（图 sidecar ≈2.6KB/点 vs 快照正文 ≈6B/chunk，约 440:1）、`flush` 侧幽灵向量时序缺口、**按存活集重新物化 + ID 重编号**方案（含 BM25 逐位一致的证明骨架）、**`compact()` 必须先 `commit()`**（D-S4-10）、manifest 重发铁律如何被既有 `save` 链路自动满足、`TombstoneStats` / `CompactionReport` 可观测、churn workload 脚本设计、D-S4-01~10 决策、S4-T1~T13 测试计划；**§10「实施结果」（v0.4）**含 10K churn 实测（graph+data 84.6→33.7MB）、Q1~Q7 结案、评审响应与集成补强记录 | 实现者、评审者（**v0.4 实现完成**：PR #29 / #30 / #31 均已合入 `main`） |
+| [`devel/v2-step5-design.md`](./devel/v2-step5-design.md)（V2 Step 5 设计） | **查询性能与可观测（T7-22 / T7-23 / NFR-13 / R18）**：R18 的整图遍历机理（`hnsw.rs:983-992` 无 fast-return + `:1019` 堆未满关闭剪枝，分水岭 = `ef=120`）、**`hnsw_rs` 存储访问能力源码核实**（`get_layer_iterator(0)` + `Point::get_v()` 零拷贝 + `get_origin_id()` = `ChunkId`；⚠️ 不可用 `PointIndexation::into_iter()`，它跨层会重复 yield）、**三路径设计**（A 热路径 / B filtered-ANN / **C 精确扫描**，策略归后端 `prefers_exact` + 编排层记账）、成本分解（路径 B 与 C 同为 `O(N)`，常数差 5~20×）、`Metrics` **四处断链**定位 + 进 `SearchResponse`、阈值标定实验设计、D-S5-01~09 决策、S5-T1~T13 测试计划、风险 R31~R35 | 实现者、评审者（**v0.1 待评审**：设计 PR 先行，follow-up 为 S5-01~08） |
 | [`devel/eval-report.md`](./devel/eval-report.md)（P5 评测报告） | **P5 评测结论**：三路对照、分桶与符号检验、tantivy 基线、网格/RRF 定稿、charabia 对照、NFR 实测、数据诚信声明 | 决策者、接入方 |
 | [`devel/v1-finish-design.md`](./devel/v1-finish-design.md)（v1 收尾设计） | **使用文档 / 评测脚本 / CI / 改名与发布 / 工程收尾**的任务清单、执行顺序与决策点（含外部评审修正记录） | 实现者（v1 收尾已完成，V1 全量交付） |
 | [`devel/requirements-spec.md`](./devel/requirements-spec.md)（需求分析说明书）     | 做什么 / 为什么 / 怎么验收  | 决策者、场景层接入方、实现者 |
@@ -43,7 +44,7 @@ devel/requirements-spec.md        devel/architecture-design.md
 ├─ FR-xx / NFR-xx 唯一定义源   ──►  只引用编号，不重复定义
 ├─ 术语表唯一定义源               ──►  直接使用
 ├─ 成功标准 / 评测指标             ──►  第 12 章做「阶段 → 需求」覆盖映射
-└─ 项目风险（P1~V2）              ──►  技术风险（R1~R25）在架构文档
+└─ 项目风险（P1~V2）              ──►  技术风险（R1~R30；Step 5 拟增 R31~R35）在架构文档
 ```
 
 **修改规则**：需求变更只改需求文档；实现变更只改架构文档。两边都不复制对方的内容，避免定义漂移。
