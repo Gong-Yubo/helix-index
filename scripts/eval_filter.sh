@@ -1,18 +1,22 @@
 #!/usr/bin/env bash
 #
 # V2 Step 1 · S1-10：过滤选择度扫描 + NFR-02 重测（T12 / T13 / T14）
+# V2 Step 5 · S5-04：精确兜底阈值标定（S5-T10）——新增路径列与 --brute-fallback 旋钮
 #
-# 把「一次一个档位」的手工 bench 变成一键扫描，产出三元数据：
+# 把「一次一个档位」的手工 bench 变成一键扫描，产出四元数据：
 #
 #   T12  选择度 × 延迟 × 召回（每个档位跑 bench，读 --json 汇总）
 #   T13  过滤求值耗时对照（--filter-cost，旧全扫 vs 新位图谓词）
 #   T14  NFR-02 重测：无过滤档位 P99 ≤ 基线 × 1.10，且 Top-10 重合率 ≥ 0.99
+#   S5-04 标定：allowed × 路径（精确占比）× P99 × 召回 —— 填 D-S5-02 阈值与 NFR-13 预算
 #
 # 用法：
 #   ./scripts/eval_filter.sh                       # 1 万级（约 2 分钟，本地冒烟）
 #   ./scripts/eval_filter.sh --n 100000            # 10 万级（约 20~30 分钟）
 #   ./scripts/eval_filter.sh --n 100000 --skip-build   # 已有快照时跳过构建
-#   ./scripts/eval_filter.sh --levels 无过滤,sel-1%    # 只跑指定档位
+#   ./scripts/eval_filter.sh --levels none,sel-1%,sel-0.1%   # 只跑指定档位
+#   ./scripts/eval_filter.sh --brute-fallback off  # A/B 对照：关闭兜底（回到 Step 5 之前）
+#   ./scripts/eval_filter.sh --brute-fallback 256  # 覆盖阈值，扫不同分界
 #
 # 产物（/tmp）：
 #   helix-filter-<n>-<档位>.json  每档位的 bench 明细
@@ -32,6 +36,7 @@ MODES="bm25,vector,hybrid"
 SKIP_BUILD=0
 LEVELS=""
 REGEN=0
+BRUTE_FALLBACK=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --n) N="$2"; shift 2 ;;
@@ -39,6 +44,7 @@ while [[ $# -gt 0 ]]; do
         --reps) REPS="$2"; shift 2 ;;
         --modes) MODES="$2"; shift 2 ;;
         --levels) LEVELS="$2"; shift 2 ;;
+        --brute-fallback) BRUTE_FALLBACK="$2"; shift 2 ;;
         --skip-build) SKIP_BUILD=1; shift ;;
         --regen) REGEN=1; shift ;;
         *) echo "未知参数: $1" >&2; exit 2 ;;
@@ -53,7 +59,17 @@ CORPUS="data/synth-${N}-corpus.jsonl"
 QUERY_FILE="data/synth-${N}-queries.jsonl"
 LEVELS_JSON="data/synth-${N}-filters.json"
 SNAPSHOT="/tmp/helix-filter-${N}.snapshot"
-OUT_MD="/tmp/helix-filter-${N}.md"
+
+# 兜底开关标签：A/B 对照时产物分开落盘，避免互相覆盖（同一快照可复用）
+if [[ -n "$BRUTE_FALLBACK" ]]; then
+    FB_TAG="-fb${BRUTE_FALLBACK}"
+    FB_DESC="覆盖阈值 ${BRUTE_FALLBACK}"
+    [[ "$BRUTE_FALLBACK" == "off" ]] && FB_DESC="关闭兜底（Step 5 之前的 ANN 行为）"
+else
+    FB_TAG=""
+    FB_DESC="默认（1024）"
+fi
+OUT_MD="/tmp/helix-filter-${N}${FB_TAG}.md"
 PY=${PYTHON:-python3}
 
 # NFR-02 基线（P5 实测，eval-report.md 8.1）：无过滤档位 P99 不得超过其 1.10 倍
@@ -62,6 +78,7 @@ BASELINE_VECTOR=8.37
 BASELINE_HYBRID=8.70
 
 echo "==> 构建 release 二进制（helix）"
+echo "    精确兜底：${FB_DESC}"
 cargo build --release -p helix
 BIN="target/release/helix"
 
@@ -105,13 +122,16 @@ for x in lv:
 
 declare -a ROWS=()
 while IFS='|' read -r name spec sel; do
-    out_json="/tmp/helix-filter-${N}-${name}.json"
+    out_json="/tmp/helix-filter-${N}-${name}${FB_TAG}.json"
     echo
-    echo "---- 档位 ${name}（spec=${spec:-<无过滤>}，声明选择度 ${sel}）----"
+    echo "---- 档位 ${name}（spec=${spec:-<无过滤>}，声明选择度 ${sel}，兜底 ${FB_DESC}）----"
     args=(--index "$SNAPSHOT" --queries "$QUERY_FILE" --modes "$MODES"
           --reps "$REPS" --json "$out_json")
     if [[ -n "$spec" ]]; then
         args+=(--filter "$spec" --filter-cost)
+    fi
+    if [[ -n "$BRUTE_FALLBACK" ]]; then
+        args+=(--brute-fallback "$BRUTE_FALLBACK")
     fi
     "$BIN" bench "${args[@]}" 2>&1 | sed 's/^/    /'
     ROWS+=("${name}|${sel}|${out_json}")
@@ -123,11 +143,12 @@ echo "==> 汇总三元数据"
 # 用环境变量把档位清单传给下面的 python（heredoc 加引号 ⇒ shell 不展开，
 # 否则 python 代码里的 ${...} 会被当成 shell 变量）
 export ROWS_JOINED="$(printf '%s\n' "${ROWS[@]}")"
-"$PY" - "${OUT_MD}" "${N}" "${BASELINE_BM25}" "${BASELINE_VECTOR}" "${BASELINE_HYBRID}" <<'PYEOF'
+"$PY" - "${OUT_MD}" "${N}" "${BASELINE_BM25}" "${BASELINE_VECTOR}" "${BASELINE_HYBRID}" "${FB_DESC}" <<'PYEOF'
 import json, os, sys
 
 out_md, n = sys.argv[1], sys.argv[2]
 baseline = {"bm25": float(sys.argv[3]), "vector": float(sys.argv[4]), "hybrid": float(sys.argv[5])}
+fb_desc = sys.argv[6]
 rows = [l.split("|") for l in os.environ["ROWS_JOINED"].splitlines() if l.strip()]
 
 lines = []
@@ -138,13 +159,21 @@ def emit(s=""):
     lines.append(s)
 
 
+def exact_cell(mode, L):
+    """bm25 模式不走向量路，'精确占比' 在该列没有意义 ⇒ 打 '-' 而不是 0%"""
+    if mode == "bm25":
+        return "-"
+    return f"{L.get('vector_route_exact_ratio', 0) * 100:>5.0f}%"
+
+
 emit()
-emit("=" * 96)
-emit(f"V2 Step 1 · S1-10 过滤选择度扫描（{n} 篇合成语料，release）")
-emit("=" * 96)
-hdr = f"{'档位':<18} {'选择度':>9} {'mode':<7} {'P50(ms)':>9} {'P99(ms)':>9} {'条数':>6} {'缺口':>6} {'重合率':>8} {'判定':>10}"
-emit(hdr)
-emit("-" * 96)
+emit("=" * 114)
+emit(f"V2 Step 5 · S5-04 精确兜底标定 + S1-10 选择度扫描（{n} 篇合成语料，release）")
+emit(f"精确兜底：{fb_desc}")
+emit("=" * 114)
+emit(f"{'档位':<18} {'选择度':>9} {'mode':<7} {'P50(ms)':>9} {'P99(ms)':>9} {'条数':>6} "
+     f"{'缺口':>6} {'内核缺口':>9} {'精确':>6} {'重合率':>8} {'判定':>10}")
+emit("-" * 114)
 
 verdicts = []
 for name, sel, path in rows:
@@ -161,6 +190,8 @@ for name, sel, path in rows:
         L = lat[mode]
         p50, p99 = L.get("p50_ms", 0), L.get("p99_ms", 0)
         hits, short = L.get("mean_hits", 0), L.get("mean_shortfall", 0)
+        short_k = L.get("vector_shortfall_kernel", 0)
+        ratio = L.get("vector_route_exact_ratio", 0)
         # 重合率来自 modes.<mode>.filter_quality（无过滤档位没有该字段）
         fq = d.get("modes", {}).get(mode, {}).get("filter_quality")
         if fq:
@@ -176,14 +207,47 @@ for name, sel, path in rows:
             note = f"基线 {baseline[mode]:.2f}→限 {tgt:.2f}"
             verdicts.append((name, mode, p99, tgt, ok))
         else:
-            ok = "" if short < 0.5 else "缺口>0"
+            # Step 5：判据从「缺口」升级为「路径 + 缺口」——
+            # 精确路径下缺口通常为 0，但**不是恒等式**（allowed 来自 Index、扫描枚举的是
+            # 图中的点）：只看缺口会把「没兜底」与「兜底了」判成一样；反过来
+            # 「精确但缺口>0」也不是矛盾，而是「图未覆盖全部 allowed」的诊断信号。
+            if ratio > 0.5:
+                ok = "精确兜底" if short_k < 0.5 else "精确但缺口>0"
+            else:
+                ok = "" if short_k < 0.5 else "缺口>0"
         emit(f"{name if first else '':<18} {sel if first else '':>9} {mode:<7} "
-             f"{p50:>9.2f} {p99:>9.2f} {hits:>6.2f} {short:>6.2f} {ov:>8} {ok:>10}"
-             + (f"  {note}" if note else ""))
+             f"{p50:>9.2f} {p99:>9.2f} {hits:>6.2f} {short:>6.2f} {short_k:>9.2f} "
+             f"{exact_cell(mode, L):>6} {ov:>8} {ok:>10}" + (f"  {note}" if note else ""))
         first = False
-emit("-" * 96)
-emit("重合率后带 * 表示 oracle 基线自身 < K（allowed 内匹配 query 的文档就这么少），")
-emit("此时只能证明「下推没比 post-filter 更差」，不能证明「召回足够」。")
+emit("-" * 114)
+emit("「缺口」= 用户视角 min(K, allowed) − 返回条数；「内核缺口」= metrics.vector_shortfall（融合前候选池）。")
+emit("「精确」= metrics.vector_route==Exact 的响应占比；>50% 表示该档位确实走了精确兜底。")
+emit("⚠️ 精确路径下「内核缺口」**通常**为 0，但不是恒等式：allowed 来自 Index、扫描枚举的是图中的点，")
+emit("   图滞后于索引时它仍 > 0(那时它是「图未覆盖全部 allowed」的诊断信号)。两种读数都要连看「精确」。")
+emit("重合率后带 * 表示 oracle 基线自身 < K，此时只能证明「下推没比 post-filter 更差」。")
+
+emit()
+emit("== 路径与耗时分解（内核 metrics 均值，D-S5-06）==")
+emit(f"{'档位':<18} {'mode':<7} {'精确':>6} {'bm25(ms)':>9} {'vector(ms)':>11} "
+     f"{'过滤求值(ms)':>12} {'n_metrics':>10}")
+emit("-" * 114)
+for name, _sel, path in rows:
+    try:
+        d = json.load(open(path))
+    except Exception:
+        continue
+    first = True
+    for mode in ["bm25", "vector", "hybrid"]:
+        L = d.get("latency", {}).get(mode)
+        if not L:
+            continue
+        emit(f"{name if first else '':<18} {mode:<7} {exact_cell(mode, L):>6} "
+             f"{L.get('mean_bm25_ms', 0):>9.3f} {L.get('mean_vector_ms', 0):>11.3f} "
+             f"{L.get('mean_filter_eval_us', 0) / 1000.0:>12.3f} {L.get('n_metrics', 0):>10}")
+        first = False
+emit("-" * 114)
+emit("「过滤求值」独立于召回路径（D-S5-09）：降级字段档位上它自己就可能 ~8ms。兜底做完仍超")
+emit("NFR-13 预算时，靠它区分「兜底没生效」与「过滤求值本身贵」——后者不归本 Step 管。")
 
 emit()
 emit("== NFR-02 重测（T14①：无过滤档位 P99 ≤ 基线 × 1.10）==")
@@ -192,11 +256,11 @@ for name, mode, p99, tgt, ok in verdicts:
     emit(f"  {mark} {mode:<7} P99={p99:6.2f}ms  限 {tgt:6.2f}ms  ({ok})")
 
 with open(out_md, "w", encoding="utf-8") as f:
-    f.write(f"# V2 Step 1 · S1-10 过滤选择度扫描（{n} 篇合成语料，release）\n\n```\n")
+    f.write(f"# V2 Step 5 · S5-04 精确兜底标定（{n} 篇合成语料，release）\n\n```\n")
     f.write("\n".join(lines))
     f.write("\n```\n")
 emit(f"\n汇总已写出：{out_md}")
 PYEOF
 
 echo
-echo "每档位明细 JSON: /tmp/helix-filter-${N}-<档位>.json"
+echo "每档位明细 JSON: /tmp/helix-filter-${N}-<档位>${FB_TAG}.json"

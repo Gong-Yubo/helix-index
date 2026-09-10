@@ -17,7 +17,7 @@ mod persist;
 mod point;
 
 pub use brute::BruteForceIndex;
-pub use hnsw_rs_index::HnswRsIndex;
+pub use hnsw_rs_index::{HnswRsIndex, BRUTE_FALLBACK_MAX_ALLOWED};
 pub use persist::{load_graph_checked, validate_graph_description, GraphStats, VectorGraphPersist};
 pub use point::NormalizedVector;
 // R19 panic 边界（V2 Step 3 / D-S3-04）：门面层写图链路必经；pub(crate) 不进公开面
@@ -26,6 +26,26 @@ pub(crate) use persist::dump_graph_caught;
 use crate::error::Result;
 use crate::predicate::CandidateFilter;
 use crate::types::ChunkId;
+
+/// 向量路本次实际走的路径（V2 Step 5 / D-S5-07）。
+///
+/// 由后端经 [`VectorIndex::prefers_exact`] 给出**策略**，编排层据此**分派**并把
+/// 结果记进 [`crate::query::Metrics::vector_route`]——「兜底到底生效了没有」由此
+/// 从延迟反推变成直接可读（V2.1 的 prefilter 判据必须连看它，见 `vector_shortfall`
+/// 的语义变更）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum VectorRoute {
+    /// 未走向量路（`SearchMode::Bm25`，以及索引为空 / 过滤排空等早退路径）。
+    ///
+    /// ⚠️ 本变体**不是**分派函数的返回值——"这次检索有没有向量路"是编排层的信息，
+    /// 不该由后端编码；后端的策略只回答 `Ann` / `Exact`。
+    #[default]
+    None,
+    /// 走了 ANN（近似；低选择度下可能有召回缺口）。
+    Ann,
+    /// 走了精确扫描（保证 `min(k, allowed)` 条、无召回缺口）。
+    Exact,
+}
 
 /// 向量索引抽象。
 pub trait VectorIndex: Send + Sync {
@@ -64,6 +84,43 @@ pub trait VectorIndex: Send + Sync {
     /// 不带过滤的检索（默认转发到 [`Self::search_filtered`]，`None` 语义见其上）。
     fn search(&self, query: &NormalizedVector, k: usize) -> Result<Vec<(ChunkId, f32)>> {
         self.search_filtered(query, k, None)
+    }
+
+    /// **精确**（无近似）的过滤检索：返回**全部**满足 `filter` 的最近 `min(k, 命中数)` 条。
+    ///
+    /// 返回值与 [`Self::search_filtered`] 同形（`(chunk_id, 平方欧氏距离)`，距离升序、
+    /// 同距离按 `chunk_id` 升序），与它的**唯一语义差异是精确性**：
+    ///
+    /// - 返回条数恒为 `min(k, 命中的候选数)`，**不允许少返回**——这正是它在低选择度
+    ///   场景的价值（ANN 会在那里静默少召回）。
+    /// - `filter = None` 时不过滤（含已软删除条目），契约同 [`Self::search_filtered`]。
+    ///
+    /// # ⚠️ 这是"必选方法"而非带默认实现
+    ///
+    /// 默认实现只能给出"某种"行为，而后端**是否真精确**是它的实现事实。设为必选
+    /// ⇒ 新增后端必须显式回答"我的精确路径是什么"（同 [`Self::as_graph_persist`]
+    /// 用 `None` 把"Brute 无图"写成类型事实的手法）。
+    ///
+    /// # 代价
+    ///
+    /// 不保证优于 [`Self::search_filtered`]——实现可能是 `O(N)`（逐点谓词判定）。
+    /// ⇒ **调用方必须先问 [`Self::prefers_exact`]**，不要无条件改用它。
+    fn search_exact_filtered(
+        &self,
+        query: &NormalizedVector,
+        k: usize,
+        filter: Option<&dyn CandidateFilter>,
+    ) -> Result<Vec<(ChunkId, f32)>>;
+
+    /// 本后端在**该谓词**下是否应走精确路径。
+    ///
+    /// **策略归后端、分派归编排层**：后端最清楚"这个谓词下我的 ANN 会不会退化成
+    /// 整图遍历"，而编排层只需据此分派并记账（`Metrics.vector_route`）——阈值规则
+    /// 只有一份实现，也不必把 `raw_vectors` 之类的内部状态穿过 `&dyn VectorIndex`。
+    ///
+    /// 默认 `false` ⇒ **不改变任何既有后端的行为**（零回归）。
+    fn prefers_exact(&self, _filter: &dyn CandidateFilter) -> bool {
+        false
     }
 
     /// 已入库向量条数（**含已软删除的**；与存活数无关）。

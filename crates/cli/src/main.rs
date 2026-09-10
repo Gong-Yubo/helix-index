@@ -87,6 +87,13 @@ struct SearchArgs {
     /// 打印 explain 详情（匹配词 + 两路 rank/score）
     #[arg(long)]
     explain: bool,
+    /// 打印一行内核指标（V2 Step 5 / NFR-07「用户可自查」）。
+    ///
+    /// 默认关：它是**诊断**输出，不是检索结果的一部分。内容 = 向量路实际走的路由
+    /// （`None`/`Ann`/`Exact`）、缺口、per-lane 耗时——低选择度档位靠它区分
+    /// 「兜底生效了」与「过滤求值本身贵」。
+    #[arg(long)]
+    metrics: bool,
     /// 查询文本
     query: String,
 }
@@ -470,7 +477,34 @@ fn search(args: SearchArgs) -> Result<()> {
     }
     let resp = req.exec()?;
     print_response(&resp, &args.query, args.explain);
+    if args.metrics {
+        print_kernel_metrics(&resp);
+    }
     Ok(())
+}
+
+/// 打印一行内核指标（V2 Step 5 / NFR-07）。
+///
+/// `route` 是本次检索**实际**走的向量路径——没有它，"兜底是否生效"只能靠延迟反推。
+/// `缺口` 走精确路径时**通常**为 0，但那不是恒等式（`allowed` 来自 `Index`、扫描枚举
+/// 的是图中的点）：`Exact` + 缺口 > 0 反过来是「图未覆盖全部 allowed」的诊断信号。
+/// 两种读数都必须**连看** `route`（设计 §4.4 推论 1）。
+fn print_kernel_metrics(resp: &SearchResponse) {
+    let m = &resp.metrics;
+    println!(
+        "\n[内核指标] route={:?} allowed={} bm25={} vector={} candidates={} 缺口={} | \
+         filter_eval={:.3}ms bm25={:.3}ms vector={:.3}ms | took={:.3}ms",
+        m.vector_route,
+        m.allowed,
+        m.bm25,
+        m.vector,
+        m.candidates,
+        m.vector_shortfall,
+        m.filter_eval.as_secs_f64() * 1000.0,
+        m.bm25_elapsed.as_secs_f64() * 1000.0,
+        m.vector_elapsed.as_secs_f64() * 1000.0,
+        m.took.as_secs_f64() * 1000.0,
+    );
 }
 
 fn compare(args: CompareArgs) -> Result<()> {

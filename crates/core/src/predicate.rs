@@ -52,7 +52,16 @@ pub trait CandidateFilter: Send + Sync {
     /// - `Alive`    = 存活 chunk 数
     /// - `Filtered` = 通过过滤的 chunk 数
     ///
-    /// 向量路用它决定过采样宽度（`knbn`）与是否可能 shortfall。
+    /// 向量路用它决定过采样宽度（`knbn`）与是否可能 shortfall；
+    /// **V2 Step 5 起它还是向量路分派的阈值输入**（`VectorIndex::prefers_exact`）。
+    ///
+    /// # ⚠️ 必须**精确**（本 PR 起是硬契约）
+    ///
+    /// 必须是 `contains` 的真实计数，**不得**返回上界 / 下界 / 估算值：一旦有实现返回
+    /// 估算值，`prefers_exact` 会**静默失效**——检索结果仍然正确，只是 R18 的低选择度
+    /// 延迟问题原样回来，而且只会表现为标定表里「精确占比 0%」，极难归因
+    /// （此前它只影响过采样宽度，估算尚且可容忍；现在它决定分派，不能容忍）。
+    /// 库内两个实现都精确（`filter.rs` 的 `allowed_chunk_count` 有对账用例）。
     fn allowed_count(&self) -> usize;
 
     /// 谓词种类（决定向量路走哪条路径）。

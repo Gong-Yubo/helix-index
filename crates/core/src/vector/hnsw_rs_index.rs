@@ -33,6 +33,21 @@ const EF_FILTER_MAX: usize = 256;
 /// 路径 A 的候选数上限（防止重度删除场景过采样爆炸）。
 const PHYSICAL_OVERSAMPLE_CAP: usize = 1024;
 
+/// `allowed` 低于此值时**绕开 ANN、走精确扫描**（路径 C）的默认阈值
+/// （V2 Step 5 / D-S5-02，初值来自 §4.3 的代价模型）。
+///
+/// # 为什么是"选择度阈值"而不是"ef 调参"
+///
+/// 带 filter 时 `hnsw_rs` **没有 fast-return**，且堆未满（`return_points.len() < ef`）
+/// 时距离剪枝全程关闭（`hnsw.rs:983-992` / `:1019`）⇒ `allowed < ef` 就是**整图遍历**。
+/// 默认 `k=10 ⇒ candidate_k=30 ⇒ ef=120`，而 sel-1% 档 `allowed≈1000`、
+/// sel-0.1% 档 `allowed≈100`——两者都远小于整图规模，路径 B 在那里每个点都要算一次
+/// 512 维距离；路径 C 每个点只做一次位图判定（常数差 5~20×）。
+///
+/// 取值覆盖 sel-1% 档（`allowed≈1000`）且比 `EF_FILTER_MAX = 256` 宽；
+/// **S5-04 标定后定稿**（阈值是性能决策点，不是正确性边界）。
+pub const BRUTE_FALLBACK_MAX_ALLOWED: usize = 1024;
+
 /// 自定义点积距离：`1 − cos`（要求向量已 L2 归一化）。
 ///
 /// **不用库里的 `DistDot`**：它在 aarch64 的标量实现里有 `assert!(dot <= 1.)`，
@@ -70,6 +85,10 @@ pub struct HnswRsIndex {
     /// 「并行 vs 串行质量等价」的测试会退化成「串行 vs 串行」还全绿
     /// （评审 #13 发现 1）。
     parallel_inserts: usize,
+    /// 精确兜底阈值（V2 Step 5 / D-S5-02）：`allowed ≤ 阈值` 时走路径 C。
+    ///
+    /// `None` = **关闭**兜底（回归对照 / bench A/B 用 `--brute-fallback off`）。
+    brute_fallback: Option<usize>,
 }
 
 impl HnswRsIndex {
@@ -87,6 +106,7 @@ impl HnswRsIndex {
             ef_search: EF_SEARCH,
             parallel_build: false,
             parallel_inserts: 0,
+            brute_fallback: Some(BRUTE_FALLBACK_MAX_ALLOWED),
         }
     }
 
@@ -106,6 +126,15 @@ impl HnswRsIndex {
     /// 字段对兄弟模块（`vector/persist.rs`）不可见，字面量构造编译不过——
     /// 本构造器是**唯一**通道。`ef_search` 必须由调用方带入：全 crate 无
     /// `set_ef*`，本字段是 ef 的唯一载体。
+    ///
+    /// # 为什么 `brute_fallback` 不加形参（V2 Step 5 / 附录 A 的第二个选项）
+    ///
+    /// 它**不是图的属性**，也**不是加载路径的配置**——「低选择度走不走精确扫描」
+    /// 是**读端策略**。加形参会把 `VectorGraphPersist::load_graph` 的签名一起改掉
+    /// （公开 trait，波及 `load_graph_checked` 与全部调用点），而唯一的非默认需求
+    /// 来自 bench 的 A/B 对照——调用方拿到具体的 `HnswRsIndex` 后调
+    /// [`Self::with_brute_fallback`] 即可（`load_graph_checked` 返回的就是具体类型）。
+    /// 故这里只写**产品默认值**，把"可关"留在构建器上。
     pub(crate) fn from_loaded(
         hnsw: Hnsw<'static, f32, DistDotClamped>,
         ef_search: usize,
@@ -116,7 +145,23 @@ impl HnswRsIndex {
             ef_search,
             parallel_build,
             parallel_inserts: 0,
+            brute_fallback: Some(BRUTE_FALLBACK_MAX_ALLOWED),
         }
+    }
+
+    /// 覆盖精确兜底阈值（V2 Step 5 / D-S5-02）。
+    ///
+    /// - `Some(n)` ⇒ `allowed ≤ n` 的 `FilterKind::Filtered` 查询走精确扫描；
+    /// - `None` ⇒ **关闭兜底**，行为逐位回到 Step 5 之前（`--brute-fallback off`
+    ///   的 A/B 对照与 `S5-T7` 的热路径零回归护栏都靠它）。
+    pub fn with_brute_fallback(mut self, max_allowed: Option<usize>) -> Self {
+        self.brute_fallback = max_allowed;
+        self
+    }
+
+    /// 当前精确兜底阈值（`None` = 已关闭；供 bench 打印配置与测试断言）。
+    pub fn brute_fallback(&self) -> Option<usize> {
+        self.brute_fallback
     }
 
     /// 打开并行建图（D-S2-05，**默认关**）。
@@ -222,6 +267,71 @@ impl VectorIndex for HnswRsIndex {
 
     fn len(&self) -> usize {
         self.hnsw.get_nb_point()
+    }
+
+    /// **路径 C：精确扫描**（V2 Step 5 / D-S5-03 方案 A）。
+    ///
+    /// 逐点遍历**向量存储本身**，对通过谓词的点算距离，取最近 k 条。
+    /// 代价 `O(N)` 次谓词判定 + `O(allowed)` 次距离——与路径 B 同为 `O(N)` 遍历，
+    /// 差别在每个点做什么：路径 B 每点一次 512 维距离（≈100ns），
+    /// 本路径每点一次位图判定（≈5~20ns）。
+    ///
+    /// # ⚠️ 全量遍历必须用 `&PointIndexation` 的 `IntoIterator`
+    ///
+    /// 它从 layer 0 **逐层上升到 `entry_point_level`**，每个点恰好 yield 一次
+    /// （`hnsw.rs:681-688` / `IterPoint::next` `:647-677`）。
+    ///
+    /// **不可**改用 `get_layer_iterator(0)`：`generate_new_point` 只把新点推入
+    /// **它自己那一层**（`hnsw.rs:500-511`，全文件唯一一处 push，**无回填低层**），
+    /// 而 `level = floor(-ln u · scale)`、`scale = 1/ln(M)` ⇒ `P(level ≥ 1) = 1/M`，
+    /// 本项目 M=32 ⇒ 约 3.1% 的点**不在 layer 0**。用它做精确扫描会**静默漏掉**
+    /// 这 3%——不是变慢、不是少召回，是**答错**（拿被漏点自己的向量去查，它会消失）。
+    /// 定向护栏见测试 `精确扫描覆盖高层点_定向用例`。
+    ///
+    /// # 与 `BruteForceIndex` 的逐位一致性（I4）
+    ///
+    /// 距离走 [`NormalizedVector::distance_to_slice`]（与 `distance_sq` 同一份求和
+    /// 实现），排序比较子与 `brute.rs` 同为 `total_cmp` ⇒ 两侧**同源**，
+    /// "逐位一致"是结构而非巧合。`(距离, chunk_id)` 在全量互异 ID 上是全序
+    /// ⇒ 结果与遍历顺序无关。
+    fn search_exact_filtered(
+        &self,
+        query: &NormalizedVector,
+        k: usize,
+        filter: Option<&dyn CandidateFilter>,
+    ) -> Result<Vec<(ChunkId, f32)>> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let mut out: Vec<(ChunkId, f32)> = Vec::new();
+        for point in self.hnsw.get_point_indexation() {
+            let id = point.get_origin_id() as ChunkId;
+            if filter.is_none_or(|f| f.contains(id)) {
+                let d = query.distance_to_slice(point.get_v());
+                // 精确路径把"依赖 embedder 输出有限"从**声明**变成**断言**：
+                // `NormalizedVector::new`（`point.rs`）的 `norm > 0.0` 在 NaN 下为
+                // false（IEEE-754：NaN 的一切比较皆 false）⇒ NaN 会被**静默存下**，
+                // 不 panic / 不报错；全 crate 无 `is_finite` / `is_nan`。
+                debug_assert!(
+                    d.is_finite(),
+                    "embedder 输出含 NaN/Inf（精确路径契约外输入）：chunk {id}"
+                );
+                out.push((id, d));
+            }
+        }
+        out.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+        out.truncate(k);
+        Ok(out)
+    }
+
+    /// 低选择度用户过滤 ⇒ 声明"该走精确路径"（策略归后端，分派与记账归编排层）。
+    fn prefers_exact(&self, filter: &dyn CandidateFilter) -> bool {
+        // 只看 `Filtered`：热路径（`None` / `Alive`）必须保住 fast-return，
+        // 而 R15 是 Step 1 明确的设计不变量，本 Step 一行不碰（D-S5-02）。
+        filter.kind() == FilterKind::Filtered
+            && self
+                .brute_fallback
+                .is_some_and(|max| filter.allowed_count() <= max)
     }
 
     /// P0-4：门面层从 `Box<dyn VectorIndex>` 触达图持久化能力的唯一通道。
@@ -523,6 +633,250 @@ mod tests {
             println!(
                 "选择度 {name:>5} (allowed={allowed:>5}) | 平均 {avg_lat:>8.1}µs | \
                  P99 {p99_lat:>8}µs | 召回 {avg_recall:.3} | 平均缺口 {avg_short:.2}"
+            );
+        }
+    }
+
+    // ========================================================================
+    // V2 Step 5 / S5-02：精确扫描（路径 C）的正确性护栏
+    // ========================================================================
+
+    /// **S5-T2 ①**：全量遍历的**基数断言**——每点恰好 yield 一次、零重复。
+    ///
+    /// 这条是 v0.1 教训的直接固化：当时把 `get_layer_iterator(0)` 当全量遍历写进
+    /// 设计，而它只迭代 layer 0（`hnsw.rs:715-723` 只索引 `pi_guard[self.layer]`），
+    /// 因 `generate_new_point` **无回填低层**（`:500-511`）而漏掉约 `1/M` 的点。
+    /// 断言"全量 API 的基数 == `get_nb_point()`"能在**有人把遍历写回 layer 0 时立刻红**。
+    #[test]
+    fn 全量遍历基数等于点数且零重复() {
+        let mut seed = 99u64;
+        let (idx, entries) = build_index(300, &mut seed);
+        let pi = idx.hnsw.get_point_indexation();
+
+        let ids: Vec<ChunkId> = pi
+            .into_iter()
+            .map(|p| p.get_origin_id() as ChunkId)
+            .collect();
+        assert_eq!(
+            ids.len(),
+            idx.hnsw.get_nb_point(),
+            "全量遍历必须覆盖每一个点（每点恰一次）"
+        );
+
+        let mut uniq = ids.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), ids.len(), "全量遍历出现重复 yield");
+
+        // 与真实 ID 全集相等：既不少（漏点）也不多（幽灵）
+        let mut expect: Vec<ChunkId> = entries.iter().map(|(id, _)| *id).collect();
+        expect.sort_unstable();
+        assert_eq!(uniq, expect, "遍历得到的 ID 集与入库集不相等");
+    }
+
+    /// **S5-T2 ②**：**定向用例**——取一个 `level ≥ 1` 的点，用**它自己的向量**查询，
+    /// 断言它排第一（距离 0）。
+    ///
+    /// 为什么必须是定向用例而不能只靠随机 Top-K：`LayerGenerator` 用
+    /// `StdRng::from_os_rng()`（`hnsw.rs:328`），**哪 3% 被漏掉每次建图都不同**
+    /// （实测漏点率 2.66%~3.74%）⇒ 随机查询恰不含漏点时测试会**时好时坏**。
+    /// 本用例同时断言 victim **不在 layer 0**，否则它会退化成"layer 0 也能过"、
+    /// 失去鉴别力。
+    #[test]
+    fn 精确扫描覆盖高层点_定向用例() {
+        let mut seed = 1234u64;
+        let (idx, _entries) = build_index(512, &mut seed);
+        let pi = idx.hnsw.get_point_indexation();
+
+        // M = 32 ⇒ P(level ≥ 1) = 1/32；N = 512 时 P(一个都没有) ≈ 1e-7
+        let victim = pi
+            .get_layer_iterator(1)
+            .next()
+            .unwrap_or_else(|| panic!("M=32 / N=512 下应存在 level ≥ 1 的点（P(不存在)≈1e-7）"));
+        let victim_id = victim.get_origin_id() as ChunkId;
+        let q = NormalizedVector::new(victim.get_v().to_vec());
+
+        assert!(
+            pi.get_layer_iterator(0)
+                .all(|p| p.get_origin_id() as ChunkId != victim_id),
+            "定向用例失效：victim {victim_id} 同时也在 layer 0"
+        );
+
+        // 用它自己的向量查：精确路径必须把它排第一且距离为 0
+        let got = idx.search_exact_filtered(&q, 3, None).unwrap();
+        assert_eq!(
+            got[0].0, victim_id,
+            "精确路径漏掉了 level ≥ 1 的点 {victim_id}（疑似用了 get_layer_iterator(0)）"
+        );
+        assert!(got[0].1.abs() < 1e-6, "自匹配距离应为 0，实际 {}", got[0].1);
+
+        // 对照：只扫 layer 0 确实找不到它 —— 把 v0.1 的误判钉成回归
+        assert!(
+            !pi.get_layer_iterator(0)
+                .any(|p| p.get_origin_id() as ChunkId == victim_id),
+            "本用例的 victim 在 layer 0 里，无法证明全量遍历的必要性"
+        );
+    }
+
+    /// **S5-T3 / I4**：精确路径与 `BruteForceIndex` 的 Top-K **逐位一致**
+    /// （`(chunk_id, distance)` 序列）。
+    ///
+    /// 多 query × 多谓词（`None` / `EvenChunks`）覆盖两条不同的谓词路径。
+    /// 一致性是**结构性**的：`distance_sq` 转发 `distance_to_slice`（单一求和实现）
+    /// + 两侧比较子同为 `total_cmp` + `(距离, chunk_id)` 全序（结果与遍历顺序无关）。
+    #[test]
+    fn 精确扫描与暴力逐位一致() {
+        let mut seed = 77u64;
+        let (idx, entries) = build_index(300, &mut seed);
+        let brute = BruteForceIndex::from_entries(entries.clone());
+        let even = EvenChunks { count: 150 };
+
+        for probe in [0usize, 41, 137, 299] {
+            let q = entries[probe].1.clone();
+            for (label, filter) in [
+                ("None", None),
+                ("EvenChunks", Some(&even as &dyn CandidateFilter)),
+            ] {
+                for k in [1usize, 5, 10, 500] {
+                    let exact = idx.search_exact_filtered(&q, k, filter).unwrap();
+                    let oracle = brute.search_filtered(&q, k, filter).unwrap();
+                    assert_eq!(
+                        exact, oracle,
+                        "probe={probe} k={k} filter={label}：精确路径与 Brute 不逐位一致"
+                    );
+                }
+            }
+        }
+
+        // **I5 / S5-T6**：同一冻结图 + 同一 query 下，精确扫描**连续 100 次**逐位一致
+        // （NFR-06 确定性）。这里可以硬断言：图已冻结，遍历与排序都是确定性的，
+        // 不受建图期 `StdRng::from_os_rng()` 影响的只有**跨建图**的拓扑，
+        // 而本用例全程用同一张图。
+        let q = entries[137].1.clone();
+        let first = idx.search_exact_filtered(&q, 10, Some(&even)).unwrap();
+        for round in 0..100 {
+            assert_eq!(
+                idx.search_exact_filtered(&q, 10, Some(&even)).unwrap(),
+                first,
+                "第 {round} 次精确扫描与首次不一致"
+            );
+        }
+    }
+
+    /// **S5-T2（hnsw 侧完整性）**：返回条数 `== min(k, 命中数)`——**不允许少返回**
+    /// （这是路径 C 与路径 B 的唯一语义差异，也是低选择度场景的价值所在）。
+    #[test]
+    fn 精确扫描条数为min_k与allowed() {
+        let mut seed = 313u64;
+        let (idx, entries) = build_index(200, &mut seed);
+        let even = EvenChunks { count: 100 };
+        let q = entries[3].1.clone();
+
+        let k4 = idx.search_exact_filtered(&q, 4, Some(&even)).unwrap();
+        assert_eq!(k4.len(), 4);
+        for (id, _) in &k4 {
+            assert!(even.contains(*id), "返回了未通过谓词的 chunk {id}");
+        }
+
+        let all = idx.search_exact_filtered(&q, 999, Some(&even)).unwrap();
+        assert_eq!(all.len(), 100, "k > allowed 时应返回全部 allowed 条");
+
+        assert!(idx
+            .search_exact_filtered(&q, 0, Some(&even))
+            .unwrap()
+            .is_empty());
+        for w in all.windows(2) {
+            assert!(
+                w[0].1 < w[1].1 || (w[0].1 == w[1].1 && w[0].0 < w[1].0),
+                "排序必须是 (距离升序, chunk_id 升序) 的全序"
+            );
+        }
+    }
+
+    /// **S5-T4 / S5-T1**：阈值边界（`≤` 成立）+ 关闭开关 + 默认值 + `Alive` 不兜底。
+    #[test]
+    fn 阈值边界与关闭开关() {
+        assert_eq!(
+            HnswRsIndex::with_capacity(8).brute_fallback(),
+            Some(BRUTE_FALLBACK_MAX_ALLOWED),
+            "默认必须开兜底（否则产品拿不到 Step 5 的收益）"
+        );
+
+        let mut seed = 5u64;
+        let (idx, _) = build_index(64, &mut seed);
+        let idx = idx.with_brute_fallback(Some(32));
+        assert_eq!(idx.brute_fallback(), Some(32));
+
+        assert!(
+            idx.prefers_exact(&EvenChunks { count: 32 }),
+            "allowed == 阈值 ⇒ 走精确（≤ 成立）"
+        );
+        assert!(
+            !idx.prefers_exact(&EvenChunks { count: 33 }),
+            "allowed == 阈值 + 1 ⇒ 走 ANN"
+        );
+
+        // 热路径（Alive）永不兜底：R15 的 fast-return 是 Step 1 的不变量
+        use crate::bitmap::Bitmap;
+        use crate::predicate::AliveOnly;
+        let mut alive = Bitmap::new();
+        alive.set(0);
+        let alive_only = AliveOnly::new(&alive);
+        assert!(
+            !idx.prefers_exact(&alive_only),
+            "FilterKind::Alive 是热路径，不得走精确扫描"
+        );
+
+        // 关闭兜底（回归对照）
+        let (off, _) = build_index(64, &mut seed);
+        let off = off.with_brute_fallback(None);
+        assert_eq!(off.brute_fallback(), None);
+        assert!(
+            !off.prefers_exact(&EvenChunks { count: 1 }),
+            "--brute-fallback off ⇒ 任何 allowed 都不兜底"
+        );
+    }
+
+    /// **S5-T7（向量层护栏）**：兜底**不改热路径**。
+    ///
+    /// 断言的是**策略层**的事实：`None` 与 `FilterKind::Alive` 谓词下
+    /// `prefers_exact` 恒 `false`（阈值调到 `usize::MAX` 也否），
+    /// 于是编排层**结构上不可能**把热路径分派到精确扫描。
+    ///
+    /// ⚠️ 为什么"开/关兜底 Top-K 逐位一致"的**行为** A/B 不放在这里：
+    /// 向量层的 `search_filtered` **根本不读阈值**——分派在编排层。要在这层比较
+    /// 两个阈值，只能构造两个不同的图（`hnsw_rs` 用 OS 熵，拓扑互不相同 ⇒ 比较
+    /// 无意义）。行为 A/B 用**同图 + 间谍后端**在 `query::searcher` 的测试里做，
+    /// 那里才能既固定拓扑又观测"到底调了哪个方法"。
+    #[test]
+    fn 热路径在策略层就排除兜底() {
+        use crate::bitmap::Bitmap;
+        use crate::predicate::AliveOnly;
+
+        let mut seed = 61u64;
+        let (idx, entries) = build_index(200, &mut seed);
+        // 阈值调到无穷大：任何"看 allowed 就兜底"的错误实现都会在这里暴露
+        let always = idx.with_brute_fallback(Some(usize::MAX));
+
+        let mut alive = Bitmap::new();
+        for i in 0..200u32 {
+            if i % 3 != 0 {
+                alive.set(i);
+            }
+        }
+        let alive_only = AliveOnly::new(&alive);
+
+        assert!(
+            !always.prefers_exact(&alive_only),
+            "FilterKind::Alive 必须永远走路径 A（R15 的 fast-return 是 Step 1 的不变量）"
+        );
+        for p in [0usize, 88, 190] {
+            // 无过滤检索的契约仍是一字未改：search() 等价于 search_filtered(None)
+            let q = entries[p].1.clone();
+            assert_eq!(
+                always.search(&q, 10).unwrap(),
+                always.search_filtered(&q, 10, None).unwrap(),
+                "None 谓词下 search() 与 search_filtered(None) 必须等价"
             );
         }
     }
