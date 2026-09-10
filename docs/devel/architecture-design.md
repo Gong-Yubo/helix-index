@@ -4,7 +4,7 @@
 
 | 项目   | 内容                   |
 | ---- | -------------------- |
-| 文档版本 | v1.8                 |
+| 文档版本 | v1.10                |
 | 创建日期 | 2026-09-02           |
 | 状态   | V2 Step 1 / Step 2 / Step 3 已并入；2026-09-07 V2 计划复审 + 步骤重排同步（Step 4 = compaction，映射见 `plan-v2.md` §附-2） |
 | 技术栈  | Rust 1.90+ / 2021 edition |
@@ -29,6 +29,7 @@
 | v1.7 | 2026-09-07 | 已定稿 | **V2 计划复审 + 步骤重排同步**（复审结论已并入 `plan-v2.md` §附-3）：① §7.5「物理回收归 Step 5 compaction」→ **Step 4** 并补「compaction 后必须重发 manifest」（否则新图永远匹配不上、冷启动恒走降级重建）；② §14.1 R22 对策同步为 Step 4；③ §14.1 **R18 更新**——低选择度兜底由「V2.1 必须解决」**提前到 V2.0**（D-J9：Step 5 / T7-22，新增 NFR-13）；④ §14.1 **R19 残余归 Step 3（S3-e）**；⑤ **§7.6.2 补记事实**——快照本体至今非原子（`storage/snapshot.rs:88` 直写无 fsync），崩溃即 `SnapshotCorrupted`（索引丢失，不是降级）；⑥ §12.2 注明矩阵仅反映 V1，V2 归属见 `plan-v2.md` §5。编号映射见 `plan-v2.md` §附-2 |
 | v1.8 | 2026-09-07 | 已定稿 | **V2 Step 3（原子快照）落地回写**（依据 `v2-step3-design.md` v0.3，D-S3-01~07 全部拍板）：① §7.6.2 前提段**销账**——快照本体原子性已落地（`storage/atomic.rs` 通用原语：tmp + flush + `sync_all` + rename + fsync 父目录，快照与 manifest 共用一份实现），Q-C3 正确性欠账清零；② §14.1 **R19 写路径残余收敛**——新增 `dump_graph_caught`（`catch_unwind` → `Err(VectorGraph)`，汇入 P0-3 语义链），残余更新为「panic=abort 宿主约束（文档级）/ panic 噪音 / 读路径（C5 边界外）」；③ 12K fsync 代价实测入 `eval-report.md` §8.7（+0.027~0.035s，不触碰任何 NFR） |
 | v1.9 | 2026-09-10 | 已定稿 | **① V2 Step 4 回写补记**（`#32` / `9e2211e` 已落地 §7.5.3 与 §14.2，但**漏记版本行**，本行补齐）：§7.5.3「墓碑物理回收（compaction，FR-30）」+ **§14.2 新增 R26~R30**（compaction 内存峰值 2× / ID 重编号破坏外部持久引用 / 耗时未实测 / 拓扑抖动 / 期间无法服务），10K churn 0.3×5 实测 graph+data 84.6→33.7MB。**② V2 Step 5 详细设计回写**（依据 `v2-step5-design.md` v0.3，D-S5-01~09 全部拍板）：**§5.4** `VectorIndex` 新增两方法（`search_exact_filtered` **必选** + `prefers_exact` 默认 `false`）并补 `vector_shortfall` 判读注记（精确路径下结构性归零 ⇒ 必须连看 `vector_route`）；**§5.8** `SearchResponse` 新增 `metrics: Metrics` 字段（**破坏性**，R35）；§8.3 新增「Step 5 补外部可见」块（`Metrics` 进 `SearchResponse` D-S5-05 / per-lane 耗时 D-S5-06 / `vector_route` D-S5-07 / 修两条早退 `took` D-S5-08）+ 改写「当前限制」为「设计已承接、待实现」；**§14 章级主表 R18 补 ④**——「0.05ms」口径修正（只含算距离、不含 `O(N)` 定位候选）+ 三路径对策 + ⚠️ 只覆盖低选择度子集；**§14.3 新增 R31~R35**（O(N) 谓词判定 / 兜底改变输出 / 阈值经验值 / 精确扫描持读锁归 Step 8 / 对外破坏性变更）；§14 风险表导读补 R31~R35 指引与「R11/R13/R17/R18 不得标已解决」的边界声明 |
+| v1.10 | 2026-09-10 | **V2 Step 5 实现期口径精确化**（PR #36 评审 F1）：`vector_shortfall` 在精确路径下**不是「恒为 0」**——`allowed` 来自 `Index`、扫描枚举的是**图里的点**，两个独立来源，图滞后于索引时该值仍 > 0。**§5.4** 注记与 **§8.3 `D-S5-07` 行**改为**条件式**，并把该条件本身升级为信号：`Exact` + 缺口 `> 0` ⟺ **图未覆盖全部 allowed chunk**（`Exact` + 缺口 `== 0` 才说明「这一档没走 ANN」）。同步精确化实现侧措辞（`query/metrics.rs`、`query/searcher.rs`、集成测试、CLI 图例、`scripts/eval_filter.sh`、CHANGELOG）。⚠️ 本行同时**补正表头版本号**：v1.9 只改了 §1.1 表，表头仍停在 v1.8 |
 
 ### 1.2 读者
 
@@ -355,8 +356,10 @@ pub trait VectorIndex: Send + Sync {
   **不允许**用未通过过滤的候选凑数
 - ⚠️ **`filter = None` = 不过滤，结果可能包含已软删除的 chunk**。这是逃生舱路径的**已知契约不是 bug**：
   `hnsw_rs` 无法从图中物理摘除向量，存活过滤必须由编排层注入谓词完成（`predicate` 模块文档 + T17 断言）
-- ⚠️ **`vector_shortfall == 0` 不再等于「无 prefilter 需求」**：走了 `Exact` 的档位它**结构性归零**，
-  判读必须连看 `Metrics.vector_route`（D-S5-07；设计文档 §4.4）
+- ⚠️ **`vector_shortfall == 0` 不再等于「无 prefilter 需求」**：走了 `Exact` 的档位它**通常**为 0，
+  但**不是恒等式**——`allowed` 来自 `Index`、扫描枚举的是**图里的点**，图滞后于索引时该值仍 > 0
+  （那时它反过来是「图未覆盖全部 allowed」的诊断信号）。**两种读数都必须连看**
+  `Metrics.vector_route`（D-S5-07；设计文档 §4.4）
 
 #### 5.4.1 软删除：存活状态的单一真源在 `Index`，不在 `VectorIndex`
 
@@ -976,7 +979,7 @@ search: took=8.2ms bm25=1.4ms(vector=6.1ms parallel) candidates=187 fused=50 too
 | --- | --- | --- |
 | `Metrics` **进响应** | `SearchResponse` 新增 `metrics: Metrics` 字段（`query` 模块同时再导出 `Metrics`）；`tracing::info!` 通道**保留**——一个给宿主、一个给调用方 | **D-S5-05**（⚠️ **对外破坏性变更**：`SearchResponse` 字段全 `pub`，外部**字面量构造**会编译失败 ⇒ 记 CHANGELOG `⚠️ 破坏性`；库内只有 `searcher.rs:268` / `:413` 两处） |
 | **per-lane 耗时** | `bm25_elapsed` / `vector_elapsed`。Hybrid 走 `rayon::join`（`searcher.rs:164-167`），单一 `took` 无法归因「是哪一路慢」 | **D-S5-06**（实现形状：lane 闭包返回 `(Result<Vec<Scored>>, Duration)`） |
-| **路径可见性** | `Metrics.vector_route: VectorRoute { None, Ann, Exact }` —— `None` = 未走向量路 / `Ann` = 走了 ANN（可能近似）/ `Exact` = 走了精确扫描（保证 `min(k, allowed)` 条且无召回缺口） | **D-S5-07**。**没有它，「兜底是否真的生效」只能靠延迟反推**；且 `vector_shortfall` 在精确路径下**结构性归零** ⇒ 「0 缺口」**≠**「无 prefilter 需求」，判读必须**连看 `vector_route`**（设计文档 §4.4） |
+| **路径可见性** | `Metrics.vector_route: VectorRoute { None, Ann, Exact }` —— `None` = 未走向量路 / `Ann` = 走了 ANN（可能近似）/ `Exact` = 走了精确扫描（保证 `min(k, allowed)` 条且无召回缺口） | **D-S5-07**。**没有它，「兜底是否真的生效」只能靠延迟反推**；且 `vector_shortfall` 在精确路径下**通常**为 0，但**不是恒等式**（`allowed` 来自 `Index`、扫描枚举的是图中的点，图滞后于索引时仍 > 0——那时它是「图未覆盖全部 allowed」的诊断信号）⇒ 「0 缺口」**≠**「无 prefilter 需求」，**两种读数都必须连看 `vector_route`**（设计文档 §4.4） |
 | 修早退 `took` | `searcher.rs:99-104`（`index_is_empty`，**连 `metrics.log` 都不调**，故 grep 该符号结构上找不到）与 `:125-127`（过滤排空）**两条**早退路径漏设 `metrics.took` ⇒ 日志 `took_ms=0` 是**假数据**，而响应 `took` 为真值（同类第三处 `:212-213` 反而设了） | **D-S5-08**（与 T7-23 同主题；观测正确性缺陷） |
 
 ⚠️ **当前限制（V2 Step 5 设计已承接，待实现）**：`Metrics` 至今仍只在 `search_parts` 内聚合并经
@@ -1569,3 +1572,4 @@ pub enum Error {
 | v1.7 | 2026-09-07 | **V2 计划复审 + 步骤重排同步**（复审结论已并入 `plan-v2.md` §附-3）：① §7.5「物理回收归 Step 5 compaction」→ **Step 4** 并补「compaction 后必须重发 manifest」；② §14.1 R22 对策同步为 Step 4；③ §14.1 R18 更新——低选择度兜底提前到 V2.0（D-J9：Step 5 / T7-22，新增 NFR-13）；④ §14.1 R19 残余归 Step 3（S3-e）；⑤ §7.6.2 补记事实——快照本体至今非原子（`storage/snapshot.rs:88` 直写无 fsync），崩溃即 `SnapshotCorrupted`；⑥ §12.2 注明矩阵仅反映 V1，V2 归属见 `plan-v2.md` §5 |
 | v1.8 | 2026-09-07 | **V2 Step 3（原子快照）落地回写**（依据 `v2-step3-design.md` v0.3，D-S3-01~07 全部拍板）：① §7.6.2 前提段**销账**——快照本体原子性已落地（`storage/atomic.rs` 通用原语 `atomic_write`：tmp + flush + `sync_all` + rename + fsync 父目录，快照与 manifest 共用一份实现；格式零变化，`FORMAT_VERSION` 保持 2），Q-C3 正确性欠账清零；② §14.1 **R19 写路径残余收敛**——`dump_graph_caught`（`catch_unwind` → `Err(VectorGraph)`，汇入 P0-3 语义链），残余更新为「panic=abort 宿主约束（文档级）/ panic 噪音 / 读路径（C5 边界外）」三条；③ 12K fsync 代价实测入 `eval-report.md` §8.7（+0.027~0.035s，不触碰任何 NFR） |
 | v1.9 | 2026-09-10 | **① V2 Step 4 回写补记**（`#32` / `9e2211e`，当时漏记版本行）：§7.5.3 墓碑物理回收（compaction，FR-30）+ **§14.2 新增 R26~R30**；10K churn 0.3×5 实测 graph+data 84.6→33.7MB。**② V2 Step 5 详细设计回写**（依据 `v2-step5-design.md` v0.3，D-S5-01~09 全部拍板）：**§5.4** `VectorIndex` 新增 `search_exact_filtered`（**必选**）+ `prefers_exact`（默认 `false`）两方法，并补 `vector_shortfall` 判读注记；**§5.8** `SearchResponse` 新增 `metrics` 字段（**破坏性**，R35）；**§8.3** 新增「Step 5 补外部可见」块（`Metrics` 进 `SearchResponse` / per-lane 耗时 / `vector_route` / 修两条早退 `took`）并把「当前限制」改写为「设计已承接、待实现」；**§14 章级主表 R18 补 ④**——「约 0.05ms」口径**修正**（只含「对候选算距离」，**不含 `O(N)` 遍历定位候选** 1~10ms）+ 三路径对策 + ⚠️ 「只覆盖低选择度子集，R11/R13/R17/R18 不得标已解决」；**§14.3 新增 R31~R35**（`O(N)` 谓词判定 / 兜底改变输出 / 阈值是经验值 / 精确扫描持 `points_by_layer` 读锁**归 Step 8** / `SearchResponse`+`VectorIndex` 对外破坏性变更）；§14 导读补 R31~R35 指引 |
+| v1.10 | 2026-09-10 | **V2 Step 5 实现期口径精确化**（PR #36 评审 F1）：`vector_shortfall` 在精确路径下**不是「恒为 0」**——`allowed` 来自 `Index`、扫描枚举的是**图里的点**，两个独立来源，图滞后于索引时该值仍 > 0。修正 **§5.4** 注记与 **§8.3 `D-S5-07` 行**为**条件式**，并把该条件本身升级为信号：`Exact` + 缺口 `> 0` ⟺ **图未覆盖全部 allowed chunk**。同步精确化实现侧措辞（`query/metrics.rs` / `query/searcher.rs` / 集成测试 / CLI 图例 / `scripts/eval_filter.sh` / CHANGELOG） |

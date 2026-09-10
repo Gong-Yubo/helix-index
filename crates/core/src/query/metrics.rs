@@ -16,9 +16,22 @@
 //!
 //! # ⚠️ `vector_shortfall == 0` 不再等于"没有 prefilter 需求"
 //!
-//! 低选择度档位现在走**精确扫描**（[`VectorRoute::Exact`]），该指标在那里
-//! **结构性归零**——那是"这一档没走 ANN"，不是"ANN 没有缺口"。
-//! 判读时**必须连看** [`Metrics::vector_route`]（设计 §4.4 推论 1）。
+//! **精确恒等式**（[`VectorRoute::Exact`] 下）：
+//!
+//! ```text
+//! shortfall = min(candidate_k, allowed) − min(candidate_k, |图 ∩ allowed|)
+//! ```
+//!
+//! `allowed` 来自 **`Index`**（存活 ∩ 谓词），而扫描枚举的是**图里的点**——两个独立来源。
+//! 于是「`Exact` ⇒ 缺口恒为 0」**只在图覆盖了全部 allowed chunk 时成立**：一旦图滞后于
+//! 索引（图里少了 allowed 的点，例如 Lenient 重载出的不完整图），缺口就会 > 0。
+//!
+//! ⇒ 正确读法是**条件式**，而且那个条件本身就是信号：
+//!
+//! - `Exact` + 缺口 `== 0` ⇒ 这一档没走 ANN（**不是**"ANN 没有缺口"）；
+//! - `Exact` + 缺口 `> 0` ⇒ **图未覆盖全部 allowed chunk**（图滞后于索引）。
+//!
+//! 两种读数都必须**连看** [`Metrics::vector_route`]（设计 §4.4 推论 1）。
 //!
 //! [`SearchResponse::metrics`]: crate::query::SearchResponse::metrics
 
@@ -52,8 +65,11 @@ pub struct Metrics {
     /// > 0 表示低选择度下 ANN 没凑够候选——不是错误，但会让召回静默下降，
     /// > 必须可观测（V2.1 是否引入 prefilter 结构的判据）。
     ///
-    /// ⚠️ 走精确路径（[`VectorRoute::Exact`]）的档位该值**恒为 0**，
-    /// 那是构造上的必然，**不能**读成"无缺口需求"——见模块文档。
+    /// ⚠️ 走精确路径（[`VectorRoute::Exact`]）时该值**通常**为 0，但那**不是恒等式**：
+    /// `allowed` 来自 `Index`、扫描枚举的是图里的点，图滞后于索引时缺口仍会 > 0。
+    /// ⇒ `Exact` + 缺口 `> 0` 反过来是「**图未覆盖全部 allowed chunk**」的诊断信号；
+    /// 而 `Exact` + 缺口 `== 0` 才说明"这一档没走 ANN"。两者都**不能**读成
+    /// "无缺口需求"——见模块文档。
     pub vector_shortfall: usize,
     /// 向量路本次**实际**走的路径（D-S5-07）。
     ///

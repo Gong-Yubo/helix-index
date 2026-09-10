@@ -208,7 +208,9 @@ for name, sel, path in rows:
             verdicts.append((name, mode, p99, tgt, ok))
         else:
             # Step 5：判据从「缺口」升级为「路径 + 缺口」——
-            # 精确路径下缺口**结构性归零**，只看缺口会把「没兜底」与「兜底了」判成一样
+            # 精确路径下缺口通常为 0，但**不是恒等式**（allowed 来自 Index、扫描枚举的是
+            # 图中的点）：只看缺口会把「没兜底」与「兜底了」判成一样；反过来
+            # 「精确但缺口>0」也不是矛盾，而是「图未覆盖全部 allowed」的诊断信号。
             if ratio > 0.5:
                 ok = "精确兜底" if short_k < 0.5 else "精确但缺口>0"
             else:
@@ -220,6 +222,8 @@ for name, sel, path in rows:
 emit("-" * 114)
 emit("「缺口」= 用户视角 min(K, allowed) − 返回条数；「内核缺口」= metrics.vector_shortfall（融合前候选池）。")
 emit("「精确」= metrics.vector_route==Exact 的响应占比；>50% 表示该档位确实走了精确兜底。")
+emit("⚠️ 精确路径下「内核缺口」**通常**为 0，但不是恒等式：allowed 来自 Index、扫描枚举的是图中的点，")
+emit("   图滞后于索引时它仍 > 0(那时它是「图未覆盖全部 allowed」的诊断信号)。两种读数都要连看「精确」。")
 emit("重合率后带 * 表示 oracle 基线自身 < K，此时只能证明「下推没比 post-filter 更差」。")
 
 emit()

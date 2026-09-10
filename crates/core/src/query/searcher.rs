@@ -157,17 +157,22 @@ pub fn search_parts(
     // 向量：恒传谓词（hnsw_rs 无法摘除已删向量，Q-C1）
     let vec_f = pred;
 
+    // 向量路依赖**只解析一次**：`Vector` / `Hybrid` 都要用它，`Bm25` 根本不需要。
+    let vec_parts = match mode {
+        SearchMode::Bm25 => None,
+        SearchMode::Vector | SearchMode::Hybrid => {
+            Some(require_vector(parts.embedder, parts.vector_index)?)
+        }
+    };
+
     // V2 Step 5：向量路**分派**（ANN / 精确）与**记账**（`Metrics.vector_route`）。
     // 策略由后端 `VectorIndex::prefers_exact` 给出（见 `VectorRetriever::plan`），
     // 编排层只做二选一——阈值规则不在这一层复制。
     // `SearchMode::Bm25` 不走向量路 ⇒ `vector_route` 保持默认 `None`（本次检索
     // 有没有向量路是编排层的信息，不该由后端编码）。
-    let vec_route = match mode {
-        SearchMode::Bm25 => VectorRoute::None,
-        SearchMode::Vector | SearchMode::Hybrid => {
-            let (e, vi) = require_vector(parts.embedder, parts.vector_index)?;
-            VectorRetriever::new(e, vi).plan(vec_f)
-        }
+    let vec_route = match vec_parts {
+        Some((e, vi)) => VectorRetriever::new(e, vi).plan(vec_f),
+        None => VectorRoute::None,
     };
 
     let (bm25_lane, vector_lane) = match mode {
@@ -180,7 +185,9 @@ pub fn search_parts(
             (Some(lane), None)
         }
         SearchMode::Vector => {
-            let (e, vi) = require_vector(parts.embedder, parts.vector_index)?;
+            // 上方已 `require_vector` 过一次，这里复用；用 `ok_or` 而非 `expect`
+            // ⇒ 检索主路径不留 panic 分支（不可达，但不可达不等于该 panic）。
+            let (e, vi) = vec_parts.ok_or(Error::NoEmbedder)?;
             let vec = VectorRetriever::new(e, vi);
             metrics.vector_route = vec_route;
             let t = Instant::now();
@@ -189,7 +196,7 @@ pub fn search_parts(
             (None, Some(lane))
         }
         SearchMode::Hybrid => {
-            let (e, vi) = require_vector(parts.embedder, parts.vector_index)?;
+            let (e, vi) = vec_parts.ok_or(Error::NoEmbedder)?;
             let bm25 =
                 Bm25Retriever::new(parts.index, parts.analyzer).with_params(parts.bm25_params);
             let vec = VectorRetriever::new(e, vi);
@@ -326,7 +333,12 @@ pub fn search_parts(
 ///
 /// 只有两臂可达：`plan()` 返回的是 `Ann` / `Exact`。`VectorRoute::None` 表示
 /// "本次检索没有向量路"，由编排层在 `SearchMode::Bm25` 下写入
-/// `Metrics.vector_route`——它**不会**流到这里（类型上就没这个状态可传）。
+/// `Metrics.vector_route`——它**不会**流到这里。
+///
+/// ⚠️ 即便"不可达"，也**不给库的检索主路径留 panic 分支**（同 R19 精神）：万一将来
+/// 有人把 `None` 传进来，退化为 `Ann`（正确但没有兜底收益）并由 `debug_assert!`
+/// 在测试期炸出来。`VectorRoute::None` 在**同一个枚举**里本就是可达概念，只是
+/// `plan()` 当下不返回它——一个 `unreachable!()` 会让这个区分变成线上 500。
 fn dispatch_vector(
     vec: &VectorRetriever<'_>,
     route: VectorRoute,
@@ -334,10 +346,14 @@ fn dispatch_vector(
     k: usize,
     filter: Option<&dyn CandidateFilter>,
 ) -> Result<Vec<Scored>> {
+    debug_assert!(
+        !matches!(route, VectorRoute::None),
+        "plan() 不返回 VectorRoute::None（Bm25 模式在编排层就写好 route，不走向量路）"
+    );
     match route {
         VectorRoute::Exact => vec.search_exact_filtered(query, k, filter),
-        VectorRoute::Ann => vec.search_filtered(query, k, filter),
-        VectorRoute::None => unreachable!("plan() 不返回 VectorRoute::None（Bm25 模式不走向量路）"),
+        // `Ann` 与（不可达的）`None` 都退化为 ANN
+        _ => vec.search_filtered(query, k, filter),
     }
 }
 
@@ -952,7 +968,9 @@ mod tests {
         assert_eq!(filt_off.metrics.vector_route, VectorRoute::Ann);
         assert_eq!(off.calls(), (2, 0), "策略为假 ⇒ 仍调 search_filtered");
 
-        // ── 语义收益（§4.4）：精确路径把缺口**结构性归零** ──
+        // ── 语义收益（§4.4）：本用例图覆盖完整 ⇒ 精确路径下缺口为 0 ──
+        // ⚠️ 这不是恒等式：`allowed` 来自 `Index`、扫描枚举的是图里的点，图滞后于索引时
+        // 精确路径的缺口仍会 > 0（那时它反过来是「图未覆盖 allowed」的诊断信号）。
         assert_eq!(filt_off.metrics.vector, 4, "ANN 只凑到 4 条");
         assert!(
             filt_off.metrics.vector_shortfall > 0,
@@ -961,16 +979,21 @@ mod tests {
         assert_eq!(filt_on.metrics.vector, 12, "精确路径返回全部 allowed");
         assert_eq!(
             filt_on.metrics.vector_shortfall, 0,
-            "精确路径的缺口恒 0 —— 但判读必须连看 vector_route（§4.4 推论 1）"
+            "本用例图覆盖完整，故精确路径缺口应为 0；判读仍须连看 vector_route（§4.4 推论 1）"
         );
     }
 
-    /// **S5-T7（行为 A/B）**：`FilterKind::Alive`（软删除过滤）也不得被兜底劫持。
+    /// **S5-T7（分派对照）**：同一个 `Filtered` 谓词下，两种策略必须落到**不同**的
+    /// `vector_route`，且 Hybrid 的 per-lane 耗时（D-S5-06）在并行分支里也被填上。
     ///
-    /// 与上一个用例同理，但走的是 Hybrid（BM25 + 向量并行），顺带验证
-    /// per-lane 耗时（D-S5-06）在并行分支里也被填上。
+    /// ⚠️ 本用例**不**比较"结果是否一致"——那是 `S5_T1` 的职责（它在热路径上比
+    /// `hits` 逐位相等）。这里比的是**分派**：两个间谍策略相反 ⇒ route 必须相反，
+    /// 否则这个 A/B 就失去鉴别力。
+    ///
+    /// `FilterKind::Alive` 下"热路径不被劫持"的行为护栏在**集成层**：
+    /// `tests/step5_query_observability.rs::S5_T7_真实软删除语料下兜底开关不改热路径`。
     #[test]
-    fn S5_T7_真假两种策略在Alive谓词下结果一致() {
+    fn S5_T7_两种策略在Filtered谓词下route不同且per_lane耗时被填() {
         use crate::schema::Filter;
 
         let (index, analyzer) = build_tagged_index(&["检索 甲", "检索 乙", "向量 丙"], "kept");
@@ -983,7 +1006,7 @@ mod tests {
         let s_on = QueryExecutor::new(&index, &analyzer).with_vector(&e, &on);
         let s_off = QueryExecutor::new(&index, &analyzer).with_vector(&e, &off);
 
-        // Hybrid + 用户过滤 ⇒ 谓词是 Filtered（策略生效）；这里比的是"结果是否一致"
+        // Hybrid + 用户过滤 ⇒ 谓词是 Filtered（策略生效）⇒ 两者 route 必须不同
         let a = s_on
             .search_filtered("检索", SearchMode::Hybrid, 10, Some(&filter))
             .unwrap();

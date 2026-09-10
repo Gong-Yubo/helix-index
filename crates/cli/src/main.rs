@@ -486,7 +486,9 @@ fn search(args: SearchArgs) -> Result<()> {
 /// 打印一行内核指标（V2 Step 5 / NFR-07）。
 ///
 /// `route` 是本次检索**实际**走的向量路径——没有它，"兜底是否生效"只能靠延迟反推。
-/// `缺口` 走精确路径时结构性归零，故必须**连看** `route`（设计 §4.4 推论 1）。
+/// `缺口` 走精确路径时**通常**为 0，但那不是恒等式（`allowed` 来自 `Index`、扫描枚举
+/// 的是图中的点）：`Exact` + 缺口 > 0 反过来是「图未覆盖全部 allowed」的诊断信号。
+/// 两种读数都必须**连看** `route`（设计 §4.4 推论 1）。
 fn print_kernel_metrics(resp: &SearchResponse) {
     let m = &resp.metrics;
     println!(

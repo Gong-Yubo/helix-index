@@ -747,6 +747,20 @@ mod tests {
                 }
             }
         }
+
+        // **I5 / S5-T6**：同一冻结图 + 同一 query 下，精确扫描**连续 100 次**逐位一致
+        // （NFR-06 确定性）。这里可以硬断言：图已冻结，遍历与排序都是确定性的，
+        // 不受建图期 `StdRng::from_os_rng()` 影响的只有**跨建图**的拓扑，
+        // 而本用例全程用同一张图。
+        let q = entries[137].1.clone();
+        let first = idx.search_exact_filtered(&q, 10, Some(&even)).unwrap();
+        for round in 0..100 {
+            assert_eq!(
+                idx.search_exact_filtered(&q, 10, Some(&even)).unwrap(),
+                first,
+                "第 {round} 次精确扫描与首次不一致"
+            );
+        }
     }
 
     /// **S5-T2（hnsw 侧完整性）**：返回条数 `== min(k, 命中数)`——**不允许少返回**

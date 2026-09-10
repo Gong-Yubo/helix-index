@@ -59,9 +59,11 @@
 
 #### Changed
 
-- **`Metrics.vector_shortfall` 的语义边界变了**：低选择度档位走精确路径后果该值
-  **结构性归零** ⇒ 「0 缺口」**不再等于**「无 prefilter 需求」，判读必须**连看
-  `vector_route`**（设计 §4.4 推论 1）。bench 因此把两套 shortfall 口径**并列**输出
+- **`Metrics.vector_shortfall` 的语义边界变了**：低选择度档位走精确路径后该值**通常**为 0
+  ——但**不是恒等式**。`allowed` 来自 `Index`、扫描枚举的是**图里的点**，两个独立来源：
+  `Exact` + 缺口 `> 0` ⟺ **存在 allowed chunk 在图里没有点**（图滞后于索引）。
+  ⇒ 「0 缺口」**不再等于**「无 prefilter 需求」，且**两种读数都必须连看 `vector_route`**
+  （设计 §4.4 推论 1）。bench 因此把两套 shortfall 口径**并列**输出
   （bench 侧 `min(K, allowed)` vs 内核侧 `min(candidate_k, allowed)`）——
   差异本身现在是"两个分母之别"的度量，而不再是"拿不到内核值"的替代。
 - **修复 D-S5-08：两条早退路径的 `metrics.took` 恒为 0**。
@@ -93,8 +95,19 @@
   `try_build_predicate(index, None)` 对**无用户过滤**也返回 `Some(AliveOnly)`（`filter.rs:195`），
   只看"有没有谓词"会把热路径误判成低选择度。
 - 集成：`crates/core/tests/step5_query_observability.rs`（新，N=400 合成语料、秒级、进 CI）——
-  真实后端 + 真实谓词 + 真实编排下端到端验 `route == Exact` / 缺口归零 / 命中全部满足谓词 /
-  与 Brute oracle 逐位一致 / `off` 回到 `Ann` / `Bm25` 模式 `route == None` / 空结果口径自洽。
+  真实后端 + 真实谓词 + 真实编排下端到端验 `route == Exact` / 缺口为 0（本 fixture 图覆盖完整）/
+  命中全部满足谓词 / 与 Brute oracle 逐位一致 / `off` 回到 `Ann` / `Bm25` 模式 `route == None` /
+  空结果口径自洽；另有 **真实软删除语料 + 同一张图上的策略开关**用例（`ToggleFallback` 包装：
+  关掉时与 `with_brute_fallback(None)` 分派等价），验 `Alive` 谓词下 on/off **逐位一致**
+  且一条死 chunk 都不漏 —— 这是 R15「热路径 fast-return 不回归」的**真后端行为**证据。
+  `for _ in 0..100` 的重复性断言同时覆盖 brute 与 hnsw 两侧（对齐设计 I5 / S5-T6）。
+
+> **风险登记**：本 Step 实现面新增 **R31~R35**（`O(N)` 谓词判定 / 兜底改变输出 / 阈值经验值 /
+> 精确扫描持读锁归 Step 8 / 对外破坏性变更），已登记在 `architecture-design.md` **§14.3**。
+> ⚠️ **R34 的措辞待改**：它不是"与写端互斥"，而是 `IterPoint::next` 在**层切换**时**递归读同一把
+> `RwLock`** ⇒ 读写并发下**可能死锁**（今天不可达：`add` 需 `&mut self`，V2.0 单写者语义）。
+> 修法是设计 §4.2.2 已写明的**逐层 `get_layer_iterator` 遍历**（覆盖等价、层间 guard 不重叠 ⇒
+> 无递归读），与 §14.3 的改写一并在 **S5-08 / Step 8 开工前**落地。
 
 ### V2 Step 5 · 详细设计（2026-09-10）
 

@@ -263,7 +263,7 @@ mod tests {
     }
 
     /// **S5-T6（brute 侧）**：同距离按 `chunk_id` 升序，且**不依赖插入序**；
-    /// 连续 10 次结果一致（NFR-06 确定性）。
+    /// 连续 **100** 次结果一致（NFR-06 确定性；与设计 I5 / S5-T6 的次数对齐）。
     #[test]
     fn 精确路径同距离按chunk_id升序且确定() {
         let mut idx = BruteForceIndex::new();
@@ -274,7 +274,7 @@ mod tests {
         let q = NormalizedVector::new(vec![1.0, 0.0]);
 
         let expect: Vec<ChunkId> = vec![7, 3, 9];
-        for round in 0..10 {
+        for round in 0..100 {
             let ids: Vec<ChunkId> = idx
                 .search_exact_filtered(&q, 10, None)
                 .unwrap()

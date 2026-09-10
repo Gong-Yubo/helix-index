@@ -4,7 +4,9 @@
 //! 谓词 + 真实编排**串起来，验证 Step 5 的两条对外承诺：
 //!
 //! 1. 低选择度过滤**真的**走精确路径，`Metrics.vector_route == Exact` 且
-//!    `vector_shortfall` 结构性归零（R18 结案的可观测形态，§4.4）；
+//!    （本 fixture 图覆盖完整，故）`vector_shortfall` 为 0（R18 结案的可观测形态，§4.4）；
+//!    ⚠️ 「`Exact` ⇒ 缺口 0」**不是恒等式**：`allowed` 来自 `Index`、扫描枚举的是图中
+//!    的点；图滞后于索引时 `Exact` 的缺口仍会 > 0（那时它是「图未覆盖 allowed」的信号）。
 //! 2. 响应口径自洽——`metrics.took == took`、`metrics.candidates == total_candidates`
 //!    （I7），含空结果路径。
 //!
@@ -24,7 +26,7 @@ use helix_core::embed::Embedder;
 use helix_core::error::Result;
 use helix_core::index::Index;
 use helix_core::predicate::CandidateFilter;
-use helix_core::query::{QueryExecutor, SearchMode, VectorRoute};
+use helix_core::query::{QueryExecutor, SearchMode, SearchResponse, VectorRoute};
 use helix_core::schema::Filter;
 use helix_core::types::ChunkId;
 use helix_core::vector::{BruteForceIndex, HnswRsIndex, NormalizedVector, VectorIndex};
@@ -138,7 +140,7 @@ fn S5_T13_低选择度端到端走精确路径且缺口归零() {
     );
     assert_eq!(
         resp.metrics.vector_shortfall, 0,
-        "精确路径下缺口结构性归零（判读仍须连看 vector_route）"
+        "本 fixture 图覆盖完整 ⇒ 精确路径缺口为 0（判读仍须连看 vector_route）"
     );
 
     // 3. soundness：最终命中的每一条都确实通过谓词
@@ -301,4 +303,194 @@ fn S5_T2_k为零返回空() {
         .unwrap()
         .is_empty());
     assert!(hnsw.search_exact_filtered(&q, 0, None).unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// S5-T7 的行为层护栏：真实软删除语料 + 同一张图上的策略开关
+// ---------------------------------------------------------------------------
+
+/// 只读的**策略开关包装**：转发到真实的 `HnswRsIndex`，**只**改 `prefers_exact` 的
+/// 回答。
+///
+/// # 为什么需要它（而不是 `with_brute_fallback(None)` 建两张图）
+///
+/// `with_brute_fallback` 会**移动** `self`；而 `hnsw_rs` 每次建图都用
+/// `StdRng::from_os_rng()` 播种（`hnsw.rs:328`，无 seed API）⇒ **两张独立的图拓扑
+/// 不同**，ANN 的 Top-K 本就可能不同。于是「跨两张图断言 on/off 结果逐位一致」会是
+/// 一条**拓扑相关**的 flaky 断言。
+///
+/// 本包装让两个策略**共用同一张图**，把「开关不改热路径结果」从一句拓扑相关的期望
+/// 变成一条**确定性**的断言。
+struct ToggleFallback<'a> {
+    inner: &'a HnswRsIndex,
+    /// 策略开关：`false` 与 `HnswRsIndex::with_brute_fallback(None)` 的分派行为等价。
+    exact_by_policy: bool,
+}
+
+impl VectorIndex for ToggleFallback<'_> {
+    fn add(&mut self, _id: ChunkId, _vec: NormalizedVector) -> Result<()> {
+        unreachable!("查询侧测试替身：只读，不参与建库")
+    }
+
+    fn search_filtered(
+        &self,
+        query: &NormalizedVector,
+        k: usize,
+        filter: Option<&dyn CandidateFilter>,
+    ) -> Result<Vec<(ChunkId, f32)>> {
+        self.inner.search_filtered(query, k, filter)
+    }
+
+    fn search_exact_filtered(
+        &self,
+        query: &NormalizedVector,
+        k: usize,
+        filter: Option<&dyn CandidateFilter>,
+    ) -> Result<Vec<(ChunkId, f32)>> {
+        self.inner.search_exact_filtered(query, k, filter)
+    }
+
+    fn prefers_exact(&self, filter: &dyn CandidateFilter) -> bool {
+        // 关掉时恒 `false` ⇒ 与 `with_brute_fallback(None)` 的分派逐位等价
+        self.exact_by_policy && self.inner.prefers_exact(filter)
+    }
+
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+}
+
+/// 与 [`build_fixture`] 同源，但额外**软删除** `dead_docs` 里的文档，并返回被删分片 id。
+///
+/// 顺序刻意是「**先建图，后软删除**」：图里残留死向量（Q-C1 的真实形态）、存活位图
+/// **非满** ⇒ `AliveOnly` 谓词这次真的在过滤东西，而不是恒真。
+fn build_fixture_with_tombstones(
+    dead_docs: &[u32],
+) -> (
+    Index,
+    MixedAnalyzer,
+    Vec<(ChunkId, NormalizedVector)>,
+    Vec<ChunkId>,
+) {
+    let analyzer = MixedAnalyzer::new();
+    let chunker = Chunker::default();
+    let mut index = Index::new();
+    let mut vectors: Vec<(ChunkId, NormalizedVector)> = Vec::new();
+    let mut dead_chunks: Vec<ChunkId> = Vec::new();
+
+    for i in 0..N_DOCS {
+        let tag = if i % KEEP_EVERY == 0 { "keep" } else { "drop" };
+        let doc = DocRecord {
+            doc_id: 0,
+            source: format!("doc-{i}"),
+            metadata: serde_json::json!({ "tag": tag }),
+            content_hash: 0,
+        };
+        let text = format!("检索 文档编号 {i} 内容 {i}");
+        let (doc_id, chunk_ids) = index.add(doc, chunker.chunk(0, &text), &analyzer).unwrap();
+        assert_eq!(chunk_ids.len(), 1, "本用例假定「一文档一分片」");
+        vectors.push((chunk_ids[0], NormalizedVector::new(fake_vec(&text))));
+        if dead_docs.contains(&doc_id) {
+            dead_chunks.push(chunk_ids[0]);
+        }
+    }
+
+    for d in dead_docs {
+        index.remove(*d, &analyzer).unwrap();
+    }
+    assert_eq!(
+        index.alive_count(),
+        N_DOCS - dead_docs.len(),
+        "存活位图必须非满（否则本用例退化为无软删除的路径）"
+    );
+
+    (index, analyzer, vectors, dead_chunks)
+}
+
+/// **S5-T7（行为层，真实软删除语料）**：`FilterKind::Alive` 路径（无用户过滤）
+/// **不得被兜底劫持**——策略 on/off 必须给出**逐位一致**的结果。
+///
+/// 与 `searcher.rs::S5_T1`（间谍后端）的分工：那条钉**分派**（spy 的 `calls()` 计数），
+/// 本条钉**真后端 + 真软删除位图**下的行为。两者合起来才是 R15「热路径 fast-return
+/// 不回归」的完整证据——此前只有前者，没有真后端的行为护栏。
+#[test]
+fn S5_T7_真实软删除语料下兜底开关不改热路径() {
+    // 含 `keep`（110 是 10 的倍数）与 `drop` 各若干，让死 chunk 落在两个标签上
+    let dead_docs: Vec<u32> = vec![3, 5, 13, 105, 110, 207];
+    let (index, analyzer, vectors, dead_chunks) = build_fixture_with_tombstones(&dead_docs);
+    // 图按**全量**向量建好（vectors 是软删除前采集的 ⇒ 图中含死向量）
+    let hnsw = build_hnsw(&vectors);
+
+    let e = FakeEmbedder;
+    let on = ToggleFallback {
+        inner: &hnsw,
+        exact_by_policy: true,
+    };
+    let off = ToggleFallback {
+        inner: &hnsw,
+        exact_by_policy: false,
+    };
+    let s_on = QueryExecutor::new(&index, &analyzer).with_vector(&e, &on);
+    let s_off = QueryExecutor::new(&index, &analyzer).with_vector(&e, &off);
+
+    let ids = |r: &SearchResponse| -> Vec<ChunkId> { r.hits.iter().map(|h| h.chunk_id).collect() };
+    let query = "检索 文档编号 200 内容 200";
+
+    // ── ① 热路径（无用户过滤 ⇒ `AliveOnly` 谓词）：开关不得改变任何东西 ──
+    let a = s_on
+        .search(query, SearchMode::Vector, 10)
+        .expect("热路径检索失败");
+    let b = s_off
+        .search(query, SearchMode::Vector, 10)
+        .expect("热路径检索失败");
+
+    assert_eq!(
+        a.metrics.vector_route,
+        VectorRoute::Ann,
+        "Alive 谓词不得触发精确路径（否则 R15 的 fast-return 就被劫持了）"
+    );
+    assert_eq!(b.metrics.vector_route, VectorRoute::Ann);
+    assert_eq!(
+        ids(&a),
+        ids(&b),
+        "同一张图 + 同一分派结论 ⇒ on/off 结果必须逐位一致"
+    );
+    assert_eq!(a.metrics.vector_shortfall, b.metrics.vector_shortfall);
+
+    // 真实软删除语料下，热路径必须**一条死 chunk 都不漏**（AliveOnly 谓词的语义）
+    for r in [&a, &b] {
+        assert_eq!(
+            r.metrics.allowed,
+            index.alive_count(),
+            "Alive 谓词的 allowed_count 必须等于存活数"
+        );
+        for hit in &r.hits {
+            assert!(
+                !dead_chunks.contains(&hit.chunk_id),
+                "热路径漏出了已软删除的 chunk {}",
+                hit.chunk_id
+            );
+        }
+    }
+
+    // ── ② 低选择度用户过滤（`Filtered`）：同一张图上开关**必须**改变路径 ──
+    // 这一半与 ① 互为对照 —— 证明 ① 的"开关没改变结果"不是开关坏了，
+    // 而是 `Alive` 谓词本就不该兜底。
+    let filter = Filter::eq("tag", "keep");
+    let fa = s_on
+        .search_filtered(query, SearchMode::Vector, 10, Some(&filter))
+        .expect("过滤检索失败");
+    let fb = s_off
+        .search_filtered(query, SearchMode::Vector, 10, Some(&filter))
+        .expect("过滤检索失败");
+    assert_eq!(
+        fa.metrics.vector_route,
+        VectorRoute::Exact,
+        "Filtered 且选择度低 ⇒ 开关打开时走精确路径"
+    );
+    assert_eq!(
+        fb.metrics.vector_route,
+        VectorRoute::Ann,
+        "同一张图、开关关闭 ⇒ 回到 ANN（证明本用例的开关真的起作用）"
+    );
 }

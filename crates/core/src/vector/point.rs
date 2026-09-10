@@ -62,8 +62,19 @@ impl NormalizedVector {
     ///
     /// # 前置条件
     ///
-    /// `other` 必须已 L2 归一化（图内数据来自 `NormalizedVector`，天然满足）。
+    /// 1. `other` 必须已 L2 归一化（图内数据来自 `NormalizedVector`，天然满足）；
+    /// 2. `other` 的**维度必须与 `self` 相同**。求和是 `.zip()`，维度不匹配会
+    ///    **静默截断**（4 维 vs 2 维 ⇒ `d² = 0.0`，不 panic、不报错），而
+    ///    `HnswRsIndex::add` / `BruteForceIndex::add` **都不校验维度** ⇒ 换 embedder
+    ///    之后往同一索引增量写入，会得到"看起来正常"的错误距离。
+    ///    本切片入口是唯一能钉住该前提的收口点，故按 NaN 的同一手法
+    ///    （把"声明"变"断言"）加 `debug_assert_eq!`。
     pub fn distance_to_slice(&self, other: &[f32]) -> f32 {
+        debug_assert_eq!(
+            self.0.len(),
+            other.len(),
+            "distance_to_slice 的维度必须相同（.zip() 会静默截断）"
+        );
         self.0
             .iter()
             .zip(other)
