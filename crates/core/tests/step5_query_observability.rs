@@ -69,7 +69,8 @@ fn fake_vec(text: &str) -> Vec<f32> {
 
 /// 选择度 10% 的语料：每 10 篇里 1 篇 `tag = keep`。
 ///
-/// 400 篇 ⇒ `allowed = 40`，远低于默认阈值 1024 ⇒ 向量路必然走精确路径。
+/// 400 篇 ⇒ `allowed = 40`，远低于默认阈值（`BRUTE_FALLBACK_MAX_ALLOWED = 8192`）
+/// ⇒ 向量路必然走精确路径。
 const N_DOCS: usize = 400;
 const KEEP_EVERY: usize = 10;
 
@@ -128,7 +129,7 @@ fn S5_T13_低选择度端到端走精确路径且缺口归零() {
     assert_eq!(
         resp.metrics.vector_route,
         VectorRoute::Exact,
-        "选择度 10% / allowed=40 ≤ 阈值 1024 ⇒ 必须走精确路径"
+        "选择度 10% / allowed=40 ≤ 默认阈值 8192 ⇒ 必须走精确路径"
     );
 
     // 2. 覆盖度：candidate_k = k×3 = 30，allowed = 40 ⇒ 精确路径应拿满 30 条

@@ -1,16 +1,16 @@
 # HelixIndex V2 · Step 5 详细设计（查询性能与可观测：低选择度精确兜底 + `Metrics` 可观测化）
 
-> 面向 Agent 场景的通用检索引擎内核——V2 Step 5 的详细设计（**v0.4：实现期口径修正版，决策已全部拍板**）。
+> 面向 Agent 场景的通用检索引擎内核——V2 Step 5 的详细设计（**v0.5：S5-04 标定定稿版，Step 5 全部完成**）。
 > 本文件回答：低选择度过滤为什么必然整图遍历、绕开 ANN 直接精确扫描在**本项目的向量存储上是否可行**、
 > 阈值该怎么标定且怎么证明"没有把热路径搞坏"、以及那个"外部拿不到实例"的 `Metrics`
 > 到底卡在哪一条链上。
 
 | 项 | 内容 |
 | --- | --- |
-| 版本 | **v0.4（实现期口径修正版；决策已全部拍板）** |
+| 版本 | **v0.5（S5-04 标定定稿版；Step 5 全部完成）** |
 | 日期 | 2026-09-10 |
-| 状态 | **决策已全部拍板**（2026-09-10 二次评审无异议）⇒ **D-S5-01 / 03 / 05 的阻塞解除，S5-01~04 可开工**。仅 **D-S5-02 / 04 的数值**由标定实验（S5-04）回填，**不阻塞实现**（形态与口径均已定） |
-| 修订记录 | v0.1 首版：现状源码级定位（§2，含 `Metrics` 四处断链与新发现的早退路径 `took` 恒 0）、**`hnsw_rs` 存储访问能力核实（§3.1 / 附录 C，本文关键技术前提）**、三路径设计（§4）、9 个决策 D-S5-01~09、S5-T1~T13 测试计划、S5-01~S5-08 任务拆分、风险 R31~R35 与未决 Q1~Q5。<br>**v0.2 评审响应（PR #33 评审）**：① **纠正 v0.1 的关键技术前提**——`get_layer_iterator(0)` **不是**全量遍历（会漏掉 level ≥ 1 的点，实测 N=5000 时漏 187 个 = 3.74%），全量遍历的正确 API 是 `&PointIndexation` 的 `IntoIterator`；v0.1 把两个 API 的安危判断**写反了**（详见 §3.1 / 附录 C，已用探针独立复现）。② D-S5-08 范围由「一条早退路径」扩为**两条**（§2.5）。③ `distance_sq` 改为转发 `distance_to_slice`，把 I4 从"巧合"变"结构"（§4.2.5）。④ 修正 R11~R18 的架构引用（在 §14 **章级主表**，非 §14.1）。⑤ 修正 CHANGELOG 中"`plan-v2.md` 未改动"的自相矛盾。<br>**v0.3 二次评审响应（PR #33 二次评审）**：① **D-S5-01~09 全部拍板**——评审对 D-S5-01 / 03 / 05 **无异议**（阻塞解除，S5-01~04 可开工），D-S5-02 / 04 的数值同意留待 S5-04 标定。② `docs/README.md` 索引行**同步纠正** v0.2 已推翻的遍历 API 结论（发现面漂移，v0.2 五处同步漏了它）。③ §4.2.2 的 NaN 论证改为**强制前提**——精确路径加 `debug_assert!(d.is_finite())` 且 `brute.rs:53-57` 排序统一为 `total_cmp`，清掉全文最后一处"文档断言源码事实、而源码不这么说"（§4.2.5 同手法：把断言变结构）。④ 附录 C 复现片段补"演示用，勿抄进测试"注记。 |<br>**v0.4 实现期口径修正（PR #36 评审 F1）**：① 「`Exact` ⇒ `vector_shortfall` 恒为 0」在全文中是**条件命题**而非恒等式——`allowed` 来自 `Index`、扫描枚举的是**图里的点**，图滞后于索引时该值仍 > 0；§4.4 的结论表与推论 1、§3 的 V2.1 依赖段改为条件式，并把该条件升级为**信号**（`Exact` + 缺口 > 0 ⟺ 图未覆盖全部 allowed chunk）。② 同一口径已同步到 `architecture-design.md` §5.4 / §8.3（架构升 v1.10）与实现侧措辞（`query/metrics.rs` / `query/searcher.rs` / 集成测试 / CLI 图例 / `scripts/eval_filter.sh` / CHANGELOG）。③ 本版**不改任何决策**（D-S5-01~09 与 S5-01~S5-08 拆分不变），只精确化措辞 |
+| 状态 | **已完成并合并**。设计：D-S5-01~09 全部拍板；实现：PR #36 已并入 main `48c0ac7`（S5-01~03 + S5-05~07）；**S5-04 阈值与 NFR-13 预算已定稿、S5-08 文档回写随本版落地**。未决 Q1 / Q2 已由标定回填、Q5 结案（**方案 A 达标 ⇒ 不做方案 B**） |
+| 修订记录 | v0.1 首版：现状源码级定位（§2，含 `Metrics` 四处断链与新发现的早退路径 `took` 恒 0）、**`hnsw_rs` 存储访问能力核实（§3.1 / 附录 C，本文关键技术前提）**、三路径设计（§4）、9 个决策 D-S5-01~09、S5-T1~T13 测试计划、S5-01~S5-08 任务拆分、风险 R31~R35 与未决 Q1~Q5。<br>**v0.2 评审响应（PR #33 评审）**：① **纠正 v0.1 的关键技术前提**——`get_layer_iterator(0)` **不是**全量遍历（会漏掉 level ≥ 1 的点，实测 N=5000 时漏 187 个 = 3.74%），全量遍历的正确 API 是 `&PointIndexation` 的 `IntoIterator`；v0.1 把两个 API 的安危判断**写反了**（详见 §3.1 / 附录 C，已用探针独立复现）。② D-S5-08 范围由「一条早退路径」扩为**两条**（§2.5）。③ `distance_sq` 改为转发 `distance_to_slice`，把 I4 从"巧合"变"结构"（§4.2.5）。④ 修正 R11~R18 的架构引用（在 §14 **章级主表**，非 §14.1）。⑤ 修正 CHANGELOG 中"`plan-v2.md` 未改动"的自相矛盾。<br>**v0.3 二次评审响应（PR #33 二次评审）**：① **D-S5-01~09 全部拍板**——评审对 D-S5-01 / 03 / 05 **无异议**（阻塞解除，S5-01~04 可开工），D-S5-02 / 04 的数值同意留待 S5-04 标定。② `docs/README.md` 索引行**同步纠正** v0.2 已推翻的遍历 API 结论（发现面漂移，v0.2 五处同步漏了它）。③ §4.2.2 的 NaN 论证改为**强制前提**——精确路径加 `debug_assert!(d.is_finite())` 且 `brute.rs:53-57` 排序统一为 `total_cmp`，清掉全文最后一处"文档断言源码事实、而源码不这么说"（§4.2.5 同手法：把断言变结构）。④ 附录 C 复现片段补"演示用，勿抄进测试"注记。 |<br>**v0.4 实现期口径修正（PR #36 评审 F1）**：① 「`Exact` ⇒ `vector_shortfall` 恒为 0」在全文中是**条件命题**而非恒等式——`allowed` 来自 `Index`、扫描枚举的是**图里的点**，图滞后于索引时该值仍 > 0；§4.4 的结论表与推论 1、§3 的 V2.1 依赖段改为条件式，并把该条件升级为**信号**（`Exact` + 缺口 > 0 ⟺ 图未覆盖全部 allowed chunk）。② 同一口径已同步到 `architecture-design.md` §5.4 / §8.3（架构升 v1.10）与实现侧措辞（`query/metrics.rs` / `query/searcher.rs` / 集成测试 / CLI 图例 / `scripts/eval_filter.sh` / CHANGELOG）。③ 本版**不改任何决策**（D-S5-01~09 与 S5-01~S5-08 拆分不变），只精确化措辞 |<br>**v0.5 S5-04 标定定稿（S5-04 / S5-08，2026-09-10）**：10 万级逐档位 A/B（`--brute-fallback off` vs 强制精确）⇒ **阈值由初值 1024 改为 8192**（§4.3 / §4.9 / D-S5-02 全部回填实测表），**NFR-13 预算定为双口径**（常规档位 ≤20ms / 降级字段档位 ≤35ms，§4.9）。**Q1 / Q2 结案**（由实测回填），**Q5 结案**（方案 A 达标 ⇒ 不做方案 B）。仅改数值与结论，**不改任何形态决策**（D-S5-01~09 的三路径骨架与 `Option<usize>` 表达一律不动） |
 | 上游 | `plan-v2.md` §4 Step 5 / issue **#22**（V2-Step5）/ `requirements-spec.md` v1.9（**NFR-13** Should）/ `architecture-design.md` §8.3（可观测性）、**§14 章级主表 `:1449-1456`（R11 / R13 / R17 / R18）**/ `v2-step1-design.md` §5.7（A/B 双路径）/ `eval-report.md` §8.5~§8.6（S1-10 实测） |
 | 范围 | **T7-22** 低选择度精确兜底（R18）+ **T7-23** `query::Metrics` 可观测化 + 阈值标定实验 + CLI/bench 观测入口 |
 | 非范围 | **prefilter 结构**（索引侧预过滤位图，V2.1 议题，判据正是本 Step 暴露的 `vector_shortfall`）；**降级字段的 `doc_bits_scan` O(N) 全扫**（Step 1 已接受的残余，Q-I1 的边界，与向量路正交）；并发检索压测（**Step 6** / T7-17，本 Step 是它的前置）；读写并发 / 在线 compaction（**Step 8**）；横切任务 T7-21（`parallel_build` 默认翻转）、T7-24（工程卫生） |
@@ -24,7 +24,7 @@
 | # | 决策 | 建议 | 状态 | 阻塞谁 |
 | --- | --- | --- | --- | --- |
 | **D-S5-01** | **精确兜底的落点**：放 `VectorIndex` 层（后端自己拥有策略）还是在编排层（把 `raw_vectors` 视图接进 `SearchParts`） | **放 `VectorIndex` 层**：新增必需方法 `search_exact_filtered` + 默认钩子 `prefers_exact(&dyn CandidateFilter) -> bool`。理由：**零 plumbing**——门面 `Searcher`、逃生舱 `QueryExecutor`、bench 三条入口全都自动受益；`BruteForceIndex` 的精确性由**类型**表达（它天然满足）。编排层方案被否决：要新增一条"精确向量源"通道，且 bench/逃生舱都得跟着接线，同一策略出现两个装配点 | ✅ **已定**（2026-09-10 二次评审无异议） | — |
-| **D-S5-02** | 兜底的**适用面与默认阈值** | **只作用 `FilterKind::Filtered`**，热路径（`None` / `Alive`）**一行不改**（保 R15 的 fast-return 不回归）；阈值以 `Option<usize>` 表达，`None` = 关闭（供 A/B 回归对照），默认值**待 §4.9 标定**，初值取 **1024**（理论分界 ≈ `ef`，见 §4.3） | ✅ **形态已定**（只作用 `Filtered` + `Option<usize>` 可关）；**数值待 S5-04 标定** | S5-04 回填，不阻塞实现 |
+| **D-S5-02** | 兜底的**适用面与默认阈值** | **只作用 `FilterKind::Filtered`**，热路径（`None` / `Alive`）**一行不改**（保 R15 的 fast-return 不回归）；阈值以 `Option<usize>` 表达，`None` = 关闭（供 A/B 回归对照），默认值取 **8192**（**S5-04 标定定稿**，见 §4.3 / §4.9） | ✅ **已定稿**（只作用 `Filtered` + `Option<usize>` 可关；数值 8192 已由 S5-04 回填） | 已结案 |
 | **D-S5-03** | 精确扫描的**候选来源** | **方案 A：遍历向量存储本身**（`HnswRsIndex` 用 `&PointIndexation` 的 `IntoIterator` **全量**遍历；谓词逐点判定、只对通过的点算距离）。代价 `O(N)` 次谓词判定 + `O(allowed)` 次距离；**零新增状态**。方案 B（枚举 allowed + `origin→PointId` 映射，做到纯 `O(allowed)`）列为"标定不达标再上"的备选（§4.2.3） | ✅ **已定**（2026-09-10 二次评审无异议；方案 B 留作逃生舱） | — |
 | **D-S5-04** | **NFR-13 的预算口径与数值** | 口径 = **端到端 P99（含过滤求值）**，10 万级、选择度 ≤1% 档位，**拟 ≤ 20ms**（与 NFR-02 同量级）。理由：只报"向量路"会掩盖降级字段档位上 `doc_bits_scan` 那 ~8ms；bench 必须**同时**打印 `filter_eval` / `vector_route` / `vector_shortfall`，才能区分"兜底没生效"与"兜底生效但过滤求值本身贵"。数值由 §4.9 标定后回填需求文档 | ✅ **口径已定**（端到端 P99）；**数值待 S5-04 标定** | S5-04 回填 + 需求文档 |
 | **D-S5-05** | `Metrics` 的**承载方式** | **进 `SearchResponse` 新字段 `metrics`** + 在 `query/mod.rs` 再导出 `Metrics`；`tracing::info!` 通道**保留**（二者一个给宿主、一个给调用方）。理由：只有进响应，外部才能**单测**、bench 才能**采集**——这正是 issue #7 / #22 的原始诉求。代价是 `SearchResponse` 是公开结构体、字段全 `pub`，加字段会破坏外部**字面量构造**；库内只有 `searcher.rs:268` / `:413` 两处，记入 CHANGELOG `⚠️ 破坏性` | ✅ **已定**（2026-09-10 二次评审确认破坏性可接受） | — |
@@ -499,11 +499,24 @@ C_C(allowed) ≈ N × c_visit + allowed × c_dist
 用 §4.2.4 的量级代入（`c_dist≈100ns`、`c_visit≈20ns`、`ef=120`、`N=10⁵`）
 得 `sel*` 在 **10⁻²~10⁻³** 区间 ⇒ 阈值落在 **10²~10³**。
 
-**结论**：默认阈值初值取 **1024**（覆盖 `sel-1%` 档 `allowed≈1000`，且比 `EF_FILTER_MAX=256` 宽），
-由 S5-04 标定后定稿。实现上它是一个常量 + 一个可注入开关：
+> ⚠️ **该模型事后被标定证伪了一半（S5-04，保留作反面记录）**：`min(N, ef / selectivity)`
+> **低估了路径 B 的成本**。实测 `allowed=100`（sel=0.1%）时 B 的向量路是 **95.6ms**；
+> 按上式 `ef / sel = 120 / 0.001 = 120000 > N` ⇒ 退化为 `N × c_dist = 10⁵ × 100ns = 10ms`，
+> 与实测差 **9.5×**。真因是**堆填不满期间剪枝全程关闭**（`hnsw.rs:1019`），
+> 实际访问的点远多于"填满堆所需"的理论下界。
+> ⇒ 该模型只可作**定性**依据（B 与 C 同为 `O(N)`、每个点的常数差 5~20×），
+> **阈值必须实测**，不能由它推出。
+
+**结论（S5-04 标定定稿）**：默认阈值取 **8192**。判据是**不需要归一化就成立的两个端点**——
+`allowed=5043` 时精确明确胜（6.93ms → 4.64ms），`allowed=9946` 时 ANN 明确胜（4.62ms → 6.64ms）
+⇒ 交叉点落在 `(5043, 9946)` 区间内，插值 ≈ **9700**；取 8192（= 2¹³）留 ~15% 余量，
+理由见 R31：路径 C 的 `O(N)` 访问项随规模线性增长（而高选择度下路径 B 由 `ef` 封顶），
+交叉点会**随规模下移** ⇒ 宁低勿高。实测全表见 **§4.9**。
+
+实现上它是一个常量 + 一个可注入开关：
 
 ```rust
-pub const BRUTE_FALLBACK_MAX_ALLOWED: usize = 1024;   // S5-04 标定后定稿
+pub const BRUTE_FALLBACK_MAX_ALLOWED: usize = 8192;   // S5-04 标定定稿
 
 /// `Some(n)` = 阈值为 n；`None` = **关闭**精确兜底（回归对照用，S5-T7 / bench A/B）。
 pub fn with_brute_fallback(mut self, max_allowed: Option<usize>) -> Self;
@@ -663,6 +676,47 @@ pub struct SearchResponse {
 扫出 P99 反转的第一个档位即阈值的上界。**NFR-13 预算**取「标定实测 P99 × 1.5~2 余量」并
 向 5ms 取整（拟 20ms），回填需求文档 §6.1 与 plan-v2 §6。
 
+**实测结果（2026-09-10 执行；10 万级、快照 `/tmp/helix-filter-100000.snapshot`、100 query × 10 次）**：
+
+> ⚠️ 两轮**非交错**执行（先全 `off`、后全强制精确），控制组（`none` 档、两轮同走 ANN）
+> 在第二轮整体偏慢 **×1.382(vector) / ×1.541(hybrid)** ⇒ 跨轮比较须按控制组归一。
+> 因此**阈值决策只用「不需要归一化就成立」的端点**（下表**加粗**两行），归一化仅用于量级说明。
+> 另：`P99` 在 `allowed≈10000` 档位内部抖动可达 ±40%（同轮内 `sel-10%` 与 `tenant-10%` 的
+> 精确 P99 为 8.46 vs 11.77ms，工作量几乎相同）⇒ **决策改看 `mean_vector_ms`**
+> （1000 个 `Metrics` 样本的均值，比 P99 稳）。
+
+| 档位 | 选择度 | `allowed` | ANN 路径 P99(ms) | 精确路径 P99(ms) | ANN 向量路均值(ms) | 精确向量路均值(ms) | 加速(归一) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| sel-0.1% | 0.1% | 100 | 120.92 / 112.69 | **4.72 / 7.06** | 95.60 | 2.84 | **46.6×** |
+| sel-1% | 1% | 1000 | 52.25 / 39.49 | **6.25 / 6.32** | 30.06 | 3.71 | **11.2×** |
+| ts-range-degraded | 0.1%（降级字段） | 115 | 193.30 / 223.24 | **17.42 / 22.84** | 108.38 | 2.95 | **50.7×** |
+| **tier-5%** | 5% | **5043** | 9.85 / 12.36 | **7.01 / 6.98** | 6.93 | 4.64 | **2.06×** |
+| sel-10% | 10% | 10000 | 7.30 / 7.16 | 8.46 / 7.91 | 4.75 | 6.37 | 1.03× |
+| **tenant-10%** | 10% | **9946** | **7.13 / 7.10** | 11.77 / 10.96 | 4.62 | 6.64 | **0.96×（反转）** |
+| score-range | 10%（降级字段） | 9912 | 20.10 / 17.52 | 15.05 / 14.69 | 6.06 | 5.86 | 1.43× |
+
+（P99 列格式 = `vector / hybrid`。`none` 控制组：ANN 3.36/3.18 → 精确轮 5.41/5.42，两轮精确占比均 0%。）
+
+**三条结论**：
+
+1. **兜底确实生效且收益巨大**：`allowed ≤ 1000` 与降级字段档位（`allowed=115`）的向量路
+   提速 **11~51×**；`ts-range-degraded` 的端到端 P99 从 **223.24ms → 22.84ms**（9.8×）。
+2. **交叉点在 `allowed ≈ 9700`**：`tier-5%`(5043) 精确胜——**未归一化**即 6.93ms → 4.64ms；
+   `tenant-10%`(9946) ANN 胜——4.62ms → 6.64ms。⇒ 阈值上界落在 `(5043, 9946)`，**定稿取 8192**。
+3. **NFR-13 预算（双口径）**：
+   - **常规档位（字段索引命中）≤ 20ms** —— 实测最差 **7.06ms**（`sel-0.1%` hybrid），余量 **2.8×**；
+   - **降级字段档位 ≤ 35ms** —— 实测最差 **22.84ms**（`ts-range-degraded` hybrid），
+     其中**过滤求值自身 8.77ms**（D-S5-09 已接受、不归本 Step），向量路仅 3.15ms。
+     即：若坚持单值口径，预算须 ≥ 35ms 才不被这个**与向量路无关**的成本顶穿；
+     拆开口径后，原拟的 **20ms 被证实**（常规档位余量 2.8×）。
+
+**Q5 结案**：方案 A（遍历向量存储）在 10 万级全部档位达标 ⇒ **不做方案 B**（候选枚举 + `origin→PointId` 映射）。
+
+**定稿阈值（8192）下的验证**（同日，`--levels sel-1%,tier-5%,sel-10%,ts-range-degraded`，走默认开关）：
+路由与预测完全一致——`sel-1%`(1000) / `tier-5%`(5043) / `ts-range-degraded`(115) 均为 **100% `Exact`**，
+`sel-10%`(10000，> 8192) 为 **0%（ANN）**；端到端 P99（vector / hybrid）依次
+**4.73/5.01、6.55/8.33、14.08/21.24、12.18/10.91 ms** ⇒ **全部落在双口径内**。
+
 **成本**：10 万级每档一次构建 + 两次扫描；沿用既有脚本的 `--skip-build` 复用快照。
 **注意**：延迟数字**只在本地可引用**（CI 共享 runner 不可引用，`docs/README.md` 已声明）。
 
@@ -679,11 +733,11 @@ pub struct SearchResponse {
 
 **结论**：取后端层。`HnswRsIndex` 本来就拥有"怎么走图"的全部知识，把"什么时候不查图"也放这里最自然。
 
-### D-S5-02 适用面与默认阈值 ✅ 建议：只对 `Filtered`，初值 1024
+### D-S5-02 适用面与默认阈值 ✅ 建议：只对 `Filtered`，定稿 8192
 
 - 适用面：`filter.kind() == FilterKind::Filtered`。热路径（`None` / `Alive`）**一行不改**——
   R15 的 fast-return 是 Step 1 明确的设计不变量，本 Step 不碰。
-- 默认值：**1024**（§4.3 的代价模型），标定后定稿；`None` = 关闭。
+- 默认值：**8192**（**S5-04 标定定稿**，§4.9 实测：交叉点 ≈ 9700，取 2¹³ 留余量；§4.3 的代价模型已被实测证伪一半，仅作定性依据）；`None` = 关闭。
 
 ### D-S5-03 候选来源 ✅ 建议方案 A（遍历向量存储）
 
@@ -803,15 +857,15 @@ Step 1 已按"接受并测量"结案（S1-10 结论②：`ts_ms` 档位加速比
 
 ### 9.2 未决问题（需评审或实测回答）
 
-> **评审项已全部结案**（Q3 / Q4，2026-09-10 二次评审无异议）；余下 Q1 / Q2 / Q5 均为**实测项**，由 S5-04 标定回填，**不阻塞 S5-01~03 开工**。
+> **全部结案**：Q3 / Q4 由 2026-09-10 二次评审结案；**Q1 / Q2 / Q5 已由 S5-04 标定回填结案**（2026-09-10）。
 
 | # | 问题 | 阻塞谁 | 谁回答 |
 | --- | --- | --- | --- |
-| **Q1** | 阈值默认值（初值 1024 是否可接受） | 仅 S5-03 的**常量取值**（形态已定，可先用初值开发） | 标定实验（S5-04） |
-| **Q2** | NFR-13 预算数值（拟 20ms） | 仅 §1.3 验收判定 | 标定实验（S5-04） |
+| **Q1** | 阈值默认值（初值 1024 是否可接受） | 仅 S5-03 的**常量取值**（形态已定，可先用初值开发） | ✅ **已结案**：**不可接受，改为 8192**——实测交叉点 ≈ 9700（§4.9），初值 1024 过保守，会漏掉 `tier-5%`（5043）这个 2.06× 的档位 |
+| **Q2** | NFR-13 预算数值（拟 20ms） | 仅 §1.3 验收判定 | ✅ **已结案**：**拆双口径**——常规档位 **≤20ms**（实测最差 7.06ms，拟值被证实）、降级字段档位 **≤35ms**（实测最差 22.84ms，其中过滤求值 8.77ms 属 D-S5-09） |
 | **Q3** | `search_exact_filtered` 设为**必选**方法是否接受（外部实现要跟进） | S5-01 | ✅ **已结案**（2026-09-10 二次评审无异议） |
 | **Q4** | `Metrics` 进 `SearchResponse`（D-S5-05）是否接受破坏性 | S5-05/06 | ✅ **已结案**（2026-09-10 二次评审确认破坏性可接受，记 CHANGELOG `⚠️ 破坏性`） |
-| **Q5** | 是否现在就把方案 B（候选枚举 + `origin→PointId` 映射）也做掉 | 无 | 标定实验：方案 A 达标则不做 |
+| **Q5** | 是否现在就把方案 B（候选枚举 + `origin→PointId` 映射）也做掉 | 无 | ✅ **已结案**：方案 A 在 10 万级全部档位达标 ⇒ **不做方案 B**（§4.9 结论 3） |
 
 ---
 
@@ -823,7 +877,7 @@ Step 1 已按"接受并测量"结案（S1-10 结论②：`ts_ms` 档位加速比
 | `vector::VectorIndex` | `fn prefers_exact(&self, &dyn CandidateFilter) -> bool` | 新增（默认 `false`） |
 | `vector::VectorRoute` | `enum { None, Ann, Exact }`（`Copy`） | 新增 |
 | `vector::HnswRsIndex` | `fn with_brute_fallback(self, Option<usize>) -> Self` | 新增 |
-| `vector::HnswRsIndex` | 常量 `BRUTE_FALLBACK_MAX_ALLOWED: usize = 1024` | 新增（S5-04 定稿） |
+| `vector::HnswRsIndex` | 常量 `BRUTE_FALLBACK_MAX_ALLOWED: usize = 8192` | 新增（**S5-04 标定定稿**，原初值 1024） |
 | `vector::HnswRsIndex` | `from_loaded(hnsw, ef_search, parallel_build)` | **签名变更**：新增 `brute_fallback`（或保持默认，附录 §4.3 已注明） |
 | `vector::NormalizedVector` | `fn distance_to_slice(&self, &[f32]) -> f32` | 新增（**唯一**求和实现） |
 | `vector::NormalizedVector` | `fn distance_sq(&self, &NormalizedVector) -> f32` | **实现变更**（转发 `distance_to_slice`，签名不变；§4.2.5） |
@@ -843,23 +897,26 @@ Step 1 已按"接受并测量"结案（S1-10 结论②：`ts_ms` 档位加速比
 cargo test --workspace
 cargo test -p helix-core --release -- --ignored T12_选择度与延迟与召回三元数据
 
-# 2) 10 万级标定：同一档位跑「关兜底 / 开兜底」两次（S5-04 / D-S5-04）
-./scripts/eval_filter.sh --n 100000 --skip-build --levels sel-10%,sel-1%,sel-0.1%
-cargo run --release -p helix-cli -- bench \
-  --input data/synth-100000-corpus.jsonl --queries data/synth-100000-queries.jsonl \
-  --modes vector,hybrid --filter "<档位谓词>" --reps 20 \
-  --brute-fallback off --json /tmp/sel01-off.json
-cargo run --release -p helix-cli -- bench \
-  --input data/synth-100000-corpus.jsonl --queries data/synth-100000-queries.jsonl \
-  --modes vector,hybrid --filter "<档位谓词>" --reps 20 \
-  --brute-fallback 1024 --json /tmp/sel01-on.json
+# 2) 10 万级 A/B 标定（S5-04 实际执行的两条；产物按开关分名落盘，互不覆盖）
+LEVELS="none,sel-0.1%,sel-1%,tier-5%,sel-10%,tenant-10%,score-range,ts-range-degraded"
+./scripts/eval_filter.sh --n 100000 --skip-build --levels "$LEVELS" \
+  --brute-fallback off --modes vector,hybrid          # → /tmp/helix-filter-100000-fboff.md
+./scripts/eval_filter.sh --n 100000 --skip-build --levels "$LEVELS" \
+  --brute-fallback 1000000 --modes vector,hybrid      # → /tmp/helix-filter-100000-fb1000000.md
+#   阈值取一个远大于语料 allowed 的数即可**强制全部走精确**（本语料 max allowed ≈ 10000）。
 
-# 3) NFR-13 验收（S5-T12；本地 release；CI 不跑）
-#    读 /tmp/sel01-on.json：vector_route_exact_ratio == 1.0
-#    且 vector P99 ≤ 预算（→ eval-report.md §8.9）
+# 3) 定稿阈值下的验证（用新默认值 8192 再跑决定性档位，确认路由与预算）
+./scripts/eval_filter.sh --n 100000 --skip-build \
+  --levels sel-1%,tier-5%,sel-10%,ts-range-degraded --modes vector,hybrid
+
+# 4) NFR-13 验收（S5-T12；本地 release；CI 不跑）
+#    读 3) 的 JSON：allowed ≤ 8192 的档位 vector_route_exact_ratio == 1.0，
+#    且端到端 P99 落在双口径内（常规 ≤20ms / 降级字段 ≤35ms）→ eval-report.md §8.9
 ```
 
-> ⚠️ 档位谓词与 `data/synth-100000-filters.json` 的对应关系见 `scripts/eval_filter.sh`；
+> ⚠️ **A/B 两轮非交错执行**，控制组 `none` 档在第二轮偏慢 ×1.38~×1.54 ⇒ 跨轮比较须按控制组归一；
+> 阈值决策只用「不需要归一化就成立」的端点。`--brute-fallback off` = 关闭兜底，用于复现 Step 5 之前的 ANN 行为。
+> 档位谓词与 `data/synth-100000-filters.json` 的对应关系见 `scripts/eval_filter.sh`；
 > 延迟数字**只在本地可引用**（CI 共享 runner 不可引用）。
 
 ---
