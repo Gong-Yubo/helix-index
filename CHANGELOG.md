@@ -71,6 +71,35 @@
   复用 `snapshot_vectors` 读回）；T16 三轮 churn 墓碑**不累积**（J2/NFR-07：每轮 compact 后
   `chunks_total` 回落到存活数、`tombstone_ratio` 归零、图中无残留墓碑点）。
 
+### V2 Step 4 · 文档回写（S4-10，2026-09-10）
+
+**Step 4 收官**：S4-01 与 S4-03~S4-10 全部完成（**S4-02 `remove_many` 为可选、未实施**），
+本 PR `Closes #21`。
+
+- **`architecture-design.md`**
+  - 新增 **§7.5.3 墓碑物理回收（compaction，FR-30）**：三条膨胀路径与量级（图 sidecar
+    ≈2.6KB/点 vs 快照正文 ≈6B/chunk，约 **440:1**）、按存活集**重新物化 + ID 重编号**
+    （D-S4-01）、步骤 0 必须 `commit()`（D-S4-10 / I8）、ID 变更的对外声明（D-S4-09 三处）、
+    BM25 逐位一致的理由（排序全序 + remap 单调）、落盘入口**唯一** = `compact_and_save`
+    （manifest 重发由既有 `save` 链路自动满足，`FORMAT_VERSION` 保持 2）、触发策略
+    （手动为主 + `save` 告警，自动默认关）、失败语义（内存已压实、重试 `save()` 即可续写）、
+    10K 实测与四条已知代价（R26~R30）。明确记录**批量删 O(N·M) 未随本 Step 解决**。
+  - 新增 **§14.2 V2 Step 4 引入的风险（R26 ~ R30）**：内存峰值 2×（R26，10K 未触发、
+    100K 未验证）、ID 重编号破坏外部引用（R27，已缓解且 T14 覆盖）、compaction 耗时
+    （**R28 维持「未实测」**——`churn_bench` CSV 无 `compact_ms` 列；采集途径为
+    `helix compact --json` 的 `compact_ms`）、重建图拓扑抖动（R29）、期间不可服务
+    （R30，在线 compaction 归 Step 8）。
+- **`requirements-spec.md`**：FR-30 打上**验收注记**（✅ 已实现 + 实测数字 + ⚠️ ID 重编号
+  警示 + 手动触发为主）。
+- **`plan-v2.md`**：升 **v0.9**；Step 4 三条进度（T7-12 核心 / S4-01 / S4-08~10）全部标 ✅
+  并挂 commit；验收清单补勾 **Step 3**（此前漏勾）与 **Step 4** 两项。
+- **`v2-step4-design.md`**：升 **v0.4（实现完成版）**，新增 **§10 实施结果**——S4-01~S4-10
+  完成状态表、10K churn 实测（含 2026-09-10 复跑 `VERDICT: PASS`、`reclaimed_chunks=15000`、
+  冷启动 94ms）、**Q1~Q7 全部结案**、PR #30/#31 评审响应要点、集成测试补强 8 例与三条
+  踩坑（`[char; N]` 作 pattern 误伤全部字符串 / 墓碑态总字节未必大于初始 / 向量近邻对
+  已删 doc 不返回空）。
+- **`docs/README.md`**：Step 4 设计条目标注 v0.4 实现完成与 §10 位置。
+
 ### V2 Step 4 · 墓碑物理回收 compaction（核心，S4-03~S4-07，D-S4-01/03/06/10，2026-09-08）
 
 **新增（资源回收）**

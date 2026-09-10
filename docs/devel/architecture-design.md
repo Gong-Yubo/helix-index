@@ -737,6 +737,66 @@ score(d) = Σ_{lane i}  w_i / (k + rank_i(d))
   会 panic → 本项目使用自定义的 `DistDotClamped`
 - ⚠️ crate 名是 **`hnsw_rs`**（下划线）
 
+#### 7.5.3 墓碑物理回收（compaction，FR-30）
+
+> **V2 Step 4 新增**。§7.5.1 / §7.5.2 解决的是「已删文档不占 Top-K 名额」（**FR-26 正确性**），
+> 但墓碑**只是被跳过、从未被移除**——磁盘与图里的死数据只增不减。本节解决**长期膨胀**。
+
+**膨胀的三条路径与量级**（逐行盘点见 `v2-step4-design.md` §2.1）：
+
+| 路径 | 增长机制 | 量级 |
+| --- | --- | --- |
+| 图 sidecar（`.hnsw.graph` / `.hnsw.data`） | `hnsw_rs` **无 remove**，墓碑点随每次 `save` 的 `file_dump` **重复累积** | **≈2.6KB/点**（大头） |
+| 快照正文（`.idx`） | 正排 `chunks` 的 `None` 槽位 + `chunk_lens` 是 push-only（`remove` 不回收） | ≈6B/chunk |
+| `raw_vectors` | `remove` 的 `retain` 本已摘净；但 `flush` 无 liveness 检查时会灌入幽灵向量（**S4-01 已堵**） | dim×4B/条 |
+
+> 图与正文约 **440:1** —— 治理重点在图；但**不重编号则正文空洞无法消除**（`Vec<Option<_>>`
+> 的 `None` 必须靠稠密化挤掉），这是 D-S4-01 选「重编号」而非「原地保留 id」的根本理由。
+
+**方案：按存活集重新物化 + ID 重编号**（D-S4-01）。一次 `compact()` 六步：正排稠密化并生成
+`IdRemap` → 倒排 remap + 死词摘除 + `chunk_lens` / `content_hashes` / 字段索引同步 →
+`raw_vectors` 过滤 + remap → 向量索引重建 → 三者**一起原子替换**（I5：失败不留半压实）。
+
+两个关键约束：
+
+- ⚠️ **步骤 0 必须先 `commit()`**（D-S4-10，是 `compact()` 的第一行）：`add` 在入 `pending`
+  **之前**就分配了 `chunk_id`，不先 flush 的话 `pending` 里仍是旧 id，紧随的 `save` → `flush`
+  会把 stale id 灌进 `raw_vectors` 与新图。不变式 **I8**：`compact()` 返回时 `pending` 必为空。
+- ⚠️ **ID 会被重编号**（D-S4-01 ⇒ D-S4-09 由「可选」升为**必做**）：跨 compaction 的持久
+  引用请用 `source` / `content_hash`，**不要用 `doc_id` / `chunk_id`**。已三处声明：
+  `CompactionReport.remapped` 字段、`SearchIndex::compact` 的 rustdoc、`user-guide.md` §1.5。
+  无墓碑时**早退且不重编号**（`remapped=false`），避免白重建整张图。
+
+**BM25 为什么不受影响**（I3 逐位一致）：BM25 排序是 `(score 降序, chunk_id 升序)` 的**全序**
+（`retriever/bm25.rs`），而 `IdRemap` 对存活集**单调** ⇒ 重编号不改变任何一对的相对顺序。
+
+**落盘与崩溃一致性**：落盘入口**唯一** = `compact_and_save(path)` = `compact()` + 既有 `save()`。
+复用 Step 3 的 `atomic_write`（**不引入新的一致性机制**），`FORMAT_VERSION` 保持 2；
+§7.5.2 的铁律「重建图后必须重发 manifest」由这条**既有 `save` 链路自动满足**，compaction 不
+另开落盘路径。`compact()` 本身是**纯内存**操作，其 `bytes_before` / `bytes_after` 恒为 `None`
+（磁盘此时未变，填任何值都是撒谎）。
+
+**触发策略**（D-S4-02）：**手动为主**——`helix compact`（`--dry-run` / `--output` / `--json`）；
+`save()` 在墓碑占比 ≥20% 且总量 ≥1024 时只打 `[提示]` 告警，**自动 compaction 默认关**
+（把 10~100s 的重建塞进 `save()` 会让写路径耗时不可预测）。
+
+**可观测**：`tombstone_stats()` → `TombstoneStats`；`compact*` → `CompactionReport`
+（`before` / `after`、三体积 `bytes_before` / `bytes_after`、`reclaimed_chunks` / `docs` /
+`terms` / `graph_points`、`remapped`、`graph_status`、耗时）。
+
+**失败语义**：`save` 失败时本方法返回 `Err`，但**内存已在 `compact()` 阶段压实**（I5 无 undo
+路径）。调用方拿到 `Err` 后对同一 `path` 重试 `save()` 即可续写，不必重跑 `compact()`。
+
+**实测**（10K 合成语料 churn 0.3 × 5 轮 = 60% 墓碑；`eval-report.md` §8.8）：图 + data
+**84.6MB → 33.7MB**（-60%），图 `nb_point` **25000 → 10000**（== 存活且有向量的 chunk 数），
+compact 后 reload `GraphStatus::Loaded`（非 `Rebuilt`）、冷启动 **91~99ms**。
+churn 0.1（33% 墓碑）50.9 → 33.8MB（-34%）。
+
+**已知代价**：① 期间内存峰值 ≈2×（新旧 Index 与图并存，**R26**）；② 重建图 O(N)，100K 级
+预估 60~100s（**R28**）；③ 重建图引入拓扑抖动（NFR-06 口径不破，**R29**）；④ 期间不可服务
+（**R30**，在线 compaction 归 Step 8）。⚠️ 批量删除的 O(N·M)（`remove` 每次全量 `retain`）
+**未随本 Step 解决**——`remove_many` 是可选 S4-02，**未实施**。
+
 ### 7.6 快照格式（FR-16）
 
 ```
@@ -1410,6 +1470,20 @@ pub enum Error {
 | **R23** | **`HnswIo` 必须比 `Hnsw` 活得长**（`load_hnsw*` 的 `'a: 'b`）⇒ 只能 `Box::leak` | 长生命周期服务反复加载会累积（每次约 200B + 路径串） | leak 后**丢弃句柄、不存字段**（P1-2），避免与 `Hnsw` 内部指向 Mmap 的共享借用形成别名 | 无回收路径；**依赖 `HnswIo: Send + Sync`** —— 已加编译期断言，`hnsw_rs` 升级时需复核 |
 | **R24** | **加载后增量插入的建图参数不同**（C8：重载后 `extend_candidates = true`，`Hnsw::new` 是 `false`） | 长期增量写入后图质量与纯内存建库存在偏差，可能影响召回 | S2-T10 覆盖；实测 oracle 重合率 | **残余应对已修正**：`Hnsw::set_extend_candidates(&mut self, bool)` 是**公开 API**（`hnsw.rs:853`），可在加载后显式对齐回 `false`；真正拿不到 setter 的是 `datamap_opt`（仅 `pub(crate)` getter）。故本项**可修**，待实测偏差决定是否实施 |
 | **R25** | **每次 `save` 全量重 dump 图** | 频繁 save 场景成本高。**12K 实测 43.5ms**（31.6MB 写入 + CRC 扫两遍）——远低于预估，当前**不是**瓶颈 | 先不优化；预留 dirty 标记（`dumped_len == len()` 可跳过）的位置 | 未解决；量级需在 100 万级复核 |
+
+---
+
+#### 14.2 V2 Step 4 引入的风险（R26 ~ R30）
+
+> 实现语义见 **§7.5.3**；完整触发条件与残余风险见 `v2-step4-design.md` §9.1。
+
+| # | 风险 | 影响 | 应对 | 残余 |
+| --- | --- | --- | --- | --- |
+| **R26** | **compaction 期间内存峰值 ≈2×**（旧 Index / 图 + 新 Index / 图并存） | 100K 级可能 OOM | 先按正确性实现；缓解手段（正排原地重排、分步替换）待实测后决定 | **10K 档实测未触发**（`eval-report.md` §8.8）；100K 扩展验证未跑 ⇒ 大语料下**仍可能 OOM**，V2.0 接受 |
+| **R27** | **ID 重编号破坏外部持久引用**（D-S4-01 的必然代价） | 场景层持有的 `doc_id` / `chunk_id` 在 compact 后失效 | D-S4-09 **三处声明**：`CompactionReport.remapped` 字段 + `SearchIndex::compact` 的 rustdoc + `user-guide.md` §1.5；`source` / `content_hash` 作稳定键 | 已缓解；**集成测试已覆盖**：存活 `source` 的专属词跨 compact 一一对齐、被删 `source` 零命中 |
+| **R28** | **compaction 耗时**（重建图 O(N)：12K 量级 ≈10~11.5s，100K 预估 60~100s） | 长时间独占 `SearchIndex` | 手动触发（D-S4-02，自动默认关）；**无墓碑早退**（`remapped=false`，不重建图）；CLI 与 `CompactionReport.total_ms` / `vector_rebuild_ms` 可观测 | ⏳ **未实测**：`churn_bench` 的 CSV 列只含 `coldstart_ms`、**不含 `compact_ms`**，故 10K 档只证明了体积/状态达标、未量出耗时。采集途径已就位（`helix compact --json` 的 `compact_ms`，或 `CompactionReport.total_ms`）；100K 档待 `SIZE=100000 ./scripts/eval_churn.sh` 扩展验证 |
+| **R29** | **重建图引入拓扑抖动**（NFR-06 口径不破，但与「增量建库」的历史评测基线不再逐位可比） | 评测可比性 | 文档说明 + oracle 重合率 ≥0.99 断言（S4-T4） | 已接受 |
+| **R30** | compaction 期间**无法服务**（单写者语义，无并发读者） | 需运维窗口 | V2.0 接受；**在线 compaction 归 Step 8**（并发读写） | 已接受 |
 
 ---
 

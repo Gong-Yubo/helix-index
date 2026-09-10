@@ -5,9 +5,9 @@
 
 | 项 | 内容 |
 | --- | --- |
-| 版本 | **v0.8（2026-09-08：Step 4 设计 v0.3 拍板——D-S4-01 重编号 / D-S4-10 `compact()` 先 `commit()`，核心实现可开工）** |
-| 日期 | 2026-09-08 |
-| 状态 | **决策已定案（D-J1~J7 + D-J8~J11）；Step 1 / Step 2 / Step 3 已完成并合并进 `main`（Step 3 = `ed25d5c`）；Step 4 详细设计已出（`v2-step4-design.md` **v0.3 拍板版**），**D-S4-01（重编号）/ D-S4-10（`compact()` 先 `commit()`）已于 2026-09-08 拍板**，核心实现（S4-01 + S4-03~S4-07）**可开工**；其余 D-S4-02~09 评审无异议、按建议执行；任务编号按 2026-09-07 复审重排** |
+| 版本 | **v0.9（2026-09-10：Step 4 完成——compaction 实现 + CLI `helix compact` + churn workload 实测 + 文档回写；10K churn 0.3 实测图+data 84.6→33.7MB，三体积与 `GraphStatus::Loaded` 验收全过）** |
+| 日期 | 2026-09-10 |
+| 状态 | **决策已定案（D-J1~J7 + D-J8~J11）；Step 1 / Step 2 / Step 3 / Step 4 均已完成并合并进 `main`（Step 3 = `ed25d5c`；Step 4 = S4-01 `1efc128` + 核心 `6f34ef2` + CLI/workload `ac9fcbe`）；Step 5~7 待做。任务编号按 2026-09-07 复审重排** |
 | 上游 | `requirements-spec.md`（需求定义源）、`architecture-design.md`（架构/ADR）、`eval-report.md`（P5 实测） |
 | 前置 | V1（P0~P6）全部完成，见 `plan.md`（V1 计划，已冻结，不再更新） |
 | 复审 | 2026-09-07 全量复审（7 处调整 A1~A7 + 4 个拍板问题 D1~D4）**结论已全部并入本文**，不另立复审文档；调整项索引与建议执行顺序见 **§附-3** |
@@ -456,8 +456,8 @@
 - [x] **Step 1**：Q-C1 修复有回归测试——删除后三路（含向量/hybrid）不再召回该 doc（PR #6）
 - [x] **Step 1**：过滤下推后，1 万 chunk 口径单 query 过滤耗时在 NFR-02 预算内；10 万级扩展验证已另测另录（`eval-report.md`）
 - [x] **Step 2**：图持久化后 12K 冷启动 ≈100ms（< 2s），且**同一快照两次加载**结果逐位一致（消 R-P5-13）
-- [ ] **Step 3**：原子快照通过故障注入测试——崩溃后 `load` 要么旧快照、要么新快照，**绝不 `SnapshotCorrupted`**
-- [ ] **Step 4**：compaction 后三个体积（向量图 sidecar / `raw_vectors` / 快照正文）不无界增长，且 `GraphStatus` 回到 `Loaded`
+- [x] **Step 3**：原子快照通过故障注入测试——崩溃后 `load` 要么旧快照、要么新快照，**绝不 `SnapshotCorrupted`**（PR #27 已合；fsync 代价 +0.027~0.035s，见 `eval-report.md` §8.7）
+- [x] **Step 4**：compaction 后三个体积（向量图 sidecar / `raw_vectors` / 快照正文）不无界增长，且 `GraphStatus` 回到 `Loaded` —— 10K churn 0.3×5 实测：graph+data **84.6→33.7MB**（-60%）、`nb_point` 25000→10000、reload `Loaded` 冷启动 91~99ms（`eval-report.md` §8.8）
 - [ ] **Step 5**：10 万级低选择度档位 P99 进入 **NFR-13** 预算；`Metrics` 有单测 + bench 采集点
 - [ ] **Step 6**：**NFR-03 按双口径**重测达标（首次全量 < 240s / 增量追加达标）；NFR-05 内存重测记录；`Searcher` 跨线程并发读吞吐 + 正确性有数据
 - [ ] **Step 7**：Reranker 接入后 MRR@10(1) 相对**已复现基线**可测提升；精排延迟满足 NFR-12
@@ -477,8 +477,9 @@
 | Step 1 | T7-08 过滤下推 + 字段索引 | ✅ 已完成（2026-09-05，PR #6 → `61e3dac`） |
 | Step 2 | T7-05 图持久化 + 并行建图 | ✅ 已完成（2026-09-07，PR #12/#15/#16/#17/#18 → `68074c9`/`e9ac2b0`/`15c1900`/`1e51156`/`9db2c00`） |
 | **Step 3** | T7-13 原子快照（S3-a~e，含 R19） | ✅ 已完成并合并（PR #27 → `ed25d5c`，2026-09-08；评审回应 `a474d86` + 集成补强 `dc31b3f`） |
-| **Step 4** | T7-12 墓碑物理回收（compaction，含 manifest 重发） | 🟩 **设计 v0.3 已拍板**：D-S4-01 = 重编号、D-S4-10 = `compact()` 先 `commit()`（含 I8/T13）；v0.2 已修评审 P0/P1 + 6 条 P2（验收 3 `nb_point` 口径、D-S4-04 理由、`graph_status` 语义、重建确定性独立命名、`CompactionReport` 三体积）。**核心实现可开工** |
-| **Step 4** | S4-01 `flush` 侧幽灵向量防线（设计期新发现） | ⬜（建议独立小 PR 先合） |
+| **Step 4** | T7-12 墓碑物理回收（compaction，含 manifest 重发）/ S4-03~S4-07 | ✅ **已完成并合并**（核心 PR #30 → `6f34ef2`，2026-09-09；含评审响应：无墓碑早退、`bytes_before=None` 诚实语义、失败语义 rustdoc） |
+| **Step 4** | S4-01 `flush` 侧幽灵向量防线（设计期新发现） | ✅ 已完成（PR #29 → `1efc128`，2026-09-09） |
+| **Step 4** | S4-08 CLI `helix compact` + S4-09 churn workload 实测 + S4-10 文档回写 | ✅ **已完成并合并**（PR #31 → `ac9fcbe`；集成测试补强 `aed8829`：CLI 语义 5 例 + compaction 场景 3 例） |
 | **Step 5** | T7-22 低选择度暴力兜底 | ⬜ |
 | **Step 5** | T7-23 `query::Metrics` 可观测化 | ⬜ |
 | **Step 6** | T7-09 embed 并行（**先 E1/E2/E3 spike**） | ⬜ |
