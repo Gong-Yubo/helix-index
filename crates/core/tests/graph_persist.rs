@@ -112,16 +112,24 @@ fn topk_searcher(s: &helix_core::search::Searcher, q: &str, k: usize) -> Vec<(u3
         .collect()
 }
 
-/// 用**精确线性扫描**（`BruteForceIndex`）算 oracle Top-K 的 chunk_id 集合。
+/// 用**精确线性扫描**（`BruteForceIndex`）建 oracle 索引（一次建好，可反复查询）。
 ///
 /// 测试 embedder 是确定性的，因此可以脱离索引重建同一批向量；HNSW 是近似索引，
-/// 与它比对才有意义（设计文档 §8 对 T3/T6 要求的「重合率 ≥ 0.95」口径）。
-fn oracle_ids(texts: &[String], q: &str, k: usize) -> Vec<u32> {
+/// 与它比对才有意义（设计文档 §8 对 T13 要求的「重合率」口径）。
+///
+/// 单独暴露「建索引」这一步是为了**复用**：早期实现每条 query 都重建一遍整库
+/// （T6 是 20 次 × 200 篇、T13 是 20 次 × 1200 篇），白算。
+fn oracle_index(texts: &[String]) -> BruteForceIndex {
     let mut b = BruteForceIndex::new();
     for (i, t) in texts.iter().enumerate() {
         b.add(i as u32, NormalizedVector::new(hash_vec(t, DIM)))
             .unwrap();
     }
+    b
+}
+
+/// 在既有的 oracle 索引上取 Top-K 的 chunk_id 集合。
+fn oracle_topk(b: &BruteForceIndex, q: &str, k: usize) -> Vec<u32> {
     let qv = NormalizedVector::new(hash_vec(q, DIM));
     b.search(&qv, k)
         .unwrap()
@@ -330,13 +338,48 @@ fn T5_截断图文件不panic() {
 }
 
 /// **S2-T6** 旧快照兼容（无 sidecar 的 FORMAT_VERSION=2 快照）。
+///
+/// # 质量门为什么是两条**不变式**，而不是「与 oracle 的重合率」数值阈值
+///
+/// 旧门是「20 个 query 的 Top-10 与 `BruteForceIndex` oracle 的重合率**均值 ≥ 0.90**」。
+/// CI 上出现过一次 `均值 0.545 / 最差 0.200`（近 25 次 run 出现 1 次，**重跑同 commit 即绿**）。
+/// 该值**落在抖动分布之外**：本地 64 次（50 单测 + 6 次整二进制并行）落在 0.990~1.000，
+/// 评审方 30 轮**每轮重新建图**（=30 个不同拓扑）实测单轮均值最低 0.995、单 query 最低 0.900。
+/// ⇒ 它是一次**尚未归因的异常**：既不能读成「阈值太紧」，也不能读成「绝对阈值不可用」。
+/// 唯一的定量解释 `0.545 ≈ k²/N = 10²/200` 是**有条件**的：它只说明「**若**检索退化为任意
+/// 返回 10 条，重合率会是这个量级」，**并不蕴含**拓扑抖动可以产生这个值
+/// （前者是后者的必要条件、不是充分条件——初版把这条推反了）。
+///
+/// 所以本测试的立场是：**把不可归因的数值门换成可归因的不变式**——同样会红，但红得能指出
+/// 是「内容缺失」「向量 / ID 灌错」还是「图不可导航」。**issue #34 的根因仍未定位**；
+/// 重合率降级为诊断打印（且**先打印、后断言**，免得失败时反而看不到量级）。
+///
+/// # 两条不变式（都与图拓扑无关，故不 flaky）
+///
+/// 1. **内容覆盖（结构层）**：`graph_points == raw_vectors == N`。
+/// 2. **自匹配（检索层，覆盖全部 N 篇）**：查询文本与文档 `i` 完全相同 ⇒ 向量逐位相同 ⇒
+///    相似度全局最大 ⇒ 文档 `i` 必须排第一、相似度≈1。
+///    ⚠️ 前提（写死在此，勿当普适结论）：① `ef_search ≥ 语料规模`（本测试 200/200；
+///    §8.6 的 ef 校准范围是 100/200/400）；② doc `i` 的 chunk 文本 == query 文本。
+///
+/// ⚠️ 两条**都要有**，且**覆盖必须到全部 N 篇**：只查 20 篇时，20 条 query 恰好覆盖文档
+/// 0..19，于是「重建只灌了前 30 篇」这类**内容缺失**（重合率已掉到 0.22）也能三查全绿。
+///
+/// ⚠️ 曾考虑但**不采用**的第三条（评审建议的「全量检索 id 集合 == 全量 id 集合」）：
+/// **它本身会 flaky**。实测 `top_n(N)` 的返回值随建图拓扑在 198~200 之间跳（7 次里
+/// 4 次 200 条、2 次缺 1 个、1 次缺 2 个：缺 `{190}` / `{199}` / `{144,198}` / `{174,198}`）。
+/// 机理是 `level ≥ 1` 的点**不在 layer 0**（`hnsw.rs:500-511`：`generate_new_point` 只把新点
+/// 推进**它自己那一层**，不回填低层），只能靠上层下降时被访问到，而访问得没访问到取决于拓扑
+/// ⇒ 「取不回全部点」是**固有现象、不是缺陷**，不能当断言。
 #[test]
 fn T6_旧快照无图可加载() {
+    const N: usize = 200;
+
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("legacy.idx");
     {
         let mut idx = builder().build();
-        for i in 0..200 {
+        for i in 0..N {
             idx.add(format!("旧文档 {i}")).unwrap();
         }
         idx.save(&path).unwrap();
@@ -350,68 +393,101 @@ fn T6_旧快照无图可加载() {
         "旧快照应降级重建"
     );
 
-    // 质量断言（评审 #14 发现 1：原实现只断言「非空」，等于没验收）。
-    //
-    // ⚠️ **本断言刻意不再用「与 oracle 的 Top-10 重合率」做绝对阈值**（issue #34）：
-    // `hnsw_rs` 的层级分配用 `StdRng::from_os_rng()` 且**没有注入口**
-    // （`LayerGenerator::new` `hnsw.rs:325-328`；`PointIndexation::new` `:447-457`
-    // 内部自建，`rng` 字段私有）⇒ **同一份数据每次建图的拓扑都不同**。而本口径下
-    // 「检索退化成任意返回 10 条」的重合率期望恰为 `k²/N = 10²/200 = 0.5`
-    // （CI 实测过一次 0.545 / 最差 0.200，与随机抽取**在统计上不可分辨**）⇒
-    // 「拓扑抖动」与「重建真坏了」在这个指标上**无法区分**，任何绝对阈值都会 flaky。
-    //
-    // 改用**拓扑无关**的不变式：查询文本与文档 `i` 完全相同 ⇒ 向量逐位相同 ⇒
-    // 距离是全局最小。只要重建把**正确的向量按正确的 ID** 灌进了**可导航**的图，
-    // 它就必然排第一。这既守住了「验收不等于非空」的实质，又不受层级/邻居随机性影响。
-    // 跨实现的召回覆盖由 S2-T13（并行 vs 串行，**相对**口径）承担。
-    let texts: Vec<String> = (0..200).map(|i| format!("旧文档 {i}")).collect();
-    let s = builder().load(&path).unwrap().into_searcher().unwrap();
-    let queries = 20;
-    // 仅诊断输出，不做断言（理由见上）。
-    let mut overlap_sum = 0.0f64;
-    for i in 0..queries {
-        let q = format!("旧文档 {i}");
-        let got = topk_searcher(&s, &q, 10);
-        assert_eq!(got.len(), 10, "query {i} 应能取满 10 条");
+    // ---- 不变式 1：内容覆盖（结构层，与检索行为 / 拓扑都无关） ----
+    let st = loaded.tombstone_stats();
+    eprintln!(
+        "[T6] 重建后：图点数 {} / 快照向量条数 {} / 期望 {N}",
+        st.graph_points, st.raw_vectors
+    );
+    assert_eq!(st.raw_vectors, N, "前提自检：快照里应有 {N} 条向量");
+    assert_eq!(
+        st.graph_points, st.raw_vectors,
+        "重建后的图点数应等于快照向量条数（{N}）：少一个就说明重建**丢了内容**\
+         ——这与拓扑抖动无关，是一类独立的退化"
+    );
 
-        // ① 自匹配：自身文档必须在 Top-K 内。它是相似度最高的点，找不到就说明
-        //    **图不可导航**或**向量 / ID 灌错**——正是「只断言非空」漏掉的真退化。
-        assert!(
-            got.iter().any(|(id, _)| *id == i as u32),
-            "query {i} 的自身文档未出现在 Top-10 中，实得 {:?}；\
-             降级重建后的图不可导航，或灌入的向量 / ID 有误（issue #34）",
-            got.iter().map(|(id, _)| *id).collect::<Vec<_>>()
+    let texts: Vec<String> = (0..N).map(|i| format!("旧文档 {i}")).collect();
+    let s = loaded.into_searcher().unwrap();
+    // oracle 只建一次再复用（早先实现每条 query 重建一遍整库，白算）。
+    let oracle = oracle_index(&texts);
+
+    // ---- 不变式 2：自匹配，**全部 N 篇**逐篇 ----
+    // 先算完、先打印诊断，再断言：断言一失败就不该再执行诊断，
+    // 否则最需要的量级线索（「均值 + 最差」正是 #34 的原始线索）反而看不到。
+    // 一条 query 的原始结果：先全部算完 → 打印诊断 → 最后才断言。
+    struct Row {
+        i: usize,
+        got: Vec<(u32, f32)>,
+        oracle: Vec<u32>,
+    }
+    let rows: Vec<Row> = (0..N)
+        .map(|i| {
+            let q = format!("旧文档 {i}");
+            Row {
+                i,
+                got: topk_searcher(&s, &q, 10),
+                oracle: oracle_topk(&oracle, &q, 10),
+            }
+        })
+        .collect();
+
+    let mut overlap_sum = 0.0f64;
+    let mut overlap_worst = 1.0f64;
+    let mut self_fail = 0usize;
+    for row in &rows {
+        let ids: Vec<u32> = row.got.iter().map(|(id, _)| *id).collect();
+        // 1-based 排名；None = 未进 Top-10。
+        let rank = ids.iter().position(|id| *id == row.i as u32).map(|r| r + 1);
+        let ov = overlap(&ids, &row.oracle);
+        overlap_sum += ov;
+        overlap_worst = overlap_worst.min(ov);
+        if rank != Some(1) {
+            self_fail += 1;
+        }
+        eprintln!(
+            "[T6] query {}: 自身文档排名 {rank:?} / top1 相似度 {:.6} / 与 oracle 重合率 {ov:.3}",
+            row.i,
+            row.got.first().map_or(f32::NAN, |(_, sc)| *sc)
         );
-        // ② 且它必须排第一、相似度≈1。`hits.score` 是**余弦相似度**而不是距离：
-        //    `hnsw_rs_index.rs:5-7` 约定实现统一输出 `d² = 2−2cos`，retriever 再换算
-        //    `score = 1 − d²/2 = cos` ⇒ 自匹配（d² = 0）的得分是 **1**，不是 0。
-        //    不同文本的向量互不相同（确定性 embedder）⇒ 最大值唯一。
-        //    容差 1e-3：`DistDotClamped` 的 clamp 与求和舍入会让它略小于 1。
-        let (top_id, top_score) = got[0];
-        assert_eq!(
-            top_id, i as u32,
-            "自身文档应排第一，实测首位 {top_id}（相似度 {top_score}）"
-        );
-        assert!(
-            (top_score - 1.0).abs() < 1e-3,
-            "自身文档的余弦相似度应≈1，实测 {top_score}"
-        );
-        // ③ oracle 侧同一不变式（确定性），顺带钉住本测试依赖的前提：
-        //    第 i 篇文档的 `chunk_id == i`。
-        let oracle = oracle_ids(&texts, &q, 10);
-        assert_eq!(
-            oracle[0], i as u32,
-            "oracle 应把自身文档排第一（同时钉住「第 i 篇 chunk_id == i」这一前提）"
-        );
-        // 诊断：与 oracle 的 Top-10 重合率，**只打印不断言**。保留它是为了
-        // issue #34 那类「检索退化为任意返回」若再现时，日志能直接给出量级。
-        overlap_sum += overlap(&got.iter().map(|(id, _)| *id).collect::<Vec<_>>(), &oracle);
     }
     eprintln!(
-        "[T6] 降级重建后 {queries} 个 query 自匹配均为 Top-1（拓扑无关口径）；\
-         与 oracle 的 Top-10 重合率均值 {:.3}（仅诊断，不断言）",
-        overlap_sum / queries as f64
+        "[T6] 降级重建：{N} 篇自匹配失败 {self_fail} 篇；与 oracle 的 Top-10 重合率 \
+         均值 {:.3} / 最差 {:.3}（**仅诊断，不断言**）",
+        overlap_sum / N as f64,
+        overlap_worst
     );
+
+    for row in &rows {
+        // ① 自匹配：**必须排第一**。排第一 ⇒ 必然在 Top-K 内，故不再单列「在 Top-K 内」——
+        //    报错信息里已列出实得 Top-10，「找不到」一眼可读（两条分工合并的理由）。
+        //    找不到 = **图不可导航** 或 **向量 / ID 灌错**，正是「只断言非空」漏掉的真退化。
+        assert_eq!(
+            row.got.first().map(|(id, _)| *id),
+            Some(row.i as u32),
+            "query {} 的自身文档应排第一；实得 Top-10 = {:?}（若无 {}，说明降级重建后的图 \
+             不可导航，或灌入的向量 / ID 有误，issue #34）",
+            row.i,
+            row.got.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            row.i
+        );
+        // ② 且相似度≈1：`hits.score` 是**余弦相似度**而非距离——`hnsw_rs_index.rs:5-7` 约定
+        //    实现统一输出 `d² = 2−2cos`，retriever 再换算 `score = 1 − d²/2 = cos`
+        //    ⇒ 自匹配（d² = 0）的得分是 **1**，不是 0。不同文本的向量互不相同
+        //    （确定性 embedder）⇒ 最大值唯一。容差 1e-3：clamp 与求和舍入让它略小于 1。
+        let top_score = row.got[0].1;
+        assert!(
+            (top_score - 1.0).abs() < 1e-3,
+            "query {} 的自身文档余弦相似度应≈1，实测 {top_score}（向量与查询不同源？）",
+            row.i
+        );
+        // ③ oracle 侧同一不变式（精确扫描，确定性），顺带钉住本测试依赖的前提：
+        //    第 i 篇文档的 `chunk_id == i`。
+        assert_eq!(
+            row.oracle.first().copied(),
+            Some(row.i as u32),
+            "oracle 应把自身文档排第一（同时钉住「第 i 篇 chunk_id == i」这一前提）"
+        );
+    }
 }
 
 /// **S2-T7** 逃生舱不破：Brute 后端加载含图快照 → 忽略图。
@@ -694,6 +770,8 @@ fn T13_并行建图质量等价() {
     // （设计文档 §8 对 T13 的口径）。此前只断言「非空」，等于串行 vs 串行也绿。
     let sp = par.into_searcher().unwrap();
     let ss = seq.into_searcher().unwrap();
+    // oracle 只建一次再复用（1200 篇 × 20 条 query，没必要每条重建）。
+    let oracle_idx = oracle_index(&texts);
     let mut sum_par = 0.0f64;
     let mut sum_seq = 0.0f64;
     let queries = 20;
@@ -710,7 +788,7 @@ fn T13_并行建图质量等价() {
         assert_eq!(a.len(), 10, "并行库 query {i} 应召回 10 条");
         assert_eq!(b.len(), 10, "串行库 query {i} 应召回 10 条");
 
-        let oracle = oracle_ids(&texts, &q, 10);
+        let oracle = oracle_topk(&oracle_idx, &q, 10);
         sum_par += overlap(&a, &oracle);
         sum_seq += overlap(&b, &oracle);
     }
@@ -728,7 +806,13 @@ fn T13_并行建图质量等价() {
         (r_par - r_seq).abs() < 0.05,
         "并行与串行相对 oracle 的重合率差应 < 5 个百分点，实测 并行 {r_par:.4} vs 串行 {r_seq:.4}"
     );
-    // 质量底线：两条路径本身都不能离谱
+    // 质量底线：两条路径本身都不能离谱。
+    // ⚠️ 这两条是**绝对**阈值，与 T6 撤掉的那条门不是同一个口径，别被「T6 说绝对值不可用」带跑：
+    // ① 本测试 N=1200 > `ef_search`=200 ⇒ 是**真正的近似检索**，重合率本就不到 1.0，
+    //    用 0.90 这种粗底线挡「并行回落到串行以下 2 个数量级」是对的；
+    // ② T6 撤门**不是**因为「绝对值不可用」，而是因为 CI 那次 0.545 无法归因
+    //    （见 issue #34 与本文件 T6 的文档注释）——成因不同，处置不同。
+    // 实测余量约 9pp（评审 3 次：1.0000/1.0000、1.0000/1.0000、0.9950/0.9900）。
     assert!(r_par >= 0.90, "并行库与 oracle 重合率过低: {r_par:.4}");
     assert!(r_seq >= 0.90, "串行库与 oracle 重合率过低: {r_seq:.4}");
 }
