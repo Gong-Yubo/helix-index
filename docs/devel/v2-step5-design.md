@@ -7,11 +7,11 @@
 
 | 项 | 内容 |
 | --- | --- |
-| 版本 | **v0.1（首版，待评审）** |
+| 版本 | **v0.2（评审响应版，待二次评审）** |
 | 日期 | 2026-09-10 |
 | 状态 | **待评审**。决策 D-S5-01 / 03 / 05 阻塞实现开工；D-S5-02 / 04 的**数值**由标定实验（S5-04）回填 |
-| 修订记录 | v0.1 首版：现状源码级定位（§2，含 `Metrics` 四处断链与新发现的早退路径 `took` 恒 0）、**`hnsw_rs` 存储访问能力核实（§3.1 / 附录 C，本文关键技术前提）**、三路径设计（§4）、9 个决策 D-S5-01~09、S5-T1~T13 测试计划、S5-01~S5-08 任务拆分、风险 R31~R35 与未决 Q1~Q5 |
-| 上游 | `plan-v2.md` §4 Step 5 / issue **#22**（V2-Step5）/ `requirements-spec.md` v1.9（**NFR-13** Should）/ `architecture-design.md` §8.3（可观测性）、§14.1（R11 / R13 / R17 / **R18**）/ `v2-step1-design.md` §5.7（A/B 双路径）/ `eval-report.md` §8.5~§8.6（S1-10 实测） |
+| 修订记录 | v0.1 首版：现状源码级定位（§2，含 `Metrics` 四处断链与新发现的早退路径 `took` 恒 0）、**`hnsw_rs` 存储访问能力核实（§3.1 / 附录 C，本文关键技术前提）**、三路径设计（§4）、9 个决策 D-S5-01~09、S5-T1~T13 测试计划、S5-01~S5-08 任务拆分、风险 R31~R35 与未决 Q1~Q5。<br>**v0.2 评审响应（PR #33 评审）**：① **纠正 v0.1 的关键技术前提**——`get_layer_iterator(0)` **不是**全量遍历（会漏掉 level ≥ 1 的点，实测 N=5000 时漏 187 个 = 3.74%），全量遍历的正确 API 是 `&PointIndexation` 的 `IntoIterator`；v0.1 把两个 API 的安危判断**写反了**（详见 §3.1 / 附录 C，已用探针独立复现）。② D-S5-08 范围由「一条早退路径」扩为**两条**（§2.5）。③ `distance_sq` 改为转发 `distance_to_slice`，把 I4 从"巧合"变"结构"（§4.2.5）。④ 修正 R11~R18 的架构引用（在 §14 **章级主表**，非 §14.1）。⑤ 修正 CHANGELOG 中"`plan-v2.md` 未改动"的自相矛盾。 |
+| 上游 | `plan-v2.md` §4 Step 5 / issue **#22**（V2-Step5）/ `requirements-spec.md` v1.9（**NFR-13** Should）/ `architecture-design.md` §8.3（可观测性）、**§14 章级主表 `:1449-1456`（R11 / R13 / R17 / R18）**/ `v2-step1-design.md` §5.7（A/B 双路径）/ `eval-report.md` §8.5~§8.6（S1-10 实测） |
 | 范围 | **T7-22** 低选择度精确兜底（R18）+ **T7-23** `query::Metrics` 可观测化 + 阈值标定实验 + CLI/bench 观测入口 |
 | 非范围 | **prefilter 结构**（索引侧预过滤位图，V2.1 议题，判据正是本 Step 暴露的 `vector_shortfall`）；**降级字段的 `doc_bits_scan` O(N) 全扫**（Step 1 已接受的残余，Q-I1 的边界，与向量路正交）；并发检索压测（**Step 6** / T7-17，本 Step 是它的前置）；读写并发 / 在线 compaction（**Step 8**）；横切任务 T7-21（`parallel_build` 默认翻转）、T7-24（工程卫生） |
 
@@ -25,12 +25,12 @@
 | --- | --- | --- | --- | --- |
 | **D-S5-01** | **精确兜底的落点**：放 `VectorIndex` 张（后端自己拥有策略）还是在编排层（把 `raw_vectors` 视图接进 `SearchParts`） | **放 `VectorIndex` 层**：新增必需方法 `search_exact_filtered` + 默认钩子 `prefers_exact(&dyn CandidateFilter) -> bool`。理由：**零 plumbing**——门面 `Searcher`、逃生舱 `QueryExecutor`、bench 三条入口全都自动受益；`BruteForceIndex` 的精确性由**类型**表达（它天然满足）。编排层方案被否决：要新增一条"精确向量源"通道，且 bench/逃生舱都得跟着接线，同一策略出现两个装配点 | ⏳ 待拍板 | 阻塞 S5-01~03 |
 | **D-S5-02** | 兜底的**适用面与默认阈值** | **只作用 `FilterKind::Filtered`**，热路径（`None` / `Alive`）**一行不改**（保 R15 的 fast-return 不回归）；阈值以 `Option<usize>` 表达，`None` = 关闭（供 A/B 回归对照），默认值**待 §4.9 标定**，初值取 **1024**（理论分界 ≈ `ef`，见 §4.3） | ⏳ 数值待标定 | 阻塞 S5-03 |
-| **D-S5-03** | 精确扫描的**候选来源** | **方案 A：遍历向量存储本身**（`HnswRsIndex` 迭代 layer 0；谓词逐点判定、只对通过的点算距离）。代价 `O(N)` 次谓词判定 + `O(allowed)` 次距离；**零新增状态**。方案 B（枚举 allowed + `origin→PointId` 映射，做到纯 `O(allowed)`）列为"标定不达标再上"的备选（§4.2.3） | ⏳ 待拍板 | 阻塞 S5-01 |
+| **D-S5-03** | 精确扫描的**候选来源** | **方案 A：遍历向量存储本身**（`HnswRsIndex` 用 `&PointIndexation` 的 `IntoIterator` **全量**遍历；谓词逐点判定、只对通过的点算距离）。代价 `O(N)` 次谓词判定 + `O(allowed)` 次距离；**零新增状态**。方案 B（枚举 allowed + `origin→PointId` 映射，做到纯 `O(allowed)`）列为"标定不达标再上"的备选（§4.2.3） | ⏳ 待拍板 | 阻塞 S5-01 |
 | **D-S5-04** | **NFR-13 的预算口径与数值** | 口径 = **端到端 P99（含过滤求值）**，10 万级、选择度 ≤1% 档位，**拟 ≤ 20ms**（与 NFR-02 同量级）。理由：只报"向量路"会掩盖降级字段档位上 `doc_bits_scan` 那 ~8ms；bench 必须**同时**打印 `filter_eval` / `vector_route` / `vector_shortfall`，才能区分"兜底没生效"与"兜底生效但过滤求值本身贵"。数值由 §4.9 标定后回填需求文档 | ⏳ 数值待标定 | 阻塞 S5-04 |
 | **D-S5-05** | `Metrics` 的**承载方式** | **进 `SearchResponse` 新字段 `metrics`** + 在 `query/mod.rs` 再导出 `Metrics`；`tracing::info!` 通道**保留**（二者一个给宿主、一个给调用方）。理由：只有进响应，外部才能**单测**、bench 才能**采集**——这正是 issue #7 / #22 的原始诉求。代价是 `SearchResponse` 是公开结构体、字段全 `pub`，加字段会破坏外部**字面量构造**；库内只有 `searcher.rs:268` / `:413` 两处，记入 CHANGELOG `⚠️ 破坏性` | ⏳ 待拍板 | 阻塞 S5-05/06 |
 | **D-S5-06** | 是否补 **per-lane 耗时** | **补**（`bm25_elapsed` / `vector_elapsed`）。Hybrid 走 `rayon::join`（`searcher.rs:164-167`），单一 `took` 无法归因"是哪一路慢"；架构 §8.3 的示例日志本就预期 `bm25=1.4ms(vector=6.1ms parallel)`。实现形状：lane 闭包返回 `(Result<Vec<Scored>>, Duration)` | ⏳ 评审无异议即可执行 | 阻塞 S5-05 |
 | **D-S5-07** | **路径可见性**（T7-22 的 A/B 判据） | **`Metrics.vector_route: VectorRoute { None, Ann, Exact }`**。`None` = 未走向量路（Bm25 模式）；`Ann` = 走了 ANN（可能近似）；`Exact` = 走了精确扫描（保证 `min(k, allowed)` 条且无召回缺口）。**没有它，"兜底是否真的生效"只能靠延迟反推**——正是 Step 1 吃过的亏（重合率当召回读） | ⏳ 评审无异议即可执行 | 阻塞 S5-05 |
-| **D-S5-08** | 早退路径 `metrics.took` 恒为 0 的修法 | **修**。`searcher.rs:125-127`（过滤排空的那条早退）设了 `filter_eval` 就直接 `log`，`took` 仍是 `Duration::ZERO` ⇒ 日志里 `took_ms=0` 是**假数据**。属观测正确性缺陷，与 T7-23 同主题（§2.5） | ⏳ 评审无异议即可执行 | 阻塞 S5-05 |
+| **D-S5-08** | 早退路径 `metrics.took` 恒为 0 的修法 | **修（两条路径）**。`searcher.rs:99-104`（`index_is_empty`，**连 `metrics.log` 都不调**）与 `:125-127`（过滤排空）都漏设 `took`，保持 `Duration::ZERO` ⇒ 日志里 `took_ms=0` 是**假数据**（响应 `took` 反而是真值）。属观测正确性缺陷，与 T7-23 同主题（§2.5） | ⏳ 评审无异议即可执行 | 阻塞 S5-05 |
 | **D-S5-09** | 是否顺带治理**降级字段** `doc_bits_scan` 的 `O(N)` 全扫 | **不做**。它与向量路正交（是**过滤求值**贵，不是召回贵），Step 1 已按"接受并测量"结案（S1-10 结论②）；本 Step 只把它**计入 NFR-13 预算**并在 bench 单列，避免"兜底做完却仍在预算外"被误判为兜底失败 | ⏳ 评审无异议即可执行 | 无 |
 
 ---
@@ -75,8 +75,8 @@ S1-10 在 **10 万级**合成语料上测出的三元数据（`plan-v2.md` §4 S
 | NFR-02（Must） | 1 万级 hybrid P99 < 20ms；**不得退化** | 热路径一行不改（D-S5-02）；S5-T7 钉住 R15 不回归 |
 | NFR-07（Must） | 可观测：不得静默降级 | `Metrics` 进响应 + `vector_route` + 修早退 `took`（D-S5-05/07/08） |
 | **NFR-10 / NFR-11（Should，Step 6）** | 并发读吞吐 / 增量可见性与写延迟 | 本 Step 是**前置**（D-S5-05 的可观测化） |
-| R18（架构 §14.1） | 低选择度延迟爆炸 | T7-22 结案（含 recall 侧的意外收益，§4.4） |
-| R11 / R13 / R17（架构 §14.1） | filtered-ANN 召回不足 / `search_filter` 结构性整图遍历 / hnsw 固有近似误差 | 精确路径在低选择度档位**同时消掉**这三条的可见影响（§4.4） |
+| R18（架构 **§14 主表** `:1456`） | 低选择度延迟爆炸 | T7-22 结案（含 recall 侧的意外收益，§4.4） |
+| R11 / R13 / R17（架构 **§14 主表** `:1449-1455`） | filtered-ANN 召回不足 / `search_filter` 结构性整图遍历 / hnsw 固有近似误差 | 精确路径在低选择度档位**同时消掉**这三条的可见影响（§4.4） |
 | FR-27（Must） | 过滤下推 + 字段索引 | 不动；精确路径复用同一 `CandidateFilter` 契约 |
 
 ### 1.3 验收标准（Step 5 完成的定义，可证伪）
@@ -87,7 +87,9 @@ S1-10 在 **10 万级**合成语料上测出的三元数据（`plan-v2.md` §4 S
    vector / hybrid P99 与 Top-K 序列**逐位一致**（消 R15 复发；不是"看起来差不多"）。
 3. **精确性可证**：同一 `(query, 谓词, k)` 下，`HnswRsIndex::search_exact_filtered` 与
    `BruteForceIndex` 的 Top-K **逐位一致**（`(chunk_id, distance)` 序列），
-   且返回条数 `== min(k, allowed)`。
+   且返回条数 `== min(k, allowed)`。**前置条件**：全量点遍历必须覆盖**每一层**的点
+   （不能只走 layer 0，见 §3.1 / 附录 C 的纠正）；另配一条**定向用例**——
+   取一个 `level ≥ 1` 的点，用**它自己的向量**查询，断言它排第一（距离 0）。
 4. **`Metrics` 可测可采**（issue #22 第二条验收）：`Metrics` 至少 **1 条单测** +
    **1 处 bench 采集点**（`--json` 输出同时含 `vector_route` 与 `vector_shortfall`）；
    `query::Metrics` 从 `query` 模块可 `use`。
@@ -148,22 +150,34 @@ R18 的对策在 D-J9 时已经定死：**`allowed` 小于阈值时绕开 ANN、
 Step 1 已经把 `vector_shortfall` 的**口径**修对了（归一到 `min(candidate_k, allowed)` 而非裸 `candidate_k`，
 `searcher.rs:174-179`，理由见 `metrics.rs:36-43`）。本 Step 只需补"能看见"这一半。
 
-### 2.5 设计期新发现：早退路径的 `took` 恒为 0
+### 2.5 设计期新发现：早退路径的 `metrics.took` 恒为 0（**两条**，非一条）
 
-`searcher.rs:110-129` 是"过滤把文档排空"的早退分支。它的尾部是：
+`search_parts` 共有**三条**早退路径。逐条核对 `metrics.took` 的赋值：
+
+| # | 早退路径 | 位置 | `metrics.took` | `metrics.log` |
+| --- | --- | --- | --- | --- |
+| 1 | `index_is_empty`（索引无文档） | `searcher.rs:99-104` | ❌ **未设**（保持 `Duration::ZERO`） | ❌ **不调用** |
+| 2 | 过滤把文档排空 | `searcher.rs:110-129` | ❌ **未设** | ✅ `:126` |
+| 3 | 融合后候选为空 | `searcher.rs:199-215` | ✅ `:212` | ✅ `:213` |
+
+三条路径的**响应** `took` 都是真值——`empty_response(reason, started)`（`:409-419`）内部
+就是 `took: started.elapsed()`。于是路径 1 / 2 出现"**日志与响应各说一套**"：
 
 ```rust
+// 路径 2（searcher.rs:125-127）尾部
 metrics.filter_eval = t0.elapsed();
-metrics.log(query);                       // ← 此时 metrics.took 仍是 Duration::ZERO
-return Ok(empty_response(reason, started));  // ← 而响应里的 took 是真实耗时
+metrics.log(query);                          // ← 此时 metrics.took 仍是 Duration::ZERO
+return Ok(empty_response(reason, started));   // ← 而响应里的 took 是真实耗时
 ```
 
-于是**日志与响应各说一套**：`tracing` 输出 `took_ms=0`，响应里 `took` 是真实值。
-同类早退的第二处（`searcher.rs:199-215` 融合后为空）反而**设了** `metrics.took = started.elapsed()`（`:212`）。
-⇒ 两处不一致，属观测正确性缺陷，与 T7-23 同主题，**并入 S5-05 一起修**（D-S5-08）。
+⇒ 属观测正确性缺陷，与 T7-23 同主题，**并入 S5-05 一起修**（D-S5-08）。
+`I7`（§4.8）一旦把 `metrics` 装进响应，路径 1 / 2 会立刻违反 `metrics.took == took`，
+而**已有的 `I8` / `S5-T8` 是按"三条"写的**——测试写对了，v0.1 的修法写少了。
 
-> 复核方式：`grep -n "metrics.log" crates/core/src/query/searcher.rs` 共 3 处（`:126` / `:213` / `:266`），
-> 只有第 1 处漏设 `took`。
+> ⚠️ **复核方式的陷阱**（v0.1 踩到）：`grep -n "metrics.log" crates/core/src/query/searcher.rs`
+> 只能看到 **`:126` / `:213` / `:266` 三处**——路径 1（`:99-104`）**根本不调用 `metrics.log`**，
+> 所以单靠 grep 该符号**结构上永远找不出它**。正确复核方式是**枚举所有 `return` 语句**：
+> `grep -n "return Ok(" crates/core/src/query/searcher.rs`，再逐个看是否设了 `took`。
 
 ---
 
@@ -172,25 +186,66 @@ return Ok(empty_response(reason, started));  // ← 而响应里的 took 是真�
 ### 3.1 【关键技术前提】`hnsw_rs` 0.3.4 的存储访问能力（源码核实）
 
 Step 1/2 已核实它的三条硬事实（无 remove API、图双文件、`'a: 'b` 只能 `Box::leak`）。
-Step 5 需要第四条：**能不能拿到已入库的向量**。核实结论：**能，且零拷贝**（完整记录见附录 C）：
+Step 5 需要第四条：**能不能拿到已入库的向量**。核实结论：**能，且零拷贝**（完整记录见附录 C）。
+
+⚠️ **v0.2 重要纠正**：v0.1 曾断言"`get_layer_iterator(0)` 即全量点遍历"，**这是错的**，
+且错的方向是让精确扫描**静默错答**（漏掉约 `1/M` 的点，不是变慢、不是少召回，是答错）。
+下表已按核实结果改正，**遍历 API 的正确选择是本文的关键技术前提**：
 
 | API | 位置 | 语义 | 对本文的意义 |
 | --- | --- | --- | --- |
 | `Hnsw::get_point_indexation() -> &PointIndexation` | `hnsw.rs:1279` | 暴露点索引结构 | 取得遍历入口 |
-| `Hnsw::get_layer_iterator(layer) -> IterPointLayer` | `hnsw.rs:614-616` | **只迭代指定层** | `layer=0` 即"全部点各一次" |
+| **`IntoIterator for &PointIndexation`**（`IterPoint::new`） | `hnsw.rs:681-688`、`:631-641` | **从 layer 0 逐层上升到 `entry_point_level`** ⇒ **每个点恰好 yield 一次** | ✅ **这才是全量遍历的正确 API**（路径 C 用它） |
+| `Hnsw::get_layer_iterator(layer) -> IterPointLayer` | `hnsw.rs:614-616` | **只迭代传入的那一层** | ⚠️ **不是全量**：`layer=0` 会漏掉 `level ≥ 1` 的点（见下） |
 | `type Layer<'b,T> = Vec<Arc<Point<'b,T>>>` | `hnsw.rs:386` | 层 = 连续 `Arc` 数组 | 迭代是顺序读指针数组 |
 | `Point::get_v(&self) -> &[T]` | `hnsw.rs:204-206` | **零拷贝切片**（mmap 时为 mmap 视图） | 距离计算无需 copy |
 | `Point::get_origin_id(&self) -> usize` | `hnsw.rs:214-216` | **就是我们的 `ChunkId`** | 谓词与结果都只需它 |
 | `Hnsw::get_point_data(&PointId) -> Option<Vec<T>>` | `hnsw.rs:582-593` | 按 `PointId` **克隆**返回 | 只在方案 B 里用到（需 `origin→PointId` 映射） |
-| `IterPointLayer::next` | `hnsw.rs:715-723` | 只走 `pi_guard[layer]`，**不跨层** | ⚠️ 必须用 `get_layer_iterator(0)`，**不能用 `PointIndexation::into_iter()`**（后者跨层遍历，高层点会被**重复** yield） |
 
-两条结构性推论（写实现时不能忘）：
+**为什么 `get_layer_iterator(0)` 不是全量**：`generate_new_point` 把新点**只推入它自己那一层**，
+**没有"再补推 `0..level` 各层"的动作**：
 
-1. **每个插入点必然在 layer 0 出现且仅出现一次**（`hnsw.rs:504-511`，`p_id.0 = 0` 起步、
-   `p_id.1 = layer0.len()` 递增）⇒ `get_layer_iterator(0)` 的基数 == `get_nb_point()`。
-   这条可以写成断言（S5-T2）。
+```rust
+let level = self.layer_g.generate();
+let mut p_id = PointId(level as u8, -1);
+p_id.1 = points_by_layer_ref[p_id.0 as usize].len() as i32;
+let point = Point::new(data.to_vec(), origin_id, p_id);
+points_by_layer_ref[p_id.0 as usize].push(Arc::clone(&new_point));   // hnsw.rs:511 — 全文件唯一一处 push
+```
+
+而 `level = floor(-ln(u) · scale)`、`scale = 1/ln(max_nb_connection)`（`hnsw.rs:325-333`、`:358-368`）
+⇒ **`P(level ≥ 1) = 1/M`**。本项目 `MAX_NB_CONNECTION = 32`（`hnsw_rs_index.rs:19`）
+⇒ **约 3.1% 的点根本不在 layer 0**。
+
+**实测复现**（探针：`crates/core/examples/` 临时脚本，M=32 / N=5000 / DIM=64，2026-09-10）：
+
+```
+get_nb_point()                = 5000
+get_layer_iterator(0).count() = 4813       ← 缺 187 个（3.74%）
+into_iter().count()           = 5000       ← distinct=5000、dup=0
+per-layer counts              : 0=4813  1=183  2=3  3=1
+
+定向反例（取 level=1 的点，用它自己的向量查询，真值距离应为 0）：
+  layer-0 扫描 top-3 : [(3356, 23.96), (3209, 24.24), (1469, 24.39)]   ← 真值消失
+  全量 brute  top-3 : [(6, 0.0), (3408, 22.78), (3356, 23.96)]         ← 正确
+```
+
+> **flaky 风险**：`LayerGenerator` 用 `StdRng::from_os_rng()`（`hnsw.rs:328`）——
+> **哪 3% 被漏掉每次建图都不同**。所以"随机 Top-K 恰不含漏点"会让测试**时好时坏**；
+> 必须有一条**定向**用例（拿 `level ≥ 1` 的点自查询），不能只靠随机数据。
+
+三条结构性推论（写实现时不能忘）：
+
+1. **每个插入点只存在于它自己那一层**（`hnsw.rs:504-511`）⇒
+   - ⚠️ `get_layer_iterator(0)` 的基数 **≠** `get_nb_point()`（会少约 `1/M`）；
+   - ✅ **全量遍历必须用 `for point in hnsw.get_point_indexation()`**（`&PointIndexation` 的
+     `IntoIterator`）或**逐层 `for l in 0..=pi.get_max_level_observed() { pi.get_layer_iterator(l) }`**；
+     两者等价，基数 == `get_nb_point()`。**这条可以写成断言（S5-T2），且必须写**——
+     v0.1 的教训正是"把错误前提当事实写成断言"。
 2. **`PointId ≠ ChunkId`**：`PointId = (layer, slot)`，`ChunkId` 是 `origin_id`。
    **库没有公开 `origin_id → PointId` 的映射** ⇒ 方案 B 需要自建（§4.2.3）。
+3. **`get_layer_iterator(l)` 本身没有错**——它在"只需要某一层"时是正确工具；
+   错的是**拿它当全量遍历**。附录 C 保留了 v0.1 的误判记录，避免后人再踩。
 
 ### 3.2 现有抽象边界（不得为了本 Step 破坏）
 
@@ -296,17 +351,39 @@ pub trait VectorIndex: Send + Sync {
 fn search_exact_filtered(&self, query, k, filter) -> Result<Vec<(ChunkId, f32)>> {
     if k == 0 { return Ok(Vec::new()); }
     let mut out: Vec<(ChunkId, f32)> = Vec::new();
-    // 只走 layer 0（§3.1 推论 1：layer 0 恰好包含全部点一次）
-    for point in self.hnsw.get_point_indexation().get_layer_iterator(0) {
+    // ⚠️ 全量遍历：必须用 `&PointIndexation` 的 IntoIterator（逐层 0..=entry_point_level），
+    // 每点恰 yield 一次。**不可**用 get_layer_iterator(0)——它只走 layer 0，
+    // 会漏掉 level ≥ 1 的点（P = 1/M ≈ 3.1%，§3.1）。
+    for point in self.hnsw.get_point_indexation() {
         let id = point.get_origin_id() as ChunkId;
         if filter.is_none_or(|f| f.contains(id)) {
-            out.push((id, distance_to_slice(query, point.get_v())));
+            out.push((id, query.distance_to_slice(point.get_v())));
         }
     }
     out.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
     out.truncate(k.min(out.len()));
     Ok(out)
 }
+```
+
+等价的逐层写法（二者取一即可，`IntoIterator` 更短）：
+
+```rust
+let pi = self.hnsw.get_point_indexation();
+for l in 0..=pi.get_max_level_observed() as usize {
+    for point in pi.get_layer_iterator(l) { /* 同上 */ }
+}
+```
+
+> **排序与遍历顺序无关**（I4 的结构性依据）：`(distance, chunk_id)` 在**互异元素**上是**全序**
+> （`chunk_id` 唯一），故无论按哪种顺序遍历，排序后的 `(chunk_id, distance)` 序列**逐位相同**。
+> 比较子用 `total_cmp`（NaN 安全、确定性），与 `brute.rs:53-57` 的
+> `partial_cmp(..).unwrap_or(Ordering::Equal)` 仅在 NaN 输入下有别——而 NaN 会被
+> `NormalizedVector::new` 的范数计算外显，不是本路径的静默风险（S5-T3 会覆盖）。
+>
+> ⚠️ **I4 只能与 `BruteForceIndex` 比，不能与"兜底前的 ANN 基线"比**：路径 C 算 `Σ(a−b)²`，
+> 路径 A/B 算 `2·(1−dot)`（`hnsw_rs_index.rs:257` / `:284`，对应 `DistDotClamped::eval`
+> 的 `1 − clamp(dot)`，`hnsw_rs_index.rs:48-53`）。单位向量下二者**数学相等但浮点不逐位相等**。
 
 fn prefers_exact(&self, filter: &dyn CandidateFilter) -> bool {
     filter.kind() == FilterKind::Filtered
@@ -333,7 +410,7 @@ fn prefers_exact(&self, _filter: &dyn CandidateFilter) -> bool { true }  // 恒�
 | 成本 | `O(N)` 次谓词判定 + `O(allowed)` 次距离 | `O(allowed)` 次映射查找 + `O(allowed)` 次距离 |
 | 新增状态 | **无** | 一份 `origin_id → PointId`（或 `→ slot`）映射：10 万级 ≈ 0.4~1.6MB |
 | 维护点 | 无 | `add` / `add_batch` / `from_loaded` / compaction 重建图 **四处**必须同步；**并行建图**下顺序不确定 ⇒ 不能靠"插入序 == slot 序"省掉映射 |
-| 依赖的库能力 | `get_layer_iterator(0)`（§3.1，已核实） | 需 `CandidateFilter` 能**枚举** allowed（`&dyn` 下发返回 `Vec<ChunkId>`）+ `get_point_data`（按 `PointId` 克隆） |
+| 依赖的库能力 | **`&PointIndexation` 的 `IntoIterator`**（§3.1，已核实：每点恰一次） | 需 `CandidateFilter` 能**枚举** allowed（`&dyn` 下发返回 `Vec<ChunkId>`）+ `get_point_data`（按 `PointId` 克隆） |
 | 风险 | 100 万级时 `O(N)` 项重新成为瓶颈（R31） | 映射与图不同步会**静默错召回**（比慢更危险） |
 | 何时改选 | —— | **标定（§4.9）显示方案 A 在 10 万级 P99 进不了 NFR-13 预算**时 |
 
@@ -362,21 +439,34 @@ B 每次算一次 512 维距离（≈100ns 量级），C 每次做一次位图�
 ⇒ 理论上有 **5~20× 的常数差**，这正是"1~10ms vs 41~158ms"的来源。
 第①段的实测值是 S5-04 要标定的头号数字。
 
-#### 4.2.5 距离函数：新增一个不分配的切片版
+#### 4.2.5 距离函数：新增切片版，并让 `distance_sq` **转发**它
 
 `NormalizedVector::distance_sq(&self, other: &NormalizedVector)`（`point.rs:42-51`）要一个
 `&NormalizedVector`——精确扫描里对每个候选都 `NormalizedVector::new(point.get_v().to_vec())`
 会**逐点分配 + 重算范数**，把 ① 的成本放大到不可接受。
 
-⇒ 新增：
+⇒ 新增切片版，并让**既有的 `distance_sq` 转发到它**（而不是并排放第二份求和循环）：
 
 ```rust
 /// 与**已归一化**的切片算平方欧氏距离（不分配、不重归一化）。
 ///
 /// ⚠️ 前置条件：`other` 已 L2 归一化（图内数据天然满足）。
-/// 与 `distance_sq` 用**同一公式**（Σ(a−b)²），保证与 `BruteForceIndex` 的结果**逐位一致**（S5-T3）。
-pub fn distance_to_slice(&self, other: &[f32]) -> f32;
+pub fn distance_to_slice(&self, other: &[f32]) -> f32 {
+    self.0.iter().zip(other).map(|(a, b)| { let d = a - b; d * d }).sum()
+}
+
+/// 既有签名**保持不变**，实现改为**转发**上面那一个（`point.rs:42-51`）。
+pub fn distance_sq(&self, other: &NormalizedVector) -> f32 {
+    self.distance_to_slice(&other.0)
+}
 ```
+
+> **为什么必须转发**（评审意见）：若新写第二份 `Σ(a−b)²` 循环，则"精确路径与
+> `BruteForceIndex` 逐位一致"（I4 / S5-T3）就**只依赖两份循环恰好被编译器同样地归约**——
+> 没有任何东西强制，是一句会腐烂的断言。**单一实现 + 转发**把 I4 从"巧合"变"结构"：
+> `BruteForceIndex` 走 `query.distance_sq(v)`（`brute.rs:50`）⇒ 天然同源。
+> 转发后 `distance_sq` 走的就是同一个 `Σ(a−b)²` 归约（表达式与原实现同形），
+> 预期逐位相同；S5-01 附一条回归断言钉住，避免"重构顺手改了数值"。
 
 ### 4.3 阈值与策略（D-S5-02）
 
@@ -423,7 +513,7 @@ pub fn with_brute_fallback(mut self, max_allowed: Option<usize>) -> Self;
 1. **`vector_shortfall == 0` 不再等于"没有 prefilter 需求"**——它现在只说明"这一档走了精确路径"。
    判读时必须**连看 `vector_route`**（D-S5-07 的第二个用途）。
 2. **R11/R13/R17 在低选择度档位"可见影响消失"，但结构性成因仍在**（一旦 `allowed > 阈值` 又回到路径 B）。
-   ⇒ 架构 §14.1 的 R11/R13 不能标"已解决"，只能标"**低选择度子集已绕过**"。
+   ⇒ 架构 **§14 章级主表**（`:1449-1456`）的 R11/R13/R17/R18 不能标"已解决"，只能标"**低选择度子集已绕过**"。
 
 ### 4.5 `Metrics` 扩展（D-S5-05/06/07/08）
 
@@ -487,8 +577,9 @@ impl VectorRetriever<'_> {
 内部把 `Vec<(ChunkId, f32)> → Vec<Scored>`（`score = 1 - d/2`）与排序抽成一个私有函数，
 两条路径共用（现有实现见 `retriever/vector.rs:52-67`），**避免出现两份排序**。
 
-**同时修 D-S5-08**：给 `searcher.rs:125` 那条早退补 `metrics.took = started.elapsed();`，
-并把 `metrics` 装进 `empty_response`。
+**同时修 D-S5-08**：给 `searcher.rs:99-104`（`index_is_empty`）与 `:125-127`（过滤排空）
+**两条**早退各补一条 `metrics.took = started.elapsed();`（在 `metrics.log` 之前），
+并把 `metrics` 装进 `empty_response`（三条路径共用）。
 
 ### 4.6 `SearchResponse` 承载（D-S5-05）
 
@@ -525,12 +616,12 @@ pub struct SearchResponse {
 | --- | --- | --- |
 | I1 | `prefers_exact == false` 时，**结果逐位回退到现状**（路径 A/B 一字不改） | S5-T7 |
 | I2 | 精确路径每条结果都满足谓词（`None` 时= 不过滤、含幽灵） | S5-T2 / T5 |
-| I3 | 精确路径条数 `== min(k, 命中候选数)` | S5-T2 |
-| I4 | 同一 `(query, 谓词, k)`，`HnswRsIndex::search_exact_filtered` ≡ `BruteForceIndex`（`(chunk_id, distance)` 逐位） | S5-T3 |
+| I3 | 精确路径条数 `== min(k, 命中候选数)`。**前置**：全量遍历覆盖**每一层**的点（§3.1，不得只走 layer 0） | S5-T2 |
+| I4 | 同一 `(query, 谓词, k)`，`HnswRsIndex::search_exact_filtered` ≡ `BruteForceIndex`（`(chunk_id, distance)` 逐位）。**结构性依据**：`distance_sq` 转发 `distance_to_slice`（单一求和实现，§4.2.5）+ `(dist, id)` 全序使结果与遍历顺序无关（§4.2.2）。**只对 Brute 比**，不与兜底前的 ANN 基线比（`Σ(a−b)²` vs `2(1−dot)` 非逐位相等） | S5-T3 |
 | I5 | 排序恒为 `(距离升序, chunk_id 升序)`；连续 100 次结果一致 | S5-T6 |
 | I6 | `Metrics.vector_route` **与实际走的路径一致**（不撒谎）；`Exact` ⇒ `vector_shortfall == 0` | S5-T8 / T12 |
 | I7 | `metrics.took == took`、`metrics.candidates == total_candidates` | S5-T9 |
-| I8 | 三条早退路径的 `took` 均为真实耗时（非 0） | S5-T8 |
+| I8 | **三条**早退路径的**响应** `took` 均为真实耗时（非 0，`empty_response` 天然满足）；且修完后**两条**（`:99` / `:125`）的 **`metrics.took` 也非 0**，与响应一致 | S5-T8 |
 
 ### 4.9 标定实验设计（S5-04，D-S5-04 的数值来源）
 
@@ -575,7 +666,9 @@ pub struct SearchResponse {
 ### D-S5-03 候选来源 ✅ 建议方案 A（遍历向量存储）
 
 见 §4.2.3 对照表。**建议先做 A**，并把方案 B 写进 §9.2 作为"标定不达标再上"的备选。
-关键前提是 §3.1 核实到的 `get_layer_iterator(0)` + `Point::get_v()`（零拷贝）。
+关键前提是 §3.1 核实到的**全量点遍历**（`&PointIndexation` 的 `IntoIterator`，每点恰一次）
+\+ `Point::get_v()`（零拷贝）。
+⚠️ v0.1 此处写的是 `get_layer_iterator(0)`——**那是错的**，会漏掉 `level ≥ 1` 的点（§3.1）。
 
 ### D-S5-04 NFR-13 预算口径 ⏳ 数值待标定
 
@@ -598,9 +691,11 @@ bench 采集点（给决策）。三者受众不同，不是重复。
 也是 `vector_shortfall` 语义变更后的**必要配套**（§4.4 推论 1）。少了它，
 "兜底生效了吗"只能从延迟反推——Step 1 已经吃过"用错了指标读错结论"的亏。
 
-### D-S5-08 早退 `took` ⏳ 建议修
+### D-S5-08 早退 `took` ⏳ 建议修（**两条**路径）
 
-见 §2.5。一条赋值语句 + 一条回归测试（S5-T8）。
+见 §2.5 的逐条核对表。**两条**（`searcher.rs:99-104` / `:110-129`）漏设 `metrics.took`，
+各加一条 `metrics.took = started.elapsed();`（在 `metrics.log` 之前），加一条回归测试（S5-T8）。
+⚠️ 不要用 `grep "metrics.log"` 复核——`:99-104` 根本不调用它，**结构上找不到**（§2.5 已修正复核方式）。
 
 ### D-S5-09 降级字段全扫 ⏳ 建议不做
 
@@ -618,7 +713,7 @@ Step 1 已按"接受并测量"结案（S1-10 结论②：`ts_ms` 档位加速比
 | `SearchResponse` | **新增 1 字段** | 外部字面量构造会编译失败；CHANGELOG `⚠️ 破坏性`；rustdoc 注明 |
 | `query` 模块公开面 | 新增 `Metrics` / `VectorRoute` 再导出 | 纯增量 |
 | `HnswRsIndex` | 新增 `brute_fallback` 字段 + `with_brute_fallback` + 穿过 `from_loaded` | 内部结构，非公开字段 |
-| `NormalizedVector` | 新增 `distance_to_slice(&[f32])` | 纯增量 |
+| `NormalizedVector` | 新增 `distance_to_slice(&[f32])`；`distance_sq` 改为转发它（单一实现，§4.2.5） | 纯增量 + 内部实现变更（签名不变） |
 | 快照 / 图格式 | **零改动** | `FORMAT_VERSION` 保持 2；不新增持久化状态 |
 | 检索结果 | 低选择度档位从**近似**变**精确**（可能改变 Top-K） | 见 §4.4；R32 |
 | 性能 | 低选择度档位 P99 大幅下降；其余档位不变 | S5-T7 钉住 |
@@ -634,13 +729,13 @@ Step 1 已按"接受并测量"结案（S1-10 结论②：`ts_ms` 档位加速比
 | # | 测试 | 判据 |
 | --- | --- | --- |
 | **S5-T1** | 三条路径各自被选中（注入 `with_brute_fallback`） | `prefers_exact` 在 `allowed ≤ 阈值 / > 阈值 / kind=Alive` 三个输入下分别为 `true/false/false`；`plan()` 返回 `Exact/Ann/Ann` |
-| **S5-T2** | 精确路径 soundness + 完整性 | 每条结果满足谓词；条数 `== min(k, allowed)`；`k=0` / 空图 / `index.is_empty()` 边界返回空 |
-| **S5-T3** | **与 Brute oracle 逐位一致** | 同一批向量构造 `HnswRsIndex` 与 `BruteForceIndex`，多 query × 多谓词下 `(chunk_id, distance)` 序列**逐位相等** |
+| **S5-T2** | 精确路径 soundness + 完整性 | 每条结果满足谓词；条数 `== min(k, allowed)`；`k=0` / 空图 / `index.is_empty()` 边界返回空。**另加两条**：① **全量遍历基数断言**——`hnsw.get_point_indexation().count() == get_nb_point()`（钉住"每层都遍历"，v0.1 的教训）；② **定向用例**——取一个 `level ≥ 1` 的点，用**它自己的向量**查询，断言它排第一（距离 0）。⚠️ 不能只靠随机 Top-K：漏点集每次建图都变（`from_os_rng`），会 flaky |
+| **S5-T3** | **与 Brute oracle 逐位一致** | 同一批向量构造 `HnswRsIndex` 与 `BruteForceIndex`，多 query × 多谓词下 `(chunk_id, distance)` 序列**逐位相等**。⚠️ **只与 `BruteForceIndex` 比**，不与兜底前的 ANN 基线比（`Σ(a−b)²` vs `2(1−dot)` 非逐位相等，§4.2.2） |
 | **S5-T4** | 阈值边界 | `allowed == 阈值`（≤ 成立）与 `allowed == 阈值 + 1`（走 B）两侧行为正确；`allowed = 0` 不可达（编排层已短路） |
 | **S5-T5** | `None` 谓词语义不变 | `search_exact_filtered(.., None, ..)` **含已软删除条目**（与 `brute.rs:92-131` 的 T17 同口径） |
 | **S5-T6** | 确定性 | 连续 100 次结果一致；同距离按 `chunk_id` 升序 |
 | **S5-T7** | **热路径零回归**（R15 护栏） | `None` / `Alive` 谓词下，`off` 与默认档的 Top-K **逐位一致**；`prefers_exact == false`（构造断言） |
-| **S5-T8** | `Metrics` 单测 | `vector_route` 三态齐全；`vector_shortfall` 口径（`min(candidate_k, allowed) - len`）；**三条早退路径 `took != 0`** |
+| **S5-T8** | `Metrics` 单测 | `vector_route` 三态齐全；`vector_shortfall` 口径（`min(candidate_k, allowed) - len`）；**两条早退路径（`index_is_empty` / 过滤排空）的 `metrics.took != 0`**（D-S5-08）；第三条（融合为空）原本已设 |
 | **S5-T9** | 响应口径自洽 | `metrics.took == took`、`metrics.candidates == total_candidates`（含空结果与过滤排空两条路径） |
 | **S5-T10** | bench 采集点存在 | `--json` 输出含 `vector_route_exact_ratio` 与 `vector_shortfall_kernel`；汇总表含 `route` 列 |
 | **S5-T11** | 标定扫描（`#[ignore]` / 脚本） | 产出 §4.9 的四元表，无硬断言（延迟数字供人工判读） |
@@ -660,14 +755,14 @@ Step 1 已按"接受并测量"结案（S1-10 结论②：`ts_ms` 档位加速比
 
 | # | 任务 | 交付 |
 | --- | --- | --- |
-| **S5-01** | `VectorIndex` 加 `search_exact_filtered`（必选）+ `prefers_exact`（默认 `false`）；`BruteForceIndex` 实现（转发 + `true`）；`NormalizedVector::distance_to_slice` | 前两个 impl + 单测（S5-T2/T3/T5/T6 的 brute 侧） |
-| **S5-02** | `HnswRsIndex::search_exact_filtered`（layer 0 遍历，§4.2.2）；加 layer 0 基数 == `get_nb_point()` 的断言 | S5-T3（核心：与 Brute 逐位一致）、S5-T6 |
+| **S5-01** | `VectorIndex` 加 `search_exact_filtered`（必选）+ `prefers_exact`（默认 `false`）；`BruteForceIndex` 实现（转发 + `true`）；`NormalizedVector::distance_to_slice` **+ `distance_sq` 改为转发它**（§4.2.5，让 I4 结构性成立） | 前两个 impl + 单测（S5-T2/T3/T5/T6 的 brute 侧）+ `distance_sq` 数值回归断言 |
+| **S5-02** | `HnswRsIndex::search_exact_filtered`（**全量点遍历**：`&PointIndexation` 的 `IntoIterator`，§4.2.2）；加 `count() == get_nb_point()` 基数断言 + **"高层点自查询"定向用例** | S5-T3（核心：与 Brute 逐位一致）、S5-T6、S5-T2 |
 | **S5-03** | `HnswRsIndex::prefers_exact` + `brute_fallback` 字段 + `with_brute_fallback` + `from_loaded` 穿透；`VectorRetriever::plan` / `search_exact_filtered`；`search_parts` 分派改造（`vector_route` 占位） | S5-T1/T4/T7 |
 | **S5-04** | bench `--brute-fallback` 旋钮 + 路径列；`scripts/eval_filter.sh` 加路径维；10 万级标定 → **定稿阈值与 NFR-13 预算** | S5-T11/T12 + `eval-report.md` §8.9（数值） |
-| **S5-05** | `Metrics` 三字段 + `VectorRoute` 定义与再导出 + **修 D-S5-08 早退 `took`** | S5-T8（`metrics.rs` 首个单测） |
-| **S5-06** | `SearchResponse.metrics` 字段 + 编排层回填（含两条早退路径）+ 集成测试 | S5-T9 + `tests/step5_query_observability.rs` |
+| **S5-05** | `Metrics` 三字段 + `VectorRoute` 定义与再导出 + **修 D-S5-08 两条早退路径的 `took`（`:99-104` / `:110-129`）** | S5-T8（`metrics.rs` 首个单测） |
+| **S5-06** | `SearchResponse.metrics` 字段 + 编排层回填（**三条早退路径都要填 `metrics`**）+ 集成测试 | S5-T9 + `tests/step5_query_observability.rs` |
 | **S5-07** | bench `LatencyResult` / JSON / 表格采集点（两套 shortfall 口径并列）；修 `metrics.rs:14` 失效引用（#7 已关）；可选 `search --metrics` | S5-T10 |
-| **S5-08** | 文档回写：架构 **§8.3**（`Metrics` 限制段销账 + 三张新表）、**§14.1 R18 结案** + 新增 **§14.3 R31~R35**、**§5.4.4**（`VectorIndex` 精确路径契约）；需求 **NFR-13 预算回填**；plan-v2 进度 + 验收勾选；`eval-report.md` §8.9；`user-guide.md`（`--brute-fallback`）；`docs/README.md`；CHANGELOG | 纯文档 |
+| **S5-08** | 文档回写：架构 **§8.3**（`Metrics` 限制段销账 + 三张新表）、**§14 主表 R18 结案（`:1456`）** + 新增 **§14.3 R31~R35**、**§5.4.4**（`VectorIndex` 精确路径契约）；需求 **NFR-13 预算回填**；plan-v2 进度 + 验收勾选；`eval-report.md` §8.9；`user-guide.md`（`--brute-fallback`）；`docs/README.md`；CHANGELOG | 纯文档 |
 
 ---
 
@@ -705,7 +800,8 @@ Step 1 已按"接受并测量"结案（S1-10 结论②：`ts_ms` 档位加速比
 | `vector::HnswRsIndex` | `fn with_brute_fallback(self, Option<usize>) -> Self` | 新增 |
 | `vector::HnswRsIndex` | 常量 `BRUTE_FALLBACK_MAX_ALLOWED: usize = 1024` | 新增（S5-04 定稿） |
 | `vector::HnswRsIndex` | `from_loaded(hnsw, ef_search, parallel_build)` | **签名变更**：新增 `brute_fallback`（或保持默认，附录 §4.3 已注明） |
-| `vector::NormalizedVector` | `fn distance_to_slice(&self, &[f32]) -> f32` | 新增 |
+| `vector::NormalizedVector` | `fn distance_to_slice(&self, &[f32]) -> f32` | 新增（**唯一**求和实现） |
+| `vector::NormalizedVector` | `fn distance_sq(&self, &NormalizedVector) -> f32` | **实现变更**（转发 `distance_to_slice`，签名不变；§4.2.5） |
 | `retriever::VectorRetriever` | `fn plan(&self, Option<&dyn CandidateFilter>) -> VectorRoute` | 新增 |
 | `retriever::VectorRetriever` | `fn search_exact_filtered(&self, &str, usize, Option<&dyn CandidateFilter>) -> Result<Vec<Scored>>` | 新增 |
 | `query::response::SearchResponse` | `pub metrics: Metrics` | **新增字段（破坏性）** |
@@ -746,12 +842,14 @@ cargo run --release -p helix-cli -- bench \
 ## 附录 C：`hnsw_rs` 0.3.4 源码核实记录（本文关键技术前提）
 
 核实环境：`~/.cargo/registry/src/index.crates.io-*/hnsw_rs-0.3.4/src/hnsw.rs`。
+**v0.2 已按评审意见复核并纠正前三行**（v0.1 的误判保留在表末，作反面记录）。
 
 | 结论 | 证据 |
 | --- | --- |
-| 每个插入点在 layer 0 出现且仅一次 | `Point::generate_new_point`：`p_id.1 = points_by_layer_ref[p_id.0].len()`，随后 `points_by_layer_ref[p_id.0].push(Arc::clone(&new_point))`（`:503-512`），`p_id.0` 自 0 起 |
-| layer 0 可迭代，且**不跨层** | `get_layer_iterator(layer)`（`:614-616`）→ `IterPointLayer::next` 只索引 `pi_guard[self.layer]`（`:715-723`） |
-| ⚠️ `PointIndexation::into_iter()` **会跨层遍历** | `IterPoint::next` 从 `layer=0` 逐层上升到 `entry_point_level`（`:647-677`）⇒ **同一高层点会被 yield 多次**，不可用于"遍历所有点" |
+| **一个点只存在于它自己那一层**（`level = floor(-ln u · scale)`，`P(level ≥ 1) = 1/M`） | `generate_new_point`：`let level = self.layer_g.generate();` → `p_id = PointId(level as u8, -1)` → **只** `points_by_layer_ref[p_id.0].push(...)`（`:500-511`，全文件唯一一处 push，**无回填低层**）；`LayerGenerator::new` 的 `scale = 1./ln(max_nb_connection)`（`:325-333`）、`generate` 的 `-xsi.ln() * scale`（`:358-368`） |
+| ✅ **全量遍历 = `&PointIndexation` 的 `IntoIterator`**：从 layer 0 逐层升到 `entry_point_level`，**每点恰 yield 一次、零重复** | `IntoIterator for &PointIndexation`（`:681-688`）→ `IterPoint::new` 取一次 `points_by_layer.read()`（`:631-641`）→ `IterPoint::next` 逐层推进（`:647-677`，`p_id.0` 是层级、每层各自遍历 `pi_guard[layer]`） |
+| ⚠️ **`get_layer_iterator(l)` 只迭代传入的那一层**（`l=0` **会漏掉 `level ≥ 1` 的点**） | `get_layer_iterator`（`:614-616`）→ `IterPointLayer::next` 只索引 `pi_guard[self.layer]`，**不外溢到其他层**（`:715-723`） |
+| **实测佐证**（M=32 / N=5000，探针脚本） | `get_nb_point()=5000`；`get_layer_iterator(0).count()=4813`（缺 187 = **3.74%**）；`into_iter().count()=5000`、`distinct=5000`、**`dup=0`**；分层 `0=4813 1=183 2=3 3=1` |
 | 向量是**零拷贝**切片 | `Point::get_v(&self) -> &[T]`（`:204-206`），内部直接返回 `self.v` 的视图（mmap 加载时指向 mmap） |
 | 原始 id 可读 | `Point::get_origin_id(&self) -> usize`（`:214-216`），即插入时传入的 `(data, origin_id)` 的第二项 ⇒ **就是 `ChunkId`** |
 | 按 `PointId` 取向量存在，但**是克隆** | `Hnsw::get_point_data(&PointId) -> Option<Vec<T>>`（`:582-593`）：`Some(self.points_by_layer.read()[l][p].get_v().to_vec())` |
@@ -759,6 +857,18 @@ cargo run --release -p helix-cli -- bench \
 | 带 filter 时 **无 fast-return** | `search_layer`：`if filter.is_none() { return return_points } else if return_points.len() >= ef { retain(..) }`（`:983-992`） |
 | 堆未满时**距离剪枝关闭** | `if e_dist_to_p < f_dist_to_p \|\| return_points.len() < ef`（`:1019`） |
 | 层类型 = `Vec<Arc<Point>>` | `type Layer<'b, T> = Vec<Arc<Point<'b, T>>>`（`:386`）⇒ 迭代含**每元素一次 `Arc::clone`**（§4.2.4 第①段的成本来源之一） |
+| ❌ **v0.1 的误判（已作废，保留以儆效尤）** | v0.1 写"每个插入点在 layer 0 出现且仅一次 ⇒ `get_layer_iterator(0)` 即全量"，并把 `IntoIterator` 标为"跨层 ⇒ 重复 yield，禁用"。**两条都反了**：点不进低层（所以 layer 0 不全），而 `IntoIterator` 逐层各遍历一次（所以不重复）。教训：**"点在某层出现" ≠ "点在所有更低层出现"**——这是 HNSW 的层级语义，不是实现细节 |
+
+**复现方法**（约 20 行，不需引入 `rand`；核实脚本用完即删，实现期由 S5-T2 的断言定格）：
+建 `Hnsw::new(32, 5000, 16, 300, DistL2)` → `insert((v, id))` 5000 条 64 维确定性伪随机向量，然后：
+
+```rust
+let pi = hnsw.get_point_indexation();
+assert_ne!(pi.get_layer_iterator(0).count(), hnsw.get_nb_point());   // 4813 vs 5000，证明不等价
+assert_eq!(pi.into_iter().count(), hnsw.get_nb_point());             // 5000 == 5000
+// 定向反例：找一个 level ≥ 1 的点，用它自己的向量查，真值距离 0
+//   只扫 layer 0 → 距离 0 的项消失；全量遍历 → 找到
+```
 
 ---
 
@@ -775,7 +885,8 @@ cargo run --release -p helix-cli -- bench \
 | `allowed_count` 口径（O(匹配文档数)） | `crates/core/src/query/filter.rs:118-126`、`:160-180` |
 | 向量路转换与排序 | `crates/core/src/retriever/vector.rs:38-68` |
 | 编排：过滤求值 / 两路并行 / shortfall 口径 | `crates/core/src/query/searcher.rs:107`、`:110-131`、`:145-179`、`:199-215`、`:262-273` |
-| 早退路径 `took` 缺失 | `crates/core/src/query/searcher.rs:125-127`（对照 `:212-213`） |
+| 早退路径 `metrics.took` 缺失（**两条**） | `crates/core/src/query/searcher.rs:99-104`（`index_is_empty`，**连 `metrics.log` 都不调**）、`:125-127`（过滤排空）；对照已设的 `:212-213` |
+| 三分支早退的响应 `took` 恒为真值 | `crates/core/src/query/searcher.rs:409-419`（`empty_response` 内 `took: started.elapsed()`） |
 | `Metrics` 现状与自述限制 | `crates/core/src/query/metrics.rs:1-15`、`:21-45` |
 | `SearchResponse` 字段与再导出 | `crates/core/src/query/response.rs:62-72`、`crates/core/src/lib.rs:68` |
 | bench 的 `mean_shortfall` 口径注释（断链 4） | `crates/cli/src/bench.rs:186-193`、`:1003-1050`、`:1266-1318` |

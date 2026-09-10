@@ -11,21 +11,27 @@
 
 ### V2 Step 5 · 详细设计（2026-09-10）
 
-- 新增 `docs/devel/v2-step5-design.md`（**v0.1，待评审**）：**查询性能与可观测
+- 新增 `docs/devel/v2-step5-design.md`（**v0.2，评审响应版；待二次评审**）：**查询性能与可观测
   （T7-22 / T7-23 / NFR-13 / R18）**的详细设计。
   - **现状源码级定位**：R18 的机理（带 filter 时 `hnsw.rs:983-992` **无 fast-return**，
     且 `:1019` 在 `return_points.len() < ef` 时**距离剪枝全程关闭** ⇒ 堆填不满即整图遍历；
     默认 `k=10 → candidate_k=30 → ef=120` 就是**分水岭**，`allowed` 远小于它时遍历全图）；
     `Metrics` **四处断链**（输出只剩 `tracing` / `SearchResponse` 无字段 / `query` 模块无再导出 /
     bench 只能另算一个口径不同的 `mean_shortfall`，`bench.rs:190-193` 注释自陈"拿不到"）。
-  - **设计期新发现**：`searcher.rs:125-127`（过滤排空早退）**设了 `filter_eval` 就 `log`，
-    漏设 `metrics.took`** ⇒ 日志 `took_ms=0` 与响应 `took` 各说一套（同类第二处 `:212-213` 反而设了）
+  - **设计期新发现**：**两条**早退路径漏设 `metrics.took`——`searcher.rs:99-104`（`index_is_empty`，
+    连 `metrics.log` 都不调，故 grep 该符号**结构上找不到它**）与 `:125-127`（过滤排空）。
+    两条的响应 `took` 都是真值（`empty_response` 内取 `started.elapsed()`）
+    ⇒ 日志 `took_ms=0` 与响应 `took` 各说一套（同类第三处 `:212-213` 反而设了）
     ⇒ 列 **D-S5-08** 随 T7-23 一起修。
-  - **关键技术前提（新增源码核实）**：`hnsw_rs` 0.3.4 **可以零拷贝遍历已入库向量**——
-    `get_layer_iterator(0)`（每点恰一次）+ `Point::get_v() -> &[T]`（零拷贝切片）+
-    `Point::get_origin_id() -> usize`（**就是 `ChunkId`**）；⚠️ `PointIndexation::into_iter()`
-    **跨层遍历会重复 yield**，不可用；`get_point_data(&PointId)` 存在但**是克隆**且
-    库**无 `origin_id → PointId` 映射** ⇒ 方案 B 需自建。核实记录见设计文档附录 C。
+  - **关键技术前提（源码核实 + 实测）**：`hnsw_rs` 0.3.4 **可以零拷贝遍历已入库向量**——
+    全量遍历 = **`&PointIndexation` 的 `IntoIterator`**（从 layer 0 逐层升到 `entry_point_level`，
+    **每点恰 yield 一次、零重复**）+ `Point::get_v() -> &[T]`（零拷贝切片）+
+    `Point::get_origin_id() -> usize`（**就是 `ChunkId`**）。
+    ⚠️ **`get_layer_iterator(0)` 不是全量**——点只被推入**它自己那一层**（`hnsw.rs:511`，无回填低层），
+    `P(level ≥ 1) = 1/M`（本项目 M=32 ⇒ **约 3.1% 的点不在 layer 0**），实测 N=5000 时
+    `get_layer_iterator(0).count()=4813`（缺 187 = 3.74%）而 `into_iter().count()=5000`。
+    `get_point_data(&PointId)` 存在但**是克隆**，且库**无 `origin_id → PointId` 映射**
+    ⇒ 方案 B 需自建。核实记录见设计文档附录 C（含 v0.1 误判的反面记录）。
   - **方案**：向量路从两条路径扩为**三条**——A 热路径（不变）/ B `filtered-ANN`（不变）/
     **C 精确扫描**（`allowed ≤ 阈值` 时绕开 ANN）。**策略归后端**（新增必选方法
     `VectorIndex::search_exact_filtered` + 默认钩子 `prefers_exact`），**分派与记账归编排层**
@@ -45,8 +51,16 @@
     测试计划 **S5-T1~T13**、任务拆分 **S5-01~08**（PR 切分为兜底 / 可观测 / 文档回写三支）、
     风险 **R31~R35**（含 R34：精确扫描全程持 `points_by_layer` 读锁 ⇒ **Step 8 必须复核**）、
     未决 **Q1~Q5**。
-- `plan-v2.md` 未改动（进度勾选留待实现完成后回写）；`docs/README.md` 索引新增 Step 5 设计行，
+- `plan-v2.md` 升 **v0.9 → v0.10**（Step 5 行补设计状态、文件头状态行重写、并加"0.05ms"读法
+  修正注记；**实现进度勾选仍留待实现完成后回写**）；`docs/README.md` 索引新增 Step 5 设计行，
   并把「技术风险（R1~R25）」校正为 **R1~R30；Step 5 拟增 R31~R35**。
+- **PR #33 评审响应（v0.1 → v0.2）**：① **纠正关键技术前提**——全量遍历 API 由误写的
+  `get_layer_iterator(0)` 改为 `&PointIndexation` 的 `IntoIterator`（v0.1 把两个遍历 API 的
+  安危判断**写反了**，照原设计实现会让精确扫描**静默漏掉约 3% 的向量**，是错答而非变慢）；
+  ② D-S5-08 由"一条早退路径"扩为**两条**（`:99-104` + `:125-127`）；③ `distance_sq` 改为
+  **转发** `distance_to_slice`，把 I4「与 Brute 逐位一致」从巧合变**结构**；④ 修正 R11~R18
+  的架构引用（在 §14 **章级主表** `:1449-1456`，而非 §14.1 的 Step 2 风险表）；
+  ⑤ 新增**"高层点自查询"定向用例**（`from_os_rng` 使漏点集每次建图都变，随机 Top-K 会 flaky）。
 
 ### V2 Step 4 · CLI `helix compact` + churn workload（S4-08 + S4-09，2026-09-08）
 
