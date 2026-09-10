@@ -1,15 +1,15 @@
 # HelixIndex V2 · Step 4 详细设计（资源回收：墓碑物理回收 compaction）
 
-> 面向 Agent 场景的通用检索引擎内核——V2 Step 4 的详细设计（**v0.1，待评审**）。
+> 面向 Agent 场景的通用检索引擎内核——V2 Step 4 的详细设计（**v0.4：实现已完成，见 §10 实施结果**）。
 > 本文件回答：删改之后哪些体积在涨、涨在哪个字节、怎么一次性回收干净、
 > 重建图之后怎么保证不踩「manifest 未重发」的铁律、以及怎么证明回收前后检索语义没变。
 
 | 项 | 内容 |
 | --- | --- |
-| 版本 | **v0.3（拍板版，可开工）** |
-| 日期 | 2026-09-08 |
-| 状态 | **D-S4-01 / D-S4-10 已拍板（2026-09-08）**；D-S4-02~09 评审无异议、按本文建议执行。核心实现（S4-03~S4-07）可开工 |
-| 修订记录 | v0.1 首版：三条膨胀路径逐行盘点 + 重新物化方案 + 9 个待拍板决策。<br>**v0.2（PR #28 评审回应）**：新增 **D-S4-10 `compact()` 与写缓冲 `pending` 的交互**（评审 P0：不先 flush 会让 stale chunk_id 污染 `raw_vectors` 与新图，采纳「先 `commit()`」修法，见 §4.1.1 / I8 / T13）；验收 3 的 `nb_point` 口径改为「存活**且有向量**」（§1.3）；D-S4-04 理由重写 + `graph_status` 语义补齐（§4.6 / 附录 A）；§4.3 明确六步作用于**新 `Index` 实例**（对齐 I5）；§4.4 「≤/≥」两层比较分开写；D-S4-03 的确定性改称「**重建确定性**」（独立于 NFR-06）；`CompactionReport` 并入字节级三体积（§4.7）。<br>**v0.3（决策拍板）**：**D-S4-01 = 重编号（方案 B）**、**D-S4-10 = `compact()` 开头先 `self.commit()?`（修法 A）** 两项正式拍板 ⇒ 从「待拍板」移入「已定案」，§9.2 的 Q1 / Q7 结案 |
+| 版本 | **v0.4（实现完成版）** |
+| 日期 | 2026-09-10 |
+| 状态 | **S4-01 与 S4-03~S4-10 全部完成并合并进 `main`（S4-02 `remove_many` 为可选、**未实施**）**；验收 1/2/3 实测 PASS（§10.2）；Q1~Q7 全部结案（§10.3）。实现结论已回写架构 §7.5.3 / §14.2（R26~R30）与需求 FR-30 |
+| 修订记录 | v0.1 首版：三条膨胀路径逐行盘点 + 重新物化方案 + 9 个待拍板决策。<br>**v0.2（PR #28 评审回应）**：新增 **D-S4-10 `compact()` 与写缓冲 `pending` 的交互**（评审 P0：不先 flush 会让 stale chunk_id 污染 `raw_vectors` 与新图，采纳「先 `commit()`」修法，见 §4.1.1 / I8 / T13）；验收 3 的 `nb_point` 口径改为「存活**且有向量**」（§1.3）；D-S4-04 理由重写 + `graph_status` 语义补齐（§4.6 / 附录 A）；§4.3 明确六步作用于**新 `Index` 实例**（对齐 I5）；§4.4 「≤/≥」两层比较分开写；D-S4-03 的确定性改称「**重建确定性**」（独立于 NFR-06）；`CompactionReport` 并入字节级三体积（§4.7）。<br>**v0.3（决策拍板）**：**D-S4-01 = 重编号（方案 B）**、**D-S4-10 = `compact()` 开头先 `self.commit()?`（修法 A）** 两项正式拍板 ⇒ 从「待拍板」移入「已定案」，§9.2 的 Q1 / Q7 结案。<br>**v0.4（实现完成，2026-09-10）**：新增 **§10 实施结果**——S4-01 / S4-03~S4-10 完成状态与对应 commit、10K churn 实测结论（含 2026-09-10 复跑 VERDICT PASS）、**Q2~Q6 结案**（Q1 / Q7 已于 v0.3 结案）、评审响应要点、集成测试补强记录（CLI-1~CLI-5 + T14~T16）与三条踩坑 |
 | 上游 | `plan-v2.md` §4 Step 4（原 Step 5，D-J10 提前）/ issue #21 / `requirements-spec.md` v1.9（FR-30 Should）/ `architecture-design.md` §7.5、§14.1（R22、R25）/ `v2-step1-design.md`（D-S1-01 存活单一真源）/ `v2-step2-design.md`（ADR-A 方案 C）/ `v2-step3-design.md`（`atomic_write`） |
 | 范围 | T7-12 墓碑物理回收（重建向量图 + 回收 `raw_vectors` + 重写快照）+ 零散写入 workload 脚本 + CLI/bench 观测入口 |
 | 非范围 | 真·物理删除 API（`usearch`，架构 §7.5 已排除）；读写并发下在线 compaction（**Step 8**）；低选择度兜底与 `Metrics` 可观测（**Step 5**）；`parallel_build` 默认值翻转（横切 **T7-21**）；R22「图体积 1.6×」本身（本 Step 只回收墓碑，不压缩存活数据） |
@@ -695,6 +695,93 @@ TermId 是内部编号（快照里 `term_dict` 与 `postings` 一起导出/导�
 - **Q6**：compaction 要不要顺带把 `content_hashes` 里指向墓碑 doc 的残留清掉？
   （现状 `Index::remove` 已摘 `content_hash`，理论上无残留 ⇒ 只需 T1 断言，不需要额外代码）
 - **~~Q7~~** ✅ **已拍板（2026-09-08）**：D-S4-10 采纳「`compact()` 开头先 `commit()`」（修法 A）；§4.1.1 的 B / C 不再考虑。
+  ⇒ Q1~Q7 的**全部结案结论**见 **§10.3**（v0.4 追加）。
+
+---
+
+## 10. 实施结果（v0.4，2026-09-10）
+
+> 本节在全部实现合并后追加，**不改前 9 节的设计结论**（设计即设计，结果另记）。
+
+### 10.1 任务完成状态
+
+| # | 任务 | 状态 | 落地 |
+| --- | --- | --- | --- |
+| **S4-01** | flush 侧幽灵向量防线 | ✅ 完成 | PR #29 → `1efc128` |
+| **S4-02** | `remove_many`（**可选**） | ⬜ **未实施** | 无需求驱动；`remove` 的 O(N·M) 代价保留（架构 §7.5.3 已记） |
+| **S4-03~06** | `Index::compact` 重编号 / 倒排 remap / `raw_vectors` / 图重建 | ✅ 完成 | PR #30 → `6f34ef2` |
+| **S4-07** | 门面层 `compact` / `compact_and_save` / `tombstone_stats` / `CompactionReport` + `save` 告警 | ✅ 完成 | PR #30 |
+| **S4-08** | CLI `helix compact` | ✅ 完成 | PR #31 → `ac9fcbe` |
+| **S4-09** | `churn_bench` + `eval_churn.sh` + 实测 | ✅ 完成 | PR #31 |
+| **S4-10** | 文档回写 | ✅ 完成 | 本 PR（架构 §7.5.3 / §14.2 R26~R30、需求 FR-30、plan-v2、CHANGELOG、README 索引） |
+
+### 10.2 实测结论（10K churn，合成 embedder）
+
+复现：`./scripts/eval_churn.sh`（默认 10K × churn {0.1, 0.3} × 5 轮），完整表格见
+`eval-report.md` §8.8。**2026-09-10 复跑（churn 0.3）**：`VERDICT: PASS`、
+`J1_gc_reclaims_graph=true J2_no_growth=true J3_reload_loaded=true`、
+`reclaimed_chunks=15000, remapped=true`，reload 冷启动 **94ms**。
+
+| 判据 | 结果 |
+| --- | --- |
+| 验收 1 三体积不无界增长 | ✅ churn 0.3：graph+data **84.6 → 33.7MB**（-60%）；`nb_point` 25000 → 10000（== 存活且有向量的 chunk 数） |
+| 验收 2 `GraphStatus::Loaded` | ✅ 非 `Rebuilt`；冷启动 91~99ms |
+| 验收 3 不累积（J2） | ✅ compact 后 snapshot 与首轮差异 <1.2%（阈 15%）；`raw_vectors` 恒 10000 |
+
+⚠️ **未量出 compaction 耗时**：`churn_bench` 的 CSV 只有 `coldstart_ms` 列、**无 `compact_ms`**，
+故 R28 维持「未实测」（架构 §14.2）。数字可用 `helix compact --json` 的 `compact_ms` 采集。
+
+### 10.3 未决问题结案（Q1 ~ Q7）
+
+- **Q1**（D-S4-01 是否重编号）✅ v0.3 已拍板 = 重编号。实现侧由 **T15** 验证「compact 后存活
+  向量 id 连续 `0..alive`、无洞」。
+- **Q2**（`save` 告警阈值 ratio ≥0.2 且 total ≥1024 是否合适）✅ **合适，保持**。实测告警如期
+  出现（churn 0.3 各轮 23.1% → 37.5% → 47.4% → 54.5% → 60.0%）。阈值为**硬编码**
+  （`search/index.rs:588`），暂不开放配置——无需求驱动，NFR-07 只要求「可观测」。
+- **Q3**（`raw_vectors` 缺向量的存活 chunk 要不要在 CLI 告警）✅ **不做**。默认装配下所有 doc
+  都 embed，该场景不出现；且缺口可自算（`chunks_alive - raw_vectors`），不新增 CLI 面。
+- **Q4**（100K 档用合成还是真实 embedder）⏳ **未跑**——100K 属 D-S4-06 的**扩展验证**，
+  非 V2.0 门槛；合成 embedder 下分钟级可跑（`SIZE=100000 ./scripts/eval_churn.sh`）。
+- **Q5**（`flush` 能否先过滤再 embed）✅ **未做，保留为优化项**。S4-01 的实际实现是
+  「**整批 embed 之后、入库之前**按 liveness 过滤」（`search/index.rs:438`）——正确性已够
+  （不入库 ⇒ 不永续），代价是仍为已删 chunk 付了 embed 算力。先过滤需先实测 `fastembed`
+  的 batch 组成无关性，不在本 Step 范围。
+- **Q6**（`content_hashes` 里指向墓碑 doc 的残留要不要清）✅ **无需额外代码**——`Index::remove`
+  已摘 `content_hash`，由 T1 断言覆盖。
+- **Q7**（D-S4-10 用哪种修法）✅ v0.3 已拍板 = `compact()` 开头先 `commit()`；**I8 / T13 已落地**。
+
+### 10.4 评审响应要点（PR #30 / #31）
+
+- **无墓碑早退**：`compact()` 在 `chunks_total == chunks_alive` 时直接返回空 report
+  （`remapped=false`，**不重建图**）——按原设计会白跑 10~100s 的重建。
+- **`bytes_before` 的诚实语义**：目标文件不存在时为 `None`，而非 `Some(0,0,0)`。
+- **失败语义写进 rustdoc**：`save` 失败时返回 `Err`，但**内存已压实**（I5 无 undo 路径），
+  调用方对同一 `path` 重试 `save()` 即可续写，不必重跑 `compact()`。
+- **CLI 机制的可测性边界**：CLI 真二进制测 compact 有两硬约束——① 无 `remove` 子命令 ⇒
+  造不出墓碑，只能测 no-op；② `--index` 走默认装配会实例化 `LocalEmbedder`
+  （**构造即触发 bge 下载 ~49s**）。故改用**门面层等效复刻**（确定性 `TestEmbedder`），见 §10.5。
+
+### 10.5 集成测试补强（PR #31 追加 commit `aed8829`，+8 例 / 553 行）
+
+| 测试 | 锁住什么 | 对应 |
+| --- | --- | --- |
+| CLI-1 `--dry-run` 只读 | `tombstone_stats()` 后磁盘三体积与文件清单**分毫不变** | D-S4-02 |
+| CLI-2 无墓碑 no-op | `remapped=false`、回收统计全 0、`bytes_before/after` 均 Some | T11 |
+| CLI-3 原地回收 | graph sidecar 回落 + reload `Loaded` | I7 / 验收 2 |
+| CLI-4 `--output` A/B | 源不被覆盖、`bytes_before=None` | §4.7 |
+| CLI-5 纯 BM25 no-op | 装配静默 `NotApplicable` 后仍可检索 | R_建议6 |
+| T14 `source` 跨 compact 稳定 | id 全变但存活 source 一一对齐、被删 source 零命中 | D-S4-09 |
+| T15 ID 连续无洞 | compact 后 `snapshot_vectors` = `{0,1,2}`、`raw.len()==nb_point` | D-S4-01 / I7 |
+| T16 三轮 churn 不累积 | 每轮 `chunks_total` 回落存活、`tombstone_ratio` 归零 | J2 / NFR-07 |
+
+**三条踩坑**（写测试时才暴露，已回写实现注释）：
+
+1. `s.contains(['b','d','f'])`：`[char; N]` 作 `str::contains` 的 pattern 会**误伤全部字符串**
+   ⇒ 必须用显式 doomed 集合。
+2. 墓碑态**总字节未必 > 初始**：`remove` 的 `retain` 已摘 `raw_vectors` 与正文，只有 hnsw 图
+   因无 remove 而涨 ⇒ 体积判别必须看 **graph sidecar**，不能看总字节。
+3. **向量近邻检索对已删 doc 不返回空**（返回的是存活近邻）⇒ 「墓碑不可召回」应断言
+   **上界 ≤ live**，不能断言零命中。
 
 ---
 

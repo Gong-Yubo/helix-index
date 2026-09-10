@@ -286,7 +286,7 @@ Agent 应用（RAG 知识库、长期记忆、代码助手）的核心瓶颈往�
 | FR-27 | 过滤下推 + 字段索引          | Must   | 元数据过滤下推到索引遍历，替换全表扫描；每 query 的过滤成本须与语料规模解耦 |
 | FR-28 | 增量构建                 | Should | 只 embed 新增文档（content_hash 跳过）              |
 | FR-29 | 图持久化                 | Must   | HNSW 图落盘/加载，冷启动达秒级。**✅ V2 Step 2 已实现**（ADR-A 方案 C：图 = 快照的派生缓存，`FORMAT_VERSION` 保持 2；sidecar 三件套 + manifest 作唯一原子发布点）。12K 实测：完整冷启动 ≈ 100ms ✅、图 dump 43.5ms、磁盘增量 1.6× |
-| FR-30 | 墓碑物理回收（compaction）   | Should | 长期膨胀治理：回收向量图 + raw_vectors + 快照          |
+| FR-30 | 墓碑物理回收（compaction）   | Should | 长期膨胀治理：回收向量图 + raw_vectors + 快照。**✅ V2 Step 4 已实现**（D-S4-01：**按存活集重新物化 + ID 重编号**，`FORMAT_VERSION` 保持 2）：`SearchIndex::compact`（纯内存）/ `compact_and_save`（**唯一落盘入口**，复用 Step 3 `atomic_write`）+ `tombstone_stats` / `CompactionReport` 可观测 + CLI `helix compact`（`--dry-run` / `--output` / `--json`）；落盘入口唯一 ⇒ 「重建图后必须重发 manifest」由既有 `save` 链路**自动满足**。10K 合成语料 churn 0.3×5 实测：graph+data **84.6→33.7MB**（-60%）、图 `nb_point` 25000→10000（== 存活且有向量的 chunk 数）、compact 后 reload `Loaded`（非 `Rebuilt`）冷启动 91~99ms（`eval-report.md` §8.8）。⚠️ **ID 会被重编号**：跨 compact 的持久引用请用 `source` / `content_hash`（D-S4-09 三处声明；架构 §7.5.3 / R27）。**手动触发为主，自动 compaction 默认关**（D-S4-02；`save` 墓碑占比 ≥20% 且总量 ≥1024 时打告警） |
 | FR-31 | 原子快照                 | **Must**（2026-09-07 由 Should 升） | 临时文件 + fsync + rename 原子替换，防崩溃损坏。✅ **已落地（V2 Step 3）**：`storage/atomic.rs` 通用原语 `atomic_write`（tmp + flush + `sync_all` + rename + fsync 父目录），崩溃不变式「save 序列任一注入点崩溃后，load 要么旧快照要么新快照，绝不 `SnapshotCorrupted`」由故障注入测试证明（`v2-step3-design.md` §7 T3~T6）；fsync 代价实测 +0.027~0.035s（`eval-report.md` §8.7） |
 | FR-32 | 命名空间隔离               | Should | 检索级命名空间（≠权限/多租户，后者范围外）                 |
 | FR-33 | 时间衰减打分钩子             | Could  | 可插拔 recency boost 机制（策略放场景层）             |
