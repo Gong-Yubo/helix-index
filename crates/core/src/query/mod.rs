@@ -16,5 +16,9 @@ pub mod metrics;
 pub mod response;
 pub mod searcher;
 
+pub use metrics::Metrics;
 pub use response::{EmptyReason, Explain, Hit, SearchResponse};
 pub use searcher::{QueryExecutor, SearchMode, SearchParts};
+// V2 Step 5 / D-S5-05：给调用方一个稳定的 `use helix_core::query::VectorRoute` 路径。
+// 类型本体定义在 `vector`（与 `VectorIndex::prefers_exact` 同源），此处只是再导出。
+pub use crate::vector::VectorRoute;

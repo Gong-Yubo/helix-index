@@ -1,20 +1,30 @@
 //! 可观测性：检索过程的轻量指标（NFR-07）。
 //!
-//! # ⚠️ 如何观测（当前限制）
+//! # 三条受众不同的通道（V2 Step 5 / D-S5-05）
 //!
-//! `Metrics` **只在 `search_parts` 内部聚合，经 [`Metrics::log`] 以 `tracing::info!`
-//! 输出**（事件名 `search`）——它既不在 `SearchResponse` 里，也不进 bench 的
-//! `bench::QueryMetrics`。由此有三个后果：
+//! `Metrics` 走**三条**通道，三者受众不同、不是重复：
 //!
-//! - 宿主程序必须挂 `tracing` subscriber 才能拿到这些数字，否则静默丢弃
-//! - **无法对其做单元测试**（外部拿不到实例）
-//! - **无法被 bench 聚合**——而 `vector_shortfall` 的定位正是「V2.1 是否引入
-//!   prefilter 的判据」。真要用它做决策，得先把 `Metrics` 暴露进响应或 bench 采集链路
+//! | 通道 | 受众 | 入口 |
+//! | --- | --- | --- |
+//! | [`SearchResponse::metrics`] | **调用方**（可单测、可断言、可聚合） | `query::Metrics` 再导出 |
+//! | `tracing::info!`（[`Metrics::log`]） | **宿主程序**（挂 subscriber 即得结构化日志） | 事件名 `search` |
+//! | bench 采集点 | **决策**（`eval-report` / V2.1 的 prefilter 判据） | `crates/cli/src/bench.rs` |
 //!
-//! 这个缺口是已知且未修的（见 issue #7），先让口径正确（按 `allowed` 归一），
-//! 再让口径可观测。
+//! Step 5 之前只有第二条，于是「宿主不挂 subscriber 就静默丢弃 / **无法单测** /
+//! **无法被 bench 聚合**」——而 `vector_shortfall` 的定位正是「V2.1 是否引入
+//! prefilter 的判据」。本 Step 把前两条补上。
+//!
+//! # ⚠️ `vector_shortfall == 0` 不再等于"没有 prefilter 需求"
+//!
+//! 低选择度档位现在走**精确扫描**（[`VectorRoute::Exact`]），该指标在那里
+//! **结构性归零**——那是"这一档没走 ANN"，不是"ANN 没有缺口"。
+//! 判读时**必须连看** [`Metrics::vector_route`]（设计 §4.4 推论 1）。
+//!
+//! [`SearchResponse::metrics`]: crate::query::SearchResponse::metrics
 
 use std::time::Duration;
+
+use crate::vector::VectorRoute;
 
 /// 一次检索的指标快照。
 #[derive(Debug, Clone, Copy, Default)]
@@ -41,7 +51,28 @@ pub struct Metrics {
     ///
     /// > 0 表示低选择度下 ANN 没凑够候选——不是错误，但会让召回静默下降，
     /// > 必须可观测（V2.1 是否引入 prefilter 结构的判据）。
+    ///
+    /// ⚠️ 走精确路径（[`VectorRoute::Exact`]）的档位该值**恒为 0**，
+    /// 那是构造上的必然，**不能**读成"无缺口需求"——见模块文档。
     pub vector_shortfall: usize,
+    /// 向量路本次**实际**走的路径（D-S5-07）。
+    ///
+    /// 它是"兜底到底生效了没有"的**直接**判据——`VectorRoute::None` = 本次检索
+    /// 没走向量路（`SearchMode::Bm25`），`Ann` = 走了 ANN，`Exact` = 走了精确扫描。
+    /// 少了它就只能从延迟反推，而 Step 1 已经吃过"用错指标读错结论"的亏。
+    pub vector_route: VectorRoute,
+    /// BM25 路耗时。
+    ///
+    /// - 单路模式（`Bm25`）= 该路耗时；
+    /// - Hybrid 下与 [`Self::vector_elapsed`] 走 `rayon::join`，**两者区间重叠**，
+    ///   相加**不等于** [`Self::took`]。
+    ///
+    /// 存在的理由：Hybrid 下单一 `took` 无法归因"是哪一路慢"
+    /// （架构 §8.3 的示例日志本就预期 `bm25=1.4ms(vector=6.1ms parallel)`）。
+    pub bm25_elapsed: Duration,
+    /// 向量路耗时（含精确扫描的 `O(N)` 遍历成本，若走了精确路径）。
+    /// 语义与重叠关系见 [`Self::bm25_elapsed`]。
+    pub vector_elapsed: Duration,
 }
 
 impl Metrics {
@@ -57,7 +88,67 @@ impl Metrics {
             filter_eval_us = self.filter_eval.as_micros() as u64,
             allowed = self.allowed,
             vector_shortfall = self.vector_shortfall,
+            vector_route = ?self.vector_route,
+            bm25_ms = self.bm25_elapsed.as_secs_f64() * 1000.0,
+            vector_ms = self.vector_elapsed.as_secs_f64() * 1000.0,
             "search"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(non_snake_case)]
+    use super::*;
+
+    /// **S5-T8（metrics.rs 首个单测）**：默认值必须是**不撒谎**的。
+    ///
+    /// `Metrics::default()` 是 `search_parts` 的草稿缓冲区，每条返回路径都必须
+    /// 显式填好再交出去。默认 `vector_route = None`（"未走向量路"）对
+    /// 索引为空 / 过滤排空 / 融合为空这三条早退路径恰好是**真话**；
+    /// 而矢量路一旦真的跑了，编排层必须覆盖它——`S5-T6` 的响应往返测试钉住这点。
+    #[test]
+    fn 默认值不撒谎() {
+        let m = Metrics::default();
+        assert_eq!(m.vector_route, VectorRoute::None, "默认 = 未走向量路");
+        assert_eq!(m.took, Duration::ZERO);
+        assert_eq!(m.bm25_elapsed, Duration::ZERO);
+        assert_eq!(m.vector_elapsed, Duration::ZERO);
+        assert_eq!(m.vector_shortfall, 0);
+        assert_eq!(m.allowed, 0);
+    }
+
+    /// `VectorRoute` 三态齐全且 `Copy`（进 `Metrics` 后不该带来克隆成本）。
+    #[test]
+    fn 向量路径三态可辨且可复制() {
+        let all = [VectorRoute::None, VectorRoute::Ann, VectorRoute::Exact];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                assert_eq!(i == j, a == b, "三态必须互不相等");
+            }
+        }
+        let copied = VectorRoute::Exact;
+        let again = copied; // Copy：移动后仍可用
+        assert_eq!(copied, again);
+    }
+
+    /// `log` 在零耗时 / 各路径取值下都不得 panic（冒烟：tracing 无 subscriber 时静默丢弃）。
+    #[test]
+    fn log在零值与全值下都不panic() {
+        Metrics::default().log("空指标");
+        let full = Metrics {
+            took: Duration::from_millis(12),
+            bm25: 30,
+            vector: 30,
+            candidates: 55,
+            fused: 10,
+            filter_eval: Duration::from_micros(430),
+            allowed: 1000,
+            vector_shortfall: 0,
+            vector_route: VectorRoute::Exact,
+            bm25_elapsed: Duration::from_micros(1400),
+            vector_elapsed: Duration::from_micros(6100),
+        };
+        full.log("满指标");
     }
 }

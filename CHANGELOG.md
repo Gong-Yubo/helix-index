@@ -9,6 +9,93 @@
 
 ## [Unreleased]
 
+### V2 Step 5 · 实现：低选择度精确兜底 + `Metrics` 可观测化（#22，2026-09-10）
+
+> 设计见 `docs/devel/v2-step5-design.md` **v0.3**（D-S5-01~09 全部拍板）。
+> 本条目覆盖 **S5-01~03 + S5-05~07 + S5-04 的代码半**；10 万级标定定稿阈值 /
+> NFR-13 预算与文档回写（S5-08）随后续 PR 落地。
+
+#### ⚠️ 破坏性变更（0.x 阶段按既有约定接受，R35）
+
+- **`VectorIndex` 新增 1 个必选方法 + 1 个默认方法**：外部实现 `VectorIndex` 的代码
+  需要补 `search_exact_filtered`。必选是刻意的——后端**是否真精确**是实现事实，
+  不该由默认实现替它回答（同 `as_graph_persist` 用 `None` 表达「Brute 无图」的手法）。
+  库内两个 impl（`HnswRsIndex` / `BruteForceIndex`）已同步。
+- **`SearchResponse` 新增公开字段 `metrics: Metrics`**：以**字面量**构造该结构体的下游
+  代码会编译失败（库内两处构造点均由内核产出，零影响）。字段全 `pub`，故未加
+  `#[non_exhaustive]`（那会同时禁掉下游的穷尽匹配，破坏面更大）。
+- `BruteForceIndex::search_filtered` 的排序比较子由 `partial_cmp(..).unwrap_or(Equal)`
+  改为 `total_cmp`：**唯一行为差异在 NaN 输入**（旧：视作相等，顺序取决于 sort 的实现
+  细节；新：确定性全序）。NaN 属 embedder 契约外输入，精确路径已用 `debug_assert!` 强制。
+
+#### Added
+
+- **路径 C：低选择度过滤走精确扫描**（T7-22 / R18 的对策，D-S5-03 方案 A）。
+  - `VectorIndex::search_exact_filtered`（必选）：返回**全部**满足谓词的
+    `min(k, 命中数)` 条，**不允许少返回**——这是它与 ANN 的**唯一**语义差异，
+    也是低选择度场景的价值所在。
+  - `VectorIndex::prefers_exact`（默认 `false`）：**策略归后端**。`HnswRsIndex` 的实现是
+    `kind() == Filtered && allowed ≤ 阈值`（默认 `BRUTE_FALLBACK_MAX_ALLOWED = 1024`，
+    数值待 S5-04 标定定稿）；`BruteForceIndex` 恒 `true`（它本来就精确）。
+  - `HnswRsIndex::with_brute_fallback(Option<usize>)` + `brute_fallback()`：
+    `None` = **关闭**兜底（A/B 回归对照）；`from_loaded` 只写产品默认值，**不改签名**
+    （阈值是读端策略，不是图的属性——改公开 trait 的签名代价远大于收益）。
+  - **全量点遍历用 `&PointIndexation` 的 `IntoIterator`**（`hnsw.rs:681-688`：从 layer 0
+    逐层升到 `entry_point_level`，**每点恰 yield 一次**）+ `Point::get_v()`（零拷贝）+
+    `Point::get_origin_id()`（即 `ChunkId`）。**不可**用 `get_layer_iterator(0)`：
+    点只被推入它自己那一层（`hnsw.rs:511`，无回填低层）⇒ `P(level ≥ 1) = 1/M`，
+    本项目 M=32 时约 **3.1% 的点不在 layer 0**，用它做精确扫描会**静默错答**。
+- **`Metrics` 可观测化**（T7-23 / NFR-07，D-S5-05/06/07）：
+  `SearchResponse.metrics` 字段 + `query` 模块再导出 `Metrics` / `VectorRoute`，
+  新增 `vector_route: {None, Ann, Exact}`（**T7-22 的 A/B 判据**）、`bm25_elapsed` /
+  `vector_elapsed`（Hybrid 并行下 `took` 无法归因"是哪一路慢"）。
+  `tracing` 通道保留——三条通道受众不同（调用方 / 宿主 / 决策），不是重复。
+- **`NormalizedVector::distance_to_slice(&[f32])`**，且 `distance_sq` **改为转发它**：
+  单一求和实现 ⇒ 「精确路径与 `BruteForceIndex` 逐位一致」是**结构**而非巧合
+  （精确扫描逐点调 `NormalizedVector::new(v.to_vec())` 会每候选一次堆分配 + 重算范数）。
+- **CLI**：`helix bench --brute-fallback <N|off>`（S5-04 的 **A/B 唯一开关**，
+  `off` ⇒ 关闭兜底）；`helix search --metrics` 打印一行内核指标（NFR-07「用户可自查」，
+  默认关，属诊断输出）。
+
+#### Changed
+
+- **`Metrics.vector_shortfall` 的语义边界变了**：低选择度档位走精确路径后果该值
+  **结构性归零** ⇒ 「0 缺口」**不再等于**「无 prefilter 需求」，判读必须**连看
+  `vector_route`**（设计 §4.4 推论 1）。bench 因此把两套 shortfall 口径**并列**输出
+  （bench 侧 `min(K, allowed)` vs 内核侧 `min(candidate_k, allowed)`）——
+  差异本身现在是"两个分母之别"的度量，而不再是"拿不到内核值"的替代。
+- **修复 D-S5-08：两条早退路径的 `metrics.took` 恒为 0**。
+  `searcher.rs` 的 `index_is_empty`（连 `metrics.log` 都不调，故 `grep metrics.log`
+  **结构上找不到它**）与"过滤排空"两条路径从不设 `took`，而响应的 `took` 一直取真值
+  ⇒ 日志与响应各说一套。现在两条都设真值；`empty_response` 改为接收**调用方算好的**
+  `took`，让 `metrics.took == took`（I7）是**逐位相等**而不是近似。
+- **`search_parts` 的向量路分派**：按 `VectorRetriever::plan()` 在
+  `search_filtered`（ANN）/ `search_exact_filtered`（精确）间二选一，并把结果写进
+  `Metrics.vector_route`。热路径（`None` / `Alive`）**一行未改**——策略在
+  `prefers_exact` 里就否掉了它们（R15 的 fast-return 是 Step 1 的设计不变量）。
+- `bench` 延迟阶段新增内核采集（`vector_shortfall_kernel` / `vector_route_exact_ratio` /
+  `mean_filter_eval_us` / per-lane 耗时并进 JSON）与汇总表两列（`缺口(内核)` / `精确占比`），
+  并单列「内核耗时分解」——降级字段档位的 `doc_bits_scan` 全扫本身就占 ~8ms，
+  没有这一节会把"过滤求值贵"误判成"兜底失败"（D-S5-04 / D-S5-09）。
+
+#### 测试
+
+- 单元：`distance_sq` 转发后**逐位不变**（`to_bits` 断言，钉住 I4 的结构性前提）、
+  全量遍历基数 `== get_nb_point()` 且零重复、**"高层点自查询"定向用例**
+  （取 `level ≥ 1` 的点用它自己的向量查、断言排第一；同时断言它**不在 layer 0**，
+  否则用例失去鉴别力——`from_os_rng` 使漏点集每次建图都变，随机 Top-K 会 flaky）、
+  与 `BruteForceIndex` 逐位一致、阈值边界 / 关闭开关 / 默认值、`None` 谓词含幽灵、
+  同距离按 `chunk_id` 升序且不依赖插入序、`Metrics` 默认值不撒谎。
+- 编排层：用**间谍后端**断言"到底调了哪个方法"（真 HNSW 的拓扑每次建图都不同，
+  用真图做 A/B 会混入拓扑噪声而不可证伪）；覆盖热路径两者逐位一致、
+  低选择度分派与 `vector_route` 记账、三条早退路径 `took` 非 0、响应口径自洽。
+  ⚠️ 间谍必须**忠实复刻**策略契约（`FilterKind::Filtered` 才谈得上兜底）——
+  `try_build_predicate(index, None)` 对**无用户过滤**也返回 `Some(AliveOnly)`（`filter.rs:195`），
+  只看"有没有谓词"会把热路径误判成低选择度。
+- 集成：`crates/core/tests/step5_query_observability.rs`（新，N=400 合成语料、秒级、进 CI）——
+  真实后端 + 真实谓词 + 真实编排下端到端验 `route == Exact` / 缺口归零 / 命中全部满足谓词 /
+  与 Brute oracle 逐位一致 / `off` 回到 `Ann` / `Bm25` 模式 `route == None` / 空结果口径自洽。
+
 ### V2 Step 5 · 详细设计（2026-09-10）
 
 - 新增 `docs/devel/v2-step5-design.md`（**v0.3，二次评审响应版；D-S5-01~09 全部拍板**）：**查询性能与可观测

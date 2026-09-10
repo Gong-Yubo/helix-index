@@ -13,17 +13,18 @@
 //! 门面层的 owned `Searcher`（I-05）同样复用 `search_parts`，不复制编排逻辑。
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::analyze::Analyzer;
 use crate::embed::Embedder;
 use crate::error::{Error, Result};
 use crate::fusion::{FusionStrategy, LaneResults, RrfFusion};
 use crate::index::Index;
+use crate::predicate::CandidateFilter;
 use crate::rerank::{NoOpReranker, Reranker};
-use crate::retriever::{Bm25Params, Bm25Retriever, Retriever, VectorRetriever};
+use crate::retriever::{Bm25Params, Bm25Retriever, Retriever, Scored, VectorRetriever};
 use crate::types::{ChunkId, Score};
-use crate::vector::VectorIndex;
+use crate::vector::{VectorIndex, VectorRoute};
 
 use super::explain::{determine_empty_reason, matched_terms};
 use super::metrics::Metrics;
@@ -97,9 +98,19 @@ pub fn search_parts(
     let query_is_empty = query_tokens.is_empty();
 
     if index_is_empty {
+        // D-S5-08：`metrics.took` 必须与响应的 `took` **同值**（旧代码保持
+        // `Duration::ZERO` ⇒ 装进响应后立刻违反 I7「metrics.took == took」）。
+        // 先算一次再共用，避免两次 `elapsed()` 的纳秒差让 I7 变成近似断言。
+        //
+        // ⚠️ 本路径**刻意不调 `metrics.log`**（与 Step 5 之前一致）：索引为空的
+        // 诊断价值在 `empty_reason`，不必让每个空库查询都刷一行日志。
+        // `took` 仍可由 `SearchResponse.metrics` 观测到。
+        let took = started.elapsed();
+        metrics.took = took;
         return Ok(empty_response(
             Some(super::response::EmptyReason::NoDocuments),
-            started,
+            took,
+            metrics,
         ));
     }
 
@@ -123,8 +134,12 @@ pub fn search_parts(
                 Some(super::response::EmptyReason::FilteredOut)
             };
             metrics.filter_eval = t0.elapsed();
+            // D-S5-08（第二条）：旧代码此处 `metrics.took` 仍是 `Duration::ZERO`
+            // ⇒ 日志打印 `took_ms=0` 而响应的 `took` 是真值，「日志与响应各说一套」。
+            let took = started.elapsed();
+            metrics.took = took;
             metrics.log(query);
-            return Ok(empty_response(reason, started));
+            return Ok(empty_response(reason, took, metrics));
         }
     };
     metrics.filter_eval = t0.elapsed();
@@ -142,17 +157,35 @@ pub fn search_parts(
     // 向量：恒传谓词（hnsw_rs 无法摘除已删向量，Q-C1）
     let vec_f = pred;
 
+    // V2 Step 5：向量路**分派**（ANN / 精确）与**记账**（`Metrics.vector_route`）。
+    // 策略由后端 `VectorIndex::prefers_exact` 给出（见 `VectorRetriever::plan`），
+    // 编排层只做二选一——阈值规则不在这一层复制。
+    // `SearchMode::Bm25` 不走向量路 ⇒ `vector_route` 保持默认 `None`（本次检索
+    // 有没有向量路是编排层的信息，不该由后端编码）。
+    let vec_route = match mode {
+        SearchMode::Bm25 => VectorRoute::None,
+        SearchMode::Vector | SearchMode::Hybrid => {
+            let (e, vi) = require_vector(parts.embedder, parts.vector_index)?;
+            VectorRetriever::new(e, vi).plan(vec_f)
+        }
+    };
+
     let (bm25_lane, vector_lane) = match mode {
         SearchMode::Bm25 => {
             let bm25 =
                 Bm25Retriever::new(parts.index, parts.analyzer).with_params(parts.bm25_params);
+            let t = Instant::now();
             let lane = to_lane(bm25.search_filtered(query, candidate_k, bm25_f)?);
+            metrics.bm25_elapsed = t.elapsed();
             (Some(lane), None)
         }
         SearchMode::Vector => {
             let (e, vi) = require_vector(parts.embedder, parts.vector_index)?;
             let vec = VectorRetriever::new(e, vi);
-            let lane = to_lane(vec.search_filtered(query, candidate_k, vec_f)?);
+            metrics.vector_route = vec_route;
+            let t = Instant::now();
+            let lane = to_lane(dispatch_vector(&vec, vec_route, query, candidate_k, vec_f)?);
+            metrics.vector_elapsed = t.elapsed();
             (None, Some(lane))
         }
         SearchMode::Hybrid => {
@@ -160,12 +193,25 @@ pub fn search_parts(
             let bm25 =
                 Bm25Retriever::new(parts.index, parts.analyzer).with_params(parts.bm25_params);
             let vec = VectorRetriever::new(e, vi);
-            // 并行执行；谓词是 Send + Sync，可安全跨 rayon 线程共享
+            metrics.vector_route = vec_route;
+            // 并行执行；谓词是 Send + Sync，可安全跨 rayon 线程共享。
+            // 每路各自计时：Hybrid 下单一 `took` 无法归因"是哪一路慢"
+            // （D-S5-06；架构 §8.3 的示例日志本就预期 bm25=/vector= 两列）。
             let (r1, r2) = rayon::join(
-                || bm25.search_filtered(query, candidate_k, bm25_f),
-                || vec.search_filtered(query, candidate_k, vec_f),
+                || {
+                    let t = Instant::now();
+                    let r = bm25.search_filtered(query, candidate_k, bm25_f);
+                    (r, t.elapsed())
+                },
+                || {
+                    let t = Instant::now();
+                    let r = dispatch_vector(&vec, vec_route, query, candidate_k, vec_f);
+                    (r, t.elapsed())
+                },
             );
-            (Some(to_lane(r1?)), Some(to_lane(r2?)))
+            metrics.bm25_elapsed = r1.1;
+            metrics.vector_elapsed = r2.1;
+            (Some(to_lane(r1.0?)), Some(to_lane(r2.0?)))
         }
     };
 
@@ -209,9 +255,10 @@ pub fn search_parts(
         } else {
             determine_empty_reason(false, query_is_empty, 0)
         };
-        metrics.took = started.elapsed();
+        let took = started.elapsed();
+        metrics.took = took;
         metrics.log(query);
-        return Ok(empty_response(reason, started));
+        return Ok(empty_response(reason, took, metrics));
     }
 
     // 3. 对 Top-K 做一次正排回捞 + 组装 explain
@@ -262,15 +309,36 @@ pub fn search_parts(
     let hits = parts.reranker.rerank(query, hits, k)?;
 
     metrics.fused = hits.len();
-    metrics.took = started.elapsed();
+    let took = started.elapsed();
+    metrics.took = took;
     metrics.log(query);
 
     Ok(SearchResponse {
         hits,
         total_candidates: metrics.candidates,
         empty_reason: None,
-        took: metrics.took,
+        took,
+        metrics,
     })
+}
+
+/// 向量路的分派（D-S5-01 的"分派归编排层"落地）。
+///
+/// 只有两臂可达：`plan()` 返回的是 `Ann` / `Exact`。`VectorRoute::None` 表示
+/// "本次检索没有向量路"，由编排层在 `SearchMode::Bm25` 下写入
+/// `Metrics.vector_route`——它**不会**流到这里（类型上就没这个状态可传）。
+fn dispatch_vector(
+    vec: &VectorRetriever<'_>,
+    route: VectorRoute,
+    query: &str,
+    k: usize,
+    filter: Option<&dyn CandidateFilter>,
+) -> Result<Vec<Scored>> {
+    match route {
+        VectorRoute::Exact => vec.search_exact_filtered(query, k, filter),
+        VectorRoute::Ann => vec.search_filtered(query, k, filter),
+        VectorRoute::None => unreachable!("plan() 不返回 VectorRoute::None（Bm25 模式不走向量路）"),
+    }
 }
 
 /// query 是否在词典里**有任何命中**（§5.8.1 的词典探针）。
@@ -406,15 +474,26 @@ impl<'a> QueryExecutor<'a> {
     }
 }
 
+/// 组装空结果响应。
+///
+/// `took` 由**调用方**算好后传入（而不是在这里 `started.elapsed()`）：
+/// [`Metrics::took`] 与响应的 `took` 必须是**同一个值**（I7），两次 `elapsed()`
+/// 之间隔着纳秒级误差，分开算会让"口径自洽"退化成近似断言。
 fn empty_response(
     reason: Option<super::response::EmptyReason>,
-    started: Instant,
+    took: Duration,
+    metrics: Metrics,
 ) -> SearchResponse {
+    debug_assert_eq!(
+        metrics.took, took,
+        "I7：空结果路径的 metrics.took 必须与响应 took 逐位一致"
+    );
     SearchResponse {
         hits: Vec::new(),
-        total_candidates: 0,
+        total_candidates: metrics.candidates,
         empty_reason: reason,
-        took: started.elapsed(),
+        took,
+        metrics,
     }
 }
 
@@ -427,6 +506,8 @@ fn to_lane(v: Vec<crate::retriever::Scored>) -> LaneResults {
 mod tests {
     #![allow(non_snake_case)] // 中文测试名含英文缩写（NoDocuments / AllTermsUnmatched）
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
     use crate::analyze::MixedAnalyzer;
     use crate::chunk::Chunker;
     use crate::document::DocRecord;
@@ -701,6 +782,297 @@ mod tests {
                 r.empty_reason,
                 Some(EmptyReason::AllTermsUnmatched),
                 "无命中 / {label} → AllTermsUnmatched（query 侧信号优先于 filter）"
+            );
+        }
+    }
+
+    // ========================================================================
+    // V2 Step 5 / S5-03 + S5-06：向量路分派、`vector_route` 记账、响应口径自洽
+    // ========================================================================
+
+    /// 间谍向量后端：**记录到底调了哪个方法**，返回值完全固定。
+    ///
+    /// 为什么用间谍而不是真的 `HnswRsIndex`：这一步要断言的是"**编排层分派对不对**"，
+    /// 而真 HNSW 的拓扑每次建图都不同（`StdRng::from_os_rng()`）⇒ "开/关兜底结果
+    /// 逐位一致"的 A/B 会混入拓扑噪声、变得不可证伪。间谍后端没有图，两条路径
+    /// 返回同一份固定数据 ⇒ 差异只可能来自**分派**，这正是 S5-T7 想钉的东西。
+    struct SpyVectorIndex {
+        /// 策略：是否声明"该谓词下走精确路径"（模拟 `HnswRsIndex` 的阈值判断）
+        exact_by_policy: bool,
+        /// `search_filtered`（ANN 路径）被调用次数
+        ann_calls: AtomicUsize,
+        /// `search_exact_filtered` 被调用次数
+        exact_calls: AtomicUsize,
+        /// ANN 路径返回的 id（刻意少于 Exact ⇒ 复现 R11 的召回缺口）
+        ann_ids: Vec<ChunkId>,
+        /// 精确路径返回的 id（= 全部 allowed ⇒ 结构性无缺口）
+        exact_ids: Vec<ChunkId>,
+    }
+
+    impl SpyVectorIndex {
+        fn new(exact_by_policy: bool, ann_ids: Vec<ChunkId>, exact_ids: Vec<ChunkId>) -> Self {
+            Self {
+                exact_by_policy,
+                ann_calls: AtomicUsize::new(0),
+                exact_calls: AtomicUsize::new(0),
+                ann_ids,
+                exact_ids,
+            }
+        }
+
+        fn calls(&self) -> (usize, usize) {
+            (
+                self.ann_calls.load(AtomicOrdering::SeqCst),
+                self.exact_calls.load(AtomicOrdering::SeqCst),
+            )
+        }
+
+        /// 固定距离序列（升序、唯一、与 id 顺序无关地确定性）
+        fn fixed(ids: &[ChunkId]) -> Vec<(ChunkId, f32)> {
+            ids.iter()
+                .enumerate()
+                .map(|(i, id)| (*id, i as f32 * 0.5))
+                .collect()
+        }
+    }
+
+    impl crate::vector::VectorIndex for SpyVectorIndex {
+        fn add(&mut self, _id: ChunkId, _vec: crate::vector::NormalizedVector) -> Result<()> {
+            Ok(())
+        }
+
+        fn search_filtered(
+            &self,
+            _query: &crate::vector::NormalizedVector,
+            _k: usize,
+            _filter: Option<&dyn CandidateFilter>,
+        ) -> Result<Vec<(ChunkId, f32)>> {
+            self.ann_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(Self::fixed(&self.ann_ids))
+        }
+
+        fn search_exact_filtered(
+            &self,
+            _query: &crate::vector::NormalizedVector,
+            _k: usize,
+            _filter: Option<&dyn CandidateFilter>,
+        ) -> Result<Vec<(ChunkId, f32)>> {
+            self.exact_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(Self::fixed(&self.exact_ids))
+        }
+
+        /// 策略必须与真后端**同契约**：`FilterKind::Filtered` 才谈得上兜底。
+        ///
+        /// ⚠️ 这条不是可选的细节：`try_build_predicate(index, None)` 对**无用户过滤**
+        /// 也返回 `Some(AliveOnly)`（`filter.rs:195`），即热路径上向量 lane **总是**
+        /// 拿到一个 `Some(谓词)`。若策略只看"有没有谓词"而不看 `kind()`，热路径会被
+        /// 误判成低选择度过滤而走精确扫描——本用例最初就是这么红的（间谍不忠实）。
+        fn prefers_exact(&self, filter: &dyn CandidateFilter) -> bool {
+            self.exact_by_policy && filter.kind() == crate::predicate::FilterKind::Filtered
+        }
+
+        fn len(&self) -> usize {
+            12
+        }
+    }
+
+    /// 带 `tag` 元数据的语料（让 `Filter::eq("tag", ..)` 能建出 `FilterKind::Filtered` 谓词）。
+    fn build_tagged_index(texts: &[&str], tag: &str) -> (Index, MixedAnalyzer) {
+        let analyzer = MixedAnalyzer::new();
+        let chunker = Chunker::default();
+        let mut index = Index::new();
+        for (i, text) in texts.iter().enumerate() {
+            let doc = DocRecord {
+                doc_id: 0,
+                source: format!("doc-{i}"),
+                metadata: serde_json::json!({ "tag": tag }),
+                content_hash: 0,
+            };
+            index.add(doc, chunker.chunk(0, text), &analyzer).unwrap();
+        }
+        (index, analyzer)
+    }
+
+    /// **S5-T1 / I6**：分派与记账**都不撒谎**。
+    ///
+    /// - 热路径（无过滤）：两个间谍都走 ANN，结果**逐位一致**（S5-T7 的行为 A/B）；
+    /// - 低选择度过滤：`exact_by_policy` 的那个走**精确**路径，`vector_route` 如实标 `Exact`；
+    ///   另一个走 ANN，标 `Ann`。
+    #[test]
+    fn S5_T1_分派与route记账不撒谎() {
+        use crate::schema::Filter;
+
+        let texts: Vec<String> = (0..12).map(|i| format!("检索 文档 {i}")).collect();
+        let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        let (index, analyzer) = build_tagged_index(&refs, "kept");
+        let e = FakeEmbedder;
+
+        // ANN 只召回 4 条（复现 R11 缺口）；精确路径返回全部 12 条
+        let ann_ids: Vec<ChunkId> = (0..4).collect();
+        let exact_ids: Vec<ChunkId> = (0..12).collect();
+        let on = SpyVectorIndex::new(true, ann_ids.clone(), exact_ids.clone());
+        let off = SpyVectorIndex::new(false, ann_ids.clone(), exact_ids.clone());
+
+        let filter = Filter::eq("tag", "kept");
+
+        // ── 热路径（无过滤）：两者都必须走 ANN，且结果逐位一致 ──
+        let s_on = QueryExecutor::new(&index, &analyzer).with_vector(&e, &on);
+        let s_off = QueryExecutor::new(&index, &analyzer).with_vector(&e, &off);
+        let hot_on = s_on.search("检索", SearchMode::Vector, 10).unwrap();
+        let hot_off = s_off.search("检索", SearchMode::Vector, 10).unwrap();
+        let ids =
+            |r: &SearchResponse| -> Vec<ChunkId> { r.hits.iter().map(|h| h.chunk_id).collect() };
+        assert_eq!(
+            ids(&hot_on),
+            ids(&hot_off),
+            "S5-T7：无过滤时兜底开关不得改变结果（热路径一行未改）"
+        );
+        assert_eq!(
+            hot_on.metrics.vector_route,
+            VectorRoute::Ann,
+            "无过滤 ⇒ 恒走 ANN"
+        );
+        assert_eq!(on.calls(), (1, 0), "热路径必须调 search_filtered");
+        assert_eq!(off.calls(), (1, 0));
+
+        // ── 低选择度过滤：策略为真的走精确、为假的走 ANN ──
+        let filt_on = s_on
+            .search_filtered("检索", SearchMode::Vector, 10, Some(&filter))
+            .unwrap();
+        assert_eq!(
+            filt_on.metrics.vector_route,
+            VectorRoute::Exact,
+            "I6：route 必须与实际走的路径一致"
+        );
+        assert_eq!(on.calls(), (1, 1), "策略为真 ⇒ 调 search_exact_filtered");
+
+        let filt_off = s_off
+            .search_filtered("检索", SearchMode::Vector, 10, Some(&filter))
+            .unwrap();
+        assert_eq!(filt_off.metrics.vector_route, VectorRoute::Ann);
+        assert_eq!(off.calls(), (2, 0), "策略为假 ⇒ 仍调 search_filtered");
+
+        // ── 语义收益（§4.4）：精确路径把缺口**结构性归零** ──
+        assert_eq!(filt_off.metrics.vector, 4, "ANN 只凑到 4 条");
+        assert!(
+            filt_off.metrics.vector_shortfall > 0,
+            "ANN 低选择度下应有可观测缺口（R11 的可见信号）"
+        );
+        assert_eq!(filt_on.metrics.vector, 12, "精确路径返回全部 allowed");
+        assert_eq!(
+            filt_on.metrics.vector_shortfall, 0,
+            "精确路径的缺口恒 0 —— 但判读必须连看 vector_route（§4.4 推论 1）"
+        );
+    }
+
+    /// **S5-T7（行为 A/B）**：`FilterKind::Alive`（软删除过滤）也不得被兜底劫持。
+    ///
+    /// 与上一个用例同理，但走的是 Hybrid（BM25 + 向量并行），顺带验证
+    /// per-lane 耗时（D-S5-06）在并行分支里也被填上。
+    #[test]
+    fn S5_T7_真假两种策略在Alive谓词下结果一致() {
+        use crate::schema::Filter;
+
+        let (index, analyzer) = build_tagged_index(&["检索 甲", "检索 乙", "向量 丙"], "kept");
+        let e = FakeEmbedder;
+        let ids: Vec<ChunkId> = (0..3).collect();
+        let on = SpyVectorIndex::new(true, ids.clone(), ids.clone());
+        let off = SpyVectorIndex::new(false, ids.clone(), ids.clone());
+        let filter = Filter::eq("tag", "kept");
+
+        let s_on = QueryExecutor::new(&index, &analyzer).with_vector(&e, &on);
+        let s_off = QueryExecutor::new(&index, &analyzer).with_vector(&e, &off);
+
+        // Hybrid + 用户过滤 ⇒ 谓词是 Filtered（策略生效）；这里比的是"结果是否一致"
+        let a = s_on
+            .search_filtered("检索", SearchMode::Hybrid, 10, Some(&filter))
+            .unwrap();
+        let b = s_off
+            .search_filtered("检索", SearchMode::Hybrid, 10, Some(&filter))
+            .unwrap();
+        assert_ne!(
+            a.metrics.vector_route, b.metrics.vector_route,
+            "两者策略不同，route 必须不同（否则本 A/B 失去鉴别力）"
+        );
+        // Hybrid 的向量 lane 输入不同 ⇒ 融合结果理应不同，但**两路耗时都必须被填**
+        assert!(a.metrics.bm25_elapsed > Duration::ZERO, "bm25 耗时未填");
+        assert!(a.metrics.vector_elapsed > Duration::ZERO, "vector 耗时未填");
+        assert!(b.metrics.bm25_elapsed > Duration::ZERO);
+        assert!(b.metrics.vector_elapsed > Duration::ZERO);
+    }
+
+    /// **S5-T8 / I8（D-S5-08）**：三条早退路径的 `took` 都必须是**真实值**。
+    ///
+    /// 旧代码里 `index_is_empty`（连 `metrics.log` 都不调）与"过滤排空"两条路径
+    /// 从不设 `metrics.took`，保持 `Duration::ZERO` ⇒ 一旦 `metrics` 进响应就立刻
+    /// 违反 `metrics.took == took`。
+    ///
+    /// ⚠️ 复核这两条**不能用 `grep "metrics.log"`**：第一条根本不调用它，
+    /// 结构上永远找不到（设计 §2.5）。
+    #[test]
+    fn S5_T8_三条早退路径的took都是真值() {
+        use crate::query::response::EmptyReason;
+        use crate::schema::Filter;
+
+        // ① index_is_empty
+        let analyzer = MixedAnalyzer::new();
+        let empty_index = Index::new();
+        let s = QueryExecutor::new(&empty_index, &analyzer);
+        let r = s.search("x", SearchMode::Bm25, 10).unwrap();
+        assert_eq!(r.empty_reason, Some(EmptyReason::NoDocuments));
+        assert_eq!(r.metrics.took, r.took, "I7：空索引路径口径必须自洽");
+        assert!(r.took > Duration::ZERO, "① 空索引路径的 took 必须非 0");
+
+        // ② 过滤排空
+        let (index, analyzer) = build_tagged_index(&["检索 甲", "检索 乙"], "kept");
+        let s = QueryExecutor::new(&index, &analyzer);
+        let impossible = Filter::eq("tag", "nope");
+        let r = s
+            .search_filtered("检索", SearchMode::Bm25, 10, Some(&impossible))
+            .unwrap();
+        assert_eq!(r.empty_reason, Some(EmptyReason::FilteredOut));
+        assert_eq!(r.metrics.took, r.took, "I7：过滤排空路径口径必须自洽");
+        assert!(r.took > Duration::ZERO, "② 过滤排空路径的 took 必须非 0");
+
+        // ③ 融合后为空（Step 5 之前就已设，钉住不回归）
+        let r = s.search("zzz_not_in_dict", SearchMode::Bm25, 10).unwrap();
+        assert_eq!(r.empty_reason, Some(EmptyReason::AllTermsUnmatched));
+        assert_eq!(r.metrics.took, r.took);
+        assert!(r.took > Duration::ZERO, "③ 融合为空路径的 took 必须非 0");
+    }
+
+    /// **S5-T9 / I7**：响应口径自洽——`metrics.took == took`、
+    /// `metrics.candidates == total_candidates`，空结果与正常结果**两条路**都成立。
+    #[test]
+    fn S5_T9_响应口径自洽() {
+        use crate::schema::Filter;
+
+        let (index, analyzer) = build_tagged_index(
+            &["检索 甲乙丙", "向量检索计算余弦相似度", "混合检索融合两路"],
+            "kept",
+        );
+        let s = QueryExecutor::new(&index, &analyzer);
+
+        // 正常结果（含 BM25 路）与两条空结果路径都要检查口径
+        let cases: Vec<(Option<Filter>, &str)> = vec![
+            (None, "正常"),
+            (Some(Filter::eq("tag", "kept")), "过滤有匹配"),
+            (Some(Filter::eq("tag", "nope")), "过滤排空"),
+        ];
+        for (f, label) in cases {
+            let r = match &f {
+                Some(f) => s
+                    .search_filtered("检索", SearchMode::Bm25, 10, Some(f))
+                    .unwrap(),
+                None => s.search("检索", SearchMode::Bm25, 10).unwrap(),
+            };
+            assert_eq!(
+                r.metrics.took, r.took,
+                "{label}：metrics.took 与 took 不一致"
+            );
+            assert_eq!(
+                r.metrics.candidates, r.total_candidates,
+                "{label}：metrics.candidates 与 total_candidates 不一致"
             );
         }
     }

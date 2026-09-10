@@ -46,7 +46,9 @@ use helix_core::retriever::Bm25Params;
 use helix_core::schema::Filter;
 use helix_core::storage;
 use helix_core::types::ChunkId;
-use helix_core::vector::{BruteForceIndex, HnswRsIndex, NormalizedVector, VectorIndex};
+use helix_core::vector::{
+    BruteForceIndex, HnswRsIndex, NormalizedVector, VectorIndex, VectorRoute,
+};
 
 /// 预期占优（分桶假设，9.4）：检验"哪路占优"，非自我实现预言
 const EXPECTED_WINNER: &[(&str, &str)] = &[
@@ -133,6 +135,16 @@ pub struct BenchArgs {
     /// 即使传入也只会被收敛到 5000 而非 panic，见 `oracle_depth_for`）
     #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..=500))]
     pub oracle_depth: u64,
+    /// 精确兜底阈值（V2 Step 5 / D-S5-02 / S5-04）：**A/B 的唯一开关**。
+    ///
+    /// - 不传 ⇒ 用内核默认（`HnswRsIndex` 的 `BRUTE_FALLBACK_MAX_ALLOWED`）
+    /// - `off` ⇒ `with_brute_fallback(None)`，**关闭**兜底（行为回到 Step 5 之前）
+    /// - 数字 N ⇒ 覆盖阈值（`allowed ≤ N` 且谓词为 `Filtered` 时走精确扫描）
+    ///
+    /// ⚠️ 只对 `--vector-index hnsw` 有意义：`BruteForceIndex` 本来就精确
+    /// （`prefers_exact` 恒 `true`），没有"关不关"这回事。
+    #[arg(long, value_name = "N|off")]
+    pub brute_fallback: Option<String>,
 }
 
 /// 评测环境：索引 + 分词器 + 可选向量后端。
@@ -275,6 +287,19 @@ pub fn run(args: BenchArgs) -> Result<()> {
             .map(|e| format!("(ef_search={e})"))
             .unwrap_or_default()
     );
+    // S5-04：A/B 开关的生效值必须显式打印——「没传」与「off」语义不同，
+    // 标定时看错一行就会把"全部退化成 ANN 基线"当成"兜底无效"。
+    println!(
+        "精确兜底: {}",
+        match parse_brute_fallback(args.brute_fallback.as_deref())? {
+            None => format!(
+                "内核默认（阈值 {}；用 --brute-fallback off 关闭做 A/B 对照）",
+                helix_core::vector::BRUTE_FALLBACK_MAX_ALLOWED
+            ),
+            Some(None) => "关闭（off）—— 行为回到 Step 5 之前".to_string(),
+            Some(Some(n)) => format!("阈值 {n}"),
+        }
+    );
     if let Some(f) = filter.as_ref() {
         let total = setup.index.num_chunks().max(1) as f64;
         // clap 校验已保证 1..=500，恒在 usize 范围内
@@ -309,6 +334,14 @@ pub fn run(args: BenchArgs) -> Result<()> {
             "selectivity": allowed as f64 / setup.index.num_chunks().max(1) as f64,
         });
     }
+    // S5-04 的 A/B 唯一开关必须进 JSON —— 否则两次跑出的文件无法自证跑的是哪一档
+    json["brute_fallback"] = serde_json::json!(match parse_brute_fallback(
+        args.brute_fallback.as_deref()
+    )? {
+        None => "kernel-default".to_string(),
+        Some(None) => "off".to_string(),
+        Some(Some(n)) => n.to_string(),
+    });
 
     // ---- 2. 阶段 A：效果（--runs 轮，每轮重建 HNSW 图模拟跨进程差异）----
     let runs = args.runs.max(1);
@@ -439,12 +472,13 @@ pub fn run(args: BenchArgs) -> Result<()> {
         );
         if filter.is_some() {
             println!(
-                "{:<8} {:>10} {:>10} {:>10} {:>10}",
-                "mode", "P50(ms)", "P99(ms)", "平均条数", "平均缺口"
+                "{:<8} {:>10} {:>10} {:>10} {:>12} {:>12} {:>10}",
+                "mode", "P50(ms)", "P99(ms)", "平均条数", "缺口(bench)", "缺口(内核)", "精确占比"
             );
         } else {
             println!("{:<8} {:>10} {:>10}", "mode", "P50(ms)", "P99(ms)");
         }
+        let mut lat_rows: Vec<(SearchMode, LatencyResult)> = Vec::new();
         for &mode in &modes {
             let searcher = make_searcher(&setup, bm25_params, rrf_k, &rrf_weights, mode)?;
             let lat = eval_latency(
@@ -463,13 +497,18 @@ pub fn run(args: BenchArgs) -> Result<()> {
                 },
             );
             if filter.is_some() {
+                // 「缺口(bench)」与「缺口(内核)」并列（S5-07）：差异本身即
+                // `min(K, allowed)` 与 `min(candidate_k, allowed)` 之别，不是重复列。
+                // 「精确占比」= `vector_route == Exact` 的响应占比——T7-22 的 A/B 判据。
                 println!(
-                    "{:<8} {:>10.2} {:>10.2} {:>10.2} {:>10.2}",
+                    "{:<8} {:>10.2} {:>10.2} {:>10.2} {:>12.2} {:>12.2} {:>10.3}",
                     mode_name(mode),
                     lat.p50_ms,
                     lat.p99_ms,
                     lat.mean_hits,
-                    lat.mean_shortfall
+                    lat.mean_shortfall,
+                    lat.mean_shortfall_kernel,
+                    lat.exact_ratio
                 );
             } else {
                 println!(
@@ -486,8 +525,45 @@ pub fn run(args: BenchArgs) -> Result<()> {
                     "p99_ms": lat.p99_ms,
                     "n_samples": lat.n,
                     "mean_hits": lat.mean_hits,
+                    // bench 口径（分母 K）与内核口径（分母 candidate_k + allowed）并列
                     "mean_shortfall": lat.mean_shortfall,
+                    "vector_shortfall_kernel": lat.mean_shortfall_kernel,
+                    "vector_route_exact_ratio": lat.exact_ratio,
+                    "mean_filter_eval_us": lat.mean_filter_eval_us,
+                    "mean_bm25_ms": lat.mean_bm25_ms,
+                    "mean_vector_ms": lat.mean_vector_ms,
+                    "n_metrics": lat.n_metrics,
                 }),
+            );
+            lat_rows.push((mode, lat));
+        }
+
+        // D-S5-04：把「兜底没生效」与「过滤求值本身贵」明确分开。
+        // 降级字段（如 ts_ms）档位的 `doc_bits_scan` 全扫本身就占 ~8ms，
+        // 与向量路正交——没有这一节，那个档位会被误判成"兜底失败"。
+        if filter.is_some() {
+            println!(
+                "\n内核耗时分解（per-lane；Hybrid 下两路走 rayon::join，**区间重叠不可相加**）："
+            );
+            println!(
+                "{:<8} {:>16} {:>12} {:>12} {:>12}",
+                "mode", "filter_eval(ms)", "bm25(ms)", "vector(ms)", "n(metrics)"
+            );
+            for (mode, lat) in &lat_rows {
+                println!(
+                    "{:<8} {:>16.4} {:>12.4} {:>12.4} {:>12}",
+                    mode_name(*mode),
+                    lat.mean_filter_eval_us / 1000.0,
+                    lat.mean_bm25_ms,
+                    lat.mean_vector_ms,
+                    lat.n_metrics
+                );
+            }
+            println!(
+                "  精确占比 = `Metrics.vector_route == Exact` 的响应占比（0 = 一次没兜底，\
+                 1 = 每次都兜底）；\n  缺口(内核) 与 缺口(bench) 的分母不同（候选池 vs K），\
+                 两者并列是为了让差异可见；\n  ⚠️ 精确路径下 缺口(内核) 结构性归零，\
+                 判读必须连看「精确占比」，不能单看缺口。"
             );
         }
         json["latency"] = latency.into();
@@ -639,6 +715,40 @@ fn load_setup(args: &BenchArgs, need_vector: bool) -> Result<Setup> {
 /// —— bench 关注检索延迟，冷启动已在 S2-T14 单独测，故内存直建维持重建并打印提示。
 type GraphSource = (std::path::PathBuf, u32, u32);
 
+/// 解析 `--brute-fallback`：
+///
+/// - `None`（未传）⇒ `Ok(None)`：不覆盖，用内核默认阈值；
+/// - `"off"` ⇒ `Ok(Some(None))`：显式关闭兜底（S5-T7 的回归对照档）；
+/// - 数字 ⇒ `Ok(Some(Some(n)))`：覆盖阈值。
+///
+/// 三层 `Option` 是刻意的：**"没传" 与 "显式关闭" 必须可区分**——
+/// 若把没传也当成关闭，`--filter` 标定档（S5-04）就会在毫不知情的情况下
+/// 全部退化成 ANN 基线，标定结论直接反向。
+fn parse_brute_fallback(raw: Option<&str>) -> Result<Option<Option<usize>>> {
+    let Some(s) = raw else { return Ok(None) };
+    match s.trim().to_ascii_lowercase().as_str() {
+        "off" | "none" => Ok(Some(None)),
+        other => {
+            let n: usize = other
+                .parse()
+                .with_context(|| format!("--brute-fallback 需要数字或 off，收到 {other:?}"))?;
+            Ok(Some(Some(n)))
+        }
+    }
+}
+
+/// 把 `--brute-fallback` 施加到 HNSW 后端（两步：先解析、后覆盖）。
+///
+/// ⚠️ 图**从 sidecar 加载**的路径同样要施加：`from_loaded` 只写产品默认值
+/// （D-S5-02），bench A/B 若只覆盖"重建路径"，`--index` 档位会静默用默认阈值、
+/// 两轮跑出同一份数据（标定结论反向）。
+fn apply_brute_fallback(idx: HnswRsIndex, raw: Option<&str>) -> Result<HnswRsIndex> {
+    Ok(match parse_brute_fallback(raw)? {
+        None => idx, // 未传：内核默认
+        Some(v) => idx.with_brute_fallback(v),
+    })
+}
+
 fn build_backend(
     vectors: &[(ChunkId, Vec<f32>)],
     args: &BenchArgs,
@@ -668,7 +778,10 @@ fn build_backend(
                              NFR-04 口径之二；消 R-P5-13 图抖动）]",
                             t.elapsed()
                         );
-                        return Ok(VectorBackend::Hnsw(idx));
+                        return Ok(VectorBackend::Hnsw(apply_brute_fallback(
+                            idx,
+                            args.brute_fallback.as_deref(),
+                        )?));
                     }
                     Err(reason) => {
                         eprintln!(
@@ -694,9 +807,18 @@ fn build_backend(
                 vectors.len(),
                 t.elapsed()
             );
-            Ok(VectorBackend::Hnsw(idx))
+            Ok(VectorBackend::Hnsw(apply_brute_fallback(
+                idx,
+                args.brute_fallback.as_deref(),
+            )?))
         }
         "brute" => {
+            if args.brute_fallback.is_some() {
+                eprintln!(
+                    "⚠️  --brute-fallback 对 --vector-index brute 无意义：\
+                     Brute 本来就精确（prefers_exact 恒 true），没有「关不关」这回事"
+                );
+            }
             let entries = vectors
                 .iter()
                 .map(|(id, v)| (*id, NormalizedVector::new(v.clone())))
@@ -1006,8 +1128,34 @@ struct LatencyResult {
     n: usize,
     /// 平均返回条数（无过滤时恒为 K，除非语料不足）
     mean_hits: f64,
-    /// 平均用户视角缺口 `min(K, allowed) − len`（无过滤时 `allowed=0`，恒为 0）
+    /// 平均**用户视角**缺口 `min(K, allowed) − len`（无过滤时 `allowed=0`，恒为 0）。
+    ///
+    /// ⚠️ 与 [`Self::mean_shortfall_kernel`] 口径不同：内核按**融合前**的候选池
+    /// `min(candidate_k, allowed)` 算（`candidate_k = max(k×3, 10)`），bench 侧看不到
+    /// 内部 `candidate_k`，这里只能用 `K` 代替。两者都叫"缺口"而分母不同，
+    /// **不可混用**——两列并列正是为了让这个差异显式（S5-07 修完断链 4 后，
+    /// 差异本身变成了"`candidate_k` 与 `k` 之别"的度量，不再是"拿不到"）。
     mean_shortfall: f64,
+    /// 平均**内核口径**缺口（`SearchResponse.metrics.vector_shortfall`，S5-07 断链 4）。
+    ///
+    /// 它才是 V2.1「是否引入 prefilter」判据的口径——与 `Metrics::vector_shortfall`
+    /// 逐位同源，不再需要 bench 侧另算一个"近似"。
+    mean_shortfall_kernel: f64,
+    /// 走**精确路径**的响应占比（`metrics.vector_route == Exact`）。
+    ///
+    /// T7-22 的 A/B 判据：0.0 = 一次都没兜底（阈值没生效），
+    /// 1.0 = 每次都兜底（该档位选择度确实 ≤ 阈值）。
+    exact_ratio: f64,
+    /// 平均过滤求值耗时（µs，内核口径）——兜底没生效与"过滤求值本身贵"靠它区分
+    /// （D-S5-04：降级字段档位上 `doc_bits_scan` 就要 ~8ms）。
+    mean_filter_eval_us: f64,
+    /// BM25 路平均耗时（ms，per-lane，D-S5-06）
+    mean_bm25_ms: f64,
+    /// 向量路平均耗时（ms，per-lane；**含精确扫描的 O(N) 遍历**）
+    mean_vector_ms: f64,
+    /// 成功取到 `metrics` 的响应数（**分母的自证**：0 表示内核没暴露 metrics，
+    /// 那一列的数字就没有意义）
+    n_metrics: usize,
 }
 
 fn eval_latency(
@@ -1024,6 +1172,13 @@ fn eval_latency(
     let mut hits_sum = 0usize;
     let mut shortfall_sum = 0usize;
     let mut n_resp = 0usize;
+    // ↓ V2 Step 5 / S5-07：内核口径采集（断链 4 的修复点）
+    let mut shortfall_kernel_sum = 0usize;
+    let mut exact_count = 0usize;
+    let mut filter_eval_us_sum = 0f64;
+    let mut bm25_ms_sum = 0f64;
+    let mut vector_ms_sum = 0f64;
+    let mut n_metrics = 0usize;
     for j in judgments {
         for _ in 0..warmup {
             let _ = run_once(searcher, &j.query, mode, k, ctx.filter);
@@ -1036,18 +1191,37 @@ fn eval_latency(
                 hits_sum += resp.hits.len();
                 shortfall_sum += k.min(allowed).saturating_sub(resp.hits.len());
                 n_resp += 1;
+
+                let m = &resp.metrics;
+                shortfall_kernel_sum += m.vector_shortfall;
+                if m.vector_route == VectorRoute::Exact {
+                    exact_count += 1;
+                }
+                filter_eval_us_sum += m.filter_eval.as_secs_f64() * 1e6;
+                bm25_ms_sum += m.bm25_elapsed.as_secs_f64() * 1000.0;
+                vector_ms_sum += m.vector_elapsed.as_secs_f64() * 1000.0;
+                n_metrics += 1;
             }
         }
     }
     samples.sort_by(|a, b| a.partial_cmp(b).expect("延迟样本无 NaN"));
     let n = samples.len();
     let denom = n_resp.max(1) as f64;
+    // 内核口径的分母是**观测到 metrics 的响应数**，与 bench 口径的 n_resp 分开记：
+    // 若两者不等，说明有响应没带 metrics（内核侧漏填），而不是"指标为 0"
+    let kdenom = n_metrics.max(1) as f64;
     LatencyResult {
         p50_ms: bench::percentile(&samples, 50.0),
         p99_ms: bench::percentile(&samples, 99.0),
         n,
         mean_hits: hits_sum as f64 / denom,
         mean_shortfall: shortfall_sum as f64 / denom,
+        mean_shortfall_kernel: shortfall_kernel_sum as f64 / kdenom,
+        exact_ratio: exact_count as f64 / kdenom,
+        mean_filter_eval_us: filter_eval_us_sum / kdenom,
+        mean_bm25_ms: bm25_ms_sum / kdenom,
+        mean_vector_ms: vector_ms_sum / kdenom,
+        n_metrics,
     }
 }
 
