@@ -6,7 +6,27 @@ all-features = true
 
 [advisories]
 version = 2
-ignore = []
+# ⚠️ 这两条**都是 `unmaintained` 公告**（不是 unsound / vulnerability），且**均无升级路径**
+#    （`Solution: No safe upgrade is available!`）。**逐条记录复核条件，不整项跳过** ——
+#    这样将来**新增**的公告仍会让 `cargo deny check advisories` 变红。
+#
+#    - **RUSTSEC-2024-0436 `paste`**（传递依赖：paste ← tokenizers ← fastembed）：
+#      上游作者已归档仓库、不再维护。
+#      复核条件：fastembed 升到不再依赖 tokenizers 的版本，或 tokenizers 换掉 `paste`（社区有 `pastey` 分叉）。
+#
+#    - **RUSTSEC-2025-0141 `bincode`**（**两条路径**）：
+#        ① `bincode 1.3.3` ← `hnsw_rs 0.3.4`（传递依赖）；
+#        ② `bincode 2.0.1` ← **本项目的直接依赖**（用于快照序列化）。
+#      上游因外部事件**永久停止开发**，并声明 `1.3.3` 即为完整版本、无需更新。
+#      复核条件：`hnsw_rs` 或本项目迁移到替代方案（公告推荐的 wincode / postcard / bitcode / rkyv）。
+#      ⚠️ **bincode 是直接依赖** ⇒ 迁移评估应**单独立项**（本 PR 只把门打开，不做迁移）。
+#
+#    ⚠️ advisories 数据库会随时间新增条目 —— **每次 CI 变红都要重新判一次**，
+#       不要把本列表当成永久白名单。
+ignore = [
+    "RUSTSEC-2024-0436",
+    "RUSTSEC-2025-0141",
+]
 
 [licenses]
 version = 2

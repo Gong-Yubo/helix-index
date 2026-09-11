@@ -9,6 +9,33 @@
 
 ## [Unreleased]
 
+### 工程 · cargo-deny 纳入 advisories 检查（Refs #25，2026-09-12）
+
+> **横切工程项**（issue #25 工程卫生的一部分），与 V2 Step 6 正交，独立 PR。
+
+#### Fixed
+
+- **`make deny` 与 CI 的 `cargo-deny` 此前只跑 `licenses bans sources`**，而 `main` 上
+  `cargo deny check advisories` **本来就是 FAILED** ⇒ 「排除」等于**这道门不存在**。
+  现改为**把 `advisories` 也纳入**，并对命中的公告**精确到 ID** 地 ignore（每条写明复核条件）：
+
+  | ID | crate | 依赖路径 | 为何不修 |
+  | --- | --- | --- | --- |
+  | **RUSTSEC-2024-0436** | `paste` | `paste ← tokenizers ← fastembed`（**传递**） | 上游作者已归档仓库、不再维护；无升级路径 |
+  | **RUSTSEC-2025-0141** | `bincode` | ① `bincode 1.3.3 ← hnsw_rs 0.3.4`（**传递**）<br>② `bincode 2.0.1` ← **本项目直接依赖**（快照序列化） | 上游因外部事件**永久停止开发**，并声明 `1.3.3` 即完整版本；无升级路径 |
+
+  ⚠️ **两条都是 `unmaintained`，不是 `unsound` / vulnerability**。
+  ⚠️ **`bincode` 是直接依赖** ⇒ 迁移评估（公告推荐 `wincode` / `postcard` / `bitcode` / `rkyv`）
+  应**单独立项**；**本 PR 只把门打开，不做迁移**。
+  ⚠️ 这条门依赖**外部 RustSec 数据库** ⇒ 数据库新增条目时 **CI 会无缘无故变红** ——
+  届时重新判一次，必要时补 ignore 并在 `deny.toml` 记下复核条件。
+  **不要把 ignore 列表当永久白名单。**
+
+#### Docs
+
+- `deny.toml` 的 `[advisories]`：`ignore = []` → 两条带**逐条复核条件**的 ignore；
+  `Makefile` 的 `deny` 目标与 `.github/workflows/ci.yml` 的 deny job 同步更新（含「数据库漂移会让 CI 变红」的说明）。
+
 ### V2 Step 6 · 详细设计 + 评审收口（#2，2026-09-11）
 
 > **纯设计 + 文档回写，不含任何代码变更**。设计文档 = `docs/devel/v2-step6-design.md` **v0.2**

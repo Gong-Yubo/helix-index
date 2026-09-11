@@ -72,7 +72,10 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny
-      - run: cargo deny check licenses bans sources
+      # 2026-09-12：纳入 advisories（deny.toml 已对两条无升级路径的 `unmaintained`
+      # 精确到 ID 地 ignore）。⚠️ 这条门依赖外部 RustSec 数据库 ⇒ **数据库新增条目时
+      # CI 会无缘无故变红**，此时应重新判一次、必要时补 ignore 并在 deny.toml 记复核条件。
+      - run: cargo deny check advisories licenses bans sources
 
   # ------------------------------------------------------------ 文档
   doc:

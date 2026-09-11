@@ -12,10 +12,15 @@ test:
 	cargo test --workspace
 
 # ADR-008 / NFR-09：依赖 License 白名单校验。首次运行会自动安装 cargo-deny（约 2~5 分钟）
+#
+# ⚠️ 2026-09-12：**把 advisories 也纳入这道门**。此前它被排除在外，而 main 上
+# `cargo deny check advisories` 本来就是 FAILED（两条 `unmaintained`、均无升级路径）⇒
+# 「排除」等于这道门不存在。现改为：在 `deny.toml` 对那两条**精确到 ID** 地 ignore
+# （每条都写了复核条件），并让本目标真的跑它 ⇒ **将来新增的公告仍会变红**。
 deny:
 	@command -v cargo-deny >/dev/null 2>&1 || \
 	  (echo "==> 首次安装 cargo-deny（约 2~5 分钟）..." && cargo install cargo-deny --locked)
-	cargo deny check licenses bans sources
+	cargo deny check advisories licenses bans sources
 
 doc:
 	cargo doc --workspace --no-deps
