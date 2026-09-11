@@ -5,18 +5,26 @@
 //! | 组 | 配置 | 想回答的问题（Q1 / Q2） |
 //! | --- | --- | --- |
 //! | **E1** | `sessions = 1`，`intra_threads = None`（= 满核），EP = CPU | 基线，同时是**探针**（复现不出 51~62 条/s 就先排查环境） |
-//! | **E2** | `sessions ∈ {2, 4}`，`intra_threads = max(1, 核数 / sessions)`，EP = CPU | 把同一批算力**切开重新分配**能不能更快（§2.3：`intra_threads` 本就吃满所有核） |
+//! | **E2** | `sessions ∈ {2, 4}`，`intra_threads = ceil(核数 / sessions)`，EP = CPU | 把同一批算力**切开重新分配**能不能更快（§2.3：`intra_threads` 本就吃满所有核） |
 //! | **E3** | `sessions = 1`，EP = CoreML（`--features coreml` 才有） | macOS aarch64 上 CoreML EP 能否初始化、能否加速 |
 //!
 //! 本文件**不进内核**：会话池是 spike 内的临时代码，`Embedder` trait 与 `LocalEmbedder`
 //! 一字不改。池化只在决策为「投」时才落地（D-S6-02 / S6-04）。
 //!
-//! 运行（release，否则吞吐无意义）：
+//! **推荐入口是 `scripts/eval_embed_session.sh`**（逐档位独立进程 + 按波交错 + 外置 `time -l`
+//! 采 RSS + 末尾输出**决策门合取表**）。本 example 直接跑也能出数，但要注意：
+//!
+//! ⚠️ **不给 `--configs` 时会把所有档位的 session 一次性建起来**（`1+2+4`，开 coreml 时 8 个），
+//! 在 batch 64 × 长文本下约 22 GB 常驻 ⇒ **换页会污染数字**，那正是本文档判为「不可用」的形态。
+//! 手工跑请显式给 `--configs`，且一次只跑一档（见 `scripts/eval_embed_session.sh` 的协议）。
 //!
 //! ```text
-//! cargo run -p helix-core --release --example bench_embed_session -- --json /tmp/s6-embed.json
-//! cargo run -p helix-core --release --features coreml --example bench_embed_session \
-//!     -- --json /tmp/s6-embed-coreml.json
+//! # 单档位（推荐用法；RSS 需外置 time 包一层）
+//! cargo run -p helix-core --release --example bench_embed_session -- \
+//!     --texts 4000 --configs e1 --rounds 3 --warmup 0 --json /tmp/s6-e1.json
+//! # E3 调优档（需 coreml feature）
+//! cargo run -p helix-core --release --features coreml --example bench_embed_session -- \
+//!     --texts 512 --configs e1,e3-coreml --rounds 2 --warmup 1 --coreml-static-shapes
 //! ```
 //!
 //! # 口径（设计 §4.2.1；三组必须同口径，否则数据不可横比）
@@ -25,8 +33,8 @@
 //! | --- | --- |
 //! | 语料 | `data/t2-corpus.jsonl` 前 **4000** 段（与 `bench_batch_size.rs` 一致 ⇒ 可与既有 51~62 条/s 对照） |
 //! | 调用方式 | 按 **64** 切片循环，复刻 `SearchIndex::flush` 的真实切片 |
-//! | 预热 | 每档位 1 轮完整语料，**丢弃计时** |
-//! | 计时 | 每轮累计 wall time；**A/B/A/B 顺序交错**（消除时间漂移），取中位数 |
+//! | 预热 | 脚本协议下：预热轮跑在**一次性进程**里（只暖 OS 缓存）；**每个计时波是该进程的首次推理** |
+//! | 计时 | 每轮累计 wall time；**逐档位独立进程 + 按波交错**（A/B/C 各起一个进程算一波） |
 //! | 保序 | 按块分发 + **按块索引回填**（与完成顺序无关，§4.3.1） |
 //!
 //! ## ⚠️ 三个容易误判的点
@@ -37,8 +45,11 @@
 //!    且读 `getrusage(2)` 需要 `unsafe`（本项目守门要求新代码无 `unsafe`）。
 //!    ⇒ 由 `scripts/eval_embed_session.sh` 用**外置 `/usr/bin/time -l`** 逐档位起独立进程采集，
 //!    与本项目 NFR-05 的既有口径一致（见 `scripts/eval_perf.sh`）。
-//! 3. **交错只在「轮」这一层**：同一轮内档位仍是顺序执行的，所以控制组（E1）的轮间漂移
+//! 3. **交错只在「波」这一层**：同一波内档位仍是顺序执行的，所以控制组（E1）的波间漂移
 //!    必须打印出来；漂移 > 10% 时跨档位比较要先按控制组归一（`perf-ab-calibration` 的教训）。
+//! 4. **本文件里的「决策门」块只判吞吐**，且要求同一进程里存在 `e1` 档位才能归一 ——
+//!    在脚本的「单档位一进程」协议下它**不会触发**。**权威的合取判定（吞吐 AND RSS）在
+//!    `scripts/eval_embed_session.sh` 的汇总表里**，别把这里的行当成「投 / 不投」结论。
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -89,6 +100,9 @@ fn default_cfgs(cores: usize) -> Vec<Cfg> {
             intra_threads: None, // None = 用满所有核（fastembed 默认）
             ep: Ep::Cpu,
         },
+        // ⚠️ 用 `div_ceil` 而不是设计 §4.2.1 字面写的 `核数 / sessions`（截断）：
+        //    10 核 / 4 session ⇒ ceil = 3（共 12 个 ONNX intra-op 线程跑在 10 核上，**允许轻微超额**
+        //    以免留核空转）。这就是 §8.10 里「2×5 / 4×3」的来历；设计公式已同步更正（评审 D/O）。
         Cfg {
             name: "e2-2",
             sessions: 2,
@@ -291,14 +305,22 @@ fn chip_name() -> String {
 
 fn load_texts(path: &std::path::Path, limit: usize) -> anyhow::Result<Vec<String>> {
     let raw = std::fs::read_to_string(path)?;
-    let texts: Vec<String> = raw
-        .lines()
-        .take(limit)
-        .map(|l| {
-            let v: serde_json::Value = serde_json::from_str(l).expect("语料每行应为 JSON");
-            v["text"].as_str().expect("语料缺 text 字段").to_string()
-        })
-        .collect();
+    let mut texts = Vec::with_capacity(limit);
+    for (i, l) in raw.lines().take(limit).enumerate() {
+        let v: serde_json::Value = serde_json::from_str(l)
+            .map_err(|e| anyhow::anyhow!("{} 第 {} 行不是合法 JSON：{e}", path.display(), i + 1))?;
+        let t = v["text"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("{} 第 {} 行缺 text 字段", path.display(), i + 1))?;
+        texts.push(t.to_string());
+    }
+    // ⚠️ 行数不足必须响亮失败：否则 `--texts N` 会静默按实际条数算吞吐，跨实验不可比（评审 Q）
+    anyhow::ensure!(
+        texts.len() == limit,
+        "语料行数不足：请求 {limit} 段，{} 只有 {} 段",
+        path.display(),
+        texts.len()
+    );
     Ok(texts)
 }
 
@@ -370,6 +392,13 @@ fn parse_args() -> anyhow::Result<Args> {
 
 fn main() -> anyhow::Result<()> {
     let args = parse_args()?;
+    // 评审 K：`--rounds 0` 会让 `median()` 的 `v[m - 1]` 下溢 panic（`len 0 / index usize::MAX`）
+    anyhow::ensure!(
+        args.rounds >= 1,
+        "--rounds 必须 ≥ 1（实得 {}）",
+        args.rounds
+    );
+    anyhow::ensure!(args.texts >= 1, "--texts 必须 ≥ 1（实得 {}）", args.texts);
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
@@ -412,6 +441,14 @@ fn main() -> anyhow::Result<()> {
         }
     };
     anyhow::ensure!(!cfgs.is_empty(), "档位表为空");
+    // 评审 F8①：`Ep::CoreMl` 是构造得出来的 ⇒ 未开 feature 时若档位表里出现它，
+    // 必须在这里响亮失败，而不是跑到一个「CPU session 却打印 ep=coreml」的档位。
+    if !cfg!(feature = "coreml") {
+        anyhow::ensure!(
+            cfgs.iter().all(|c| c.ep != Ep::CoreMl),
+            "档位表含 CoreML 档位，但本二进制未启用 coreml feature（需 --features coreml 构建）"
+        );
+    }
 
     // ---- 建池（模型加载与 ONNX 图优化不计入任何计时）----
     println!(
@@ -422,6 +459,17 @@ fn main() -> anyhow::Result<()> {
             .collect::<Vec<_>>()
             .join(", ")
     );
+    // 评审 F8②/N：同进程并存多个 pool 正是文档判为「不可用」的形态（batch 64 × 长文本下
+    // 单 session 峰值 RSS 就 2~3.3 GB）⇒ 换页会污染数字。手工跑必须看到这句。
+    if cfgs.len() > 1 {
+        let n_sessions: usize = cfgs.iter().map(|c| c.sessions).sum();
+        println!(
+            "⚠️ 同一进程并存 {} 个档位（共 {} 个 session）⇒ RSS 与换页风险高，数字只可作吞吐参考；\
+             \n  权威协议是逐档位独立进程（见 scripts/eval_embed_session.sh）",
+            cfgs.len(),
+            n_sessions
+        );
+    }
     let pools: Vec<SessionPool> = cfgs
         .iter()
         .map(|c| SessionPool::build(c, args.coreml_static_shapes))
@@ -507,20 +555,32 @@ fn main() -> anyhow::Result<()> {
         println!("⚠️ 漂移 > 10% ⇒ 跨档位比较请先按控制组归一（perf-ab-calibration 纪律）");
     }
 
-    // ---- 决策门（D-S6-01，写死在输出里）----
+    // ---- 吞吐半边（⚠️ **不是**决策门判定；评审 A/F3）----
+    //
+    // 决策门是**合取**（吞吐 ≥ +30% 且 峰值 RSS 增量 ≤ +20%），而 RSS 是进程级量、本进程测不了；
+    // 且本块要求同一进程里存在 `e1` 才能归一 —— 在脚本的「单档位一进程」协议下**不会触发**。
+    // ⇒ 权威判定落在 `scripts/eval_embed_session.sh` 的汇总表（那里同时有吞吐与 RSS）。
+    let mut printed = false;
     if let Some(e1) = rounds.iter().find(|r| r.cfg.name == "e1") {
         for rd in rounds.iter().filter(|r| r.cfg.name != "e1") {
             let gain = (e1.median() / rd.median() - 1.0) * 100.0;
             println!(
-                "决策门：{} 相对 e1 吞吐增益 {:+.1}%（门槛 ≥ +30%；RSS 增量由脚本单独测，门槛 ≤ +20%）⇒ 吞吐口径{}",
+                "[吞吐半边·非权威] {} 相对 e1 增益 {:+.1}%（门槛 ≥ +30% ⇒ {}）",
                 rd.cfg.name,
                 gain,
                 if gain >= 30.0 { "过" } else { "不过" }
             );
+            printed = true;
         }
     }
+    if !printed {
+        println!(
+            "[吞吐半边·非权威] 本进程只有单档位或无 e1 ⇒ 无法归一，不判（这是脚本协议的常态）"
+        );
+    }
     println!(
-        "⚠️ 峰值 RSS 不在本进程内测：见 scripts/eval_embed_session.sh（外置 /usr/bin/time -l）"
+        "⚠️ 合取判定（吞吐 AND 峰值 RSS 增量）见 scripts/eval_embed_session.sh 的汇总表；\
+         本进程不测 RSS（peak RSS 是进程级单调量，同进程无法分档归因）"
     );
 
     // ---- JSON 落盘 ----
