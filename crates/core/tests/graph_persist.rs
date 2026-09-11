@@ -11,10 +11,13 @@
 
 use std::sync::Arc;
 
+use helix_core::document::Document;
 use helix_core::embed::Embedder;
 use helix_core::error::Result;
+use helix_core::query::{SearchMode, VectorRoute};
+use helix_core::schema::Filter;
 use helix_core::search::{
-    GraphPersistMode, GraphStatus, SearchIndex, SearchIndexBuilder, VectorBackend,
+    GraphPersistMode, GraphStatus, SearchIndex, SearchIndexBuilder, Searcher, VectorBackend,
 };
 use helix_core::vector::{BruteForceIndex, HnswRsIndex, NormalizedVector, VectorIndex};
 
@@ -73,6 +76,13 @@ fn hash_vec(text: &str, dim: usize) -> Vec<f32> {
 
 const DIM: usize = 64;
 
+/// T13 的 **ANN 名次门**：ANN 返回的每一条都必须落在**本图精确序**的 top-N 内。
+///
+/// 为什么是 20：实测带宽 `worst exact rank ∈ [10, 11]`（80 次独立建图；min 10 /
+/// p50 10 / p95 11 / **max 11**；N=1200、rayon 10、debug profile），余量 ≈ 1.8×。
+/// 该量是**同一张图**上的比较（非跨图）⇒ 对给定图逐位可复现，不受建图 RNG 影响。
+const T13_EXACT_RANK_GATE: usize = 20;
+
 /// 装配：测试 embedder + Hnsw 后端（默认图持久化开）。
 fn builder() -> SearchIndexBuilder {
     SearchIndexBuilder::default()
@@ -128,14 +138,36 @@ fn oracle_index(texts: &[String]) -> BruteForceIndex {
     b
 }
 
-/// 在既有的 oracle 索引上取 Top-K 的 chunk_id 集合。
+/// 在既有的 oracle 索引上取 Top-K 的 chunk_id，**按引擎的输出约定排序**：
+/// `score = 1 − d²/2` 降序、同分按 `chunk_id` 升序 —— 与 `VectorRetriever::to_scored`
+/// 同一约定（评审 #39 意见 1）。
+///
+/// 为什么不直接用 `BruteForceIndex` 的原始距离序 `(d² 升序, id 升序)`：它与 score 序
+/// `(score 降序, id 升序)` 只在 `1 − d²/2` 于 f32 下**单射**时才逐位等价。一旦两个不同
+/// 的 d² 舍入到同一 score，tie-break 会让两侧的**序列**翻脸 —— 那不是缺陷，是一次良性
+/// 并列，却会挂在 T13 G2 的逐位比对上、且挂因无法归因（两侧都没错）。套同一变换 ⇒
+/// 两侧语义（含并列）结构性相同。
+///
+/// ⚠️ 这是与 `VectorRetriever::to_scored` **同一口径的第二处实现**：那边改公式（例如换
+/// 成 f64 或 `mul_add`），这里要同步。**故意不隐藏这处耦合**：同步失败会以 G2 变红的
+/// 形式暴露（本函数也顺带把 score 公式钉住了），而不是静默放宽。
+///
+/// 注：T6 也调用本函数，但那里只经 `overlap()` 用**集合**语义，排序不影响结果。
 fn oracle_topk(b: &BruteForceIndex, q: &str, k: usize) -> Vec<u32> {
     let qv = NormalizedVector::new(hash_vec(q, DIM));
-    b.search(&qv, k)
+    let mut scored: Vec<(u32, f32)> = b
+        .search(&qv, k)
         .unwrap()
         .into_iter()
-        .map(|(id, _)| id)
-        .collect()
+        .map(|(id, d)| (id, 1.0 - d / 2.0))
+        .collect();
+    // score 降序；同分按 chunk_id 升序（与 `to_scored` 逐字同约定，含 `unwrap_or` 口径）
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+    scored.into_iter().map(|(id, _)| id).collect()
 }
 
 /// Top-K 集合重合率（|A∩B| / k），用于与 oracle 比对。
@@ -728,93 +760,262 @@ fn T16_图与快照版本错配降级() {
     assert_eq!(topk(builder().load(&path).unwrap(), "文档 2", 10).len(), 10);
 }
 
-/// **S2-T13** 并行建图（D-S2-05）：打开开关后与串行的 oracle 重合率差 < 5 个百分点；
-/// 阈值以下的小批量自动回落串行（行为等价）。
+/// **S2-T13** 并行建图（D-S2-05）质量等价 —— **可归因不变式口径**（2026-09-11 重写）。
 ///
-/// ⚠️ 只验证**质量等价**，不做拓扑断言——并行的插入顺序不确定（C8），
-/// 「两次建库一致」在并行下物理上不成立，这是打开开关的既定代价。
+/// # 为什么不再比「与 oracle 的平均 Top-10 重合率」
+///
+/// 旧口径断言两条数值门：① 并行与串行的重合率差 `< 0.05`；② 各自 `>= 0.90`。
+/// 它是**跨两张独立建图**的比较，而 `hnsw_rs` 每次建图都用 `StdRng::from_os_rng()`
+/// 分配层高、并行插入顺序本身也不确定（C8）⇒ 两张图的拓扑互不相同，该数值带一条
+/// **无上界**的随机尾巴：
+///
+/// | 观测（**运行范围**见右列） | 值 |
+/// | --- | --- |
+/// | CI run `34562148819` charabia job | 并行 **0.6400** / 串行 1.0000 ⇒ 挂 |
+/// | 本机 320 次独立建图（10 物理核；rayon 2/10；含 6 路 CPU 负载） | min **0.9650**，无一 < 0.95 |
+/// | 本机整套 `--test graph_persist` 22 次（5 次无负载 + 17 次 4 路负载） | min **0.9850**，全绿 |
+///
+/// 即「0.64 / 0.86」这类离群在本机**复现不出**，也**归因不到**具体代码路径——
+/// 用阈值堵不住（幅度 14~36pp）。故照 T6（#35）的同一味药：把**不可归因的数值门**
+/// 换成**可归因的不变式**。原重合率与差值仍打印，但**不参与判定**。
+///
+/// # 已用探针排除的候选因子（本 PR 的实测结论，勿重复）
+///
+/// - **capacity**：门面建初始索引用 `HnswRsIndex::with_capacity(1024)`
+///   （`search/index.rs:320`），小于 N=1200；但 `hnsw_rs` 的 `max_elements` 只是
+///   `Vec::with_capacity` 的**预分配提示**（`hnsw.rs:447-462`），没有越界迁置分支
+///   ⇒ 实测 1024 与 1200 **无差异**，也不与并行插入构成竞态。
+/// - **save→load roundtrip**：**同一张图**的 pre（内存图）/ post（load 回来的图）
+///   逐位一致 —— 50 次同图 A/B，`max|Δ重合率| = 0.0000` ⇒ dump/load 不丢边、不退化。
+/// - **图丢点 / 向量错位**：80 次建图的图内点数恒 `== 1200`，且**图内精确** top-10 与
+///   oracle 的重合率恒 `== 1.0000`。
+/// - **不可达点**（点的自身向量查不到自己）：抽样 ≤ 3/300 = 1%。
+/// - **hnsw_rs `entry_point` 竞态**（`hnsw.rs:1085-1100`）：真实存在但量级仅 ~1%，
+///   不足以解释 0.64（与 §2.2 的探针结论一致）。
+///
+/// # 现在的门（全部是**同一张图**上的确定量，对给定图逐位可复现）
+///
+/// 1. **G1 覆盖**：加载后的图点数 `==` 文档数，且精确路径枚举出的 id 集合
+///    `==` 全部 `chunk_id`（不漏 / 不重 / 不多）。并行插入丢点、越界、重复插 → 红。
+/// 2. **G2 保真**：`QUERIES` 条 query 的**图内精确** top-10 `id` 序列 `==`
+///    `BruteForceIndex` oracle 的 top-10 序列（**两侧同约定**：见 `oracle_topk`）。
+///    id↔向量错位、向量被截断、score 公式被改坏 → 红。
+/// 3. **G3 ANN 质量（同图）**：ANN 路返回的 10 条**全部**落在**本图精确序**的
+///    top-[`T13_EXACT_RANK_GATE`] 内。
+///    实测带宽：`worst exact rank ∈ [10, 11]`（80 次建图；min 10 / p50 10 / max 11）
+///    ⇒ 余量 ≈ 1.8×。它比「重合率」稳在有界空间里：图/检索一退步，返回项会掉到精确序
+///    的远处（名次从十位量级跳到百位量级），而不是只差 3 个百分点。
+///    ⚠️ 两条腿各带一条**前置路由断言**（exact 腿 `Route::Exact`、ANN 腿 `Route::Ann`）：
+///    任一条静默走到另一条 ⇒ 立刻红，而不是让 G2/G3 悄悄退化成恒真式。
+/// 4. **G4 冻结图确定性**：同一 query 在冻结图上共查 `REPEATS` 次，`(chunk_id, score)`
+///    序列逐位一致（NFR-06）。
+///
+/// # ⚠️ 本测试覆盖不到什么（如实声明）
+///
+/// 它**不再**断言「并行图与串行图的 ANN 召回率在统计意义上等价」——那是一个**跨图
+/// 统计命题**，而 `hnsw_rs` 的建图 RNG 无 seed，无法确定性地判定。两次建图的重合率
+/// 仍打进 `stderr` 供人工比对趋势；T7-21（翻 `parallel_build` 默认值）若需要这条统计
+/// 证据，应走 bench/离线标定，而不是一条会在 CI 里间歇翻脸的断言。
+///
+/// 「并行分支真的被走到」由 **T22** 钉死（`parallel_inserts() == 1`，**后端层**）——
+/// 门面层不暴露该计数器，故本测试把它当前置护栏。
+///
+/// ⚠️ **T22 钉死的范围比「门面确实走了并行」小一圈**（评审 #39 意见 3）：它直接驱动
+/// `HnswRsIndex::with_parallel_build(true)` + `add_batch`，钉的是**后端分派**（开关 +
+/// 阈值）；未覆盖门面层透传（`SearchIndexBuilder::parallel_build` → 新建/重建两条路径）
+/// 与 `flush` 是否真把 ≥1000 条交付给 `add_batch`（`batch_size` 耦合）。若门面接线回退，
+/// 本测试会退化成「串行 vs 串行」，而 G1~G4 **与 T22 双双全绿**（T22 自己的注释也写了
+/// 这处盲区）。门面级护栏待 #24（翻转 `parallel_build` 默认值）一并补。
 #[test]
 fn T13_并行建图质量等价() {
+    const N: usize = 1200;
+    // 本测试同框有三个互不相干的「20」（评审 #39 意见 4），分别起名防将来只改一处：
+    // `QUERIES` = 参与比对的 query 数；`REPEATS` = G4 同一 query 的**重复查询总数**；
+    // 文件级 `T13_EXACT_RANK_GATE` = ANN 名次门（**语义不同**，不并入这两者）。
+    const QUERIES: usize = 20;
+    const REPEATS: usize = 20;
     let dir = tempfile::tempdir().unwrap();
-    let texts: Vec<String> = (0..1200).map(|i| format!("并行文档 {i} 的内容")).collect();
+    // 每篇文档带同一个 meta 标记：match-all 过滤 ⇒ `FilterKind::Filtered`
+    // （**不是**热路径的 `Alive`）⇒ allowed = N ≤ 阈值 ⇒ 门面走**精确路径（C）**。
+    // 这是本测试所有「图内精确」断言的可达路径。
+    const MARK: &str = "t13-match-all";
+    let docs: Vec<Document> = (0..N)
+        .map(|i| Document {
+            text: format!("并行文档 {i} 的内容"),
+            source: String::new(),
+            metadata: serde_json::json!({ "t13": MARK }),
+            dedup_key: None,
+        })
+        .collect();
+    let texts: Vec<String> = docs.iter().map(|d| d.text.clone()).collect();
+    let all = Filter::eq("t13", MARK);
 
     // ⚠️ **并行生效的前提是 `parallel_build(true)` 与 `batch_size(>=1000)` 同时成立**：
     // `add()` 在 `pending.len() >= batch_size` 时才 flush，默认 batch_size=64 ⇒
     // `add_batch` 每次最多收到 64 条，永远够不到并行阈值 1000（评审 #13 发现 1）。
     // 两个库用**同一个** batch_size，保证唯一变量是 parallel_build。
-    const N: usize = 1200;
     let path_par = dir.path().join("par.idx");
     {
         let mut idx = builder().parallel_build(true).batch_size(N).build();
-        for t in &texts {
-            idx.add(t.clone()).unwrap();
+        for d in &docs {
+            idx.add(d.clone()).unwrap();
         }
         idx.save(&path_par).unwrap();
     }
     let par = builder().batch_size(N).load(&path_par).unwrap();
-    assert_eq!(par.graph_status(), &GraphStatus::Loaded);
+    assert_eq!(
+        par.graph_status(),
+        &GraphStatus::Loaded,
+        "basename 拼错会静默降级（P0-1）——降级后本测试全部断言都失去意义"
+    );
 
     // 串行建图（默认）
     let path_seq = dir.path().join("seq.idx");
     {
         let mut idx = builder().batch_size(N).build();
-        for t in &texts {
-            idx.add(t.clone()).unwrap();
+        for d in &docs {
+            idx.add(d.clone()).unwrap();
         }
         idx.save(&path_seq).unwrap();
     }
     let seq = builder().batch_size(N).load(&path_seq).unwrap();
     assert_eq!(seq.graph_status(), &GraphStatus::Loaded);
 
-    // 质量对账：**与 oracle（精确线性扫描）的重合率**，两条路径的差距 < 1 个百分点
-    // （设计文档 §8 对 T13 的口径）。此前只断言「非空」，等于串行 vs 串行也绿。
+    // ---- G1 覆盖：图点数 + raw_vectors 条数（`tombstone_stats` 是唯一公开口径）----
+    for (label, idx) in [("并行", &par), ("串行", &seq)] {
+        let ts = idx.tombstone_stats();
+        assert_eq!(
+            ts.graph_points, N,
+            "{label}库图内点数应 == 文档数（本语料 chunk 1:1）；并行插入丢点会在此暴露，实测 {}",
+            ts.graph_points
+        );
+        assert_eq!(ts.raw_vectors, N, "{label}库 raw_vectors 条数应 == 文档数");
+        assert_eq!(idx.num_chunks(), N as u32, "{label}库 chunk 数应 == 文档数");
+    }
+
     let sp = par.into_searcher().unwrap();
     let ss = seq.into_searcher().unwrap();
     // oracle 只建一次再复用（1200 篇 × 20 条 query，没必要每条重建）。
     let oracle_idx = oracle_index(&texts);
-    let mut sum_par = 0.0f64;
-    let mut sum_seq = 0.0f64;
-    let queries = 20;
-    for i in 0..queries {
-        let q = format!("并行文档 {i}");
-        let a: Vec<u32> = topk_searcher(&sp, &q, 10)
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
-        let b: Vec<u32> = topk_searcher(&ss, &q, 10)
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
-        assert_eq!(a.len(), 10, "并行库 query {i} 应召回 10 条");
-        assert_eq!(b.len(), 10, "串行库 query {i} 应召回 10 条");
 
-        let oracle = oracle_topk(&oracle_idx, &q, 10);
-        sum_par += overlap(&a, &oracle);
-        sum_seq += overlap(&b, &oracle);
+    // 「图内精确」结果：match-all 过滤 ⇒ 路径 C。`route == Exact` 是本口径的**前置断言**——
+    // 若哪天兜底阈值被改小到 < N，这里会立刻红，而不是静默退化成 ANN 让断言变弱。
+    let exact = |s: &Searcher, q: &str, k: usize| -> Vec<u32> {
+        let r = s
+            .search_with(q)
+            .mode(SearchMode::Vector)
+            .top_n(k)
+            .filter(&all)
+            .exec()
+            .unwrap();
+        assert_eq!(
+            r.metrics.vector_route,
+            VectorRoute::Exact,
+            "match-all 过滤（allowed = {N} ≤ 兜底阈值）必须走精确路径；\
+             若退化为 Ann，本测试的『图内精确』口径即失效"
+        );
+        r.hits.iter().map(|h| h.chunk_id).collect()
+    };
+
+    // ANN 腿：**无用户过滤** ⇒ `try_build_predicate(index, None)` 返回 `AliveOnly`
+    // （`query/filter.rs:195`）⇒ `plan()` 恒 `Ann`（`retriever/vector.rs:48-53`；
+    // hnsw 的 `prefers_exact` 只认 `FilterKind::Filtered`，`hnsw_rs_index.rs:351-358`）。
+    // 与 exact 腿**同构的前置断言**（评审 #39 意见 2）：若哪天热路径分派翻转、这条腿
+    // 静默变成 exact 结果，G3 就退化成「exact top-10 ⊆ exact top-20」的**恒真式**——
+    // 绿着失效、零红灯。四条门因此全部自证路径。
+    let ann = |s: &Searcher, q: &str, k: usize| -> Vec<(u32, f32)> {
+        let r = s
+            .search_with(q)
+            .mode(SearchMode::Vector)
+            .top_n(k)
+            .exec()
+            .unwrap();
+        assert_eq!(
+            r.metrics.vector_route,
+            VectorRoute::Ann,
+            "无用户过滤的向量路必须走 ANN；退化为 Exact 会让 G3 的名次门变成恒真式"
+        );
+        r.hits.iter().map(|h| (h.chunk_id, h.score)).collect()
+    };
+
+    // G1（续）：精确路径全量枚举的 id 集合必须恰为 0..N（不漏 / 不重 / 不多）
+    let expect: Vec<u32> = (0..N as u32).collect();
+    for (label, s) in [("并行", &sp), ("串行", &ss)] {
+        let mut got = exact(s, "并行文档 0", N + 1);
+        got.sort_unstable();
+        assert_eq!(
+            got, expect,
+            "{label}库：图内全量枚举的 id 集合应恰为 0..{N}（并行插入丢点/重复插在此暴露）"
+        );
     }
-    let r_par = sum_par / queries as f64;
-    let r_seq = sum_seq / queries as f64;
-    eprintln!("[T13] 与 oracle 的平均 Top-10 重合率：并行 {r_par:.4} / 串行 {r_seq:.4}");
-    // ⚠️ **阈值口径（实测校准，别再收紧到 1pp）**：并行相对串行**通常低 0~2 个百分点**，
-    // 根因是 C8——并行的插入顺序不确定 ⇒ 图拓扑自带随机性 ⇒ 召回率天然抖动，
-    // 不是缺陷而是打开并行开关的既定代价。评审期定的 1pp 在 `--features charabia`
-    // 下实测出现过 `0.9850 vs 1.0000`（1.5pp）与 `0.9900 vs 1.0000`（正好 1pp 边界），
-    // CI **间歇性红**（同树两次一过一挂）。故放宽到 5pp：仍能抓住真正的退化
-    // （并行回落到串行以下 2 个数量级的错误），又不会被固有抖动翻脸。
-    // 真正钉死「并行确实走了并行」的是 **T22**，不是本断言。
-    assert!(
-        (r_par - r_seq).abs() < 0.05,
-        "并行与串行相对 oracle 的重合率差应 < 5 个百分点，实测 并行 {r_par:.4} vs 串行 {r_seq:.4}"
+
+    // ---- G2 / G3 + 诊断（重合率只打印，不判定）----
+    let audit = |s: &Searcher, label: &str| -> (f64, usize) {
+        let mut sum = 0.0f64;
+        let mut worst = 0usize;
+        for i in 0..QUERIES {
+            let q = format!("并行文档 {i}");
+            let oracle_ids = oracle_topk(&oracle_idx, &q, 10);
+
+            // G2：图内精确 top-10 应与 oracle **逐位一致**（含顺序）
+            let ex_ids = exact(s, &q, 10);
+            assert_eq!(
+                ex_ids, oracle_ids,
+                "{label}库 query {i}：图内精确 top-10 应与 BruteForce oracle 逐位一致"
+            );
+
+            // G3：ANN 返回的每一条都必须落在本图精确序的 top-T 内
+            let top_t = exact(s, &q, T13_EXACT_RANK_GATE);
+            let ann_ids = ann(s, &q, 10)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<u32>>();
+            assert_eq!(ann_ids.len(), 10, "{label}库 query {i} 应召回 10 条");
+            for id in &ann_ids {
+                match top_t.iter().position(|x| x == id) {
+                    Some(pos) => worst = worst.max(pos + 1),
+                    None => panic!(
+                        "{label}库 query {i}：ANN 返回 chunk {id} 落在本图精确序 \
+                         top-{T13_EXACT_RANK_GATE} 之外 —— 图/检索已退化（旧口径只把它\
+                         记成一个百分数，看不出名次掉到了哪里）"
+                    ),
+                }
+            }
+
+            let set: std::collections::HashSet<u32> = oracle_ids.iter().copied().collect();
+            sum += ann_ids.iter().filter(|x| set.contains(x)).count() as f64 / 10.0;
+        }
+        (sum / QUERIES as f64, worst)
+    };
+    let (r_par, worst_par) = audit(&sp, "并行");
+    let (r_seq, worst_seq) = audit(&ss, "串行");
+
+    // ---- G4 冻结图确定性：同一 query 共查 `REPEATS` 次（1 次基准 + REPEATS-1 次重复），
+    // `(chunk_id, score)` 序列逐位一致（NFR-06）----
+    // `1..REPEATS` 而非 `0..REPEATS`：第 0 轮是 `first == first` 的恒真式，不构成检验
+    // （评审 #39 意见 4）。
+    for (label, s) in [("并行", &sp), ("串行", &ss)] {
+        let q = "并行文档 7";
+        let first = ann(s, q, 10);
+        for round in 1..REPEATS {
+            assert_eq!(
+                ann(s, q, 10),
+                first,
+                "{label}库第 {round} 次重复查询与首次不逐位一致"
+            );
+        }
+    }
+
+    eprintln!(
+        "[T13] 诊断（**不参与判定**，跨图数值）：与 oracle 的平均 Top-10 重合率 并行 \
+         {r_par:.4} / 串行 {r_seq:.4}（差 {:.4}）",
+        (r_par - r_seq).abs()
     );
-    // 质量底线：两条路径本身都不能离谱。
-    // ⚠️ 这两条是**绝对**阈值，与 T6 撤掉的那条门不是同一个口径，别被「T6 说绝对值不可用」带跑：
-    // ① 本测试 N=1200 > `ef_search`=200 ⇒ 是**真正的近似检索**，重合率本就不到 1.0，
-    //    用 0.90 这种粗底线挡「并行回落到串行以下 2 个数量级」是对的；
-    // ② T6 撤门**不是**因为「绝对值不可用」，而是因为 CI 那次 0.545 无法归因
-    //    （见 issue #34 与本文件 T6 的文档注释）——成因不同，处置不同。
-    // 实测余量约 9pp（评审 3 次：1.0000/1.0000、1.0000/1.0000、0.9950/0.9900）。
-    assert!(r_par >= 0.90, "并行库与 oracle 重合率过低: {r_par:.4}");
-    assert!(r_seq >= 0.90, "串行库与 oracle 重合率过低: {r_seq:.4}");
+    eprintln!(
+        "[T13] 判定门：图内精确 == oracle 逐位 ✓ / 图内全量 id 集合 ✓ / ANN 返回项均落在\
+         本图精确序 top-{T13_EXACT_RANK_GATE} 内（最差名次 并行 {worst_par} / 串行 {worst_seq}）\
+         / 冻结图重复查询逐位一致 ✓"
+    );
 }
 
 /// **S2-T22** ⚠️ 并行分支**真的被走到**（T13 的前置护栏）。
