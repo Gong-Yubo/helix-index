@@ -2,10 +2,10 @@
 
 | 项 | 内容 |
 | --- | --- |
-| 版本 | **v0.1（首版，待评审）** |
+| 版本 | **v0.2（评审收口，2026-09-11）** |
 | 日期 | 2026-09-11 |
-| 状态 | **设计中**。D-S6-01~09 待评审拍板；D-S6-01 的**数值**由 S6-06 的 spike 回答，本版只定形态与判据 |
-| 上游 | `plan-v2.md` §4 Step 6 / issue **#2**（V2-Step6）/ `requirements-spec.md` v1.12（**NFR-03 双口径**、NFR-05、NFR-10、NFR-11）/ `eval-report.md` §8.2、§8.4、§8.6 / `search/index.rs`、`embed/local.rs`、`search/config.rs`、`cli/{main,bench}.rs` |
+| 状态 | **设计中（评审已收口，2026-09-11）**。PR #38 评审的 **7 条意见（F1~F7）全部采纳**（见 §10）；**Q4 / Q5 / Q6 / Q7 已由评审表态拍板** ⇒ **D-S6-05** 与 **D-S6-08（NFR-10 口径 = 方案 A）** 定案，需求文档随之升 **v1.14**；**D-S6-01 的数值**仍由 S6-06 的 spike 回答，本版只定形态与判据 |
+| 上游 | `plan-v2.md` §4 Step 6（v0.14）/ issue **#2**（V2-Step6）/ `requirements-spec.md` v1.14（**NFR-03 双口径**、NFR-05、NFR-10、NFR-11）/ `eval-report.md` §8.2、§8.4、§8.6 / `search/index.rs`、`embed/local.rs`、`search/config.rs`、`cli/{main,bench}.rs` |
 | 范围 | **T7-09** embed 并行（**先 spike、后定是否投 M 级**）+ **T7-11** 增量构建 + **T7-17** 并发检索压测进 bench |
 | 非范围 | 量化模型（D-J6 不引入）；换 embedding 模型；prefilter 索引侧预过滤（V2.1）；读写并发 / delta 分段（**Step 8**：T7-06 / T7-18）；横切 **T7-21**（`parallel_build` 默认翻转，独立 PR，与本 Step 正交）；**Step 7** 精排；并发**写**（`add` 仍需 `&mut self`，V2.0 单写者语义不变） |
 | 交付物 | ① `crates/core/examples/bench_embed_session.rs`（E1/E2/E3 spike 载体）② 若 E2/E3 胜出：`LocalEmbedder` 池化 / EP 配置（**独立决策门**）③ `helix build --index` 追加路径 ④ `helix bench --threads` ⑤ `eval-report.md` §8.10 ⑥ 四处定义面回写 |
@@ -20,10 +20,10 @@
 | **D-S6-02** | 并行的落点（若投） | ✅ 建议：`LocalEmbedder` 内部**会话池 + 保序回填**，`Embedder` trait **一字不改** | §4.3 |
 | **D-S6-03** | E3 的依赖接入方式 | ✅ 建议：`ort` 提为**直接依赖**并开 `coreml` feature（fastembed 无 coreml 透传）；**不默认开启** | §4.4 / 附录 C |
 | **D-S6-04** | EP / 线程配置如何进入快照语义 | ✅ 建议：**编码进 `embedder_id`**（`&'static str` 由 match 产生），**不扩 `ConfigFingerprint` 结构** | §3.1 / §4.4.2 |
-| **D-S6-05** | `default_embedder()` 的静默降级 | ✅ 建议：本 Step 内**消除**（`LocalEmbedder::new().ok()` ⇒ 显式可见），与 NFR-07「降级不得静默」对齐 | §2.7 / §4.4.3 |
+| **D-S6-05** | `default_embedder()` 的静默降级 | ✅ **已拍板（评审 Q6）**：方案 A —— 本 Step 内**消除**（`LocalEmbedder::new().ok()` ⇒ 显式可见），与 NFR-07「降级不得静默」对齐；**不额外加兼容开关** | §2.7 / §4.4.3 |
 | **D-S6-06** | T7-11 的形态 | ✅ 建议：**形态 A（`build --index` 追加）必做**；形态 B（跨 run chunk 级 embed 缓存）**列为可选、本 Step 不做** | §4.5 |
 | **D-S6-07** | 追加后是否自动 compact | ✅ 建议：**不自动**；文档给出「追加 → compact」的推荐序列（compact 是显式动作，Step 4 已定） | §4.5.5 |
-| **D-S6-08** | NFR-10 的**数值目标** | ⏳ **缺失，需评审或用户拍板**：现口径只有「多线程并发检索吞吐与正确性」，**没有任何数字** ⇒ 无法判定达标 | §9.2 Q4 |
+| **D-S6-08** | NFR-10 的**数值目标** | ✅ **已拍板（评审 Q4）**：方案 A（相对提升）—— `--threads 4` QPS ≥ `--threads 1` × **2.5**；**逐位一致为前置条件**；测量口径见 §4.6.2。已落需求文档 **v1.14**（标「拟」，数值待 S6-08 实测后定稿） | §4.6.3 / §9.2 Q4 |
 | **D-S6-09** | T7-17 的计时与对照口径 | ✅ 建议：**吞吐为主、延迟为辅**（并发下 per-query 延迟含竞争，不可与 NFR-02 横比）；**结果逐位对照单线程** | §4.6.2 |
 
 ---
@@ -56,7 +56,9 @@
 2. **T7-11 达标**：`helix build --index <既有快照> --input <delta>` 追加 10% 文档，**实测耗时 < 首次全量 × 10% × 1.2**（NFR-03 ②），且脚本可一键复现。
 3. **T7-11 正确性**：追加结果与「全量重建同语料」在**可比口径上一致**——比较对象是 **`(source, score)` 序列**，**不比较 `doc_id` / `chunk_id`**（追加语义下 id 必然不同；口径见 §4.5.3）。
 4. **T7-11 幂等**：同一 delta 重复追加两次，索引的文档数 / 分片数 / 词项总数**不变**（`content_hashes` 双保险必须生效）。
-5. **T7-17 达标**：`helix bench --threads {1,2,4,8}` 输出 QPS、各线程延迟分位；**多线程检索结果与单线程逐位一致**（`hits` 的 `chunk_id` 序列与 `score` 逐位相同）。
+5. **T7-17 达标（NFR-10，方案 A 已拍板）**：`helix bench --threads {1,2,4,8}` 输出 QPS、各线程延迟分位；
+   **前置条件**：多线程检索结果与单线程**逐位一致**（`hits` 的 `chunk_id` 序列与 `score` 逐位相同）；
+   **吞吐判据**：`--threads 4` 的 QPS ≥ `--threads 1` × **2.5**；测量口径见 §4.6.2 / 附录 B 第 3 步。
 6. **若采纳 E3（CoreML）**：向量数值变更**已显式声明**，且 ① `embedder_id` 编码生效（CPU 建库 / CoreML 加载会 `ConfigMismatch` 而非静默错配）② `default_embedder()` 的静默降级已消除 ③ NFR-06（同快照两次加载逐位一致）与相关性评测**已重测或明确声明暂不重测**。
 7. **守门全绿**：`make fmt && make lint && make test && make deny`；新代码无 `unsafe`；CI 全绿。
 
@@ -139,6 +141,8 @@ let mut model = self.inner.lock().expect("embedder 锁已中毒");
 ### 2.6 并发检索的真实现状：是"缺采集点"，不是"缺能力"
 
 **实测 grep（`crates/core/src/`）**：`query/`、`search/searcher.rs`、`retriever/`、`fusion/`、`index/` 中 **`Mutex` / `RwLock` / `RefCell` / `Cell<` / `unsafe` 命中数为 0**。
+
+> **评审补充（已采纳）**：grep 词清单补入 **`rayon`** —— `search/searcher.rs:207` 有 **`rayon::join`**（双 lane 并行）。它是**并行但确定性合并**（结果按固定顺序拼装），**不构成** S6-T11「逐位一致」的反例；补进来是为了避免后人以为「没查并行」。
 
 - 读路径是**纯不可变**的：`Searcher { cfg: Arc<Config>, inner: Arc<Inner>, .. }`，`search(&self, ..)`。
 - 已有编译期断言：`search/searcher.rs:249` `fn assert_impl<T: Clone + Send + Sync + 'static>()` + `assert_impl::<Searcher>()`。
@@ -282,13 +286,20 @@ sessions = 1（先固定），intra_threads 同 E1，EP = CoreML（按 E2 结论
 // 示意：按块分发，按块索引回填；完成顺序无关
 let mut out: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
 pool.install(|| {
-    out.par_chunks_mut(BATCH)
-        .enumerate()
-        .for_each(|(i, slot)| {
-            let texts = &texts[i * BATCH..(i + 1) * BATCH];
-            let v = sessions[i % sessions.len()].lock().unwrap().embed(texts, None).unwrap();
-            for (s, x) in slot.iter_mut().zip(v) { *s = Some(x); }
-        });
+    out.par_chunks_mut(BATCH).enumerate().for_each(|(i, slot)| {
+        // ⚠️ 末块可能不足 BATCH：`texts[i * BATCH..(i + 1) * BATCH]` 会**越界 panic**（评审 F6）
+        //    ⇒ 必须夹紧右界；等价写法是与 `texts.chunks(BATCH)` 配对。
+        let lo = i * BATCH;
+        let hi = (lo + BATCH).min(texts.len());
+        let v = sessions[i % sessions.len()]
+            .lock()
+            .unwrap()
+            .embed(&texts[lo..hi], None)
+            .unwrap();
+        for (s, x) in slot.iter_mut().zip(v) {
+            *s = Some(x);
+        }
+    });
 });
 ```
 
@@ -329,6 +340,15 @@ fn id(&self) -> &'static str {
 - ⇒ **CPU 建库 + CoreML 加载** ⇒ `ConfigMismatch`，**从静默错配变成显式报错**（正是 B1 的修法）。
 - ⇒ 老快照（`embedder_id == "bge-small-zh-v1.5"`）在**默认配置**下继续可加载，**零迁移成本**。
 - ⚠️ 是否需要把 `sessions` / `intra_threads` 也编进去，**取决于 spike 是否观测到数值差异**（S6-T6 的探针结果）。**若观测到差异就必须编**；只靠"我认为它不影响"是不够的。
+- ⚠️ **评审 F3：若 S6-T6 判定「必须编」，`&'static str` 覆盖不了任意 `usize` / `Option<usize>` 组合**
+  （`Embedder::id()` 现签名见 `embed/mod.rs:43`）。⇒ **两条升级路径先写在这里，别等探针出结果才临时找路**：
+
+  | 路径 | 形态 | 对指纹 / 老快照的兼容性 |
+  | --- | --- | --- |
+  | **a（建议）有限档位枚举** | `sessions` / `intra_threads` 都**收敛成有限档**（如 `sessions ∈ {1,2,4,8}`、`intra_threads ∈ {None,1,2,4}`），`id()` 仍由 `match` 出 `&'static str` | **零结构变更**、零分配；老快照取值不变 ⇒ 照常加载。代价 = 配置面被收窄（超档组合需报错或吸附到最近档） |
+  | **b 放宽为 `Cow<'static, str>`** | `id()` 返回 `Cow<'static, str>`，任意组合格式化出串 | `ConfigFingerprint` 的**字段类型变了** ⇒ 与 R35 同类的**破坏性变更**（老快照读不出该字段），需 `FORMAT_VERSION` 处理或迁移 |
+
+  ⇒ 若走 b，D-S6-04 的"零迁移成本"结论**失效**，必须同步 §3.1 / §6 影响面与架构 R35 的判定。
 
 #### 4.4.3 消除静默降级（D-S6-05）
 
@@ -409,7 +429,7 @@ helix bench --index <snapshot> --threads {1,2,4,8} --reps <n> [--modes bm25,vect
 
 ⚠️ 与 `perf-ab-calibration` 的既有教训一致：**并发数字对机器状态极敏感** ⇒ ① 必须先跑一轮预热并丢弃 ② 顺序交错（1/2/4/8/1/2/4/8）③ 报告时**标运行范围**（核数、是否插电、是否在 CI）。
 
-#### 4.6.3 NFR-10 的数值目标缺失（D-S6-08）——**需要评审拍板**
+#### 4.6.3 NFR-10 的数值目标缺失（D-S6-08）——✅ **已拍板：方案 A**（评审 2026-09-11）
 
 现状：NFR-10 全文只有「多线程并发检索吞吐与正确性（`Searcher` 跨线程）」+「V2.0 Step 6 实测」。**没有任何数字**。
 
@@ -421,8 +441,14 @@ helix bench --index <snapshot> --threads {1,2,4,8} --reps <n> [--modes bm25,vect
 | B | 定绝对 QPS 目标 | 与机器强耦合（本项目已明确「性能数字不具跨机可引用性」）⇒ **不建议** |
 | C | 维持"只记录，不判定" | 诚实，但 NFR-10 永远无法关闭 |
 
-- 本文建议 **A**，本 Step 先把数据测出来，**口径修订作为独立决策**在评审时定（因为改 NFR 需要需求文档版本行，属"定义面"变更）。
-- ⚠️ 若选 A，需注意**读路径无共享可变状态**（§2.6）是个**强先验**：4 线程低于 2.5× 反而需要解释（内存带宽 / 分配器）。⇒ 该判据有鉴别力，不是橡皮图章。
+- ~~本文建议 **A**~~ ⇒ **评审已拍板：方案 A**。口径随之写入 `requirements-spec.md` **v1.14**，但**标「拟」、数值待 S6-08 实测后定稿**——
+  与 Step 5 的 NFR-13 先例一致（v1.10 先落「拟 ≤20ms」，v1.12 标定后才定稿）。
+- **评审补充的两点必须一并落进需求文本**（已写进 v1.14，后续修订**不得丢掉**）：
+  1. 「各线程 `hits` 逐位一致」是**前置条件**（先正确、后吞吐），**不是**与吞吐并列的第二条判据；
+  2. 判据必须**写明测量口径**：预热丢弃首轮 + 顺序交错（1/2/4/8/1/2/4/8）+ 报告运行范围（核数 / 是否插电 / 是否在 CI）
+     —— 即 §4.6.2 与附录 B 第 3 步的口径，避免将来被不同口径的重测打脸。
+- **评审对另两方案的反对**（记入决策）：**反对 B**（绝对 QPS 与机器强耦合，与本项目「性能数字不具跨机可引用性」的既定立场矛盾）；**反对 C**（只记录、不判定 ⇒ NFR-10 永远无法关闭）。
+- ⚠️ 方案 A 的**鉴别力来源**：读路径**无共享可变状态**（§2.6）是个**强先验** ⇒ 4 线程低于 2.5× 反而需要解释（内存带宽 / 分配器争用）。不是橡皮图章。
 
 ---
 
@@ -452,9 +478,11 @@ helix bench --index <snapshot> --threads {1,2,4,8} --reps <n> [--modes bm25,vect
 - 老快照在默认配置下**继续可加载**（`"bge-small-zh-v1.5"` 不变）。
 - 是否把 `sessions` / `intra_threads` 也编进去，**由 S6-T6 探针的实测结果决定**（观测到数值差异就必须编）。
 
-### D-S6-05 消除静默降级 ✅ 建议：方案 A（显式请求向量则硬失败）
+### D-S6-05 消除静默降级 ✅ **已拍板（评审 Q6）：方案 A**（显式请求向量则硬失败）
 
 - 见 §4.4.3 的方案对比。
+- **评审意见（Q6）**：0.x 阶段 + CHANGELOG `Changed` + 迁移说明**足够**，**不需要**额外的兼容开关。
+  理由：它把「静默拿错结果」换成「启动时显式报错」⇒ 对依赖旧行为的脚本而言是**把潜伏 bug 提前暴露**，收益大于成本。
 - ⚠️ 这是**行为变更**（此前静默退化成功、此后报错）⇒ 必须在 CHANGELOG 标 `Changed` 并说明迁移方式。
 
 ### D-S6-06 T7-11 的形态 ✅ 建议：形态 A 必做，形态 B 不做
@@ -467,10 +495,15 @@ helix bench --index <snapshot> --threads {1,2,4,8} --reps <n> [--modes bm25,vect
 - `compact` 会**重编号 ID**（D-S4-01）⇒ 自动做会让"我刚追加的 doc_id"失效，破坏用户预期。
 - 文档给出推荐序列（§4.5.5）。
 
-### D-S6-08 NFR-10 的数值目标 ⏳ **需评审 / 用户拍板**（§4.6.3）
+### D-S6-08 NFR-10 的数值目标 ✅ **已拍板：方案 A**（评审 2026-09-11，§4.6.3）
 
-- 建议方案 A（相对提升，近线性判据）。
-- 改 NFR 属**定义面变更** ⇒ 若采纳，需 `requirements-spec.md` 升版本行 + `plan-v2.md` §6 门槛同步。
+- 口径 = **相对提升（近线性判据）**：`--threads 4` 的 QPS ≥ `--threads 1` × **2.5**（允许 40% 折损）；
+  **逐位一致为前置条件**；测量口径见 §4.6.2 / 附录 B 第 3 步。
+- 评审**反对 B**（绝对 QPS 与机器强耦合）与 **C**（只记录不判定 ⇒ 永不关闭）。
+- 改 NFR 属**定义面变更** ⇒ 本 PR 已同步四处：`requirements-spec.md` **v1.13 → v1.14**（NFR-10 口径 + NFR-03 ② 的单位注记）/
+  `plan-v2.md` **v0.14**（§6 门槛、§7 进度表、§8 回写计划）/ `architecture-design.md` **v1.13**（版本面同步，无架构变更）/ `docs/README.md` 索引行。
+- ⚠️ **数值以「拟」写入，待 S6-08 实测后定稿**（同 Step 5 的 NFR-13 先例）——这样既让 NFR-10 从"无法判定"变为"可判定"，
+  又不把未测的数字写成既成事实。
 
 ### D-S6-09 T7-17 的计时与对照口径 ✅ 建议：吞吐为主、延迟为辅、结果逐位对照
 
@@ -515,6 +548,15 @@ helix bench --index <snapshot> --threads {1,2,4,8} --reps <n> [--modes bm25,vect
 
 > **CI 口径**：S6-T6 / S6-T14 需模型与 EP ⇒ `#[ignore]`（沿用项目既有模式，共 6 个 `#[ignore]` 中的新增项）。
 > **性能数字一律本地 release 跑**，不进 CI（CI 共享 runner 的数字不具可引用性——项目既有纪律）。
+>
+> **可测性前提（S6-T4 / S6-T5 / S6-T7 的共同前置；评审 F7）**：这三条要在 CI 里秒级跑，必须先做**逻辑与真模型解耦**，
+> 否则与上表的 CI 口径自相矛盾：
+> - **S6-T4 / S6-T5**：会话池 + 保序回填要抽成**对 session 泛型的辅助结构**（池化逻辑若内嵌在持有真模型的
+>   `LocalEmbedder` 里，`Dummy` embedder 无法注入）⇒ 否则只能 `#[ignore]`。
+> - **S6-T7**：`default_embedder()` 的**校验逻辑与构造必须分离**（现在是自由函数直接 `LocalEmbedder::new()`）
+>   ⇒ 否则无法"注入必失败的 embedder"。
+> ⇒ 这三条属**可测性驱动的设计约束**，在 **S6-04 / S6-05 / S6-09** 落地时一并满足；
+> 若最终仍做不到，**如实降级为 `#[ignore]` 并在 PR 里说明**（不得把 `#[ignore]` 悄悄留在表里当成已覆盖）。
 
 ---
 
@@ -551,17 +593,60 @@ helix bench --index <snapshot> --threads {1,2,4,8} --reps <n> [--modes bm25,vect
 
 > R38/R39/R40 都属"**今天不破、但没人锁**"的类型——本项目的既有教训是这类问题最终都会有人撞上（R34 的潜在死锁即先例）。
 
-### 9.2 未决问题（需评审或实测回答）
+### 9.2 未决问题（**Q4~Q7 已由评审拍板**；Q1~Q3 待实测回答）
 
 | # | 问题 | 由谁回答 | 阻塞谁 |
 | --- | --- | --- | --- |
 | **Q1** | E2 的收益方向与量级？ | S6-02 实测 | S6-03 决策门 |
 | **Q2** | E3 在 macOS aarch64 上能否初始化？能否加速？ | S6-02 实测（可能"秒失败"） | S6-03 决策门 |
 | **Q3** | 不同 `sessions` / `intra_threads` 是否改变向量数值？ | S6-T6 探针 | D-S6-04 是否需编入线程配置 |
-| **Q4** | **NFR-10 的数值目标**（今天完全缺失） | **评审 / 用户拍板**（§4.6.3 三方案） | NFR-10 能否关闭 |
-| **Q5** | "增量追加 10% 文档"的 **10% 以什么为单位**（文档数？chunk 数？字节？） | 评审（建议：**文档数**，因为 `NFR-03 ②` 写的是"追加 10% 文档"） | NFR-03 ② 的判据 |
-| **Q6** | `default_embedder` 硬失败（方案 A）会不会破坏既有用户脚本？ | 评审 | D-S6-05 |
-| **Q7** | 追加路径是否需要 `--no-graph-persist` 之类的逃生舱？ | 评审（建议：沿用既有 `--no-graph-persist`，不新增） | S6-06 |
+| **Q4** | **NFR-10 的数值目标**（此前完全缺失） | ✅ **评审已拍板：方案 A**（§4.6.3 / D-S6-08）⇒ 需求 **v1.14** 落「拟」口径，数值待 S6-08 实测后定稿 | **已解**；NFR-10 由「无法判定」变为「可判定」 |
+| **Q5** | "增量追加 10% 文档"的 **10% 以什么为单位**（文档数？chunk 数？字节？） | ✅ **评审已拍板：文档数**（`NFR-03 ②` 原文即"追加 10% 文档"）；**chunk 数只作参考指标、不进判据**（已写进 v1.14） | **已解** |
+| **Q6** | `default_embedder` 硬失败（方案 A）会不会破坏既有用户脚本？ | ✅ **评审已拍板：方案 A**（0.x + CHANGELOG `Changed` + 迁移说明足够，不需额外兼容开关） | **已解**（D-S6-05 定案） |
+| **Q7** | 追加路径是否需要 `--no-graph-persist` 之类的逃生舱？ | ✅ **评审已拍板：沿用既有 `--no-graph-persist`，不新增** | **已解**（S6-06） |
+
+> **评审同时背书（评审 §4）**：① **D-S6-01「只承诺 spike、不预先承诺落地」**（93% 分解的算术复核无误；
+> "不把探路承诺成交付"正是 2026-09-07 复审 A2 刚纠正过的错误类型）；② **「先 T7-11（跳过 embed）后 T7-09（加速 embed）」的顺序**；
+> ③ **R38 的定性**——`search/config.rs:312-318` 的 `.ok()` 属实，**今天既有缺陷、非本 PR 引入**，作为既有缺陷登记而非本 PR 范围；
+> ④ **T13 flaky 不放宽阈值**（该 flaky 已由 PR #39 在 `main` 上按「同图可归因不变式」改造完毕，见 `CHANGELOG.md`）。
+
+---
+
+## 10. 评审收口记录（PR #38，2026-09-11）
+
+**评审形态**：`pulls/38/reviews` = **1 条正式评审**（`COMMENTED`）／`pulls/38/comments` = 0 条行内／`issues/38/comments` = 0 条。
+评审结论：**设计主体与证据链成立**（40+ 处 `file:line` 断言逐条独立复核全部命中，无一处行号/语义漂移），
+但附录 B 有两处会让 S6-07 照抄执行时产出无效数据或直接报错 ⇒ **F1 / F2 为合并前必修**（合计 ~3 行），其余为 minor。
+
+### 10.1 七条意见的处置（**全部采纳**）
+
+| # | 意见 | 处置 | 落点 |
+| --- | --- | --- | --- |
+| **F1** | 附录 B 的 delta 与 base **完全重叠** ⇒ NFR-03 ② 的验收测量是空转（`data/t2-corpus.jsonl` **恰 12000 行**；base 吃全量、delta 取前 1200 ⇒ 1200 条全部命中 `add` 短路查重，不进 pending / 不 embed / 不建图，耗时 ≈ load+save，判据必然通过） | ✅ **采纳**（本次最重要的实质缺陷） | 附录 B 第 2 步：base/delta 改为**不相交**（`sed -n '1,10800p'` / `tail -n 1200`）+ 硬约束文字 + 预期耗时（≈23s vs 阈值 27.1s，**通过但不宽裕**）与"重叠版秒过=空转"的鉴别说明；S6-07 同步 |
+| **F2** | `cargo run -p helix-cli` 的包不存在 | ✅ **采纳**（独立复算：`cargo pkgid -p helix-cli` 报 `did not match any packages`；`crates/cli/Cargo.toml:2` 是 `name = "helix"`） | 附录 B **3 处**改为 `-p helix` |
+| **F3** | `Embedder::id()` 现签名 `-> &'static str` 覆盖不了任意 `sessions` / `intra_threads` 组合，而设计又说"观测到差异就必须编" ⇒ 别等探针出结果才临时找路 | ✅ **采纳** | §4.4.2 预写两条升级路径（**a** 有限档位枚举 = 零结构变更 / **b** `Cow<'static, str>` = 与 R35 同类的破坏性变更）及各自对指纹与老快照的影响 |
+| **F4** | 设计文档"上游"行与附录 D 引 `requirements-spec.md` v1.12，而同批已升 v1.13 ⇒ 合并瞬间即成陈旧锚点（正是本 PR 在别处清理的"定义面漂移"） | ✅ **采纳**，锚点改为 **v1.14**——本 PR 因 D-S6-08 拍板而**再升一版**（见 §5） | 头表"上游"行 + 附录 D |
+| **F5** | CHANGELOG `#### Fixed` 收录的是"发现"而非"修复"，会让读者误读为静默降级已修复 | ✅ **采纳** | `CHANGELOG.md`：该条目挪出 `Fixed`，首句改为「**发现并登记（未修复）**」 |
+| **F6** | §4.3.1 示意代码 `texts[i*BATCH..(i+1)*BATCH]` 在 `texts.len()` 非 BATCH 整数倍时**末块越界 panic** | ✅ **采纳** | §4.3.1 改为夹紧右界 `(lo + BATCH).min(texts.len())`（等价写法：与 `texts.chunks(BATCH)` 配对） |
+| **F7** | S6-T4 / T5 / T7 的**可测性前提**未写：`Dummy` / 必失败 embedder 无法注入 ⇒ 只能 `#[ignore]`，与 §7 的 CI 口径矛盾 | ✅ **采纳** | §7 新增「可测性前提」注记，把解耦要求写成 **S6-04 / S6-05 / S6-09** 的设计约束 |
+
+### 10.2 评审建议的补充（已采纳）
+
+- **§2.6 的 grep 词清单补 `rayon`**：`search/searcher.rs:207` 有 `rayon::join`（双 lane 并行、**确定性合并**），
+  **不构成** S6-T11 逐位一致的反例，但写进清单可免后人以为"没查并行"。
+- **工作区残留探针**：评审提醒 `crates/core/tests/zz_tmp_probe_dist.rs`——已核实**早已删除**（`git status --porcelain` 为空），无残留。
+
+### 10.3 对 F1 / F2 的**独立复算**（不采信评审结论，自己跑一遍）
+
+| 复核项 | 命令 | 结果 |
+| --- | --- | --- |
+| F1 的前提：`data/t2-corpus.jsonl` 到底几行 | `wc -l data/t2-corpus.jsonl` | **12000** ⇒ base 若吃全量、delta 取前 1200，确实 100% 重叠 ✅ 评审属实 |
+| F2 的前提：包名是否存在 | `cargo pkgid -p helix-cli` / `-p helix`；`crates/cli/Cargo.toml` | `helix-cli` → `did not match any packages`；`helix` → `path+file:///…/crates/cli#helix@0.1.0`；`Cargo.toml:2` = `name = "helix"` ✅ 评审属实 |
+| 残留探针 | `ls crates/core/tests/zz_tmp_*.rs` | `no matches found` ⇒ **早已删除**，工作区无残留 ✅ |
+
+### 10.4 本文**未**按评审建议改的口径
+
+（本版无。评审对本文档自述事实的复核**全部为属实**，未提出需撤回的断言；7 条意见 100% 采纳。）
 
 ---
 
@@ -611,20 +696,28 @@ make fmt && make lint && make test && make deny
 cargo run -p helix-core --release --example bench_embed_session -- --json /tmp/s6-embed.json
 #    交错 A/B/A/B + 控制组漂移打印；漂移 >10% 时按控制组归一后再比较
 
-# 2) T7-11 增量：先建全量基线，再追加 10%
-cargo run -p helix-cli --release -- build --input data/t2-corpus.jsonl  --vectors --single-chunk --output /tmp/base.idx
-head -n 1200 data/t2-corpus.jsonl > /tmp/delta.jsonl          # 12K 的 10%
-cargo run -p helix-cli --release -- build --index /tmp/base.idx --input /tmp/delta.jsonl --vectors --output /tmp/inc.idx
-#    判据：本次耗时 < 首次全量 × 10% × 1.2（NFR-03 ②）
-#    对照：全量重建 12K + 1200 与 /tmp/inc.idx 的 (source, score) 序列一致（S6-T2）
+# 2) T7-11 增量：先建基线，再追加 10%（⚠️ delta 必须与 base **不相交**）
+sed -n '1,10800p' data/t2-corpus.jsonl > /tmp/base-corpus.jsonl   # base = 前 10800 篇（12K 的 90%）
+tail  -n 1200     data/t2-corpus.jsonl > /tmp/delta.jsonl         # delta = 后 1200 篇（全新，与 base 不相交）
+cargo run -p helix --release -- build --input /tmp/base-corpus.jsonl --vectors --single-chunk --output /tmp/base.idx
+cargo run -p helix --release -- build --index /tmp/base.idx --input /tmp/delta.jsonl --vectors --output /tmp/inc.idx
+#    ⚠️ **硬约束（评审 F1）**：delta 必须与 base 不相交。`data/t2-corpus.jsonl` **恰好 12000 行**，
+#       若 base 吃全量而 delta 只是它的前 1200 行，则 1200 条**全部**命中 `add` 的短路查重
+#       （`search/index.rs:356-365`）⇒ 不进 pending、不 embed、不建图，"本次耗时" ≈ load + save（~1-2s），
+#       判据**必然通过却什么都没测到**；对照项「全量重建 12K + 1200」也退化成 12K。
+#       测幂等是 **S6-T3** 的职责，不能充当 NFR-03 ② 的测量。
+#    判据：本次耗时 < 首次全量 × 10% × 1.2（NFR-03 ②；首次全量 = 12K 的 225.5s ⇒ 阈值 27.1s）
+#         预期 ≈ 1200/12000 × 209.9s + ~2s ≈ 23s ⇒ **通过但不宽裕**（这正是"重叠版秒过=空转"的证据）
+#    对照：全量重建全 12K 与 /tmp/inc.idx 的 (source, score) 序列一致（S6-T2；**不比 id**）
 
 # 3) T7-17 并发检索（结果正确性 + QPS）
 for t in 1 2 4 8; do
-  cargo run -p helix-cli --release -- bench --index /tmp/base.idx --threads $t \
+  cargo run -p helix --release -- bench --index /tmp/base.idx --threads $t \
     --modes bm25,vector,hybrid --reps 20 --json /tmp/s6-threads-$t.json
 done
-#    判据：--threads 4 的 QPS ≥ --threads 1 × 2.5（若 D-S6-08 采纳方案 A）；
-#          且 $t 线程的 hits 序列逐位等于 --threads 1
+#    判据（NFR-10 方案 A，已拍板）：--threads 4 的 QPS ≥ --threads 1 × 2.5
+#          **前置条件**：$t 线程的 hits（chunk_id + score）序列**逐位等于** --threads 1
+#    口径：预热丢弃首轮 + 顺序交错（1/2/4/8/1/2/4/8）+ 报告运行范围（核数 / 是否插电 / 是否在 CI）
 
 # 4) 数据落表
 #    把 1) 与 3) 的结果写入 docs/devel/eval-report.md §8.10（新增小节），
@@ -685,7 +778,7 @@ done
 | `ConfigFingerprint` 四字段 + `ConfigMismatch` | `crates/core/src/storage/snapshot.rs:30-45`、`:152` |
 | `default_embedder` 静默降级 | `crates/core/src/search/config.rs:312-318` |
 | `Config: Send + Sync` 的理由 | `crates/core/src/search/config.rs:28-34` |
-| NFR-03 双口径 / NFR-05 / NFR-10 / NFR-11 | `docs/devel/requirements-spec.md` §6.1（v1.12） |
+| NFR-03 双口径 / NFR-05 / NFR-10 / NFR-11 | `docs/devel/requirements-spec.md` §6.1（**v1.14**） |
 | 225.5s（embed 209.9s）/ 批次表 / 建图 4% | `docs/devel/eval-report.md` §8.2（`:137-156`）、§8.6（`:232-233`）、§8.4（`:199`） |
 | Step 4 的 manifest 重发铁律 | `docs/devel/plan-v2.md` §4 Step 4（`:288-290`） |
 | R35（破坏性变更的判定先例） | `docs/devel/architecture-design.md` §14.3 |
