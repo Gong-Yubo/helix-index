@@ -9,6 +9,52 @@
 
 ## [Unreleased]
 
+### V2 Step 6 · 详细设计（#2，2026-09-11）
+
+> **纯设计 + 文档回写，不含任何代码变更**。设计文档 = `docs/devel/v2-step6-design.md` **v0.1**（新）。
+> 覆盖 T7-09（embed 并行 spike）/ T7-11（增量构建）/ T7-17（并发检索压测）。
+> ⚠️ **D-S6-01 ~ D-S6-09 待评审**，其中 **D-S6-08（NFR-10 数值目标缺失）需评审或用户拍板**。
+
+#### Added
+
+- **`docs/devel/v2-step6-design.md` v0.1**（Step 6 详细设计）：
+  - **构建耗时的真实分解**：embed **209.9s / 225.5s = 93%**、建图 11.7s（5.2%）、纯索引 ~3s（1.3%）
+    ⇒ 任何不触碰 embed 的优化**上界收益 < 7%**；故 **T7-11（跳过 embed）优先于 T7-09（加速 embed）**。
+    ⚠️ 明确**不承诺**把 NFR-03 ① 从 225.5s 压到 120s（D-J8 已判定不可达），① 口径只做「别弄坏」。
+  - **E1 / E2 / E3 spike 设计与决策门**：单 session 基线 / 多 session × `intra_threads` 分片 / CPU EP vs **CoreML EP**；
+    决策门写死为「吞吐提升 ≥ 30% 且 峰值 RSS 增量 ≤ 20%」，**不达标即不投**（避免把"探路"承诺成"交付"）。
+  - **增量构建的现状核实（好消息）**：doc 级增量**骨架已在** —— `content_hashes` **入快照**
+    （`index/mod.rs:88` / `:501-503` / `:535`）⇒ `load` 之后 `doc_id_by_hash` 仍可用，重复文档**天然跳过 embed**；
+    真正缺的只有 ① CLI 无「追加」入口（`BuildArgs` 只有 `--input`）；② hash 粒度是**整篇文档**（改一字 ⇒ 全量重 embed）。
+  - **`build --index` 追加的 ID 不复用证明**（`insert_doc`/`insert_chunk` 用槽位长度分配 + `export/import` 保留尾部空洞）
+    ⇒ `raw_vectors` / 图 sidecar 中的旧向量不会被新 chunk 复用；并**要求写成不变式测试**（S6-T8）而非只留文档。
+  - **并发检索的实证**：读路径（`query/` `retriever/` `fusion/` `index/`）**零 `Mutex`/`RwLock`/`RefCell`/`unsafe`**
+    ⇒ T7-17 只需**采集点**（`bench --threads`），不需改内核；「近线性」是强先验。
+  - 风险 **R36 ~ R40**（R36 多 session 内存峰值 / R37 CoreML 改变向量数值 / R38 静默降级 /
+    R39 追加漏发 manifest / R40 ID 复用致幽灵向量）；未决 **Q1 ~ Q7**；测试计划 **S6-T1~T14**；任务拆分 **S6-01~S6-10**。
+
+#### Fixed
+
+- **设计期发现：`default_embedder()` 的静默降级**（`search/config.rs:312-318`）：`LocalEmbedder::new().ok()`
+  ⇒ 模型初始化失败时**静默退化为纯 BM25**（要向量却拿到纯文本，无错误无告警）。已登记为架构 **R38** 并给出
+  修法（D-S6-05：显式请求向量时硬失败）。⚠️ 这是**既有行为**、非本 PR 引入，本 PR 只把它显式化。
+
+#### Docs
+
+- **`docs/devel/plan-v2.md` v0.13**：Step 6 小节补「设计已出 + 三处更正」；§7 进度表 Step 5 两行 ⬜ → ✅、
+  新增 Step 6 设计行；§6 门槛 Step 5 打勾；§8 标题由「执行中：Step 1 / Step 2 已回写」更正为
+  「Step 1 ~ Step 6 设计均已回写」；§附-1 更正 EP 类型名与两处源码路径。
+- **`docs/devel/architecture-design.md` v1.12**：**§14.4 新增 R36~R40**（R36 / R37 标注**条件性**）；
+  §14 导读同步；文档信息表状态刷新（Step 1~5 已并入 main `590315d`）。**无 trait / 结构变更**
+  （`Embedder` trait 不改；`ConfigFingerprint` **不扩字段**——EP 配置编码进 `embedder_id`，理由同 R35 的破坏性判定）。
+- **`docs/devel/requirements-spec.md` v1.13**：NFR-03 ② / NFR-05 / NFR-10 / NFR-11 补「设计已出」与设计锚点；
+  ⚠️ **NFR-10 数值目标缺失**（Q4）与 **NFR-03 ② 的 10% 单位**（Q5）登记待拍板；**§1.1 版本表补齐 v1.11 / v1.12 两行**。
+  **未修订任何 FR / NFR 指标**（阈值、预算、时限一字未动）。
+- **`docs/README.md`**：新增 Step 6 设计索引行。
+- ⚠️ **清理上一批遗留的陈旧状态行**（本 PR 顺带完成，避免「Agent 不直推 main ⇒ 只能随下个 PR 回写」的尾巴越积越多）：
+  `docs/README.md` 与 `plan-v2.md` §4 Step 3 的「PR #27 **待合并**」→ 已合并 **`ed25d5c`**；
+  Step 5 收尾 PR **#37** 并入 main **`590315d`** 的记录补齐（此前四处只记到 `#36` → `48c0ac7`）。
+
 ### V2 Step 5 · 收尾：S5-04 阈值标定定稿 + S5-08 文档回写（#22，2026-09-10）
 
 > 设计与实现见 `docs/devel/v2-step5-design.md` **v0.5**；实现主体是 PR **#36**（已并入 main `48c0ac7`）。
