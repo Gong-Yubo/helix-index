@@ -5,9 +5,9 @@
 
 | 项 | 内容 |
 | --- | --- |
-| 版本 | **v0.12（2026-09-10：Step 5 设计**文档回写**落地——架构升 v1.9（§8.3 / §14 R18 ④ / **§14.3 R31~R35**）、需求升 v1.10（NFR-13 口径 + NFR-07 落地路径）、`docs/README.md` 风险范围 R1~R35；同时在 `main` `01e01eb` 上补齐 S2-T6 断言修正的提交 hash）** |
-| 日期 | 2026-09-10 |
-| 状态 | **决策已定案（D-J1~J7 + D-J8~J11）；Step 1 / Step 2 / Step 3 / Step 4 均已完成并合并进 `main`（main 现为 `01e01eb`；Step 3 = `ed25d5c`；Step 4 = S4-01 `1efc128` + 核心 `6f34ef2` + CLI/workload `ac9fcbe` + 文档回写 `9e2211e`；Step 2 的 S2-T6 质量门修正 = `01e01eb`）；Step 5 设计已定稿并完成文档回写（`v2-step5-design.md` v0.3，**D-S5-01~09 全部拍板**，S5-01~04 可开工）；Step 6~7 待做。任务编号按 2026-09-07 复审重排** |
+| 版本 | **v0.14（2026-09-11：Step 6 设计**评审收口**——`v2-step6-design.md` 升 **v0.2**：评审 7 条意见（F1~F7）全部采纳、**D-S6-05 / D-S6-08 拍板**、Q4~Q7 收口；**需求文档随之升 `requirements-spec.md` v1.14**（NFR-10 口径改为方案 A + NFR-03 ② 单位注记），架构 v1.13；main 现为 **`bb23553`**（PR #39 的 T13 质量门改造已并入）。此前 v0.13：Step 6 详细设计已出（v0.1，D-S6-01~09 待评审）+ 清掉上一批遗留的陈旧状态行——Step 5 收尾 PR #37 已并入（`590315d`）、Step 3「PR #27 待合并」改为已合并 `ed25d5c`、Step 5 进度表两行由 ⬜ 改 ✅）** |
+| 日期 | 2026-09-11 |
+| 状态 | **决策已定案（D-J1~J7 + D-J8~J11）；Step 1 / Step 2 / Step 3 / Step 4 / Step 5 均已完成并合并进 `main`（main 现为 **`bb23553`**——PR #39「T13 质量门 → 同图可归因不变式」已并入；Step 3 = `ed25d5c`；Step 4 = S4-01 `1efc128` + 核心 `6f34ef2` + CLI/workload `ac9fcbe` + 文档回写 `9e2211e`；Step 5 = 设计 `ee42b34` + 实现 `48c0ac7` + 收尾 `590315d`，issue #22 已结案）；**Step 6 详细设计已出、评审已收口、实现未开工**（`v2-step6-design.md` **v0.2**：评审 7 条意见 F1~F7 全部采纳、**D-S6-05 / D-S6-08 已拍板**、Q4~Q7 收口——**NFR-10 口径改为方案 A**（`--threads 4` QPS ≥ `--threads 1` × 2.5，逐位一致为前置条件），需求文档随之升 **v1.14**；**D-S6-01「T7-09 是否投 M 级」仍由 E1/E2/E3 spike 数据回答**）；Step 7 待做。任务编号按 2026-09-07 复审重排** |
 | 上游 | `requirements-spec.md`（需求定义源）、`architecture-design.md`（架构/ADR）、`eval-report.md`（P5 实测） |
 | 前置 | V1（P0~P6）全部完成，见 `plan.md`（V1 计划，已冻结，不再更新） |
 | 复审 | 2026-09-07 全量复审（7 处调整 A1~A7 + 4 个拍板问题 D1~D4）**结论已全部并入本文**，不另立复审文档；调整项索引与建议执行顺序见 **§附-3** |
@@ -220,7 +220,7 @@
 > ⚠️ **达标依赖图 sidecar 命中**——降级路径仍是 ~10s。这正是 NFR-07「降级不得静默」
 > 的由来：`GraphStatus::Rebuilt(reason)` 必须显式可见，否则 NFR-04 会静默失效而不自知。
 
-#### Step 3 · 可靠性（原子快照）✅ 实现完成（2026-09-07 落地，PR #27 待合并）
+#### Step 3 · 可靠性（原子快照）✅ 已完成并合并（PR #27 → `ed25d5c`，2026-09-08）
 
 > **完成记录**：单实现 PR #27 落地 S3-02~09（设计 `v2-step3-design.md` v0.3，D-S3-01~07 全按建议采纳）。
 > **验收对照**：① 崩溃不变式 ✅——故障注入 cp1/cp2/cp3（S3-T3~T5 单元层 + S3-T6 端到端）
@@ -339,6 +339,13 @@
   - **代码**：PR **#36**（`feat/v2-step5-exact-fallback`）已并入 main **`48c0ac7`** —— 三提交：
     `c29c31f` 后端兜底 / `23a3cc7` 编排层分派 + `Metrics` 可观测 + D-S5-08 修复 + CLI/bench 入口
     / `bded58c` 评审响应（口径改条件式 + S5-T7 补真后端行为护栏）。
+  - **收尾**：PR **#37**（`perf(vector):`）已并入 main **`590315d`**（2026-09-11，**用户手动合并**）——
+    两提交 `fdf365c`（S5-04 阈值 8192 定稿 + NFR-13 双口径）与 `af748c9`（S5-08 文档回写 + 评审响应）；
+    CI run `34554828828` 9/9；**issue #22 已结案**（`CLOSED`/`COMPLETED`）。⚠️ 本文件此前的
+    「PR #36 → `48c0ac7`」已由本条补齐（#37 才是 main 的当前落点）。
+  - ⚠️ **遗留的文档尾巴已随 Step 6 设计 PR 一并清理**：`docs/README.md` / `architecture-design.md` §14.3 /
+    `v2-step5-design.md` 状态行 / 本文 §7 进度表与 §6 门槛勾选；另 §4 Step 3 小节标题里的
+    「PR #27 **待合并**」与 `docs/README.md` 同处的陈旧行（Step 3 早已并入 `ed25d5c`）同批清。
   - **S5-04 标定**：10 万级 A/B（`--brute-fallback off` vs 强制精确，8 档位 × 2 轮）⇒
     **阈值定稿 `8192`**（两端点实测 + 归一插值交叉点 ≈ 9700；原初值 1024 **过保守**，会漏掉 `allowed=5043`
     这个实测 2.06× 的档位）。全表见 **`eval-report.md` §8.9**。
@@ -386,9 +393,37 @@
   且 `ConfigFingerprint` 需纳入 execution provider（否则 CoreML 建库 / CPU 加载会静默错配，
   正是 B1/B2 那类坑）。
 
-- **依赖**：T7-23（Step 5）是 T7-17 的前置；T7-11 依赖 Step 1。
+- **依赖**：T7-23（Step 5）是 T7-17 的前置（✅ **已满足**：`Metrics` 已进 `SearchResponse`，随 Step 5 合并）；T7-11 依赖 Step 1（✅ 已合）。
 - **风险**：中（embed 并行内存峰值上升，需重测 NFR-05；E3 改变数值）。
 - **量级**：M（含 S 级 spike）。
+
+> **状态（2026-09-11 更新）：🟩 详细设计已出（评审已收口）、实现未开工**（`docs/devel/v2-step6-design.md` **v0.2**，
+> issue **#2**，PR **#38**；评审 **7 条意见 F1~F7 全部采纳**，**D-S6-05 / D-S6-08 已拍板**、Q4~Q7 收口）。
+> ⚠️ 评审的两处**合并前必修**（均在附录 B）：**F1** delta 必须与 base **不相交**（否则 1200 条全部命中 `add` 短路查重 ⇒ NFR-03 ② 的测量空转）；
+> **F2** `cargo run -p helix-cli` 的包不存在 ⇒ 应为 **`-p helix`**。
+>
+> 设计期核实与修订（以源码为准，**三处与本节原描述不一致，已更正**）：
+>
+> | 本节原描述 | 核实结果 |
+> | --- | --- |
+> | 「`ort-2.0.0-rc.13` 有 `coreml` feature」 | ✅ 对（`ort/Cargo.toml` `coreml = ["ort-sys/coreml"]`） |
+> | 「fastembed 暴露 `with_execution_providers`」 | ✅ 对（`text_embedding/init.rs:51/83/122`），且 `lib.rs:89` 重导出 `ExecutionProviderDispatch` |
+> | ⚠️「走 CoreML 只需加 feature」 | ❌ **不成立**：fastembed 6.0.2 **没有 coreml 透传**（只有 `directml`）⇒ 必须把 `ort` 提为**直接依赖**并开 `coreml` |
+> | ⚠️ EP 类型名 | ❌ **已过时**：rc.13 的真实路径是 **`ort::ep::CoreML`**（`#[cfg(feature="coreml")]`），**不是** `CoreMLExecutionProvider` |
+> | ⚠️「单 session 按 `DEFAULT_BATCH_SIZE=256` 串行分块」 | ✅ 对，但**实际进入 ONNX 的 batch 是 64**——调用链在 `flush()` 的 `batch_size`(64) 处已切片（`search/index.rs:390`），内部 256 的切分**从不触发**。排障时别把 256 当实际 batch |
+>
+> 设计期新事实（对 T7-11 有利）：**doc 级增量骨架已在** —— `content_hashes` 入快照
+> （`index/mod.rs:88/501-503/535`）⇒ `load` 之后 `doc_id_by_hash` 仍可用，重复文档**天然跳过 embed**；
+> 真正缺的只有 ① CLI 无「追加」入口（`BuildArgs` 只有 `--input`）② hash 粒度是**整篇文档**（改一字 ⇒ 全量重 embed）。
+> 另发现 **`default_embedder()` 静默降级**（`search/config.rs:312-318` 的 `.ok()`）——要向量却拿到纯 BM25 且无告警（架构 **R38**）。
+>
+> 设计期登记风险：**架构 §14.4 R36~R40**（其中 R36/R37 为**条件性**，取决于 spike 的「投 / 不投」判定）。
+> ⚠️ **本 Step 不承诺**把 NFR-03 ① 从 225.5s 压到 120s（D-J8 已判定不可达）；NFR-03 ① 只做「别弄坏」。
+> ✅ **已拍板（评审 2026-09-11）**：**D-S6-08 / Q4 —— NFR-10 口径 = 方案 A**（`--threads 4` QPS ≥ `--threads 1` × **2.5**；
+> 逐位一致为**前置条件**；测量口径 = 预热丢弃首轮 + 顺序交错 + 报告运行范围；**数值标「拟」、待 S6-08 实测定稿**）
+> ⇒ 需求文档已升 **`requirements-spec.md` v1.14**。**Q5 —— 「追加 10%」= 文档数**（chunk 数只作参考、不进判据）；
+> **Q6** = 方案 A（`default_embedder` 硬失败，不需额外兼容开关）；**Q7** = 沿用既有 `--no-graph-persist`、不新增。
+> 评审同时背书：**D-S6-01「只承诺 spike」**、**「先 T7-11（跳过 embed）后 T7-09（加速 embed）」的顺序**，以及 **R38 的定性**（既有缺陷、非设计引入）。
 
 #### Step 7 · 精排（相关性第一刀，V2.0 收尾，原 Step 6）
 
@@ -500,8 +535,8 @@
 - [x] **Step 2**：图持久化后 12K 冷启动 ≈100ms（< 2s），且**同一快照两次加载**结果逐位一致（消 R-P5-13）
 - [x] **Step 3**：原子快照通过故障注入测试——崩溃后 `load` 要么旧快照、要么新快照，**绝不 `SnapshotCorrupted`**（PR #27 已合；fsync 代价 +0.027~0.035s，见 `eval-report.md` §8.7）
 - [x] **Step 4**：compaction 后三个体积（向量图 sidecar / `raw_vectors` / 快照正文）不无界增长，且 `GraphStatus` 回到 `Loaded` —— 10K churn 0.3×5 实测：graph+data **84.6→33.7MB**（-60%）、`nb_point` 25000→10000、reload `Loaded` 冷启动 91~99ms（`eval-report.md` §8.8）
-- [ ] **Step 5**：10 万级低选择度档位 P99 进入 **NFR-13** 预算；`Metrics` 有单测 + bench 采集点
-- [ ] **Step 6**：**NFR-03 按双口径**重测达标（首次全量 < 240s / 增量追加达标）；NFR-05 内存重测记录；`Searcher` 跨线程并发读吞吐 + 正确性有数据
+- [x] **Step 5**：10 万级低选择度档位 P99 进入 **NFR-13** 预算（常规最差 **7.06ms** ≤ 20ms / 降级字段最差 **22.84ms** ≤ 35ms）；`Metrics` 有单测（`step5_query_observability.rs` 7 条）+ bench 采集点（PR #36 / #37 → **`590315d`**）
+- [ ] **Step 6**：**NFR-03 按双口径**重测达标（首次全量 < 240s ✅ 已达标 / **增量追加待实现**）；NFR-05 内存重测记录；`Searcher` 跨线程并发读吞吐 + 正确性有数据。✅ **开工前置已解除**：详细设计已出（`v2-step6-design.md` **v0.2**）且**评审已收口**——**D-S6-08 / Q4 已拍板方案 A** ⇒ NFR-10 口径已落 `requirements-spec.md` **v1.14**（**可判定达标**；⚠️ ×2.5 为拟值，随 S6-08 实测定稿）。⚠️ **仍待 spike 回答的**：**D-S6-01 —— T7-09「投 / 不投」**（E1/E2/E3 决策门：吞吐 ≥ +30% 且峰值 RSS ≤ +20%）
 - [ ] **Step 7**：Reranker 接入后 MRR@10(1) 相对**已复现基线**可测提升；精排延迟满足 NFR-12
 - [ ] `make fmt && make lint && make test && make deny` 全绿；CI 全绿
 
@@ -522,8 +557,9 @@
 | **Step 4** | T7-12 墓碑物理回收（compaction，含 manifest 重发）/ S4-03~S4-07 | ✅ **已完成并合并**（核心 PR #30 → `6f34ef2`，2026-09-09；含评审响应：无墓碑早退、`bytes_before=None` 诚实语义、失败语义 rustdoc） |
 | **Step 4** | S4-01 `flush` 侧幽灵向量防线（设计期新发现） | ✅ 已完成（PR #29 → `1efc128`，2026-09-09） |
 | **Step 4** | S4-08 CLI `helix compact` + S4-09 churn workload 实测 + S4-10 文档回写 | ✅ **已完成并合并**（PR #31 → `ac9fcbe`；集成测试补强 `aed8829`：CLI 语义 5 例 + compaction 场景 3 例） |
-| **Step 5** | T7-22 低选择度暴力兜底 | ⬜ |
-| **Step 5** | T7-23 `query::Metrics` 可观测化 | ⬜ |
+| **Step 5** | T7-22 低选择度暴力兜底 | ✅ **已完成并合并**（设计 PR #33 → `ee42b34`；实现 PR #36 → `48c0ac7`；收尾 PR #37 → **`590315d`**，2026-09-11，issue #22 已结案） |
+| **Step 5** | T7-23 `query::Metrics` 可观测化 | ✅ **已完成并合并**（同上；`Metrics` 已进 `SearchResponse`，`step5_query_observability.rs` 7 条单测 + bench 采集点） |
+| **Step 6** | T7-09 embed 并行 / T7-11 增量构建 / T7-17 并发检索压测 | 🟩 **详细设计已出（评审已收口）、实现未开工**（`v2-step6-design.md` **v0.2**，2026-09-11，PR **#38**：F1~F7 全部采纳、D-S6-05/D-S6-08 拍板、Q4~Q7 收口；需求随之 **v1.14**） |
 | **Step 6** | T7-09 embed 并行（**先 E1/E2/E3 spike**） | ⬜ |
 | **Step 6** | T7-11 增量构建 | ⬜ |
 | **Step 6** | T7-17 并发检索压测 | ⬜ |
@@ -545,17 +581,25 @@
 
 ---
 
-## 8. 文档回写计划（**执行中**：Step 1 / Step 2 已回写）
+## 8. 文档回写计划（**执行中**：Step 1 ~ Step 6 设计均已回写）
+
+> 回写节奏：**每步一个 PR 收口**，四处定义面（需求 / 架构 / `docs/README.md` / 本文）与 CHANGELOG 同批落地。
+> ⚠️ 本文此前把本节标题停留在「Step 1 / Step 2 已回写」，实际 Step 3~5 均已回写（Step 4 见 `#32`、Step 5 见 `#33`/`#37`）——**本次一并更正**。
 
 1. `requirements-spec.md`：
    - ✅ FR-18 原条目内修订（保留单编号）；FR-17 标注「部分交付 / 完整版 V2.1」；FR-15/16 扩展删除与原子性语义。
    - ✅ FR-26~33 / NFR-10~12 正式入表（含与 FR-15/16 的修订关系）。
    - ✅ **NFR-03 备注刷新为 225.5s**（P6 重测值，替换 P5 的 236.7s）；NFR-04 明确「快照 + 图加载」口径。
-   - 🆕 **2026-09-07 复审回写（本轮）**：NFR-03 拆「首次全量 / 增量」双口径（D-J8）；**新增 NFR-13**（低选择度过滤延迟，D-J9）；NFR-11 口径改为「commit 后立即可查」；FR-31 优先级 Should → **Must**；NFR-10/11/12 的「对应步骤」按重排编号更新。
+   - ✅ **2026-09-07 复审回写**：NFR-03 拆「首次全量 / 增量」双口径（D-J8）；**新增 NFR-13**（低选择度过滤延迟，D-J9）；NFR-11 口径改为「commit 后立即可查」；FR-31 优先级 Should → **Must**；NFR-10/11/12 的「对应步骤」按重排编号更新。
+   - ✅ **Step 5 回写**（`#33` → v1.10；S5-04 标定定稿 → **v1.12**）：NFR-13 由「拟 ≤20ms」改为**双口径**（常规 ≤20ms / 降级字段 ≤35ms）+ 成本口径修正 + NFR-07 落地路径。
+   - ✅ **Step 6 设计回写（→ v1.13）**：NFR-03 ② / NFR-05 / NFR-10 / NFR-11 补「设计已出」与设计锚点；⚠️ **NFR-10 数值目标缺失**（设计 §9.2 Q4）与 **NFR-03 ② 的 10% 单位**（Q5）登记待拍板；**§1.1 版本表补齐 v1.11 / v1.12 两行**（清「定义面漂移」）。**未修订任何指标**。
+   - 🆕 **Step 6 评审收口（本轮 → v1.14）**：**NFR-10 口径按方案 A 修订**——① **前置条件**（各线程 `hits`（`chunk_id` + `score`）逐位等于单线程）+ ② **吞吐判据**（`--threads 4` QPS ≥ `--threads 1` × **2.5**，允许 40% 折损）+ **写明测量口径**（预热丢弃首轮 / 顺序交错 / 报告运行范围）；⚠️ **×2.5 标「拟」**，随 **S6-08** 实测定稿（同 Step 5 的 NFR-13 先例：v1.10 落「拟 ≤20ms」、v1.12 定稿）。**NFR-03 ② 的 10% 单位 = 文档数**（chunk 数只作参考、不进判据）。**这是 Step 6 唯一触碰 FR / NFR 的改动。**
 2. `architecture-design.md`：
    - 新增 **ADR-A**（图持久化格式 + 多文件原子性）、**ADR-010**（向量软删除 / 过滤下推 / 图持久化的架构决策）。
    - **第 14 章风险表 R1 补「已关闭」状态**（P5 已换 hnsw_rs，instant-distance 移除）；**p5-design 的 D7 结案**（图持久化落地）——**✅ 已由 V2 Step 2 完成**（2026-09-06）：ADR-A 方案 C，12K 完整冷启动 11.57s → ≈100ms，NFR-04 达标；R-P5-13 一并消解（图落盘即冻结拓扑，同快照两次加载逐位一致）。
    - ADR-002（instant-distance）在 ADR-010 落地时标废。
+   - ✅ **Step 2~5 回写**：§14.1 R19~R25（v1.6）→ §14.2 R26~R30（v1.9）→ §14.3 R31~R35（v1.9/v1.11）。
+   - 🆕 **Step 6 设计回写（本轮 → v1.12）**：**§14.4 新增 R36~R40**（R36/R37 **条件性**）；**无 trait / 结构变更**（`Embedder` 不改、`ConfigFingerprint` 不扩——EP 配置编码进 `embedder_id`，理由同 R35 的破坏性判定）。
 3. `CHANGELOG.md` / README「已知局限」随版本发布更新。
 4. 详细设计（ADR-A、H2/H3 等）在对应步骤开工时单独出 `pX-design.md`，不在本文件展开。
 
@@ -577,6 +621,18 @@
   `src/models/text_embedding.rs` —— **无中文量化变体**（量化仅 `NomicEmbedTextV15Q` / `ParaphraseMLMiniLML12V2Q`）；
   `src/models/reranking.rs:6-11` —— `RerankerModel::BGERerankerV2M3` 存在且带外置 `model.onnx.data`。
   `ort-2.0.0-rc.13` `Cargo.toml:145` —— 有 `coreml = ["ort-sys/coreml"]` feature。
+
+- **2026-09-11 Step 6 设计期复核（**三处更正**，路径以 `v2-step6-design.md` 附录 C 为准）**：
+  ① ⚠️ 上行「有 `coreml` feature」**容易读成"加个 feature 就能用"** —— 实际 **`fastembed-6.0.2` 没有 coreml 透传**
+  （`[features]` 里只有 `directml = ["ort/directml"]`）⇒ 走 CoreML **必须把 `ort` 提为直接依赖**并开 `coreml`；
+  ② ⚠️ EP 类型名 **不是 `CoreMLExecutionProvider`** —— rc.13 的真实路径是 **`ort::ep::CoreML`**
+  （`ort/src/ep/coreml.rs:68`，`#[cfg(feature = "coreml")]` gate 在 `ort/src/ep/mod.rs`）；
+  ③ 路径更正：`intra_threads` 在 **`src/text_embedding/init.rs:33`**（非 `src/init.rs:30-33`）；
+  内部 `DEFAULT_BATCH_SIZE=256` 的切分在 **`src/text_embedding/impl.rs:364`**（非 `:373`）；
+  **且实际进入 ONNX 的 batch 是 64** —— 调用链在 `SearchIndex::flush` 的 `batch_size`(64) 处已切片
+  （`search/index.rs:390`），内部 256 的分块**从不触发**。
+  ④ 新增核实：`fastembed-6.0.2/src/lib.rs:89` 重导出 `ExecutionProviderDispatch`（只重导出**类型**，不透传 feature）；
+  `src/text_embedding/init.rs:51/83/122` 的 `with_execution_providers` 确实存在。
 
 ---
 
