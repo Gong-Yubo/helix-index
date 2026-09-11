@@ -61,13 +61,17 @@ LEVELS_JSON="data/synth-${N}-filters.json"
 SNAPSHOT="/tmp/helix-filter-${N}.snapshot"
 
 # 兜底开关标签：A/B 对照时产物分开落盘，避免互相覆盖（同一快照可复用）
+# 默认阈值**从源码读**（S5-04 定稿后仍是同一处真源），避免脚本文案与常量漂移
+DEFAULT_FB="$(sed -n 's/^pub const BRUTE_FALLBACK_MAX_ALLOWED: usize = \([0-9]*\);.*/\1/p' \
+    crates/core/src/vector/hnsw_rs_index.rs | head -1)"
+: "${DEFAULT_FB:?无法从 crates/core/src/vector/hnsw_rs_index.rs 读出 BRUTE_FALLBACK_MAX_ALLOWED}"
 if [[ -n "$BRUTE_FALLBACK" ]]; then
     FB_TAG="-fb${BRUTE_FALLBACK}"
     FB_DESC="覆盖阈值 ${BRUTE_FALLBACK}"
     [[ "$BRUTE_FALLBACK" == "off" ]] && FB_DESC="关闭兜底（Step 5 之前的 ANN 行为）"
 else
     FB_TAG=""
-    FB_DESC="默认（1024）"
+    FB_DESC="默认（${DEFAULT_FB}，S5-04 标定定稿）"
 fi
 OUT_MD="/tmp/helix-filter-${N}${FB_TAG}.md"
 PY=${PYTHON:-python3}
