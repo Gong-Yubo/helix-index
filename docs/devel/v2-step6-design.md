@@ -111,8 +111,8 @@ let mut model = self.inner.lock().expect("embedder 锁已中毒");
 
 | 事实 | 位置 | 对设计的影响 |
 | --- | --- | --- |
-| `InitOptions.intra_threads: Option<usize>`，`None` = 用满所有核 | `fastembed-6.0.2/src/text_embedding/init.rs:33`；`with_intra_threads` 在 `:133` | E2 的**唯一可调旋钮** |
-| `with_execution_providers(Vec<ExecutionProviderDispatch>)` 存在 | 同文件 `:51`（`TextInitOptions`）/ `:83`、`:122`（`InitOptions*`） | E3 的接入点 |
+| `InitOptions.intra_threads: Option<usize>`，`None` = 用满所有核 | `fastembed-6.0.2/src/init.rs:20`（`InitOptionsWithLength`）；`with_intra_threads` 在 `:94`。⚠️ **路径已更正**（2026-09-11 实现期复核，见附录 C） | E2 的**唯一可调旋钮** |
+| `with_execution_providers(Vec<ExecutionProviderDispatch>)` 存在 | `src/init.rs:83`（`InitOptionsWithLength`，= 我们走的 `TextInitOptions`）/ `:122`（`InitOptions<M>`）。⚠️ **路径已更正** | E3 的接入点 |
 | `fastembed` 重导出 `ExecutionProviderDispatch` | `src/lib.rs:89` | 不需要直接依赖 `ort` 才能**表达** EP 类型 |
 | **`fastembed` 无 `coreml` feature**（features 列表只有 `directml`/`cuda`/`mkl`/… 透传） | `fastembed-6.0.2/Cargo.toml` `[features]` 全文 | ⚠️ **E3 必须把 `ort` 提为直接依赖**并开 `coreml` |
 | `ort` 有 `coreml = ["ort-sys/coreml"]` | `ort-2.0.0-rc.13/Cargo.toml` `[features]`（计划文档写的 "Cargo.toml:145" 位置对，名称对） | 同上 |
@@ -274,7 +274,14 @@ sessions = 1（先固定），intra_threads 同 E1，EP = CoreML（按 E2 结论
 
 照 `examples/bench_batch_size.rs` 的体例（自包含、`required-features = ["local-embed"]`、release 跑、打印表格）。设计要点：
 
-- **一次进程内跑完 E1/E2/E3 的所有档位** ⇒ 消除跨进程的环境漂移（这是本项目已吃过亏的坑：`perf-ab-calibration` 里"非交错执行有系统性偏差 ×1.38~1.54"）。
+- ~~**一次进程内跑完 E1/E2/E3 的所有档位** ⇒ 消除跨进程的环境漂移~~（这是本项目已吃过亏的坑：`perf-ab-calibration` 里"非交错执行有系统性偏差 ×1.38~1.54"）。
+  ⚠️ **实现期推翻（2026-09-11，S6-01）**：本机实测**单 session 在 batch 64 × 长文本下的峰值 RSS 就约 2 GB**
+  （是**激活张量**不是权重；对照：同模型 batch-1 的 `search` 路径才 372MB），
+  而同进程并存 7 个 session（`1+2+4`）会顶穿 32GB 内存 ⇒ 换页会**均匀拖慢所有档位**、
+  使"档位间比较"失去意义。⇒ 改为**逐档位独立进程 + 按波交错**（`A/B/C` 各起一个进程算一波，跑 R 波），
+  交错仍保留在"波"这一层，且顺带得到**可归因的分档位峰值 RSS**（peak RSS 是进程级单调量，
+  同进程方案要么做不到、要么得用 `unsafe` 读 `getrusage(2)`）。实现与实测见
+  `scripts/eval_embed_session.sh` 与 `eval-report.md` §8.10。
 - ⚠️ **档位内两轮、顺序交错**（A/B/A/B），并**打印控制组（E1）在两轮之间的漂移**，供事后归一。仅当漂移 <10% 才允许跨档位直接比较；否则按控制组归一后再比。
 - 输出 JSON（可选 `--json <path>`）⇒ 供 `eval-report.md` §8.10 落表，避免手工抄录。
 
@@ -732,9 +739,10 @@ done
 
 | 位置 | 事实 |
 | --- | --- |
-| `src/text_embedding/init.rs:33` | `pub intra_threads: Option<usize>`（默认 `None` = 用满所有核） |
-| `src/text_embedding/init.rs:51` / `:83` / `:122` | `with_execution_providers(Vec<ExecutionProviderDispatch>)` 存在 |
-| `src/text_embedding/init.rs:133` | `with_intra_threads` 存在 |
+| `src/init.rs:20` | `InitOptionsWithLength.intra_threads: Option<usize>`（默认 `None` = 用满所有核）。**这才是 `TextEmbedding::try_new` 收的类型**：`fastembed::InitOptions`（`src/lib.rs:105`）= `TextInitOptions`（`src/text_embedding/init.rs:20`）= `InitOptionsWithLength<EmbeddingModel>`（`src/init.rs:11`） |
+| `src/init.rs:83` / `:122` | `with_execution_providers(Vec<ExecutionProviderDispatch>)`——`:83` 属 `InitOptionsWithLength`、`:122` 属 `InitOptions<M>` |
+| `src/init.rs:94` / `:133` | `with_intra_threads`——`:94` 属 `InitOptionsWithLength`、`:133` 属 `InitOptions<M>` |
+| ⚠️ **更正（2026-09-11，实现期复核）** | 本节原先把上述锚点写成 `src/text_embedding/init.rs:33/:51/:83/:122/:133`。实际 **`:33`/`:51`/`:67` 是 `InitOptionsUserDefined`**（`:27`，用于**用户自带模型**，不是我们走的路径），而 `:83`/`:122`/`:133` 的行号对、**文件错**（实为 `src/init.rs`）。已按本表更正；`embed/local.rs:42-46` 的推断（我们没调 `with_intra_threads`）**不受影响**，仍然成立 |
 | `src/lib.rs:89` | `pub use ort::execution_providers::ExecutionProviderDispatch;`（**只重导出类型，不透传 feature**） |
 | `Cargo.toml` `[features]` | **无 `coreml`**；EP 透传只有 `directml = ["ort/directml"]`（及 `cuda`/`mkl`/`metal`/`accelerate` 等 candle 侧） |
 | `src/text_embedding/mod.rs:5` | `const DEFAULT_BATCH_SIZE: usize = 256;` |

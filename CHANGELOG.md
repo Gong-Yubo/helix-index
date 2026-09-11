@@ -9,6 +9,51 @@
 
 ## [Unreleased]
 
+### V2 Step 6 · T7-09 embed 并行 spike：E1/E2/E3 实测与「不投」结论（Refs #2，2026-09-11）
+
+> **含代码**：新增 spike 载体与一键脚本；**不改任何默认路径**（`build` / `search` 的行为逐位不变）。
+> **结论：T7-09 判「不投」** —— E2 多 session 池化的吞吐增益仅 **+11.7% / +16.0%**（门槛 ≥ +30%），
+> 而峰值 RSS 增量 **+96.4% / +289.2%**（门槛 ≤ +20%）；E3 CoreML EP 即使调优后也只与 CPU
+> **持平（+1.2%）**。⇒ 设计 §8 的 **PR 3（S6-04 池化）/ PR 4（S6-05 EP 接入）取消**。
+> 实测全表与决策门判定见 `docs/devel/eval-report.md` **§8.10**。
+
+#### Added
+
+- **`crates/core/examples/bench_embed_session.rs`**（S6-01 spike 载体）：E1（1 session，`intra_threads=None` 满核）/
+  E2（2、4 session × `intra_threads` 分片）/ E3（CoreML EP，由 `coreml` feature 门控）三组对照。
+  实现要点：**按块分发 + 按块索引回填**（保序正确性**不依赖** rayon 的 `collect` 语义，末块右界显式夹紧）；
+  轮次交错 + 控制组漂移打印 + `--json` 落盘；`--coreml-static-shapes` 作为 EP 调优探针
+  （回答"E3 慢是否源于动态形状"这个反诘）。
+- **`scripts/eval_embed_session.sh`**（S6-02 一键跑）：**逐档位独立进程 + 按波交错**，
+  用外置 `/usr/bin/time -l` 采集**可归因的分档位峰值 RSS**，输出逐波明细、汇总表与决策门判定。
+- **`crates/core/Cargo.toml`**：新增**默认关闭**的 `coreml` feature + `ort = "=2.0.0-rc.13"` 可选直接依赖。
+  原因：`fastembed 6.0.2` **没有 coreml 透传**（`[features]` 只有 `directml`），要表达 EP 只能直连 `ort`；
+  `ort-sys` 的 `coreml = []` 是**纯开关**（不引入新 crate）⇒ 依赖许可面不变。默认构建**不编译任何内容**。
+- **`docs/devel/eval-report.md` §8.10**：E1/E2/E3 实测（4000 段 × 1 预热 + 3 波）、
+  **峰值 RSS 的口径归属旁证**（真实 `helix build` 在 30 篇短文本 408MB / 8 篇长文本 517MB /
+  64 篇长文本 **2.32GB**）、决策门判定与结论。
+
+#### Changed
+
+- **S6-01 的测量协议推翻设计 §4.2.5 的「一次进程内跑完所有档位」**：实现期实测证伪该前提 ——
+  单 session（batch 64 × 长文本）的峰值 RSS 已达 **2~3.3 GB**（是**激活张量**不是权重），
+  7 个 session（`1+2+4`）并存会顶穿 32GB 内存 ⇒ 换页会**均匀拖慢所有档位**，使档位间比较失去意义。
+  ⇒ 改为**逐档位独立进程 + 按波交错**（交错保留在"波"这一层，控制组漂移 **−0.9%**）。
+  该更正已同时写入 `v2-step6-design.md` §4.2.5 与 `eval-report.md` §8.10。
+
+#### Docs
+
+- **`docs/devel/v2-step6-design.md` 更正 `fastembed` 的源码锚点**（§2.4 表 + 附录 C）：
+  `fastembed::InitOptions` 的真实位置是 **`src/init.rs`**（= `TextInitOptions` = `InitOptionsWithLength`，
+  `intra_threads` 在 `:20`、`with_execution_providers` 在 `:83`、`with_intra_threads` 在 `:94`）；
+  原文引的 `src/text_embedding/init.rs:33/:51/:133` 属于**另一个类型** `InitOptionsUserDefined`
+  （用于用户自带模型，不是我们走的路径）。**「未调 `with_intra_threads`」的推断不受影响，仍然成立**。
+- ⚠️ **新增待决 Q8（请评审裁定）**：NFR-05 的 372MB 只覆盖 `search` 路径（batch 1），
+  而 build 路径（batch 64）实测 2.3~3.3GB ⇒ 是否把 build 路径纳入 NFR-05 口径、或单独立风险项 R41？
+  本 PR **不擅自登记**。
+- **未修订任何 FR / NFR 指标** ⇒ `requirements-spec.md` / `architecture-design.md` / `plan-v2.md` /
+  `docs/README.md` 的「定义面」回写**留待 S6-10 收尾 PR**（避免把一个未合并的 PR 写进进度表）。
+
 ### V2 Step 6 · 详细设计 + 评审收口（#2，2026-09-11）
 
 > **纯设计 + 文档回写，不含任何代码变更**。设计文档 = `docs/devel/v2-step6-design.md` **v0.2**
