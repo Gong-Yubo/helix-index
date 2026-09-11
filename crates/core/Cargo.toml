@@ -12,6 +12,11 @@ local-embed  = ["dep:fastembed"]
 remote-embed = []            # P2 引入 dep:reqwest
 positions    = []            # posting 存储位置信息
 charabia     = ["dep:charabia"]  # T5-09 分词对照实验（feature 隔离）
+# ⚠️ coreml 默认关闭，只服务 V2 Step 6 / T7-09 的 E3 spike（bench_embed_session）。
+#    原因：fastembed 6.0.2 **没有** coreml 透传（[features] 只有 directml），
+#    必须由本 crate 直接依赖 ort 才能表达 EP ⇒ 见下方 ort 依赖的注释。
+#    若 D-S6-01 判定「不投」，S6-05 会连同该 feature 一起移除。
+coreml       = ["dep:ort", "ort/coreml", "local-embed"]
 
 [dependencies]
 # 工程基础
@@ -42,6 +47,15 @@ charabia = { version = "0.10", default-features = false, features = ["chinese"],
 # 可选：本地 embedding（P2 启用）
 fastembed = { workspace = true, optional = true }
 
+# ⚠️ 只被 `coreml` feature 拉入（可选，默认不编译任何内容）：
+#    - fastembed 重导出了 `ExecutionProviderDispatch` **类型**，但不透传 EP feature，
+#      所以"加个 feature 就能用 CoreML"是错的（v2-step6-design 附录 C 的更正）。
+#    - ort-sys 的 `coreml = []` 是**纯开关**（不引入新 crate）⇒ 依赖许可面不变。
+#    - `default-features = false`：feature 是加法式合并的，fastembed 已启用 std/ndarray 等，
+#      这里关掉默认 feature 不会影响最终图。
+#    - 精确锁定 rc.13，与 workspace 里 fastembed 的注释同源（Cargo.lock 必须入库）。
+ort = { version = "=2.0.0-rc.13", default-features = false, optional = true }
+
 [dev-dependencies]
 # ADR-007：仅作为 BM25 正确性对照基线，不参与构建产物
 tantivy  = "0.26"
@@ -57,4 +71,10 @@ required-features = ["local-embed"]
 
 [[example]]
 name = "search_basic"
+required-features = ["local-embed"]
+
+# V2 Step 6 / S6-01：embed 并行 spike 载体（E1/E2/E3）。
+# E3（CoreML）额外需要 `--features coreml`，缺省时该档位自动缺席。
+[[example]]
+name = "bench_embed_session"
 required-features = ["local-embed"]
