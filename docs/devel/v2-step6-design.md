@@ -2,9 +2,9 @@
 
 | 项 | 内容 |
 | --- | --- |
-| 版本 | **v0.2（评审收口，2026-09-11）** |
-| 日期 | 2026-09-11 |
-| 状态 | **设计中（评审已收口，2026-09-11）**。PR #38 评审的 **7 条意见（F1~F7）全部采纳**（见 §10）；**Q4 / Q5 / Q6 / Q7 已由评审表态拍板** ⇒ **D-S6-05** 与 **D-S6-08（NFR-10 口径 = 方案 A）** 定案，需求文档随之升 **v1.14**；**D-S6-01 的数值**仍由 S6-06 的 spike 回答，本版只定形态与判据 |
+| 版本 | **v0.3（实现期更正，2026-09-12）** |
+| 日期 | 2026-09-12 |
+| 状态 | **设计已收口；T7-09 已由 S6-01/S6-02 实测定案为「不投」（2026-09-12，PR #40）**。T7-09 的判定：E2 吞吐 +11.7%/+16.0%（门槛 ≥+30%）、峰值 RSS +96.4%/+289.2%（门槛 ≤+20%）；E3 调优后仅 +1.2%⇒ **S6-04 / S6-05 不开工**，`coreml` feature 作为默认关闭的探针基础设施保留（详见 `eval-report.md` §8.10）。⚠️ **本版只做「实现期更正 + 状态注记」，不回写定义面四处**（`plan-v2.md` / `architecture-design.md` / `requirements-spec.md` / `docs/README.md` 的同步留待 **S6-10**）；本文中 D-S6-01 行与 §9.2 的 Q1/Q2/R36 仍按设计期语气保留，**以 §10 之后的「实现期更正」段与 §8.10 为准**。此前 v0.2：**设计中**。PR #38 评审的 **7 条意见（F1~F7）全部采纳**（见 §10）；**Q4 / Q5 / Q6 / Q7 已由评审表态拍板** ⇒ **D-S6-05** 与 **D-S6-08（NFR-10 口径 = 方案 A）** 定案，需求文档随之升 **v1.14**；**D-S6-01 的数值**仍由 S6-06 的 spike 回答，本版只定形态与判据 |
 | 上游 | `plan-v2.md` §4 Step 6（v0.14）/ issue **#2**（V2-Step6）/ `requirements-spec.md` v1.14（**NFR-03 双口径**、NFR-05、NFR-10、NFR-11）/ `eval-report.md` §8.2、§8.4、§8.6 / `search/index.rs`、`embed/local.rs`、`search/config.rs`、`cli/{main,bench}.rs` |
 | 范围 | **T7-09** embed 并行（**先 spike、后定是否投 M 级**）+ **T7-11** 增量构建 + **T7-17** 并发检索压测进 bench |
 | 非范围 | 量化模型（D-J6 不引入）；换 embedding 模型；prefilter 索引侧预过滤（V2.1）；读写并发 / delta 分段（**Step 8**：T7-06 / T7-18）；横切 **T7-21**（`parallel_build` 默认翻转，独立 PR，与本 Step 正交）；**Step 7** 精排；并发**写**（`add` 仍需 `&mut self`，V2.0 单写者语义不变） |
@@ -97,10 +97,10 @@ let mut model = self.inner.lock().expect("embedder 锁已中毒");
 
 | 复审论断 | 核实结果 | 证据 |
 | --- | --- | --- |
-| `intra_threads` 默认 `None` = **用满所有核**，我们未覆盖 | ✅ 成立 | `fastembed-6.0.2/src/text_embedding/init.rs:33`（`pub intra_threads: Option<usize>`）、`embed/local.rs:42-46` 确实没调 `with_intra_threads` |
+| `intra_threads` 默认 `None` = **用满所有核**，我们未覆盖 | ✅ 成立 | `fastembed-6.0.2/src/init.rs:20`（`InitOptionsWithLength.intra_threads`，即 `TextInitOptions`；⚠️ 路径已更正，原写 `src/text_embedding/init.rs:33` 是 `InitOptionsUserDefined`）、`embed/local.rs:42-46` 确实没调 `with_intra_threads` |
 | 批次不是瓶颈 | ✅ 成立 | 32/64/128/256 → 62.6/59.1/54.4/51.6 条/s，差异 <20%，且**小 batch 略快**（`eval-report.md:147-148`） |
 | 并行建图只占 4% | ✅ 成立 | 12K 里 11.7s/225.5s = 5.2%（`eval-report.md` §8.6） |
-| fastembed 暴露 `with_execution_providers` | ✅ 成立 | `src/text_embedding/init.rs:51/83/122` |
+| fastembed 暴露 `with_execution_providers` | ✅ 成立 | `src/init.rs:83`（`InitOptionsWithLength`）/ `:122`（`InitOptions<M>`）。⚠️ 路径已更正（原写 `src/text_embedding/init.rs:51/83/122`） |
 | **走 CoreML 只要加个 feature** | ❌ **不成立，需修正** | fastembed 6.0.2 **没有 coreml feature**（只有 `directml = ["ort/directml"]`）⇒ 必须把 `ort` 提为直接依赖。详见 2.4 |
 
 ⚠️ 由此得到一个**反直觉但重要**的推论：`intra_threads` 已经用满所有核 ⇒ **E2（多 session × 线程分片）的本质不是"加并行"，而是"把同一批算力切开重新分配"**。若 ort 的 per-session arena 不能共享，E2 完全可能**零收益甚至负收益**。这正是它必须是 spike 而非承诺的原因。
@@ -249,7 +249,7 @@ sessions = 1, intra_threads = None（= 满核）, EP = CPU
 #### 4.2.3 E2 · 多 session × `intra_threads` 分片
 
 ```
-sessions ∈ {2, 4}，intra_threads = max(1, 核数 / sessions)，EP = CPU
+sessions ∈ {2, 4}，intra_threads = ceil(核数 / sessions)（⚠️ **实现期更正**：原写 `max(1, 核数 / sessions)` 是**截断**，10 核 / 4 session ⇒ 2；实现取 `div_ceil` ⇒ 3、共 12 个 intra-op 线程跑在 10 核上，**允许轻微超额以免留核空转**。§8.10 的「2×5 / 4×3」即后者），EP = CPU
 ```
 
 - 实现载体（spike 内，不进内核）：`Vec<Mutex<TextEmbedding>>` + `rayon::ThreadPoolBuilder::new().num_threads(sessions)`，把 `texts.chunks(64)` **按块**分发给 session，**按块索引回填**（不依赖完成顺序）。
@@ -266,7 +266,11 @@ sessions = 1（先固定），intra_threads 同 E1，EP = CoreML（按 E2 结论
 ```
 
 - **依赖接入（D-S6-03）**：`fastembed` 无 coreml 透传（§2.4）⇒ 需在 `crates/core/Cargo.toml` 增加
-  `ort = { version = "=2.0.0-rc.13", default-features = false, features = ["coreml"] }`（**feature 参与加法式合并**，不会与 fastembed 拉进两份 ort；**必须精确锁定**，理由同 `Cargo.lock` 里 ort 的锁定注释）。
+  `ort = { version = "=2.0.0-rc.13", default-features = false, optional = true }`
+  + `coreml = ["dep:ort", "ort/coreml", "local-embed"]`（**feature 参与加法式合并**，不会与 fastembed 拉进两份 ort；
+  **必须精确锁定**，理由同 `Cargo.lock` 里 ort 的锁定注释）。
+  ⚠️ **实现期更正（评审 F6）**：本行原写 `features = ["coreml"]` 的非可选形态 —— 实际落地的**可选依赖 + 默认关闭的 feature**
+  更好（默认构建完全不拉 `ort`），此处已按代码更正。
 - ⚠️ **E3 的定位是"探路"而非"承诺"**：macOS aarch64 上的 CoreML EP 是否真的接入、是否真的加速，**没有任何先验证据**。三档可能：显著加速 / 无差异 / 初始化失败（此时正好验证 §2.7 的静默降级风险）。
 - ⚠️ **E3 若有效，代价是三重的**：① 向量数值变（§3.5）② 快照语义变（§3.1，需 D-S6-04）③ 内存峰值变（CoreML 有额外转换缓冲）。三者**都必须在上线前处理**，因此 E3 落地**必须单独立决策**，不能"顺手打开"。
 
@@ -275,14 +279,15 @@ sessions = 1（先固定），intra_threads 同 E1，EP = CoreML（按 E2 结论
 照 `examples/bench_batch_size.rs` 的体例（自包含、`required-features = ["local-embed"]`、release 跑、打印表格）。设计要点：
 
 - ~~**一次进程内跑完 E1/E2/E3 的所有档位** ⇒ 消除跨进程的环境漂移~~（这是本项目已吃过亏的坑：`perf-ab-calibration` 里"非交错执行有系统性偏差 ×1.38~1.54"）。
-  ⚠️ **实现期推翻（2026-09-11，S6-01）**：本机实测**单 session 在 batch 64 × 长文本下的峰值 RSS 就约 2 GB**
+  ⚠️ **实现期推翻（2026-09-11，S6-01）**：本机实测**单 session 在 batch 64 × 长文本下的峰值 RSS：1 个 batch 2.11 GB、8 个 batch 后饱和于 3.3 GB**（`eval-report.md` §8.10 表 3）
   （是**激活张量**不是权重；对照：同模型 batch-1 的 `search` 路径才 372MB），
   而同进程并存 7 个 session（`1+2+4`）会顶穿 32GB 内存 ⇒ 换页会**均匀拖慢所有档位**、
   使"档位间比较"失去意义。⇒ 改为**逐档位独立进程 + 按波交错**（`A/B/C` 各起一个进程算一波，跑 R 波），
   交错仍保留在"波"这一层，且顺带得到**可归因的分档位峰值 RSS**（peak RSS 是进程级单调量，
   同进程方案要么做不到、要么得用 `unsafe` 读 `getrusage(2)`）。实现与实测见
   `scripts/eval_embed_session.sh` 与 `eval-report.md` §8.10。
-- ⚠️ **档位内两轮、顺序交错**（A/B/A/B），并**打印控制组（E1）在两轮之间的漂移**，供事后归一。仅当漂移 <10% 才允许跨档位直接比较；否则按控制组归一后再比。
+- ~~⚠️ **档位内两轮、顺序交错**（A/B/A/B）~~ ⇒ **实现期替换**：现协议是**每波一个独立进程、每档位每波只有一个计时样本**（`scripts/eval_embed_session.sh` 恒传 `--warmup 0`），
+  **没有"档位内重复采样"**；交错只发生在「波」这一层，**每档位样本量 = 波数（实测用 3）**。控制组波间漂移仍打印，供事后归一（实测 −0.9%）。
 - 输出 JSON（可选 `--json <path>`）⇒ 供 `eval-report.md` §8.10 落表，避免手工抄录。
 
 ### 4.3 T7-09 若采纳 E2 的落地形态（**仅当 spike 判定投**）
@@ -571,7 +576,7 @@ helix bench --index <snapshot> --threads {1,2,4,8} --reps <n> [--modes bm25,vect
 
 | # | 任务 | 依赖 | 量级 | PR 切分建议 |
 | --- | --- | --- | --- | --- |
-| **S6-01** | `examples/bench_embed_session.rs`（E1/E2/E3 载体 + 交错 A/B/A/B + JSON 输出） | 无 | S | **PR 1**（spike 载体，可与本设计一并或紧随） |
+| **S6-01** | `examples/bench_embed_session.rs`（E1/E2/E3 载体 + JSON 输出）+ `scripts/eval_embed_session.sh`（逐档位独立进程 + 按波交错 + 决策门合取表） | 无 | S | **PR 1**（spike 载体，可与本设计一并或紧随） |
 | **S6-02** | 跑 E1/E2/E3 + 记账入 `eval-report.md` §8.10 | S6-01 | S | PR 1 或 PR 2 |
 | **S6-03** | **决策门**：产出「T7-09 投 / 不投」结论 + 依据（D-S6-01 的 30%/20% 判据） | S6-02 | S | PR 2（文档） |
 | **S6-04** | `LocalEmbedder` 池化（若投）+ S6-T4/T5 | S6-03 | M | **PR 3**（独立，可延后） |
@@ -611,6 +616,12 @@ helix bench --index <snapshot> --threads {1,2,4,8} --reps <n> [--modes bm25,vect
 | **Q5** | "增量追加 10% 文档"的 **10% 以什么为单位**（文档数？chunk 数？字节？） | ✅ **评审已拍板：文档数**（`NFR-03 ②` 原文即"追加 10% 文档"）；**chunk 数只作参考指标、不进判据**（已写进 v1.14） | **已解** |
 | **Q6** | `default_embedder` 硬失败（方案 A）会不会破坏既有用户脚本？ | ✅ **评审已拍板：方案 A**（0.x + CHANGELOG `Changed` + 迁移说明足够，不需额外兼容开关） | **已解**（D-S6-05 定案） |
 | **Q7** | 追加路径是否需要 `--no-graph-persist` 之类的逃生舱？ | ✅ **评审已拍板：沿用既有 `--no-graph-persist`，不新增** | **已解**（S6-06） |
+| **Q8** | **build 路径的峰值 RSS 是否纳入 NFR-05 口径 / 单独立风险项（R41）？** —— 实测 build 路径（batch 64 × 长文本）2.32~3.33GB，而 NFR-05 的 372MB 是 search 路径（batch 1）口径 | ⏳ **待评审裁定（PR #40）**；已补三点实验钉死「RSS 与语料规模解耦、1 batch 后饱和」⇒ 见 `eval-report.md` §8.10 | 阻塞 **T7-11 的验收口径**；登记动作归 **S6-10** |
+| — | ⚠️ **Q1 / Q2 / Q3 的实际状态**（评审 F 补充）：Q1/Q2 已由 S6-02 实测**结案**（结论 = 不投，见 §8.10）；**Q3（不同 sessions / intra_threads 是否改变向量数值）随 S6-05 取消而挂起** —— 它是 D-S6-04 的前置，若将来重开池化必须先答 | — | — |
+
+> ⚠️ **决策状态的文档内漂移（评审 F，2026-09-12）**：`eval-report.md` §8.10 已写「D-S6-01 结案 / R36 命中」，
+> 而本文档 `D-S6-01` 行与 §9.2 仍按设计期语气写「⏳ 由 spike 数据决定 / 待实测回答」，R36 的残余也未标注。
+> **本版保留设计期语气**（避免半途改写已评审内容），但在此显式声明：**以 §8.10 为准，定义面的状态统一回写留待 S6-10**。
 
 > **评审同时背书（评审 §4）**：① **D-S6-01「只承诺 spike、不预先承诺落地」**（93% 分解的算术复核无误；
 > "不把探路承诺成交付"正是 2026-09-07 复审 A2 刚纠正过的错误类型）；② **「先 T7-11（跳过 embed）后 T7-09（加速 embed）」的顺序**；
@@ -654,6 +665,58 @@ helix bench --index <snapshot> --threads {1,2,4,8} --reps <n> [--modes bm25,vect
 ### 10.4 本文**未**按评审建议改的口径
 
 （本版无。评审对本文档自述事实的复核**全部为属实**，未提出需撤回的断言；7 条意见 100% 采纳。）
+
+---
+
+## 11. 实现期更正与状态注记（2026-09-12，PR #40）
+
+> 本节由 **S6-01 / S6-02 的实际实现与实测**回写，并吸收 PR #40 三轮评审的意见。
+> **本节只更正「设计说错了什么」与「状态变成什么」，不重写决策与形态**（那是 S6-10 的事）。
+
+### 11.1 实测定案：T7-09 判「不投」
+
+- 判据（决策门，**合取**）：吞吐增益 ≥ +30% **且** 峰值 RSS 增量 ≤ +20%（§4.2.1 / D-S6-01）。
+- 实测：**E2** +11.7%（2 session）/ +16.0%（4 session），峰值 RSS **+96.4% / +289.2%**；
+  **E3** 调优后（`RequireStaticInputShapes` + `MLProgram`）仅 **+1.2%** ⇒ **两侧门槛都不过**。
+- ⇒ **S6-04（池化）/ S6-05（EP 接入）不开工**；`coreml` feature 作为**默认关闭的探针基础设施**保留
+  （评审裁定 2：它是「不投」这个结论的物证，也是换机重测的唯一入口）。
+- 完整数据、局限与协议更正见 `eval-report.md` **§8.10**。
+
+### 11.2 测量协议更正（§4.2.5 已就地标注）
+
+1. **「一次进程内跑完所有档位」被实测推翻** ⇒ 改为**逐档位独立进程 + 按波交错**。
+   理由：单 session 在 batch 64 × 长文本下的峰值 RSS 就 2~3.3 GB（**激活张量**，不是权重），
+   7 个 session（`1+2+4`）并存会顶穿本机 32 GB ⇒ 换页会均匀拖慢所有档位。
+2. **「档位内两轮、顺序交错（A/B/A/B）」被替换** ⇒ 每波一个独立进程（恒传 `--warmup 0`），
+   **每档位每波只有一个计时样本**，交错只发生在「波」这一层；**每档位样本量 = 波数（实测 3）**。
+3. **预热口径**：脚本级预热跑在**一次性进程**里，只暖 OS 文件缓存；**每个计时波是该进程的首次推理**。
+   （`run_pass` 的秒表起在 `SessionPool::build` 之后，模型加载与 ONNX 图优化本就不进计时。）
+
+### 11.3 本次一并更正的源码锚点
+
+| 位置 | 原写 | 更正为 |
+| --- | --- | --- |
+| §2.3 表（两行） | `src/text_embedding/init.rs:33` / `:51/83/122` | `src/init.rs:20` / `:83`、`:122`（`InitOptionsWithLength` 才是 `TextEmbedding::try_new` 收的类型） |
+| §2.4 表（两行） | 同上 | 同上 |
+| 附录 C（三处） | `impl.rs:381`、`ep/coreml.rs:147-153`、缺 E3 旋钮 | `impl.rs:373`、`ep/coreml.rs:159`、补 `:102` / `:121` / `:49-51` |
+| §4.2.1 | `intra_threads = max(1, 核数 / sessions)`（截断） | `ceil(核数 / sessions)`（实现用 `div_ceil`，允许轻微超额以免留核空转） |
+| §4.2.4 | `ort = { …, features = ["coreml"] }` | `optional = true` + `coreml = ["dep:ort", "ort/coreml", "local-embed"]` |
+
+⚠️ **仍待 S6-10 处理**：`plan-v2.md` §附-1 的锚点（与附录 C 相反）、定义面四处回写、
+以及 §9.2 下方的「决策状态漂移」注记。
+
+### 11.4 新增未决 Q8（见 §9.2）
+
+build 路径峰值 RSS 与 NFR-05 的 372MB（search 口径）差一个数量级：
+是否把 build 路径纳入 NFR-05 口径、或单独立风险项 **R41**。**登记动作归 S6-10**。
+已补三点实验（`--texts 64 / 512 / 4096`，固定文本长度）钉死「RSS 与**语料规模解耦**、1 batch 后饱和」
+⇒ R41 的预算形态应按 **batch × 序列长度**给，而不是按语料规模给。
+
+### 11.5 挂起项：Q3 随 S6-05 取消
+
+**Q3**（不同 `sessions` / `intra_threads` 是否改变向量数值）原本挂在 S6-05 的 **S6-T6** 上；
+S6-05 不开工 ⇒ **Q3 挂起**。它不影响 D-S6-01，但它是 **D-S6-04（`embedder_id` 编码）的前置**
+⇒ 若将来重开池化，**必须先答 Q3**。
 
 ---
 
@@ -701,7 +764,7 @@ make fmt && make lint && make test && make deny
 
 # 1) T7-09 spike（E1/E2/E3 一次跑完；release；本机 aarch64）
 cargo run -p helix-core --release --example bench_embed_session -- --json /tmp/s6-embed.json
-#    交错 A/B/A/B + 控制组漂移打印；漂移 >10% 时按控制组归一后再比较
+#    逐档位独立进程 + 按波交错 + 控制组漂移打印；漂移 >10% 时按控制组归一后再比较
 
 # 2) T7-11 增量：先建基线，再追加 10%（⚠️ delta 必须与 base **不相交**）
 sed -n '1,10800p' data/t2-corpus.jsonl > /tmp/base-corpus.jsonl   # base = 前 10800 篇（12K 的 90%）
@@ -748,7 +811,7 @@ done
 | `src/text_embedding/mod.rs:5` | `const DEFAULT_BATCH_SIZE: usize = 256;` |
 | `src/text_embedding/impl.rs:364` | `batch_size.unwrap_or(DEFAULT_BATCH_SIZE)` |
 | `src/text_embedding/impl.rs:71` | `init_session_builder(execution_providers, intra_threads)` —— E1/E2/E3 共用同一构造路径 |
-| `src/text_embedding/impl.rs:381` | `texts.chunks(batch_size)` —— 内部切块（我们传 `None` ⇒ 256，但调用方已按 64 切，故不触发） |
+| `src/text_embedding/impl.rs:373` | `texts.chunks(batch_size)` —— 内部切块（我们传 `None` ⇒ 256，但调用方已按 64 切，故不触发）。⚠️ 行号已更正（原写 `:381`） |
 
 **`ort-2.0.0-rc.13`**（`~/.cargo/registry/src/*/ort-2.0.0-rc.13`）
 
@@ -757,11 +820,15 @@ done
 | `Cargo.toml` `[features]` | `coreml = ["ort-sys/coreml"]` 存在 |
 | `src/ep/mod.rs`（gate 段） | `#[cfg(feature = "coreml")] pub mod coreml; pub use self::coreml::CoreML;` |
 | `src/ep/coreml.rs:68` | `pub struct CoreML`（**不是** `CoreMLExecutionProvider`——计划文档的写法已过时） |
-| `src/ep/coreml.rs:147-153` | `with_compute_units(ComputeUnits::CPUAndNeuralEngine)` 等旋钮 |
+| `src/ep/coreml.rs:159` | `with_compute_units(ComputeUnits::CPUAndNeuralEngine)`。⚠️ 行号已更正（原写 `:147-153`，那是 rustdoc 示例） |
+| `src/ep/coreml.rs:102` | `with_static_input_shapes(bool)` —— **E3 结论所依赖的旋钮**：不开时 CoreML 会因每个 batch 形状不同反复重编译 |
+| `src/ep/coreml.rs:121` / `:49-51` | `with_model_format(ModelFormat)` / `enum ModelFormat { MLProgram, NeuralNetwork }` —— 另一个被 E3 用到的旋钮 |
 | `src/lib.rs:39` | `pub mod ep;` |
 
 ⚠️ **反面记录**：`plan-v2.md` §4 Step 6 与 §附-1 写「`fastembed` 暴露 `with_execution_providers`」（✅ 对）与「`RerankerModel::BGERerankerV2M3` 含 `model.onnx.data`」（属 Step 7，未在本步核实）——本文**只更正 EP 类型名**，其余不改。
-✅ **已同步**：`plan-v2.md` §附-1 已补「2026-09-11 Step 6 设计期复核」三条更正（EP 类型名 `ort::ep::CoreML`、`fastembed` 无 coreml 透传、两处源码路径 + 实际 batch 是 64），与本附录一致。
+⚠️ **更正（2026-09-12）**：本行原写「✅ 已同步：`plan-v2.md` §附-1 已补三条更正……与本附录一致」——**这句是假的**。
+`plan-v2.md` §附-1 补的三条里，第 ③ 条把锚点写成了 `src/text_embedding/init.rs:33`（非 `src/init.rs`）与
+`impl.rs:364`（非 `:373`），**恰好与本附录相反**。⇒ 现更正为：**`plan-v2.md` §附-1 的锚点仍待更正，随 S6-10 一并做**。
 
 ---
 
