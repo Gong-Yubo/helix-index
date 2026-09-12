@@ -306,21 +306,100 @@ impl SearchIndexBuilder {
     }
 }
 
-/// 默认 Embedder：`local-embed` feature 下用本地 bge-small-zh-v1.5；
-/// 未启用时退化为 `None`（纯 BM25）。
+/// 本地 embedder 的**构造器**签名——S6-T7 的**内部测试接缝**，不是公开扩展点。
+///
+/// 存在的唯一理由是**可测性**（设计 §7 的可测性前提）：`LocalEmbedder::new()` 要拉
+/// ONNX 模型 + 推理，CI 里跑不动。把「构造」抽成函数指针之后，「显式请求向量却拿不到
+/// 向量」这条策略就能用**必失败的构造器**在秒级单测里钉住。
+///
+/// ⚠️ **按 PR #43 评审 P3-5 收敛为私有**（原为 `pub`）：它只为单测注入而存在，
+/// 公开出去会被误当成受稳定承诺保护的 API（原形态一次导出 3 个公开项，而生产只用
+/// 到其中 1 个）。入口收敛为 [`required_local_embedder`]（**公开**，供 CLI 的
+/// `--vectors`）+ [`default_embedder`]（**私有**，供零配置装配）两处
+/// —— 即**公开面只有 1 个**（PR #43 第 2 轮评审 P3 的措辞更正）。
+type EmbedderCtor = fn() -> Result<Arc<dyn Embedder>>;
+
+/// 默认本地 embedder 的真实构造器（`local-embed` feature）。
+///
+/// 模型首次下载约 49 s；**失败不 panic**，把错误原样交给调用方，
+/// 由 [`resolve_embedder`] 按「是否显式请求」决定上抛还是退化。
 #[cfg(feature = "local-embed")]
-fn default_embedder() -> Option<Arc<dyn Embedder>> {
+fn local_embedder_ctor() -> Result<Arc<dyn Embedder>> {
     use crate::embed::LocalEmbedder;
-    // 模型首次下载约 49s；失败时退化为纯 BM25 而非 panic（零配置可用）。
-    LocalEmbedder::new()
-        .ok()
-        .map(|e| Arc::new(e) as Arc<dyn Embedder>)
+    Ok(Arc::new(LocalEmbedder::new()?) as Arc<dyn Embedder>)
 }
 
-/// 默认 Embedder（未启用 `local-embed`）：无向量，纯 BM25。
+/// 默认本地 embedder 的构造器（未启用 `local-embed`：**恒失败**，无本地推理能力）。
 #[cfg(not(feature = "local-embed"))]
+fn local_embedder_ctor() -> Result<Arc<dyn Embedder>> {
+    Err(crate::error::Error::NoEmbedder)
+}
+
+/// 解析**默认** embedder：按「是否显式请求向量」决定失败语义（D-S6-05 方案 A）。
+///
+/// | `require` | 场景 | 构造失败时 |
+/// | --- | --- | --- |
+/// | `true` | 显式请求向量（`helix build --vectors`） | **上抛 `Err`** |
+/// | `false` | 零配置默认装配（`SearchIndex::builder().build()`） | 退化 `Ok(None)`（纯 BM25）+ **stderr 告警** |
+///
+/// # 为什么要把「策略」与「构造」分开
+///
+/// 「要了向量却拿到纯 BM25」是典型的**静默降级**：检索不报错，只是召回悄悄变差，
+/// 用户往往在结果不对时才发现——这与 Step 2 用 `GraphStatus` 消灭「图降级无人知」
+/// 是同一条纪律（NFR-07）。而 `require == false` 时必须保留退化，否则
+/// `SearchIndex::builder().build()` 的「零配置可用」契约（G4）就破了。
+///
+/// 两者是不同的人机界面，因此**不能**用一句 `.ok()` 同时糊过去。
+/// 分离之后，测试注入一个必失败的 [`EmbedderCtor`] 即可覆盖完整策略，
+/// 不必依赖真实模型。
+///
+/// ⚠️ **退化分支必须保留根因**（PR #43 评审 P2-1）：设计 §7 对 S6-T7 的验收判据是
+/// 「要么 `Err`、要么**可观测标志**为真，**绝不静默**」——只丢一句 `Ok(None)` 满足
+/// 「不报错」，却不满足「可观测」。更关键的是下游代价：`search --mode vector` /
+/// `compare` 只能看到 `None`，于是报「未启用任何 Embedder 实现，请开启 local-embed
+/// 或 remote-embed feature」——而 feature 明明是开着的，真因是**模型没拿到** ⇒
+/// 把用户指向错的方向。这里与 `GraphStatus::Rebuilt(reason)` 保留 reason 的做法对齐。
+fn resolve_embedder(require: bool, ctor: EmbedderCtor) -> Result<Option<Arc<dyn Embedder>>> {
+    match ctor() {
+        Ok(e) => Ok(Some(e)),
+        // 显式请求：错就是错，不许静默换轨
+        Err(err) if require => Err(err),
+        // 零配置路径：退化而非报错（契约见 rustdoc 上表），但**不静默**
+        Err(err) => {
+            eprintln!(
+                "[警告] 本地 embedder 初始化失败，本次装配退化为纯 BM25（原因: {err}）；\
+                 要向量检索请检查模型下载与缓存目录"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// **显式请求向量**的生产入口：拿不到本地 embedder 即 `Err`（`helix build --vectors` 用）。
+///
+/// 这是 **S6-09 / D-S6-05 方案 A** 的唯一公开入口。策略本体在 `resolve_embedder`，
+/// 这里只固定 `require = true`，使调用方**不必**处理「`Ok` 却拿到 `None`」这条不可达
+/// 分支——原形态把它暴露出去后，CLI 被迫多一个 `expect`（新 panic 分支、无测试覆盖，
+/// 见 PR #43 评审 P3-5）。
+///
+/// 与零配置路径 `default_embedder` 的区别是**人机界面**：用户显式要了向量却拿不到，
+/// 属于必须当场告知的错误；而未显式请求时的退化只需可观测（保 G4 契约）。
+///
+/// ⚠️ 0.x 阶段按评审 Q6 拍板**不做额外兼容开关**（D-S6-05），故这里不接受
+/// 「允许半向量」之类的放行参数。
+pub fn required_local_embedder() -> Result<Arc<dyn Embedder>> {
+    // `require = true` ⇒ 必为 `Some`；用 `ok_or` 而非 `expect`，是为了不引入 panic 分支。
+    resolve_embedder(true, local_embedder_ctor)?.ok_or(crate::error::Error::NoEmbedder)
+}
+
+/// 默认 Embedder：走 [`resolve_embedder`] 的**非显式请求**分支。
+///
+/// `local-embed` 下是本地 bge-small-zh-v1.5；未启用该 feature 时
+/// `local_embedder_ctor` 恒失败 ⇒ 得到 `None`（纯 BM25）**并打一条 stderr 告警**
+/// （退化可观测，见 §7 的 S6-T7 判据）。
 fn default_embedder() -> Option<Arc<dyn Embedder>> {
-    None
+    // `require = false` 时 resolve_embedder 不会返回 Err，故这里的 unwrap 不可能 panic。
+    resolve_embedder(false, local_embedder_ctor).unwrap_or(None)
 }
 
 #[cfg(test)]
@@ -359,5 +438,71 @@ mod tests {
             b.vector_backend(VectorBackend::Brute).backend(),
             VectorBackend::Brute
         );
+    }
+
+    // ---- D-S6-05 / S6-T7：显式请求向量必须给向量（**不需要真实模型**） ----
+
+    use crate::error::Error;
+
+    /// 注入用：恒失败的构造器（模拟模型下载失败 / 未启用 `local-embed`）。
+    fn failing_ctor() -> Result<Arc<dyn Embedder>> {
+        Err(Error::Embedding("注入的必失败构造器".to_string()))
+    }
+
+    /// 注入用：恒成功的构造器（最小 Embedder，不碰 ONNX）。
+    fn ok_ctor() -> Result<Arc<dyn Embedder>> {
+        Ok(Arc::new(ProbeEmbedder))
+    }
+
+    struct ProbeEmbedder;
+
+    impl Embedder for ProbeEmbedder {
+        fn dim(&self) -> usize {
+            4
+        }
+        fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![0.0; 4]).collect())
+        }
+        fn embed_query(&self, _text: &str) -> Result<Vec<f32>> {
+            Ok(vec![0.0; 4])
+        }
+        fn id(&self) -> &'static str {
+            "probe-embedder"
+        }
+    }
+
+    /// S6-T7 主断言：**显式请求向量 ⇒ 构造失败必须上抛**，不许悄悄退化成纯 BM25。
+    ///
+    /// 用 `match` 而非 `expect_err`：后者要求成功侧的 `Option<Arc<dyn Embedder>>`
+    /// 实现 `Debug`，为一个测试给 trait 加 bound 得不偿失。
+    #[test]
+    fn 显式请求向量时构造失败必须报错() {
+        let err = match resolve_embedder(true, failing_ctor) {
+            Ok(v) => panic!(
+                "require=true 时必须上抛 Err，实际拿到 Ok({:?})",
+                v.is_some()
+            ),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("注入的必失败构造器"),
+            "应原样上抛构造错误（而不是换成别的错），实际: {err}"
+        );
+    }
+
+    /// S6-T7 对照面：**零配置路径**必须保住「零配置可用」契约——
+    /// 构造失败退化为纯 BM25，而不是让 `builder().build()` 整体不可用。
+    #[test]
+    fn 未显式请求时构造失败退化为纯bm25() {
+        assert!(resolve_embedder(false, failing_ctor).unwrap().is_none());
+    }
+
+    /// 构造成功时两种模式都要拿到 embedder（防「require 分支写反」类回归）。
+    #[test]
+    fn 构造成功时两种模式都拿到向量() {
+        for require in [true, false] {
+            let got = resolve_embedder(require, ok_ctor).unwrap();
+            assert!(got.is_some(), "require={require} 构造成功应给出 embedder");
+        }
     }
 }

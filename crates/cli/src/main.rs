@@ -1,7 +1,8 @@
 //! helix —— HelixIndex 的命令行工具。
 //!
 //! 已实现：
-//! - `build`：摄入语料并**落盘快照**（`--vectors` 同时保存向量）
+//! - `build`：摄入语料并**落盘快照**（`--vectors` 同时保存向量）；
+//!   `--index <既有快照> --input <delta>` 走**增量追加**（V2 Step 6 / T7-11 / FR-28）
 //! - `search --mode {bm25|vector|hybrid}`：`--input` 重建 或 `--index` 从快照加载
 //! - `compare`：三路同屏对比
 //! - `compact`（V2 Step 4 / S4-08）：墓碑物理回收，`--dry-run` 只读预览
@@ -11,6 +12,7 @@
 mod bench;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -21,7 +23,7 @@ use helix_core::embed::{Embedder, LocalEmbedder};
 use helix_core::index::Index;
 use helix_core::query::{EmptyReason, Hit, SearchMode, SearchResponse};
 use helix_core::schema::Filter;
-use helix_core::search::{GraphStatus, SearchIndex};
+use helix_core::search::{required_local_embedder, GraphStatus, SearchIndex, SearchIndexBuilder};
 use helix_core::types::ChunkId;
 
 #[derive(Parser)]
@@ -34,6 +36,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// 建索引并落盘快照
+    //
+    // `override_usage`：缺参时 clap 把**可选**的 `--output` 与必填项并列进 usage
+    // （`helix build --output <OUTPUT> --input <INPUT>`），读起来像两个都必须给，
+    // 与 `required_unless_present` 想表达的语义正好相反（PR #43 评审 P3-4）。
+    // ⚠️ 用普通注释而不是 `///`：doc comment 会被 clap 当用户可见的帮助文本渲染。
+    #[command(override_usage = "helix build [OPTIONS] (--input <INPUT> | --index <INDEX>)")]
     Build(BuildArgs),
     /// 检索（--mode bm25 / vector / hybrid；--input 重建 或 --index 快照）
     Search(SearchArgs),
@@ -47,13 +55,26 @@ enum Command {
 
 #[derive(clap::Args)]
 struct BuildArgs {
-    /// 语料文件（JSONL：每行 {"source": "...", "text": "..."}）
-    #[arg(short, long)]
-    input: PathBuf,
-    /// 输出快照路径（P4 起真正落盘）
+    /// 语料文件（JSONL：每行 {"source": "...", "text": "..."}）。
+    ///
+    /// - 只给 `--input`：**全量构建**（V1 起的既有语义）
+    /// - 同时给 `--index`：**追加**（把本文件的文档追加进既有快照）
+    #[arg(short, long, required_unless_present = "index")]
+    input: Option<PathBuf>,
+    /// 既有快照：与 `--input` 同时给出 = **追加**；单独给出 = 仅加载后重存（往返诊断）。
+    ///
+    /// ⚠️ 追加要求**与建库时相同的装配**（`--single-chunk` / `--vectors`）——
+    /// 否则配置指纹校验会报 `ConfigMismatch`，绝不静默换分词器/模型（修 B1/B2）。
+    #[arg(long)]
+    index: Option<PathBuf>,
+    /// 输出快照路径。全量构建缺省时只在内存（打印提示）；
+    /// **追加时缺省 = 原地覆盖 `--index`**（沿用 `helix compact` 的先例）
     #[arg(short, long)]
     output: Option<PathBuf>,
-    /// 同时嵌入并保存向量（vector/hybrid 检索需要；首次会下载模型）
+    /// 同时嵌入并保存向量（vector/hybrid 检索需要；首次会下载模型）。
+    ///
+    /// 这是**显式请求向量**：拿不到本地 embedder 会**报错**而非静默退化为纯 BM25
+    /// （V2 Step 6 / S6-09 / D-S6-05 方案 A）。
     #[arg(long)]
     vectors: bool,
     /// 每段落强制单 chunk（评测口径：段落级标注防多 chunk 双计，NFR-03 对齐"1 万 chunk"）
@@ -286,9 +307,12 @@ pub(crate) fn embed_chunks(
         .collect())
 }
 
-fn build(args: BuildArgs) -> Result<()> {
-    let started = std::time::Instant::now();
-
+/// 按 `--vectors` / `--single-chunk` / `--no-graph-persist` 装配门面层 builder。
+///
+/// `--vectors` 走**显式请求**语义（S6-09 / D-S6-05 方案 A）：要向量就必须给向量，
+/// 拿不到本地 embedder 直接报错。不给时显式装 `embedder(None)`（纯 BM25）——
+/// 这样「用户没要向量」与「要了但拿不到」是两条不同的路径，不会互相掩盖。
+fn configured_builder(args: &BuildArgs) -> Result<SearchIndexBuilder> {
     // 门面层装配（p6-design 4.1）：默认 MixedAnalyzer + bge-small-zh + HNSW；
     // --single-chunk 切评测口径 chunker；--vectors 决定是否配 embedder。
     let chunker = if args.single_chunk {
@@ -296,44 +320,261 @@ fn build(args: BuildArgs) -> Result<()> {
     } else {
         Chunker::default()
     };
-    let mut builder = SearchIndex::builder().chunker(chunker);
-    if !args.vectors {
-        builder = builder.embedder(None);
-    }
+    let mut builder = SearchIndex::builder()
+        .chunker(chunker)
+        .embedder(if args.vectors {
+            Some(require_local_embedder()?)
+        } else {
+            None
+        });
     // V2 Step 2：图持久化逃生舱（磁盘紧张 / 排查图问题时不落图）
     if args.no_graph_persist {
         builder = builder.without_graph_persist();
     }
-    let mut index = builder.build();
+    Ok(builder)
+}
 
-    // 读语料 → 批量摄入（倒排 + 写缓冲；向量延后到 commit）
-    let docs = read_corpus_documents(&args.input)?;
-    index.add_documents(docs)?;
+/// 显式请求向量时的 embedder 解析（S6-09 / D-S6-05 方案 A）。
+///
+/// 与 Step 2 的 `GraphStatus` 同一条纪律：**降级必须显式可见**。
+/// 「要了向量却拿到纯 BM25」不会报错、只是召回悄悄变差，用户往往在结果不对时才
+/// 发现——所以这里上抛 `Err` 并给出可执行的提示。
+///
+/// ⚠️ 用 core 的 [`required_local_embedder`]（返回 `Result<Arc<dyn Embedder>>`）而不是
+/// `resolve_embedder(.., ..).expect(..)`：后者会引入一个**不可达却无测试覆盖的 panic 分支**
+/// （PR #43 评审 P3-5），且把「策略」缝暴露成公开 API。
+fn require_local_embedder() -> Result<Arc<dyn Embedder>> {
+    required_local_embedder().context(
+        "--vectors 需要本地 embedder，但初始化失败（要向量却拿不到向量）；\
+         若只想要 BM25 检索请去掉 --vectors",
+    )
+}
 
-    println!("索引构建完成:");
+/// 半向量场景的**共用文案**（预检与权威判据共用一份，避免两处措辞漂移）。
+///
+/// `detail` 说明「本次是怎么发现快照没有向量的」，其余是给用户的可执行指引。
+fn partial_vectors_hint(detail: &str) -> String {
+    format!(
+        "{detail}：带 --vectors 追加/重存会落盘一个「半向量」快照——\n  \
+         · `--mode vector` 只召回本次新增的文档，老文档静默缺席；\n  \
+         · 快照指纹会被改写成「含向量」且不可逆，之后不带 --vectors 的装配会被 ConfigMismatch 拒绝。\n\
+         要覆盖全集的向量索引，请从语料**全量重建**；只想要 BM25 增量，请去掉 --vectors。"
+    )
+}
+
+/// **构造 embedder 之前**的预检：快照指纹的 `embedder_id` 为空 ⇒ 该快照本来就不含向量。
+///
+/// 判据 = 快照指纹（`ConfigFingerprint.embedder_id`，空串 = 纯 BM25），用**现成的公开
+/// reader** `storage::load_with_crc` ⇒ **不新增任何 API**。
+///
+/// ⚠️ 这是**预检**而非权威判据：
+/// - 读不到 / 解不开 ⇒ 直接放行，交给正常路径报错（保持**单一错误来源**）；
+/// - 指纹非空却 `raw_vectors < chunks_alive`（**部分向量**，指纹看不出来）⇒ 预检放行，
+///   由 [`build_into_existing`] 里拿到 `tombstone_stats()` 后的守卫兜住。
+///
+/// ⚠️ 代价：一次快照解析（release / 12K 档 ≈150 ms，相对 23.7 s 的追加 ≈0.63%）。
+/// 解析结果在本函数返回前即释放，**不与**随后那次真正的 `load` 并存 ⇒ 不抬高峰值 RSS。
+/// 只读不写 ⇒「拒绝时磁盘上的原快照不变、不留半成品」的性质不受影响。
+fn reject_vectorless_snapshot(idx: &Path) -> Result<()> {
+    let embedder_id = {
+        let Ok((_, _, fp, _)) = helix_core::storage::load_with_crc(idx) else {
+            return Ok(());
+        };
+        fp.embedder_id
+    };
+    if embedder_id.is_empty() {
+        bail!(
+            "{}",
+            partial_vectors_hint(&format!(
+                "快照 {} 的配置指纹显示它**不含向量**（embedder_id 为空）",
+                idx.display()
+            ))
+        );
+    }
+    Ok(())
+}
+
+fn build(args: BuildArgs) -> Result<()> {
+    let started = std::time::Instant::now();
+
+    // ⚠️ P3（PR #43 第 2 轮评审）：把「快照本来就不含向量」挡在**构造 embedder 之前**。
+    // 权威判据在 `build_into_existing` 里（要 `tombstone_stats()`），但它晚于
+    // `configured_builder()` ⇒ 在拿不到模型的机器上，「半向量」这条更该看的错误会被
+    // 「模型没拿到」盖住，且为一个**注定失败**的命令仍会去构造（首次即触发 ~49 s 下载）。
+    // 预检之后这条 CLI 接线**不再需要真模型** ⇒ 第一次进得了 CI（`CLI smoke` 的
+    // 「半向量守卫必须拒绝」）。
+    if args.vectors {
+        if let Some(idx) = args.index.as_deref() {
+            reject_vectorless_snapshot(idx)?;
+        }
+    }
+
+    let builder = configured_builder(&args)?;
+
+    match (&args.index, args.input.as_deref()) {
+        // --index [+ --input]：追加 / 重存（V2 Step 6 / T7-11 / FR-28）
+        (Some(idx), delta) => build_into_existing(&args, builder, idx, delta, started),
+        // --input：全量构建（V1 起的既有语义）
+        (None, Some(input)) => {
+            let mut index = builder.build();
+            // 读语料 → 批量摄入（倒排 + 写缓冲；向量延后到 commit）
+            let docs = read_corpus_documents(input)?;
+            index.add_documents(docs)?;
+
+            println!("索引构建完成:");
+            print_index_stats(&index);
+
+            let Some(out) = args.output.as_deref() else {
+                println!("  （未指定 --output，索引仅存在于本次进程）");
+                return Ok(());
+            };
+            save_and_report(&args, &mut index, out, started)
+        }
+        // clap 的 `required_unless_present` 已挡住这一支，这里只做防御
+        (None, None) => bail!("--input 与 --index 至少给出一个"),
+    }
+}
+
+/// 追加构建（V2 Step 6 / T7-11 / FR-28）：加载既有快照 → 追加 delta → 落盘。
+///
+/// - `--index` + `--input` = **追加**；`--index` 单独给出 = 仅加载后重存（往返诊断）。
+/// - `--output` 缺省时**原地覆盖 `--index`**（沿用 `helix compact` 的先例）。
+/// - **幂等**：`--input` 中已存在的文档（`content_hash` 命中）被跳过，
+///   同一 delta 重复追加不改变文档数/分片数/词项总数（FR-15 + FR-28）。
+/// - **增量收益来自 `load` 复用快照里的 `raw_vectors` + 图**，**不是**查重：
+///   `load` 把已持久化的向量直接灌回向量索引、**根本不调用 `embed_documents`**，
+///   于是只有 delta 需要推理（实测 embed 217.35 s → 21.41 s，`eval-report.md` §8.11）。
+///   查重（`content_hashes` / `doc_id_by_hash`）保证的是**重复追加的幂等**（S6-T3），
+///   是另一个性质 —— 实测那次 `去重跳过 0` 恰好说明收益与查重无关。
+///   ⚠️ 别顺着「查重」去优化增量路径，收益不会动（PR #43 评审 P3-2）。
+///
+/// ⚠️ **不是 upsert-by-source**：同一 `source` 内容变了就是**一篇新文档**，旧文档仍在。
+/// 需要替换语义请显式 `remove` 后再 `compact`（见设计 §4.5.5）。
+///
+/// - ⚠️ **带 `--vectors` 追加/重存到「无向量快照」时硬失败**（PR #43 评审 P1）：
+///   `load` 的 embedder 校验是**非对称**的（允许「快照无向量 + 装配有 embedder」作为
+///   升级路径，见 `index.rs` 的 `embedder_ok`），故这一步**能**走到 `add_documents`；
+///   但那样会**落盘**一个自称含向量、实际只有新增部分有向量的**半向量快照**
+///   （指纹还会被改写成「含向量」且**不可逆**，下游 `compact --dry-run` 会把它当健康态）。
+///   `--mode vector` 则静默只回答 delta 那部分语料 —— 与 `search --index` **不同构**
+///   （那只是只读的、进程结束即消失，不污染磁盘）。
+///   ⇒ **两层**：`build()` 里先做**预检**（只读指纹、不进 embedder 构造，见
+///   [`reject_vectorless_snapshot`]）挡住「快照本来就不含向量」；这里再用
+///   `tombstone_stats()` 做**权威判据**，兜住指纹看不出来的**部分向量**。
+///   ⚠️ **不加放行开关**：D-S6-05 已按评审 Q6 拍板「不额外加兼容开关」。
+fn build_into_existing(
+    args: &BuildArgs,
+    builder: SearchIndexBuilder,
+    idx_path: &Path,
+    delta: Option<&Path>,
+    started: std::time::Instant,
+) -> Result<()> {
+    let t_load = std::time::Instant::now();
+    let mut index = builder.load(idx_path).with_context(|| {
+        format!(
+            "加载既有快照失败（追加要求与建库时相同的装配，如 --single-chunk / --vectors）: {}",
+            idx_path.display()
+        )
+    })?;
+    let load_ms = t_load.elapsed();
+
+    println!("增量构建: {}", idx_path.display());
+    println!("  加载快照耗时 {load_ms:?}");
+    report_graph_status(&index);
+
+    // ⚠️ P1（PR #43 评审）：`--vectors` 要向量，但快照里的**存活分片没有对应向量**
+    // ⇒ 这是「半向量」状态。静默继续会落盘一个自称含向量、实际只有新增部分有向量的快照
+    // （指纹被改写成「含向量」且**不可逆**），`--mode vector` 只答新增那部分语料。
+    //
+    // 判据就地取自 `tombstone_stats()`（不新增公开 API）：健康的向量快照恒有
+    // `raw_vectors == chunks_alive`（`remove` 会同步 retain 掉对应向量），`<` 即
+    // 「有存活分片缺向量」。放在 `add_documents` **之前** —— 落盘之后再告警就晚了；
+    // 也因此覆盖 `--index` 单独给出的「仅重存」路径（那条同样会改写指纹）。
+    if args.vectors {
+        let st = index.tombstone_stats();
+        if st.raw_vectors < st.chunks_alive {
+            bail!(
+                "{}",
+                partial_vectors_hint(&format!(
+                    "快照里的存活分片没有向量（raw_vectors {} < chunks_alive {}）",
+                    st.raw_vectors, st.chunks_alive
+                ))
+            );
+        }
+    }
+
+    let (before_docs, before_chunks) = (index.num_docs(), index.num_chunks());
+
+    match delta {
+        Some(p) => {
+            let docs = read_corpus_documents(p)?;
+            let total = docs.len();
+            let outcomes = index.add_documents(docs)?;
+            let deduped = outcomes.iter().filter(|o| o.deduped).count();
+            // NFR-11：commit 后新增内容立即可查；写延迟 = 本批 flush 耗时
+            index.commit()?;
+            println!(
+                "  追加 {} 篇：新增 {} / 去重跳过 {}",
+                total,
+                total - deduped,
+                deduped
+            );
+        }
+        None => println!("  （未指定 --input：仅加载后重存，用于往返诊断）"),
+    }
+
+    print_index_stats(&index);
+    println!(
+        "  变化: 文档 {} → {} ｜ 分片 {} → {}",
+        before_docs,
+        index.num_docs(),
+        before_chunks,
+        index.num_chunks()
+    );
+
+    let out = args.output.as_deref().unwrap_or(idx_path);
+    if args.output.is_none() {
+        println!("  （未指定 --output：原地覆盖 {}）", idx_path.display());
+    }
+    save_and_report(args, &mut index, out, started)
+}
+
+/// 打印索引四项计数（全量与追加共用）。
+fn print_index_stats(index: &SearchIndex) {
     println!("  文档数   = {}", index.num_docs());
     println!("  分片数   = {}", index.num_chunks());
     println!("  词项总数 = {}", index.total_len());
     println!("  平均分片 = {:.2}", index.avgdl());
+}
 
-    let Some(out) = args.output else {
-        println!("  （未指定 --output，索引仅存在于本次进程）");
-        return Ok(());
-    };
+/// 落盘 + 打印（全量与追加共用的收尾）。
+///
+/// 开头显式 `commit()`：`save` 内部虽也 `commit`，但 `embed_count` / `embed_elapsed`
+/// 是**累计量**，残余 `pending`（不足 `batch_size` 的尾批）必须在此处 flush 才会累加进去，
+/// 否则 embed 读数会**少算最后一批** —— 口径类 bug 里最难发现的那一种。
+/// ⚠️ 本函数已**不读** `num_chunks`（旧注释曾以此为理由）；别据此判定这次 `commit()`
+/// 与 `save` 内部那次重复而删掉它（PR #43 评审 P3-1）。
+fn save_and_report(
+    args: &BuildArgs,
+    index: &mut SearchIndex,
+    out: &Path,
+    started: std::time::Instant,
+) -> Result<()> {
+    index.commit()?;
 
-    // 向量嵌入：--vectors 时 commit 冲刷残余缓冲；embed 实际分散在 add_documents
-    // 的自动 flush 里，故耗时取门面层累计值（而非此处 commit 计时，否则只测到最后一批）
+    // 向量嵌入：embed 实际分散在 add_documents 的自动 flush 里，故耗时取门面层累计值
+    //（而非在此处计时，那样只测到最后一批）
     if args.vectors {
-        index.commit()?;
         println!(
-            "  embed {} 条 耗时 {:?}（NFR-03 口径 = embed，不含 HNSW / 落盘）",
-            index.num_chunks(),
+            "  embed {} 条 耗时 {:?}（NFR-03 口径 = embed，不含 HNSW / 落盘；\
+             增量构建时这里是**本次新增**条数，不是索引总量）",
+            index.embed_count(),
             index.embed_elapsed()
         );
     }
 
     let t_save = std::time::Instant::now();
-    index.save(&out)?;
+    index.save(out)?;
     println!(
         "  快照已写入 {}（{}，{}）耗时 {:?}",
         out.display(),
@@ -342,7 +583,7 @@ fn build(args: BuildArgs) -> Result<()> {
         } else {
             "纯文本"
         },
-        humansize(&out),
+        humansize(out),
         t_save.elapsed()
     );
     println!(
@@ -355,7 +596,7 @@ fn build(args: BuildArgs) -> Result<()> {
         println!("  图 sidecar dump 耗时 {dump:?}（纯落盘，不含 HNSW 建图）");
     }
     if args.vectors && !args.no_graph_persist {
-        let paths = helix_core::storage::graph_paths(&out);
+        let paths = helix_core::storage::graph_paths(out);
         if let Ok(Some(m)) = helix_core::storage::read_manifest(&paths.manifest) {
             let graph_bytes = m.graph_len + m.data_len;
             println!(
@@ -376,6 +617,23 @@ fn build(args: BuildArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// 打印向量图 sidecar 状态（NFR-07：降级必须显式可见，不能只留日志）。
+fn report_graph_status(index: &SearchIndex) {
+    match index.graph_status() {
+        GraphStatus::Loaded => eprintln!("[向量图加载：持久化图（快路径）]"),
+        GraphStatus::Rebuilt(reason) => eprintln!(
+            "[向量图加载：⚠️ 降级重建（原因：{reason}）—— 冷启动会变慢\
+             （图是派生缓存，丢弃不影响正确性）]"
+        ),
+        GraphStatus::NotApplicable => {
+            eprintln!("[向量图加载：不适用（Brute 后端 / 纯 BM25 / 已关闭持久化）]")
+        }
+        GraphStatus::PersistFailed(reason) => {
+            eprintln!("[向量图落盘：⚠️ 失败（原因：{reason}）—— 快照本身完好，下次加载会重建图]")
+        }
+    }
 }
 
 /// 从 JSONL 语料读取为 `Document` 输入 DTO（build / search --input / compare 共用）。
@@ -443,21 +701,7 @@ fn search(args: SearchArgs) -> Result<()> {
                 .with_context(|| format!("加载快照失败: {}", idx_path.display()))?;
             eprintln!("[快照加载 {} 耗时 {:?}]", idx_path.display(), t.elapsed());
             // V2 Step 2：图 sidecar 状态（NFR-07 —— 降级不能静默，必须显式可见）
-            match index.graph_status() {
-                helix_core::search::GraphStatus::Loaded => {
-                    eprintln!("[向量图加载：持久化图（快路径）]")
-                }
-                helix_core::search::GraphStatus::Rebuilt(reason) => eprintln!(
-                    "[向量图加载：⚠️ 降级重建（原因：{reason}）—— 冷启动会变慢，\
-                     重建耗时已计入上方「快照加载」]"
-                ),
-                helix_core::search::GraphStatus::NotApplicable => {
-                    eprintln!("[向量图加载：不适用（Brute 后端 / 纯 BM25 / 已关闭持久化）]")
-                }
-                helix_core::search::GraphStatus::PersistFailed(reason) => eprintln!(
-                    "[向量图落盘：⚠️ 失败（原因：{reason}）—— 快照本身完好，下次加载会重建图]"
-                ),
-            }
+            report_graph_status(&index);
             index.into_searcher()?
         }
         (None, Some(input)) => {

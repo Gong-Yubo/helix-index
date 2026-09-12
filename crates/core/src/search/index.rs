@@ -289,6 +289,12 @@ pub struct SearchIndex {
     /// 累计 embed 推理耗时（`flush` 中累加，供 NFR-03 构建耗时口径观测）。
     /// 只计 `embed_documents` 推理本身，不含归一化 / 灌向量索引。
     pub(crate) embed_elapsed: std::time::Duration,
+    /// 累计送入 `embed_documents` 的**条数**（与 `embed_elapsed` 同源累加）。
+    ///
+    /// 存在的理由：增量构建时 `num_chunks()` 是**索引总量**，而本次真正
+    /// 吃 ONNX 推理的只有新增的那一批 —— 用 `num_chunks()` 报「embed N 条」
+    /// 会把 NFR-03 的口径讲错（增量场景下高估）。
+    pub(crate) embed_count: usize,
     /// 图持久化开关（ef_search 回填 / strict 模式 / 逃生舱）
     pub(crate) graph: super::config::GraphOpts,
     /// 最近一次图 sidecar 的状态（NFR-07：降级必须可观测）
@@ -337,6 +343,7 @@ impl SearchIndex {
             inner,
             pending: Vec::new(),
             embed_elapsed: std::time::Duration::ZERO,
+            embed_count: 0,
             graph,
             graph_status: GraphStatus::NotApplicable,
             graph_dump_elapsed: None,
@@ -428,6 +435,7 @@ impl SearchIndex {
         let t = std::time::Instant::now();
         let vecs = embedder.embed_documents(&texts)?;
         self.embed_elapsed += t.elapsed();
+        self.embed_count += texts.len();
         debug_assert_eq!(vecs.len(), texts.len(), "embed 输出条数应与输入一致");
 
         // 归一化 + 灌向量索引 + 记录原始向量（快照用）。
@@ -497,6 +505,15 @@ impl SearchIndex {
     /// 应取这个累计值。
     pub fn embed_elapsed(&self) -> std::time::Duration {
         self.embed_elapsed
+    }
+
+    /// 累计送入 `embed_documents` 的条数（与 [`Self::embed_elapsed`] 同源累加）。
+    ///
+    /// ⚠️ **不要**用 `num_chunks()` 代替它来报「本次 embed 了多少条」：
+    /// 增量构建（`build --index`）时 `num_chunks()` 是索引**总量**，
+    /// 而本次真正吃推理的只有新增那批 ⇒ 会高估 NFR-03 的口径。
+    pub fn embed_count(&self) -> usize {
+        self.embed_count
     }
 
     /// 交出所有权，产出只读 `Searcher`（`'static + Clone + Send + Sync`）。
@@ -971,6 +988,7 @@ impl SearchIndex {
             },
             pending: Vec::new(),
             embed_elapsed: std::time::Duration::ZERO,
+            embed_count: 0,
             graph,
             graph_status,
             graph_dump_elapsed: None,
