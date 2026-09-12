@@ -29,7 +29,8 @@
   shell 恰好落在 C locale，所以这类缺陷**能一路混过本地裸跑**。修法：`$VAR` → `${VAR}`。
 - **同一类缺陷不止一处（评审只点了 1 个文件，全仓扫出 3 个文件、14 处）。**
   除 `eval_embed_session.sh` 的 **10 处**（`:57/:65/:129×2/:158/:164/:170/:187×2/:226`，与评审清单逐行吻合）
-  外，另有 **`eval_filter.sh` 2 处、`eval_quality.sh` 1 处**。⚠️ 只修 `:187` 不够：其余 9 处都在
+  外，另有 **`eval_filter.sh` 3 处**（`:96`×1 / `:111`×2）+ **`eval_quality.sh` 1 处**（`:51`）= **10+3+1 = 14**。
+  ⚠️ 只修 `:187` 不够：其余 9 处都在
   **错误/汇总分支**里 ⇒ 最坏情况是「基准失败 → 想打印『作废：…（详见 $log）』→ 自己先挂掉，把真正的原因盖掉」。
 
 #### Added
@@ -68,6 +69,19 @@
 - **`TMPDIR="${TMPDIR%/}"`**：产物目录打印出 `.../T//s6-embed-XXXX` 双斜杠（`TMPDIR` 末尾自带 `/`）。
 - **`RSS_MAX_GB` 改按字节计算**：原先由**已取整**的 `PHYS_GB` 算（36GB 机器会算成 32GB × 0.9）；
   现直接用 `PHYS_BYTES * 0.9`。
+
+#### 质量门（全绿）
+
+运行范围：**本分支 `5d87c52` / 本机 macOS aarch64 / 默认特性**。
+
+- `cargo fmt --all -- --check` ✅
+- `cargo clippy --workspace --all-targets -- -D warnings` ✅
+- `cargo test --workspace` ✅ **276 passed / 6 ignored / 0 failed**（**13** 条 `^test result` 行全 ok）
+  ⚠️ 报数口径：**必须取全部 `^test result` 行求和** —— 用 `| tail -12` 会截断第一条（`9 passed`），少算 9。
+- `make shell` ✅（新增守门）/ `bash -n` 全部 5 个脚本 ✅
+- **UTF-8 locale 下实跑** `LC_ALL=en_US.UTF-8 TEXTS=64 ROUNDS=1 WARMUP=0 ./scripts/eval_embed_session.sh` ⇒ **exit 0**
+  （预热 → 波 → 汇总 → 决策门合取表 → 产物目录全通；产物目录 `/var/folders/.../T/s6-embed-9sZprG` **无双斜杠**）
+- CI run `34693636678`：**10/10 全绿**，含新 job **`shell expansion`**
 
 ### V2 Step 6 · Q8 裁定记录：方案 C（拆两步）（Refs #2，2026-09-12）
 
