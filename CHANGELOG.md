@@ -9,6 +9,84 @@
 
 ## [Unreleased]
 
+### 构建 · V2 Step 6 PR 5：增量构建 + 显式请求向量的硬失败（S6-06 / S6-07 / S6-09）（Refs #2，2026-09-12）
+
+> 本 PR 落地 V2 Step 6 的三件事：**`T7-11` 增量构建**（FR-28）、**NFR-03 ② 增量口径实测**（S6-07）、
+> 以及 **`default_embedder()` 静默降级的消除**（S6-09 / D-S6-05 方案 A）。
+> ⚠️ `T7-09`（embed 并行）已由 PR #40 实测判「**不投**」⇒ **S6-04 池化 / S6-05 EP 接入不在本 PR 范围**，
+> 本 PR 只做 `T7-11`（跳过已 embed 的文档）这条**结构性**收益路径。
+
+#### Added
+
+- **`helix build --index <既有快照> [--input <delta>]`：增量构建（T7-11 / FR-28）。**
+  语义 = `load` 既有快照 → 追加 delta → `commit` → 落盘：
+  - `--index` + `--input` = **追加**；`--index` 单独给出 = 仅加载后重存（往返诊断）；
+  - `--output` 缺省**原地覆盖 `--index`**，给出则另存（沿用 `helix compact` 的先例）；
+  - **幂等**：已存在的文档被 `content_hashes` 双保险挡在 `pending` 之外 ⇒
+    重复追加不改变文档数 / 分片数 / 词项总数，且**不耗 ONNX 推理**
+    （这正是增量的收益来源：`content_hashes` 随快照持久化，`load` 之后仍可用）；
+  - `--input` 与 `--index` 都不给时由 clap 的 `required_unless_present` 拒绝；
+  - ⚠️ **不是 upsert-by-source**：同一 `source` 内容变了就是**一篇新文档**，旧文档仍在。
+    需要替换语义请显式 `remove` 后再 `compact`（设计 §4.5.5，已由测试钉住）。
+- **`SearchIndex::embed_count()`**：累计送入 `embed_documents` 的**条数**（与既有
+  `embed_elapsed()` 同源累加）。存在的理由是**口径正确性**：增量构建时 `num_chunks()`
+  是索引总量，用它会高估「本次 embed 了多少条」，把 NFR-03 的读数讲错。
+- **`scripts/eval_incremental.sh`：NFR-03 ② 一键复现脚本（S6-07）。**
+  同一次运行内取三个计时（`T_full` / `T_base` / `T_inc`），按 `T_inc < T_full × RATIO% × 1.2`
+  出判定，并把增量耗时分解为 **load / embed / save** 三段；结果同时写 `result.json`。
+  分钟级、**不进 CI**（性能数字一律本地 release 跑）。
+  口径与 `eval-report.md` §8.2 的 NFR-03 ① 对齐：`--single-chunk --vectors` ⇒ 1 篇 == 1 chunk。
+
+#### Changed ⚠️ 行为变更
+
+- **`--vectors` 现在是「显式请求向量」：拿不到向量就报错，不再静默退化为纯 BM25
+  （S6-09 / D-S6-05 方案 A）。** 此前 `fastembed` 初始化失败被 `.ok()` 吞掉，
+  用户拿到的是**悄悄少了向量路**的索引 —— 检索不报错、召回静默变差，正是
+  NFR-07「降级必须显式可见」要消灭的那类问题（与 Step 2 用 `GraphStatus`
+  消灭「图降级无人知」同构）。
+  - **零配置路径不受影响**：`SearchIndex::builder().build()` 未显式请求向量，
+    模型不可用时仍退化为纯 BM25（保住「零配置可用」契约 G4）。
+  - **迁移**：要向量却装不上模型时会看到明确报错并附可执行提示；
+    只想要 BM25 检索的话，去掉 `--vectors` 即可。
+  - 实现把**策略与构造分离**（`search::resolve_embedder(require, ctor)` +
+    `search::local_embedder_ctor()`），使这条策略能在 CI 里用**必失败的构造器**
+    秒级覆盖，不必依赖模型下载。
+
+#### 实测（NFR-03 ② 增量口径）
+
+- 复现：`./scripts/eval_incremental.sh`；口径 `--single-chunk --vectors`、`data/t2-corpus.jsonl` 前 12,000 篇，
+  `base` 10,800 篇 / `delta` 取**尾部** 1,200 篇（与 base **不相交** —— 评审 F1 的硬约束，
+  相交会让 1200 条全部命中查重短路、判据必然通过却什么都没测到）。
+- **判定 ✅ PASS**：`T_inc` = **23.705 s** < 预算 **27.973 s**（= `T_full` 233.107 s × 10% × 1.2），余量 **15.3%**。
+- 分解：`T_full` = embed 217.35 s + save 0.122 s；`T_inc` = load 0.151 s + embed **21.412 s** + save 0.114 s。
+- **增量省的是 embed**：217.35 s → 21.41 s（**−90.2%**）—— 12,000 篇里只有 delta 的
+  **1,200 篇（10%）**需要重新 embed，base 的 **10,800 篇（90%）** 向量已在快照里、不重算。
+  ⚠️ 分母已按 10% 缩过，故「省 90%」在判据上表现为「只用了全量的 **10.17%**，容许 12%」，
+  别把这里的小余量误读成增量收益小。
+- 三档 embed 吞吐一致（55.2~57.5 条/s）⇒ 不存在隐含的全量回灌（否则 `T_inc` 会退化到 ≈200 s 量级）。
+- 与设计附录 B 的预估（"预期 ≈23 s / 阈值 27.1 s ⇒ 通过但不宽裕"）**高度一致**（实测 23.705 s）。
+- 完整表、`T_inc` 余额归因（**进程内口径 ≈1.88 s**）、两种时钟（墙钟 / 进程内）的区分、
+  NFR-11 写延迟旁证（≈1.14 s/批）与三条局限，见 **`docs/devel/eval-report.md` §8.11**
+  （§8.10 已被 T7-09 的 spike 占用，故另起一节）。
+
+#### 测试
+
+- 新增 `crates/core/tests/step6_incremental_build.rs`（7 条）：
+  S6-T1 追加后计数 == 全量重建 /
+  S6-T2 追加后 BM25 `(source, score)` 序列 == 全量重建（**不比 id**，口径见设计 §4.5.3）/
+  S6-T3 重复追加同一 delta 幂等（含**跨快照**，去重必须能在 save/load 后存活）/
+  S6-T8 追加分配的 ID **严格大于**历史最大 ID（含**尾部墓碑**场景 —— ID 复用最容易发生的地方）/
+  S6-T9 追加前后配置指纹不变 /
+  S6-T13 追加后图 sidecar manifest **重发**且冷启动 `Loaded` 而非 `Rebuilt`
+  （Step 4 踩过的同一个坑：图变了不重发 manifest ⇒ 每次冷启动白重建 ≈10s）/
+  + 语义边界「追加不是 upsert-by-source」。
+- `search/config.rs` 新增 S6-T7 三条单测：注入**必失败**的构造器 ⇒
+  断言「显式请求 ⇒ `Err`」「零配置 ⇒ 退化为 `None`」。
+- CI `CLI smoke` 新增两条：`--index` 追加往返（并 `grep` 幂等计数）、
+  既无 `--input` 也无 `--index` 必须被拒绝。
+- **变异验证**：把 `ForwardStore::insert_doc` 改成「复用第一个空槽」⇒ S6-T8 立即失败
+  （证明这条不变式测试有牙齿，而不是恒真断言）。
+
 ### 工程 · cargo-deny advisories 门评审响应（PR #41 第 1 轮）（Refs #25，2026-09-12）
 
 > 评审**无阻塞项**（3×P2 + 3×P3），结论「**可以合并**」，并明示「**改完 P2-1 / P2-2 我就给 approve**」。
