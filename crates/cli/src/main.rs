@@ -1,7 +1,8 @@
 //! helix —— HelixIndex 的命令行工具。
 //!
 //! 已实现：
-//! - `build`：摄入语料并**落盘快照**（`--vectors` 同时保存向量）
+//! - `build`：摄入语料并**落盘快照**（`--vectors` 同时保存向量）；
+//!   `--index <既有快照> --input <delta>` 走**增量追加**（V2 Step 6 / T7-11 / FR-28）
 //! - `search --mode {bm25|vector|hybrid}`：`--input` 重建 或 `--index` 从快照加载
 //! - `compare`：三路同屏对比
 //! - `compact`（V2 Step 4 / S4-08）：墓碑物理回收，`--dry-run` 只读预览
@@ -11,6 +12,7 @@
 mod bench;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -21,7 +23,9 @@ use helix_core::embed::{Embedder, LocalEmbedder};
 use helix_core::index::Index;
 use helix_core::query::{EmptyReason, Hit, SearchMode, SearchResponse};
 use helix_core::schema::Filter;
-use helix_core::search::{GraphStatus, SearchIndex};
+use helix_core::search::{
+    local_embedder_ctor, resolve_embedder, GraphStatus, SearchIndex, SearchIndexBuilder,
+};
 use helix_core::types::ChunkId;
 
 #[derive(Parser)]
@@ -47,13 +51,26 @@ enum Command {
 
 #[derive(clap::Args)]
 struct BuildArgs {
-    /// 语料文件（JSONL：每行 {"source": "...", "text": "..."}）
-    #[arg(short, long)]
-    input: PathBuf,
-    /// 输出快照路径（P4 起真正落盘）
+    /// 语料文件（JSONL：每行 {"source": "...", "text": "..."}）。
+    ///
+    /// - 只给 `--input`：**全量构建**（V1 起的既有语义）
+    /// - 同时给 `--index`：**追加**（把本文件的文档追加进既有快照）
+    #[arg(short, long, required_unless_present = "index")]
+    input: Option<PathBuf>,
+    /// 既有快照：与 `--input` 同时给出 = **追加**；单独给出 = 仅加载后重存（往返诊断）。
+    ///
+    /// ⚠️ 追加要求**与建库时相同的装配**（`--single-chunk` / `--vectors`）——
+    /// 否则配置指纹校验会报 `ConfigMismatch`，绝不静默换分词器/模型（修 B1/B2）。
+    #[arg(long)]
+    index: Option<PathBuf>,
+    /// 输出快照路径。全量构建缺省时只在内存（打印提示）；
+    /// **追加时缺省 = 原地覆盖 `--index`**（沿用 `helix compact` 的先例）
     #[arg(short, long)]
     output: Option<PathBuf>,
-    /// 同时嵌入并保存向量（vector/hybrid 检索需要；首次会下载模型）
+    /// 同时嵌入并保存向量（vector/hybrid 检索需要；首次会下载模型）。
+    ///
+    /// 这是**显式请求向量**：拿不到本地 embedder 会**报错**而非静默退化为纯 BM25
+    /// （V2 Step 6 / S6-09 / D-S6-05 方案 A）。
     #[arg(long)]
     vectors: bool,
     /// 每段落强制单 chunk（评测口径：段落级标注防多 chunk 双计，NFR-03 对齐"1 万 chunk"）
@@ -286,9 +303,12 @@ pub(crate) fn embed_chunks(
         .collect())
 }
 
-fn build(args: BuildArgs) -> Result<()> {
-    let started = std::time::Instant::now();
-
+/// 按 `--vectors` / `--single-chunk` / `--no-graph-persist` 装配门面层 builder。
+///
+/// `--vectors` 走**显式请求**语义（S6-09 / D-S6-05 方案 A）：要向量就必须给向量，
+/// 拿不到本地 embedder 直接报错。不给时显式装 `embedder(None)`（纯 BM25）——
+/// 这样「用户没要向量」与「要了但拿不到」是两条不同的路径，不会互相掩盖。
+fn configured_builder(args: &BuildArgs) -> Result<SearchIndexBuilder> {
     // 门面层装配（p6-design 4.1）：默认 MixedAnalyzer + bge-small-zh + HNSW；
     // --single-chunk 切评测口径 chunker；--vectors 决定是否配 embedder。
     let chunker = if args.single_chunk {
@@ -296,44 +316,168 @@ fn build(args: BuildArgs) -> Result<()> {
     } else {
         Chunker::default()
     };
-    let mut builder = SearchIndex::builder().chunker(chunker);
-    if !args.vectors {
-        builder = builder.embedder(None);
-    }
+    let mut builder = SearchIndex::builder()
+        .chunker(chunker)
+        .embedder(if args.vectors {
+            Some(require_local_embedder()?)
+        } else {
+            None
+        });
     // V2 Step 2：图持久化逃生舱（磁盘紧张 / 排查图问题时不落图）
     if args.no_graph_persist {
         builder = builder.without_graph_persist();
     }
-    let mut index = builder.build();
+    Ok(builder)
+}
 
-    // 读语料 → 批量摄入（倒排 + 写缓冲；向量延后到 commit）
-    let docs = read_corpus_documents(&args.input)?;
-    index.add_documents(docs)?;
+/// 显式请求向量时的默认 embedder 解析（S6-09 / D-S6-05 方案 A）。
+///
+/// 与 Step 2 的 `GraphStatus` 同一条纪律：**降级必须显式可见**。
+/// 「要了向量却拿到纯 BM25」不会报错、只是召回悄悄变差，用户往往在结果不对时才
+/// 发现——所以这里选择上抛 `Err` 并给出可执行的提示。
+fn require_local_embedder() -> Result<Arc<dyn Embedder>> {
+    let got = resolve_embedder(true, local_embedder_ctor).context(
+        "--vectors 需要本地 embedder，但初始化失败（要向量却拿不到向量）；\
+         若只想要 BM25 检索请去掉 --vectors",
+    )?;
+    Ok(got.expect("resolve_embedder(require=true, ..) 返回 Ok 时必为 Some"))
+}
 
-    println!("索引构建完成:");
+fn build(args: BuildArgs) -> Result<()> {
+    let started = std::time::Instant::now();
+    let builder = configured_builder(&args)?;
+
+    match (&args.index, args.input.as_deref()) {
+        // --index [+ --input]：追加 / 重存（V2 Step 6 / T7-11 / FR-28）
+        (Some(idx), delta) => build_into_existing(&args, builder, idx, delta, started),
+        // --input：全量构建（V1 起的既有语义）
+        (None, Some(input)) => {
+            let mut index = builder.build();
+            // 读语料 → 批量摄入（倒排 + 写缓冲；向量延后到 commit）
+            let docs = read_corpus_documents(input)?;
+            index.add_documents(docs)?;
+
+            println!("索引构建完成:");
+            print_index_stats(&index);
+
+            let Some(out) = args.output.as_deref() else {
+                println!("  （未指定 --output，索引仅存在于本次进程）");
+                return Ok(());
+            };
+            save_and_report(&args, &mut index, out, started)
+        }
+        // clap 的 `required_unless_present` 已挡住这一支，这里只做防御
+        (None, None) => bail!("--input 与 --index 至少给出一个"),
+    }
+}
+
+/// 追加构建（V2 Step 6 / T7-11 / FR-28）：加载既有快照 → 追加 delta → 落盘。
+///
+/// - `--index` + `--input` = **追加**；`--index` 单独给出 = 仅加载后重存（往返诊断）。
+/// - `--output` 缺省时**原地覆盖 `--index`**（沿用 `helix compact` 的先例）。
+/// - **幂等**：`--input` 中已存在的文档（`content_hash` 命中）被跳过，
+///   同一 delta 重复追加不改变文档数/分片数/词项总数（FR-15 + FR-28）。
+/// - 增量收益来自**跳过已 embed 的文档**：`content_hashes` 随快照持久化，`load`
+///   之后 `doc_id_by_hash` 仍可用，重复文档天然不进 `pending`（不耗 ONNX 推理）。
+///
+/// ⚠️ **不是 upsert-by-source**：同一 `source` 内容变了就是**一篇新文档**，旧文档仍在。
+/// 需要替换语义请显式 `remove` 后再 `compact`（见设计 §4.5.5）。
+///
+/// ⚠️ **已知限制（既有行为，非本路径引入）**：往**纯 BM25 快照**追加时若带上
+/// `--vectors`，`load` 的 embedder 校验是**非对称**的（允许「快照无向量 + 装配有
+/// embedder」作为升级路径，见 `index.rs` 的 `embedder_ok`），故**不会报错**，而是建出
+/// 「老文档没有向量」的索引——`--mode vector` 只能召回本次新增的文档。要得到覆盖全集
+/// 的向量索引，请**从语料全量重建**。同一组合经 `search --index` 亦可达到。
+/// 是否改为显式报错/告警属语义决策，留待评审（见 PR 说明）。
+fn build_into_existing(
+    args: &BuildArgs,
+    builder: SearchIndexBuilder,
+    idx_path: &Path,
+    delta: Option<&Path>,
+    started: std::time::Instant,
+) -> Result<()> {
+    let t_load = std::time::Instant::now();
+    let mut index = builder.load(idx_path).with_context(|| {
+        format!(
+            "加载既有快照失败（追加要求与建库时相同的装配，如 --single-chunk / --vectors）: {}",
+            idx_path.display()
+        )
+    })?;
+    let load_ms = t_load.elapsed();
+
+    println!("增量构建: {}", idx_path.display());
+    println!("  加载快照耗时 {load_ms:?}");
+    report_graph_status(&index);
+
+    let (before_docs, before_chunks) = (index.num_docs(), index.num_chunks());
+
+    match delta {
+        Some(p) => {
+            let docs = read_corpus_documents(p)?;
+            let total = docs.len();
+            let outcomes = index.add_documents(docs)?;
+            let deduped = outcomes.iter().filter(|o| o.deduped).count();
+            // NFR-11：commit 后新增内容立即可查；写延迟 = 本批 flush 耗时
+            index.commit()?;
+            println!(
+                "  追加 {} 篇：新增 {} / 去重跳过 {}",
+                total,
+                total - deduped,
+                deduped
+            );
+        }
+        None => println!("  （未指定 --input：仅加载后重存，用于往返诊断）"),
+    }
+
+    print_index_stats(&index);
+    println!(
+        "  变化: 文档 {} → {} ｜ 分片 {} → {}",
+        before_docs,
+        index.num_docs(),
+        before_chunks,
+        index.num_chunks()
+    );
+
+    let out = args.output.as_deref().unwrap_or(idx_path);
+    if args.output.is_none() {
+        println!("  （未指定 --output：原地覆盖 {}）", idx_path.display());
+    }
+    save_and_report(args, &mut index, out, started)
+}
+
+/// 打印索引四项计数（全量与追加共用）。
+fn print_index_stats(index: &SearchIndex) {
     println!("  文档数   = {}", index.num_docs());
     println!("  分片数   = {}", index.num_chunks());
     println!("  词项总数 = {}", index.total_len());
     println!("  平均分片 = {:.2}", index.avgdl());
+}
 
-    let Some(out) = args.output else {
-        println!("  （未指定 --output，索引仅存在于本次进程）");
-        return Ok(());
-    };
+/// 落盘 + 打印（全量与追加共用的收尾）。
+///
+/// 开头显式 `commit()`：`save` 内部虽也 commit，但此处要保证下面读到的
+/// `num_chunks` 覆盖面完整（含残余写缓冲），否则 embed 耗时那行会少算一批。
+fn save_and_report(
+    args: &BuildArgs,
+    index: &mut SearchIndex,
+    out: &Path,
+    started: std::time::Instant,
+) -> Result<()> {
+    index.commit()?;
 
-    // 向量嵌入：--vectors 时 commit 冲刷残余缓冲；embed 实际分散在 add_documents
-    // 的自动 flush 里，故耗时取门面层累计值（而非此处 commit 计时，否则只测到最后一批）
+    // 向量嵌入：embed 实际分散在 add_documents 的自动 flush 里，故耗时取门面层累计值
+    //（而非在此处计时，那样只测到最后一批）
     if args.vectors {
-        index.commit()?;
         println!(
-            "  embed {} 条 耗时 {:?}（NFR-03 口径 = embed，不含 HNSW / 落盘）",
-            index.num_chunks(),
+            "  embed {} 条 耗时 {:?}（NFR-03 口径 = embed，不含 HNSW / 落盘；\
+             增量构建时这里是**本次新增**条数，不是索引总量）",
+            index.embed_count(),
             index.embed_elapsed()
         );
     }
 
     let t_save = std::time::Instant::now();
-    index.save(&out)?;
+    index.save(out)?;
     println!(
         "  快照已写入 {}（{}，{}）耗时 {:?}",
         out.display(),
@@ -342,7 +486,7 @@ fn build(args: BuildArgs) -> Result<()> {
         } else {
             "纯文本"
         },
-        humansize(&out),
+        humansize(out),
         t_save.elapsed()
     );
     println!(
@@ -355,7 +499,7 @@ fn build(args: BuildArgs) -> Result<()> {
         println!("  图 sidecar dump 耗时 {dump:?}（纯落盘，不含 HNSW 建图）");
     }
     if args.vectors && !args.no_graph_persist {
-        let paths = helix_core::storage::graph_paths(&out);
+        let paths = helix_core::storage::graph_paths(out);
         if let Ok(Some(m)) = helix_core::storage::read_manifest(&paths.manifest) {
             let graph_bytes = m.graph_len + m.data_len;
             println!(
@@ -376,6 +520,23 @@ fn build(args: BuildArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// 打印向量图 sidecar 状态（NFR-07：降级必须显式可见，不能只留日志）。
+fn report_graph_status(index: &SearchIndex) {
+    match index.graph_status() {
+        GraphStatus::Loaded => eprintln!("[向量图加载：持久化图（快路径）]"),
+        GraphStatus::Rebuilt(reason) => eprintln!(
+            "[向量图加载：⚠️ 降级重建（原因：{reason}）—— 冷启动会变慢\
+             （图是派生缓存，丢弃不影响正确性）]"
+        ),
+        GraphStatus::NotApplicable => {
+            eprintln!("[向量图加载：不适用（Brute 后端 / 纯 BM25 / 已关闭持久化）]")
+        }
+        GraphStatus::PersistFailed(reason) => {
+            eprintln!("[向量图落盘：⚠️ 失败（原因：{reason}）—— 快照本身完好，下次加载会重建图]")
+        }
+    }
 }
 
 /// 从 JSONL 语料读取为 `Document` 输入 DTO（build / search --input / compare 共用）。
@@ -443,21 +604,7 @@ fn search(args: SearchArgs) -> Result<()> {
                 .with_context(|| format!("加载快照失败: {}", idx_path.display()))?;
             eprintln!("[快照加载 {} 耗时 {:?}]", idx_path.display(), t.elapsed());
             // V2 Step 2：图 sidecar 状态（NFR-07 —— 降级不能静默，必须显式可见）
-            match index.graph_status() {
-                helix_core::search::GraphStatus::Loaded => {
-                    eprintln!("[向量图加载：持久化图（快路径）]")
-                }
-                helix_core::search::GraphStatus::Rebuilt(reason) => eprintln!(
-                    "[向量图加载：⚠️ 降级重建（原因：{reason}）—— 冷启动会变慢，\
-                     重建耗时已计入上方「快照加载」]"
-                ),
-                helix_core::search::GraphStatus::NotApplicable => {
-                    eprintln!("[向量图加载：不适用（Brute 后端 / 纯 BM25 / 已关闭持久化）]")
-                }
-                helix_core::search::GraphStatus::PersistFailed(reason) => eprintln!(
-                    "[向量图落盘：⚠️ 失败（原因：{reason}）—— 快照本身完好，下次加载会重建图]"
-                ),
-            }
+            report_graph_status(&index);
             index.into_searcher()?
         }
         (None, Some(input)) => {
