@@ -1252,6 +1252,7 @@ dependencies = [
  "hnsw_rs",
  "jieba-rs",
  "moka",
+ "ort",
  "proptest",
  "rayon",
  "serde",

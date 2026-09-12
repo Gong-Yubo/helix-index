@@ -39,6 +39,17 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  # ------------------------------------------------------------ 脚本静态检查
+  # bash 3.2（macOS 自带）在多字节 locale 下不把非 ASCII 字节当作变量名终止符：
+  # `"$VAR（"` 会被解析成一个变量名 ⇒ `set -u` 报 unbound variable 并中止脚本。
+  # `LC_ALL=C` 下不触发 ⇒ 本地裸跑可能漏掉，须由确定性守门兜住。
+  shell:
+    name: shell expansion
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: python3 scripts/check_shell_expansion.py
+
   # ------------------------------------------------------------ lint
   lint:
     name: clippy
