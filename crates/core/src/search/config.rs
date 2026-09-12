@@ -306,26 +306,30 @@ impl SearchIndexBuilder {
     }
 }
 
-/// 本地 embedder 的**构造器**签名——D-S6-05 的可注入接缝。
+/// 本地 embedder 的**构造器**签名——S6-T7 的**内部测试接缝**，不是公开扩展点。
 ///
-/// 存在的唯一理由是**可测性**：`LocalEmbedder::new()` 要拉 ONNX 模型 + 推理，
-/// CI 里跑不动。把「构造」抽成函数指针之后，「显式请求向量却拿不到向量」这条
-/// 策略就能用**必失败的构造器**在秒级单测里钉住（设计 §7 的可测性前提）。
-pub type EmbedderCtor = fn() -> Result<Arc<dyn Embedder>>;
+/// 存在的唯一理由是**可测性**（设计 §7 的可测性前提）：`LocalEmbedder::new()` 要拉
+/// ONNX 模型 + 推理，CI 里跑不动。把「构造」抽成函数指针之后，「显式请求向量却拿不到
+/// 向量」这条策略就能用**必失败的构造器**在秒级单测里钉住。
+///
+/// ⚠️ **按 PR #43 评审 P3-5 收敛为私有**（原为 `pub`）：它只为单测注入而存在，
+/// 公开出去会被误当成受稳定承诺保护的 API（原形态一次导出 3 个公开项，而生产只用
+/// 到其中 1 个）。公开面收敛为 [`required_local_embedder`] + [`default_embedder`] 两个入口。
+type EmbedderCtor = fn() -> Result<Arc<dyn Embedder>>;
 
 /// 默认本地 embedder 的真实构造器（`local-embed` feature）。
 ///
 /// 模型首次下载约 49 s；**失败不 panic**，把错误原样交给调用方，
 /// 由 [`resolve_embedder`] 按「是否显式请求」决定上抛还是退化。
 #[cfg(feature = "local-embed")]
-pub fn local_embedder_ctor() -> Result<Arc<dyn Embedder>> {
+fn local_embedder_ctor() -> Result<Arc<dyn Embedder>> {
     use crate::embed::LocalEmbedder;
     Ok(Arc::new(LocalEmbedder::new()?) as Arc<dyn Embedder>)
 }
 
 /// 默认本地 embedder 的构造器（未启用 `local-embed`：**恒失败**，无本地推理能力）。
 #[cfg(not(feature = "local-embed"))]
-pub fn local_embedder_ctor() -> Result<Arc<dyn Embedder>> {
+fn local_embedder_ctor() -> Result<Arc<dyn Embedder>> {
     Err(crate::error::Error::NoEmbedder)
 }
 
@@ -334,7 +338,7 @@ pub fn local_embedder_ctor() -> Result<Arc<dyn Embedder>> {
 /// | `require` | 场景 | 构造失败时 |
 /// | --- | --- | --- |
 /// | `true` | 显式请求向量（`helix build --vectors`） | **上抛 `Err`** |
-/// | `false` | 零配置默认装配（`SearchIndex::builder().build()`） | 退化为 `Ok(None)`（纯 BM25） |
+/// | `false` | 零配置默认装配（`SearchIndex::builder().build()`） | 退化 `Ok(None)`（纯 BM25）+ **stderr 告警** |
 ///
 /// # 为什么要把「策略」与「构造」分开
 ///
@@ -346,20 +350,51 @@ pub fn local_embedder_ctor() -> Result<Arc<dyn Embedder>> {
 /// 两者是不同的人机界面，因此**不能**用一句 `.ok()` 同时糊过去。
 /// 分离之后，测试注入一个必失败的 [`EmbedderCtor`] 即可覆盖完整策略，
 /// 不必依赖真实模型。
-pub fn resolve_embedder(require: bool, ctor: EmbedderCtor) -> Result<Option<Arc<dyn Embedder>>> {
+///
+/// ⚠️ **退化分支必须保留根因**（PR #43 评审 P2-1）：设计 §7 对 S6-T7 的验收判据是
+/// 「要么 `Err`、要么**可观测标志**为真，**绝不静默**」——只丢一句 `Ok(None)` 满足
+/// 「不报错」，却不满足「可观测」。更关键的是下游代价：`search --mode vector` /
+/// `compare` 只能看到 `None`，于是报「未启用任何 Embedder 实现，请开启 local-embed
+/// 或 remote-embed feature」——而 feature 明明是开着的，真因是**模型没拿到** ⇒
+/// 把用户指向错的方向。这里与 `GraphStatus::Rebuilt(reason)` 保留 reason 的做法对齐。
+fn resolve_embedder(require: bool, ctor: EmbedderCtor) -> Result<Option<Arc<dyn Embedder>>> {
     match ctor() {
         Ok(e) => Ok(Some(e)),
         // 显式请求：错就是错，不许静默换轨
         Err(err) if require => Err(err),
-        // 零配置路径：退化而非报错（契约见 rustdoc 上表）
-        Err(_) => Ok(None),
+        // 零配置路径：退化而非报错（契约见 rustdoc 上表），但**不静默**
+        Err(err) => {
+            eprintln!(
+                "[警告] 本地 embedder 初始化失败，本次装配退化为纯 BM25（原因: {err}）；\
+                 要向量检索请检查模型下载与缓存目录"
+            );
+            Ok(None)
+        }
     }
+}
+
+/// **显式请求向量**的生产入口：拿不到本地 embedder 即 `Err`（`helix build --vectors` 用）。
+///
+/// 这是 **S6-09 / D-S6-05 方案 A** 的唯一公开入口。策略本体在 `resolve_embedder`，
+/// 这里只固定 `require = true`，使调用方**不必**处理「`Ok` 却拿到 `None`」这条不可达
+/// 分支——原形态把它暴露出去后，CLI 被迫多一个 `expect`（新 panic 分支、无测试覆盖，
+/// 见 PR #43 评审 P3-5）。
+///
+/// 与零配置路径 `default_embedder` 的区别是**人机界面**：用户显式要了向量却拿不到，
+/// 属于必须当场告知的错误；而未显式请求时的退化只需可观测（保 G4 契约）。
+///
+/// ⚠️ 0.x 阶段按评审 Q6 拍板**不做额外兼容开关**（D-S6-05），故这里不接受
+/// 「允许半向量」之类的放行参数。
+pub fn required_local_embedder() -> Result<Arc<dyn Embedder>> {
+    // `require = true` ⇒ 必为 `Some`；用 `ok_or` 而非 `expect`，是为了不引入 panic 分支。
+    resolve_embedder(true, local_embedder_ctor)?.ok_or(crate::error::Error::NoEmbedder)
 }
 
 /// 默认 Embedder：走 [`resolve_embedder`] 的**非显式请求**分支。
 ///
 /// `local-embed` 下是本地 bge-small-zh-v1.5；未启用该 feature 时
-/// `local_embedder_ctor` 恒失败 ⇒ 得到 `None`（纯 BM25）。
+/// `local_embedder_ctor` 恒失败 ⇒ 得到 `None`（纯 BM25）**并打一条 stderr 告警**
+/// （退化可观测，见 §7 的 S6-T7 判据）。
 fn default_embedder() -> Option<Arc<dyn Embedder>> {
     // `require = false` 时 resolve_embedder 不会返回 Err，故这里的 unwrap 不可能 panic。
     resolve_embedder(false, local_embedder_ctor).unwrap_or(None)

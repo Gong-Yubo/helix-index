@@ -23,9 +23,7 @@ use helix_core::embed::{Embedder, LocalEmbedder};
 use helix_core::index::Index;
 use helix_core::query::{EmptyReason, Hit, SearchMode, SearchResponse};
 use helix_core::schema::Filter;
-use helix_core::search::{
-    local_embedder_ctor, resolve_embedder, GraphStatus, SearchIndex, SearchIndexBuilder,
-};
+use helix_core::search::{required_local_embedder, GraphStatus, SearchIndex, SearchIndexBuilder};
 use helix_core::types::ChunkId;
 
 #[derive(Parser)]
@@ -38,6 +36,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// 建索引并落盘快照
+    //
+    // `override_usage`：缺参时 clap 把**可选**的 `--output` 与必填项并列进 usage
+    // （`helix build --output <OUTPUT> --input <INPUT>`），读起来像两个都必须给，
+    // 与 `required_unless_present` 想表达的语义正好相反（PR #43 评审 P3-4）。
+    // ⚠️ 用普通注释而不是 `///`：doc comment 会被 clap 当用户可见的帮助文本渲染。
+    #[command(override_usage = "helix build [OPTIONS] (--input <INPUT> | --index <INDEX>)")]
     Build(BuildArgs),
     /// 检索（--mode bm25 / vector / hybrid；--input 重建 或 --index 快照）
     Search(SearchArgs),
@@ -330,17 +334,20 @@ fn configured_builder(args: &BuildArgs) -> Result<SearchIndexBuilder> {
     Ok(builder)
 }
 
-/// 显式请求向量时的默认 embedder 解析（S6-09 / D-S6-05 方案 A）。
+/// 显式请求向量时的 embedder 解析（S6-09 / D-S6-05 方案 A）。
 ///
 /// 与 Step 2 的 `GraphStatus` 同一条纪律：**降级必须显式可见**。
 /// 「要了向量却拿到纯 BM25」不会报错、只是召回悄悄变差，用户往往在结果不对时才
-/// 发现——所以这里选择上抛 `Err` 并给出可执行的提示。
+/// 发现——所以这里上抛 `Err` 并给出可执行的提示。
+///
+/// ⚠️ 用 core 的 [`required_local_embedder`]（返回 `Result<Arc<dyn Embedder>>`）而不是
+/// `resolve_embedder(.., ..).expect(..)`：后者会引入一个**不可达却无测试覆盖的 panic 分支**
+/// （PR #43 评审 P3-5），且把「策略」缝暴露成公开 API。
 fn require_local_embedder() -> Result<Arc<dyn Embedder>> {
-    let got = resolve_embedder(true, local_embedder_ctor).context(
+    required_local_embedder().context(
         "--vectors 需要本地 embedder，但初始化失败（要向量却拿不到向量）；\
          若只想要 BM25 检索请去掉 --vectors",
-    )?;
-    Ok(got.expect("resolve_embedder(require=true, ..) 返回 Ok 时必为 Some"))
+    )
 }
 
 fn build(args: BuildArgs) -> Result<()> {
@@ -377,18 +384,25 @@ fn build(args: BuildArgs) -> Result<()> {
 /// - `--output` 缺省时**原地覆盖 `--index`**（沿用 `helix compact` 的先例）。
 /// - **幂等**：`--input` 中已存在的文档（`content_hash` 命中）被跳过，
 ///   同一 delta 重复追加不改变文档数/分片数/词项总数（FR-15 + FR-28）。
-/// - 增量收益来自**跳过已 embed 的文档**：`content_hashes` 随快照持久化，`load`
-///   之后 `doc_id_by_hash` 仍可用，重复文档天然不进 `pending`（不耗 ONNX 推理）。
+/// - **增量收益来自 `load` 复用快照里的 `raw_vectors` + 图**，**不是**查重：
+///   `load` 把已持久化的向量直接灌回向量索引、**根本不调用 `embed_documents`**，
+///   于是只有 delta 需要推理（实测 embed 217.35 s → 21.41 s，`eval-report.md` §8.11）。
+///   查重（`content_hashes` / `doc_id_by_hash`）保证的是**重复追加的幂等**（S6-T3），
+///   是另一个性质 —— 实测那次 `去重跳过 0` 恰好说明收益与查重无关。
+///   ⚠️ 别顺着「查重」去优化增量路径，收益不会动（PR #43 评审 P3-2）。
 ///
 /// ⚠️ **不是 upsert-by-source**：同一 `source` 内容变了就是**一篇新文档**，旧文档仍在。
 /// 需要替换语义请显式 `remove` 后再 `compact`（见设计 §4.5.5）。
 ///
-/// ⚠️ **已知限制（既有行为，非本路径引入）**：往**纯 BM25 快照**追加时若带上
-/// `--vectors`，`load` 的 embedder 校验是**非对称**的（允许「快照无向量 + 装配有
-/// embedder」作为升级路径，见 `index.rs` 的 `embedder_ok`），故**不会报错**，而是建出
-/// 「老文档没有向量」的索引——`--mode vector` 只能召回本次新增的文档。要得到覆盖全集
-/// 的向量索引，请**从语料全量重建**。同一组合经 `search --index` 亦可达到。
-/// 是否改为显式报错/告警属语义决策，留待评审（见 PR 说明）。
+/// - ⚠️ **带 `--vectors` 追加/重存到「无向量快照」时硬失败**（PR #43 评审 P1）：
+///   `load` 的 embedder 校验是**非对称**的（允许「快照无向量 + 装配有 embedder」作为
+///   升级路径，见 `index.rs` 的 `embedder_ok`），故这一步**能**走到 `add_documents`；
+///   但那样会**落盘**一个自称含向量、实际只有新增部分有向量的**半向量快照**
+///   （指纹还会被改写成「含向量」且**不可逆**，下游 `compact --dry-run` 会把它当健康态）。
+///   `--mode vector` 则静默只回答 delta 那部分语料 —— 与 `search --index` **不同构**
+///   （那只是只读的、进程结束即消失，不污染磁盘）。
+///   ⇒ 在 `add_documents` **之前**判「装配有向量、快照无向量」并 `bail!`。
+///   ⚠️ **不加放行开关**：D-S6-05 已按评审 Q6 拍板「不额外加兼容开关」。
 fn build_into_existing(
     args: &BuildArgs,
     builder: SearchIndexBuilder,
@@ -408,6 +422,29 @@ fn build_into_existing(
     println!("增量构建: {}", idx_path.display());
     println!("  加载快照耗时 {load_ms:?}");
     report_graph_status(&index);
+
+    // ⚠️ P1（PR #43 评审）：`--vectors` 要向量，但快照里的**存活分片没有对应向量**
+    // ⇒ 这是「半向量」状态。静默继续会落盘一个自称含向量、实际只有新增部分有向量的快照
+    // （指纹被改写成「含向量」且**不可逆**），`--mode vector` 只答新增那部分语料。
+    //
+    // 判据就地取自 `tombstone_stats()`（不新增公开 API）：健康的向量快照恒有
+    // `raw_vectors == chunks_alive`（`remove` 会同步 retain 掉对应向量），`<` 即
+    // 「有存活分片缺向量」。放在 `add_documents` **之前** —— 落盘之后再告警就晚了；
+    // 也因此覆盖 `--index` 单独给出的「仅重存」路径（那条同样会改写指纹）。
+    if args.vectors {
+        let st = index.tombstone_stats();
+        if st.raw_vectors < st.chunks_alive {
+            bail!(
+                "快照里的存活分片没有向量（raw_vectors {} < chunks_alive {}）：\
+                 带 --vectors 追加/重存会落盘一个「半向量」快照——\n\
+                 · `--mode vector` 只召回本次新增的文档，老文档静默缺席；\n\
+                 · 快照指纹会被改写成「含向量」且不可逆，之后不带 --vectors 的装配会被 ConfigMismatch 拒绝。\n\
+                 要覆盖全集的向量索引，请从语料**全量重建**；只想要 BM25 增量，请去掉 --vectors。",
+                st.raw_vectors,
+                st.chunks_alive
+            );
+        }
+    }
 
     let (before_docs, before_chunks) = (index.num_docs(), index.num_chunks());
 
@@ -455,8 +492,11 @@ fn print_index_stats(index: &SearchIndex) {
 
 /// 落盘 + 打印（全量与追加共用的收尾）。
 ///
-/// 开头显式 `commit()`：`save` 内部虽也 commit，但此处要保证下面读到的
-/// `num_chunks` 覆盖面完整（含残余写缓冲），否则 embed 耗时那行会少算一批。
+/// 开头显式 `commit()`：`save` 内部虽也 `commit`，但 `embed_count` / `embed_elapsed`
+/// 是**累计量**，残余 `pending`（不足 `batch_size` 的尾批）必须在此处 flush 才会累加进去，
+/// 否则 embed 读数会**少算最后一批** —— 口径类 bug 里最难发现的那一种。
+/// ⚠️ 本函数已**不读** `num_chunks`（旧注释曾以此为理由）；别据此判定这次 `commit()`
+/// 与 `save` 内部那次重复而删掉它（PR #43 评审 P3-1）。
 fn save_and_report(
     args: &BuildArgs,
     index: &mut SearchIndex,

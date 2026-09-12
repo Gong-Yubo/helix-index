@@ -15,10 +15,7 @@ mod config;
 mod index;
 mod searcher;
 
-pub use config::{
-    local_embedder_ctor, resolve_embedder, EmbedderCtor, GraphPersistMode, SearchIndexBuilder,
-    VectorBackend,
-};
+pub use config::{required_local_embedder, GraphPersistMode, SearchIndexBuilder, VectorBackend};
 pub use index::{
     AddOutcome, CompactionReport, GraphStatus, SearchIndex, SizeBytes, TombstoneStats,
 };
