@@ -4,9 +4,10 @@
 
 | 项目      | 内容                                                                                                                                                                                                                                               |
 | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 版本      | v1.5                                                                                                                                                                                                                                             |
+| 版本      | v1.6                                                                                                                                                                                                                                             |
 | 创建日期    | 2026-09-02                                                                                                                                                                                                                                       |
 | 状态      | **P0~P6 全部完成**（P6 接口重构 2026-09-04 落地，回归对账通过）；下一步 P7（v2）                                                                                                                                                                                                     |
+| v1.6 变更 | **事实同步（2026-09-12，PR #41）**：`make deny` 与 CI 的 cargo-deny 从 `licenses bans sources` 扩为 **`advisories licenses bans sources`**，并把检查器版本 **pin 到 `0.20.2`**（`deny.toml` / `Makefile` / `ci.yml` 三处），T0-06 行与「每日开发循环」段的命令字面量同步。⚠️ `advisories` 需联网拉 RustSec 数据库 ⇒ **断网时 `make all` 会在此失败，且与代码无关**（离线复核用 `cargo deny --offline check advisories`）；新增的这道门**拟登记为 R42**（与 R41 同批，随 S6-10 定义面回写）。 |
 | v1.5 变更 | P6 完成：I-01~I-14 全部落地（门面层 SearchIndex/Searcher、写缓冲+批量 embed、配置指纹校验、CLI/示例/文档迁移、bench 回归对账 brute 逐位一致）。batch_size 实测 32~256 差异 <20% 维持 64；NFR 重测见 eval-report 8.x |
 | v1.4 变更 | 依据 issue #1 与 `p6-design.md`：**P6 重新定义为「融合索引接口重构」**（原 v2 顺延 P7）。新增任务 I-01~I-14；接口目标 `index.add(doc)` / `searcher.search(query)`（仅 query 必选）。详见 `p6-design.md` |
 | v1.3 变更 | P5 完成：三路对照 + 参数定稿（BM25 k1=1.5/b=0.75、RRF weights 1:1.5）、tantivy 基线相对差 0.31%、charabia 保留自研链、NFR 实测（延迟达标/构建未达标）、README、D8 移除 instant-distance。详见 `eval-report.md` |
@@ -129,7 +130,7 @@ P1 ─────────────────────────�
 | T0-03 | 建 workspace 骨架 + git + 许可文件 | 根 `Cargo.toml`（workspace members）、`crates/core`、`crates/cli`、`.gitignore`（**不得忽略 `Cargo.lock`**）、`rust-toolchain.toml`（**pin 1.90**，NFR-08）、`LICENSE-MIT` + `LICENSE-APACHE`、`git init`                                                                                                                               | `cargo build` 空工程通过；`git log` 有初始提交；`Cargo.lock` 已入库               |
 | T0-04 | **依赖可获取性验证**                | `cargo add` 以下依赖并 `cargo build`：`instant-distance`(with-serde) / `jieba-rs` / `unicode-segmentation` / `unicode-normalization` / `fastembed` / `rayon` / `bincode:3.0` / `serde` / `thiserror` / `smol_str` / `clap` / `tracing` / `moka` / `crc32fast` / `serde_json` / `anyhow`；dev 依赖 `tantivy`（体积大，可放到 T1-15 前验证） | 全部编译通过。⚠️ `fastembed` 依赖 ort，编译最慢，单独先验证                            |
 | T0-05 | **ONNX 模型下载 + 推理验证**（最高风险）  | `crates/core/examples/embed_smoke.rs`：`LocalEmbedder` 对一句中文 `embed_query`，打印前 4 维与 L2 范数                                                                                                                                                                                                                              | 模型下载成功（必要时用 `HF_ENDPOINT=https://hf-mirror.com`）；单句耗时记录；向量范数 ≈ 1.0 |
-| T0-06 | 固化工程命令 + 依赖合规               | 根目录 `Makefile`：`make fmt` / `make lint`（clippy -D warnings）/ `make test` / **`make deny`**（`cargo-deny` License 白名单，NFR-09 / ADR-008）/ `make all`；`deny.toml` 白名单：`MIT, Apache-2.0, BSD-3-Clause, BSL-1.0, CC0-1.0, Zlib, ISC, Unicode-DFS-2016`                                                                      | `make all` 一键跑通；故意引入 GPL 依赖时 `make deny` 失败                        |
+| T0-06 | 固化工程命令 + 依赖合规               | 根目录 `Makefile`：`make fmt` / `make lint`（clippy -D warnings）/ `make test` / **`make deny`**（`cargo-deny` License 白名单，NFR-09 / ADR-008；**2026-09-12 起另含 `advisories`**，见 v1.6 变更）/ `make all`；`deny.toml` 白名单：`MIT, Apache-2.0, BSD-3-Clause, BSL-1.0, CC0-1.0, Zlib, ISC, Unicode-DFS-2016`                                                                      | `make all` 一键跑通；故意引入 GPL 依赖时 `make deny` 失败                        |
 | T0-07 | 建模块骨架                       | 按架构文档 4.1 建 `analyze/ index/ retriever/ vector/ embed/ fusion/ rerank/ query/ storage/ chunk/` 各 `mod.rs`，`lib.rs` 统一声明                                                                                                                                                                                               | `cargo build` 通过，`cargo doc` 可生成                                   |
 
 **P0 完成后技术决策落定**：若 T0-04/T0-05 任一失败，回到架构文档 ADR-003（本地 fastembed 默认）重新决策，可能切换为 `remote-embed` 优先。
@@ -468,7 +469,7 @@ rustc --version
 make fmt        # cargo fmt
 make lint       # cargo clippy --all-targets -- -D warnings
 make test       # cargo test
-make deny       # cargo-deny：依赖 License 白名单校验（NFR-09 / ADR-008）
+make deny       # cargo-deny：依赖 License 白名单 + 安全公告（NFR-09 / ADR-008 / 拟登记 R42；需联网）
 make all        # 以上四条
 
 # 分阶段验证

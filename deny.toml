@@ -1,13 +1,45 @@
-# cargo-deny 配置 —— ADR-008 / NFR-09
-# 运行：make deny
+# cargo-deny 配置
+#
+# 追溯：**NFR-09**（依赖许可合规）+ **依赖安全公告漂移**（拟登记 R42，见下）
+# 运行：`make deny`（= advisories + licenses + bans + sources）
+#
+# ⚠️ **本目标需要联网**：advisories 检查会拉取 RustSec 数据库（缓存在 `~/.cargo/advisory-db`）。
+#    离线 / 防火墙拦 GitHub 时这一步会失败，且**失败原因与代码无关**。
+#    离线复核用：`cargo deny --offline check advisories`（走本地缓存；`--frozen` = `--locked` + `--offline`）。
 
 [graph]
 all-features = true
 
+# ---------------------------------------------------------------------------
+# 依赖安全公告（RustSec）
+#
+# ⚠️ 这两条**都是 `unmaintained` 公告**（不是 `unsound` / vulnerability），且 cargo-deny 对它们
+#    逐条报 `Solution: No safe upgrade is available!` —— 即**当前确实无升级路径**。
+#    ⇒ 处理方式是**精确到 ID 地 ignore，不整项跳过**。
+#    （实测否证：0.20.2 的 `unmaintained = "workspace"` 会把 `paste` 与 `bincode 1.3.3`
+#      这类**传递**依赖一起放过 —— 那正是要消灭的 fail-open，只是换成"按传递性静默"。）
+#
+# ✅ 为什么用结构化 `{ id, reason }` 而不是只写注释：
+#    `reason` 会随 `note[advisory-ignored]` 诊断一起打印（`cargo deny -L info check advisories`
+#    可见 `── ignore reason`）⇒ 「为什么 ignore」与「何时该撤销」**跟着诊断走**，
+#    不依赖本文件注释是否被人删掉，也可被 `--format json` 机器消费。
+#
+# 🔁 复核配方：`cargo deny -L info check advisories` —— 列出**当前生效**的 ignore 及其 reason。
+#
+# ⚠️ RustSec 数据库会随时间新增条目 ⇒ **每次 CI 变红都要重新判一次**，不要把这个列表当永久白名单。
+# ⚠️ 因**数据库新增条目**而变红时，允许**在同一个 PR 内**补 ignore + 复核条件
+#    （提交信息带 `Refs #25` 即可），不必等一个专门的依赖 PR —— 这是明示的低门槛处置路径。
+
 [advisories]
 version = 2
-ignore = []
+ignore = [
+    # 核实于 2026-09-12：tokenizers 0.23.2（最新稳定版）仍依赖 paste ^1.0.14。
+    { id = "RUSTSEC-2024-0436", reason = "paste 上游已归档、无升级路径；依赖路径 paste ← tokenizers ← fastembed 是传递依赖，本项目无法自行消除。解除条件在上游：tokenizers 改用维护中的替代（pastey 分叉，crates.io 已有 0.2.x），或 paste 出现新维护者。" },
+    # 核实于 2026-09-12：hnsw_rs 0.3.4（最新稳定版）仍依赖 bincode ^1.3。
+    { id = "RUSTSEC-2025-0141", reason = "bincode 上游永久停更、无升级路径；两条路径各有 owner：① bincode 1.3.3 ← hnsw_rs 0.3.4 是传递依赖（owner = hnsw_rs 上游）；② bincode 2.0.1 是本项目直接依赖、用于快照序列化（owner = 本项目），触发点是既有决策钩子 ADR-005 §7.6 的 bincode vs rkyv A/B 取舍规则 + p4-design R-P4-4。" },
+]
 
+# ---------------------------------------------------------------------------
 [licenses]
 version = 2
 allow = [

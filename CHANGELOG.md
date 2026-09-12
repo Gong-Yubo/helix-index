@@ -9,6 +9,94 @@
 
 ## [Unreleased]
 
+### 工程 · cargo-deny advisories 门评审响应（PR #41 第 1 轮）（Refs #25，2026-09-12）
+
+> 评审**无阻塞项**（3×P2 + 3×P3），结论「**可以合并**」，并明示「**改完 P2-1 / P2-2 我就给 approve**」。
+> 本轮 **P2-1 / P2-2 / P3-1 / P3-2 / P3-3 / P3-4 全采纳**；**P2-3 部分采纳**（活文档已同步；
+> 「风险追溯 ID」按 Q8 对 R41 的同一裁定留 S6-10，理由见下）。
+> 评审给出的 9 条复核证据我独立复算过（见下方「独立复核」段）。
+
+#### Changed
+
+- **P2-1 采纳：`ignore` 改为结构化 `{ id, reason }`。** `reason` 内含**核实日期**与**可判定的解除条件**。
+  实测（`cargo deny -L info check advisories`）：`note[advisory-ignored]` 会打印 `── ignore reason`
+  并**指回配置行** ⇒ 理由**跟着诊断走**，不依赖注释是否被人删掉，也可被 `--format json` 机器消费。
+- **P2-2 采纳：pin 检查器版本（这道门的第二个漂移源）。** `ci.yml` 的 `tool: cargo-deny`
+  → **`cargo-deny@0.20.2`**；`Makefile` 的 `cargo install cargo-deny --locked` 追加 **`--version 0.20.2`**。
+  理由：检查器版本决定默认 lint / 配置字段语义 / ignore 解析行为，两端浮动会打破
+  「本地 `make deny` 绿 ⇒ CI 绿」的等价性。`0.20.2` 与 `docs/devel/thirdparty.md`（`:91`/`:321`/`:393`）
+  记录的**项目工具版本一致** ⇒ 是**回归既有记录**，不是新增约束。
+- **P3-1 采纳：`bincode` 的复核条件改引用既有决策钩子**（`architecture-design.md` ADR-005 §7.6 的
+  bincode vs rkyv A/B 取舍规则 + `p4-design.md` R-P4-4），两条依赖路径**各标 owner**（hnsw_rs 上游 / 本项目）
+  ⇒ 不再是「没有触发点的悬空立项」。
+- **P3-2 采纳：补「本目标需要联网」。** `Makefile` 与 `deny.toml` 均写明 advisories 会拉 RustSec 数据库
+  （缓存 `~/.cargo/advisory-db`）、**断网时 `make all` 在此失败且与代码无关**，并给出离线兜底
+  `cargo deny --offline check advisories`（`--frozen` = `--locked` + `--offline`，已核 `cargo deny --help`）。
+- **P3-3 采纳：修掉** `paste` **不可达的复核条件。** 原写「fastembed 升到不再依赖 tokenizers 的版本」
+  ——fastembed 的本职就是 tokenization ⇒ 等于没写。改为**外部条件**「tokenizers 改用维护中的替代
+  （`pastey` 分叉，crates.io 已有 0.2.x）或 paste 出现新维护者」+ 明确「本项目无法自行消除」。
+- **P3-4 采纳：补复核配方** `cargo deny -L info check advisories`，并把「**因数据库新增条目变红 ⇒
+  允许在同一个 PR 内补 ignore + 复核条件（提交信息带 `Refs #25`）**」写成**明示的低门槛处置路径**
+  （评审的原话是「让它成为一个明示的、低门槛的处置路径，而不是让人去猜这红是不是我的锅」）。
+
+#### Fixed
+
+- **P2-3 部分采纳：活文档的命令字面量已同步**（此前文档描述的是**另一条命令**）：
+  - `docs/devel/v1-finish-design.md:189` —— 这是 **`ci.yml` 头部自引的设计依据**，`deny` 行改为
+    `cargo deny check advisories licenses bans sources` 并加「2026-09-12 事实同步」注记；
+  - `docs/devel/plan.md:132`（T0-06）与 `:471`（每日开发循环）两处字面量同步，`plan.md` 升 **v1.6** 并记变更行；
+  - `ci.yml` 头部注释由「deny 是 **NFR-09 依赖许可合规**的自动化守门」改为
+    「**NFR-09 + 依赖安全公告漂移（拟登记 R42）**」，并注明两个漂移源与 pin 的用意。
+  - ⚠️ **有意未动**：`docs/devel/p0-design.md:443`（P0 执行日志，属历史存档）、
+    `docs/README.md:48`（「技术风险 R1~R35」本就因 PR #38 登记 R36~R40 而漏更 ⇒ 随 S6-10 的
+    「docs/README 索引」一并修，避免同一行改两次）。
+- ⚠️ **P2-3 的「风险追溯 ID」部分按 R41 的同一裁定留 S6-10。** 新增的 advisories 门**拟登记为 R42**
+  （**R41 已由 Q8 裁定预留给 build 路径峰值 RSS**）。理由：登记风险会牵动**定义面四处 + 版本行**，
+  与 R41 属**同一类动作**；且上一个 PR（#40 新增 `shell expansion` 门）也是同样处置（回写留 S6-10）。
+  「拟登记 R42」已写进 `deny.toml` / `ci.yml` / `Makefile` / `plan.md` ⇒ **有 owner、有触发点**，不悬空。
+  若评审要求在本 PR 内就登记，说一句即可加上。
+
+#### 独立复核（评审给的 9 条证据我逐条复算）
+
+| 评审断言 | 我复算的方式 | 结果 |
+| --- | --- | --- |
+| `tokenizers` 最新版仍依赖 `paste ^1.0.14` | 直接拉 crates.io sparse index（`/to/ke/tokenizers`）解析最新稳定版依赖 | ✅ `0.23.2` → `paste ^1.0.14`（normal、非 optional） |
+| `hnsw_rs` 最新版仍依赖 `bincode ^1.3` | 同上（`/hn/sw/hnsw_rs`） | ✅ `0.3.4` → `bincode ^1.3` |
+| `fastembed` 最新版仍 pin `tokenizers ^0.23.2` | 同上（`/fa/st/fastembed`） | ✅ `6.0.3` → `tokenizers ^0.23.2` |
+| `pastey` 分叉确实存在 | 拉 `/pa/st/pastey` | ✅ 7 个稳定版，最新 `0.2.3` |
+| 结构化 `{ id, reason }` 在 0.20.2 可用、且随诊断打印 | 改完 `deny.toml` 实跑 `-L info` | ✅ 见上图 `── ignore reason` |
+| 本机 cargo-deny 版本 = 项目记录版本 | `cargo deny --version` vs `thirdparty.md` | ✅ 均为 `0.20.2` |
+| `install-action` 支持 `tool@version` | 拉该 action 的 README 核对语法 | ✅ README:45-50 明示 `tool: cargo-hack@0.5.24` |
+| `cargo deny --offline` 存在 | `cargo deny --help` | ✅ 另有 `--frozen` = `--locked` + `--offline` |
+| RustSec 数据库本地缓存无隐藏漂移 | **未复跑**（评审已做，且结论不影响本 PR 的任何改动） | — |
+
+### 工程 · cargo-deny 纳入 advisories 检查（Refs #25，2026-09-12）
+
+> **横切工程项**（issue #25 工程卫生的一部分），与 V2 Step 6 正交，独立 PR。
+
+#### Fixed
+
+- **`make deny` 与 CI 的 `cargo-deny` 此前只跑 `licenses bans sources`**，而 `main` 上
+  `cargo deny check advisories` **本来就是 FAILED** ⇒ 「排除」等于**这道门不存在**。
+  现改为**把 `advisories` 也纳入**，并对命中的公告**精确到 ID** 地 ignore（每条写明复核条件）：
+
+  | ID | crate | 依赖路径 | 为何不修 |
+  | --- | --- | --- | --- |
+  | **RUSTSEC-2024-0436** | `paste` | `paste ← tokenizers ← fastembed`（**传递**） | 上游作者已归档仓库、不再维护；无升级路径 |
+  | **RUSTSEC-2025-0141** | `bincode` | ① `bincode 1.3.3 ← hnsw_rs 0.3.4`（**传递**）<br>② `bincode 2.0.1` ← **本项目直接依赖**（快照序列化） | 上游因外部事件**永久停止开发**，并声明 `1.3.3` 即完整版本；无升级路径 |
+
+  ⚠️ **两条都是 `unmaintained`，不是 `unsound` / vulnerability**。
+  ⚠️ **`bincode` 是直接依赖** ⇒ 迁移评估（公告推荐 `wincode` / `postcard` / `bitcode` / `rkyv`）
+  应**单独立项**；**本 PR 只把门打开，不做迁移**。
+  ⚠️ 这条门依赖**外部 RustSec 数据库** ⇒ 数据库新增条目时 **CI 会无缘无故变红** ——
+  届时重新判一次，必要时补 ignore 并在 `deny.toml` 记下复核条件。
+  **不要把 ignore 列表当永久白名单。**
+
+#### Docs
+
+- `deny.toml` 的 `[advisories]`：`ignore = []` → 两条带**逐条复核条件**的 ignore；
+  `Makefile` 的 `deny` 目标与 `.github/workflows/ci.yml` 的 deny job 同步更新（含「数据库漂移会让 CI 变红」的说明）。
+
 ### V2 Step 6 · T7-09 spike 评审响应（PR #40 第 4 轮）（Refs #2，2026-09-12）
 
 > 评审第四轮：**1 条正式评审 + 4 条行内**（0 issue 评论）。上一轮 24 条已有交代，本轮有一处**阻断项**（§2）

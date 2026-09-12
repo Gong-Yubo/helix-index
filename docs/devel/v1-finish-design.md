@@ -186,12 +186,16 @@ README 指向 `docs/user-guide.md`；`docs/README.md` 增设"使用文档"分区
 | `fmt` | `cargo fmt --all -- --check` | 格式 |
 | `lint` | `cargo clippy --workspace --all-targets -- -D warnings` | lint |
 | `test` | `cargo test --workspace` | 单测 |
-| `deny` | `cargo deny check licenses bans sources` | **NFR-09** |
+| `deny` | `cargo deny check advisories licenses bans sources` | **NFR-09** + 依赖安全公告（拟登记 R42） |
 | `doc` | `cargo doc` + `RUSTDOCFLAGS="-D warnings"` | **（v1.1 新增）rustdoc 守门** |
 | `build-release` | `cargo build --release --workspace` | 确保评测脚本依赖的二进制可编出 |
 | `smoke` | demo 语料（30 篇）秒级 `bench` 冒烟 | 验证 CLI 未被改坏 |
 
 （v1.1：把第 5 节承诺但未入表的 release build + 冒烟正式写入 job 表。）
+
+> **⚠️ 2026-09-12 事实同步（PR #41）**：上表 `deny` 行已扩为 `advisories licenses bans sources`
+> ——`advisories` 会**联网拉 RustSec 数据库**，且检查器版本已 pin 到 **`0.20.2`**（`deny.toml` / `Makefile` / `ci.yml`）。
+> 本行是**事实同步**，不动本文档「✅ 已完成（v1.3）」的版本面：它是 v1 的**已完结执行记录**，不属定义面。
 
 ### V1-09 MSRV 验证（NFR-08）
 
