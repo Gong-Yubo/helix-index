@@ -193,3 +193,22 @@ jobs:
             echo "错误：不支持的运算符 <= 应当被拒绝" >&2
             exit 1
           fi
+      # V2 Step 6 / T7-11（PR 5）：增量追加路径（`--index`）的端到端覆盖。
+      # 第一次追加同一份 demo 语料 ⇒ 全部命中 content_hash ⇒ 应为「新增 0 / 去重 N」；
+      # 这同时钉住幂等（S6-T3 的 CLI 侧对应）与「追加后仍可检索」。
+      # ⚠️ 不用 `| tee`：管道会吞掉 helix 的退出码，失败会被 tee 的成功掩盖。
+      - name: incremental build (--index)
+        run: |
+          ./target/release/helix build --input data/corpus.jsonl --output /tmp/incr.snapshot
+          ./target/release/helix build --index /tmp/incr.snapshot \
+            --input data/corpus.jsonl > /tmp/incr-second.log 2>&1
+          cat /tmp/incr-second.log
+          grep -qE "新增 0 / 去重跳过" /tmp/incr-second.log
+          ./target/release/helix search --index /tmp/incr.snapshot --mode bm25 "向量检索"
+      # `--input` 与 `--index` 都不给必须报错（clap 的 required_unless_present）。
+      - name: build 参数缺失必须被拒绝
+        run: |
+          if ./target/release/helix build --output /tmp/should-not-exist.snapshot 2>/dev/null; then
+            echo "错误：既无 --input 也无 --index 时应当报错" >&2
+            exit 1
+          fi
