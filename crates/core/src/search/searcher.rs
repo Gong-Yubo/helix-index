@@ -103,6 +103,8 @@ impl Searcher {
                 inner,
                 pending: Vec::new(),
                 embed_elapsed: std::time::Duration::ZERO,
+                // 读端从未 embed 过（swap 回写端后重新计数）
+                embed_count: 0,
                 graph: self.graph,
                 graph_status: self.graph_status,
                 backend: self.backend,
