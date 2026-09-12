@@ -369,3 +369,76 @@ fn 追加不是upsert_by_source() {
         assert_eq!(hits[0].source, "same.md");
     }
 }
+
+// ---------------------------------------------------------------------------
+// S6-T14：P1 守卫的**判据前提**（半向量检测）在两个方向上都成立
+// ---------------------------------------------------------------------------
+
+/// CLI 侧 P1 守卫（`build_into_existing` 里 `--vectors` 的 `bail!`）依赖一条不变式：
+/// **健康的向量快照恒有 `raw_vectors == chunks_alive`**（`remove` 会同步 retain 掉
+/// 对应向量，见 `step4_liveness.rs` 的 T5b），于是 `raw_vectors < chunks_alive`
+/// 精确表达「有存活分片缺向量」= **半向量**。
+///
+/// 守卫本体在 CLI，端到端要真模型（评审 P3-3 已确认向量追加路径不进 CI）⇒ 本测试退一步，
+/// 在**门面层**把这条判据的**前提**钉在 CI 里，两个方向都断：
+///   ① 健康向量快照（含追加后）⇒ **相等** ⇒ 守卫**不会误报**；
+///   ② 无向量快照（存活分片 > 0）+ 能 embed 的装配 ⇒ **严格小于** ⇒ 守卫**必定触发**。
+///
+/// ⚠️ 覆盖不到：CLI 里的那段 `if args.vectors { ... bail! }` 的**接线**本身
+/// （需要真模型构造 embedder）。接线由本 PR 的本地端到端实测 + 变异验证负责，
+/// 已在 PR 说明里标注。
+#[test]
+fn S6_T14_半向量判据的前提在两方向上都成立() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // ---- ① 健康向量快照：raw_vectors == chunks_alive（追加前后都必须成立）----
+    let vpath = dir.path().join("vec.idx");
+    let mut v = common::builder_hnsw().build();
+    v.add_documents(corpus(0..8)).unwrap();
+    v.commit().unwrap();
+    v.save(&vpath).unwrap();
+    let st = v.tombstone_stats();
+    assert_eq!(st.chunks_alive, 8, "前提自检：8 篇单 chunk");
+    assert_eq!(
+        st.raw_vectors, st.chunks_alive,
+        "健康向量快照应 raw_vectors == chunks_alive（否则守卫会误报）"
+    );
+
+    // 追加 2 篇（装配带 embedder，即 CLI `--vectors` 的形态）
+    let mut v2 = common::builder_hnsw().load(&vpath).unwrap();
+    let pre = v2.tombstone_stats();
+    assert!(
+        pre.raw_vectors >= pre.chunks_alive,
+        "追加前判据不得成立（否则守卫会误报）：raw {} vs alive {}",
+        pre.raw_vectors,
+        pre.chunks_alive
+    );
+    v2.add_documents(corpus(8..10)).unwrap();
+    v2.commit().unwrap();
+    let post = v2.tombstone_stats();
+    assert_eq!(post.chunks_alive, 10, "追加后存活分片数");
+    assert_eq!(
+        post.raw_vectors, post.chunks_alive,
+        "追加后仍须 raw_vectors == chunks_alive（两方向都要成立）"
+    );
+
+    // ---- ② 无向量快照 + 能 embed 的装配 ⇒ 判据严格成立（守卫会触发）----
+    let bpath = dir.path().join("bm25.idx");
+    let mut b = bm25_builder().build();
+    b.add_documents(corpus(0..5)).unwrap();
+    b.commit().unwrap();
+    b.save(&bpath).unwrap();
+
+    // 带 embedder 的装配 load 纯 BM25 快照 —— `load` 的非对称校验会**放行**
+    //（这正是 P1 描述的入口），故这里能拿到一个「装配有向量能力、快照没有向量」的实例。
+    let loaded = common::builder_hnsw().load(&bpath).unwrap();
+    let stb = loaded.tombstone_stats();
+    assert_eq!(stb.chunks_alive, 5, "被追加目标应有 5 个存活分片");
+    assert_eq!(stb.raw_vectors, 0, "纯 BM25 快照没有向量");
+    assert!(
+        stb.raw_vectors < stb.chunks_alive,
+        "P1 守卫的判据必须在此形态下成立（{} < {}）——否则守卫形同虚设",
+        stb.raw_vectors,
+        stb.chunks_alive
+    );
+}
