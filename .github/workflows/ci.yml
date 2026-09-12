@@ -229,6 +229,27 @@ jobs:
           fi
           cat /tmp/half.log
           grep -q "配置指纹显示它" /tmp/half.log
+      # S6-T12（V2 Step 6 / T7-17）：`bench --threads 1`（默认）必须与不传该参数**行为完全一致**
+      # —— 即**不新增任何输出阶段**。用 `--no-latency` 把输出限定在确定性部分（效果指标），
+      # 只屏蔽「快照加载 耗时」这一行计时，其余**逐字比对**。
+      # 🔑 走 BM25（**不需要模型**）⇒ 可进 CI。
+      # ⚠️ 末条是**反向自证**：含 >1 档时**必须**出现并发阶段 —— 否则上面的 `diff`
+      #    可能只是「两边都没跑到」式的空转通过（本项目踩过「判据必然通过却什么都没测到」）。
+      # ⚠️ 依赖前面的 /tmp/incr.snapshot（纯 BM25，来自 data/corpus.jsonl）。
+      - name: bench --threads 1 与默认一致
+        run: |
+          python3 -c "import json,pathlib;srcs=[json.loads(l)['source'] for l in pathlib.Path('data/corpus.jsonl').read_text(encoding='utf-8').splitlines() if l.strip()];rows=[{'qid':'t%d'%i,'query':'检索 文档%d'%i,'type':'exact','relevance':[{'grade':3 if j==i else 0,'source':s} for j,s in enumerate(srcs[:8])]} for i in range(8)];pathlib.Path('/tmp/bq.jsonl').write_text('\n'.join(json.dumps(r,ensure_ascii=False) for r in rows)+'\n',encoding='utf-8')"
+          B=./target/release/helix
+          $B bench --index /tmp/incr.snapshot --queries /tmp/bq.jsonl --modes bm25 --no-latency > /tmp/b-default.out 2>&1
+          $B bench --index /tmp/incr.snapshot --queries /tmp/bq.jsonl --modes bm25 --no-latency --threads 1 > /tmp/b-t1.out 2>&1
+          grep -v "快照加载 耗时" /tmp/b-default.out > /tmp/b-d.txt
+          grep -v "快照加载 耗时" /tmp/b-t1.out > /tmp/b-1.txt
+          diff /tmp/b-d.txt /tmp/b-1.txt
+          if grep -q "并发吞吐" /tmp/b-t1.out; then
+            echo "错误：--threads 1 不应出现并发阶段" >&2; exit 1
+          fi
+          $B bench --index /tmp/incr.snapshot --queries /tmp/bq.jsonl --modes bm25 --threads 1,2 --reps 2 > /tmp/b-t12.out 2>&1
+          grep -q "并发吞吐" /tmp/b-t12.out
       # `--input` 与 `--index` 都不给必须报错（clap 的 required_unless_present）。
       - name: build 参数缺失必须被拒绝
         run: |
