@@ -9,12 +9,61 @@
 
 ## [Unreleased]
 
+### 构建 · V2 Step 6 PR 5 评审响应（PR #43 第 1 轮：1×P1 + 2×P2 + 5×P3）（Refs #2，2026-09-13）
+
+> 评审结论「**建议改后合并**」。**8 条意见全部采纳**（P2-2 按评审自己的建议**只记账不改语义**）；
+> 新增 1 条集成测试（S6-T14）+ 1 条 CI 断言，并做了**两处变异验证**。
+
+#### ⚠️ 行为变更（同一 PR 内加固）
+
+- **`--vectors` 追加/重存到「无向量快照」时硬失败（P1）。** 此前会**静默**落盘一个自称含向量、
+  实际只有新增部分有向量的**半向量快照**：`--mode vector` 只召回新增文档（老文档静默缺席）、
+  快照指纹被改写成「含向量」且**不可逆**（之后不带 `--vectors` 的装配被 `ConfigMismatch` 拒绝）、
+  下游 `compact --dry-run` 还会把它当健康态。判据 = `raw_vectors < chunks_alive`（复用
+  `tombstone_stats()`，**不新增公开 API**），且放在 `add_documents` **之前** ⇒ 同时覆盖了
+  `--index` **单独给出**的「仅重存」路径（实测那条同样会改写指纹，故守卫前移到分发之前）。
+  **不加放行开关**：D-S6-05 已按评审 Q6 拍板「**不额外加兼容开关**」。
+- **模型拿不到时的退化不再「无解释」（P2-1）。** `resolve_embedder(require = false)` 过去是
+  `Err(_) => Ok(None)`，于是 `search --mode vector` / `compare` 只能报「未启用任何 Embedder 实现，
+  请开启 local-embed feature」—— 而 feature 明明是开着的、真因是**模型没拿到** ⇒ 把用户指向错的方向。
+  现在退化时打一条**带根因**的 stderr 告警（与 `GraphStatus::Rebuilt(reason)` 保留 reason 对齐）；
+  退化为纯 BM25 的契约（**G4**）不变。这条同时补齐了设计 §7 对 S6-T7 的验收判据
+  「要么 `Err`、要么**可观测标志**为真，**绝不静默**」。
+
+#### Fixed
+
+- **P3-1** `save_and_report` 里 `commit()` 的理由注释已过期（函数体已不读 `num_chunks`）⇒ 换成
+  仍然成立的理由（`embed_count` / `embed_elapsed` 是**累计量**，尾批须在此 flush 才计入），
+  并显式标注「别据此判定它与 `save` 内部那次重复而删掉」。
+- **P3-2** 增量收益归因写反了：收益来自 **`load` 复用快照里的 `raw_vectors` + 图**，**不是**查重
+  （见上文 Added 段与 `main.rs` 的更正）。
+- **P3-3** CI `CLI smoke`：写明**覆盖边界**（只覆盖纯 BM25 追加；向量追加路径要真模型 ⇒ **不进 CI**），
+  并补上 `--index` **单独给出**这条此前**零断言**的分支。
+- **P3-4** `helix build` 缺参时 usage 把**可选**的 `--output` 与必填项并列 ⇒ 加
+  `#[command(override_usage = "...")]`，错误路径与 `--help` 顶部都变为
+  `helix build [OPTIONS] (--input <INPUT> | --index <INDEX>)`。
+- **P3-5** 公开面收敛：`resolve_embedder` / `local_embedder_ctor` / `EmbedderCtor` 改**私有**
+  （只为单测注入而存在），公开入口只剩 `required_local_embedder()` ⇒ CLI 侧不再需要兜不可达分支的
+  `expect`（**少一个无测试覆盖的 panic 分支**）。仍满足设计 §7「校验逻辑与构造必须分离」。
+
+#### 测试
+
+- 新增 `S6_T14_半向量判据的前提在两方向上都成立`：把 P1 守卫依赖的不变式（健康向量快照恒有
+  `raw_vectors == chunks_alive`）**两个方向**都钉住 —— 健康快照（含追加后）**相等** ⇒ 不误报；
+  无向量快照 + 能 embed 的装配 ⇒ **严格小于** ⇒ 守卫必触发。守卫**接线**需真模型、不进 CI，
+  已在测试注释里写明**覆盖不到什么**。
+- **变异验证 ①（S6-T14）**：把 `load` 后的 `raw_vectors` 人为清空 ⇒ S6-T14 **报红**
+  （`追加前判据不得成立（否则守卫会误报）：raw 0 vs alive 8`，`step6_incremental_build.rs:410`）。
+- **变异验证 ②（P1 守卫）**：把 `if args.vectors` 改成 `if false` ⇒ 本地端到端**重现**评审描述的
+  半向量快照（exit=0、`含向量`、图仅 10 点、`--mode vector` 查不到真正相关的 base 文档），
+  并**证实** `--index` 单独给出同样会改写指纹。两次变异均已还原并复跑确认。
+
 ### 构建 · V2 Step 6 PR 5：增量构建 + 显式请求向量的硬失败（S6-06 / S6-07 / S6-09）（Refs #2，2026-09-12）
 
 > 本 PR 落地 V2 Step 6 的三件事：**`T7-11` 增量构建**（FR-28）、**NFR-03 ② 增量口径实测**（S6-07）、
 > 以及 **`default_embedder()` 静默降级的消除**（S6-09 / D-S6-05 方案 A）。
 > ⚠️ `T7-09`（embed 并行）已由 PR #40 实测判「**不投**」⇒ **S6-04 池化 / S6-05 EP 接入不在本 PR 范围**，
-> 本 PR 只做 `T7-11`（跳过已 embed 的文档）这条**结构性**收益路径。
+> 本 PR 只做 `T7-11`（`load` 复用快照里**已持久化的向量** ⇒ 只有 delta 需要推理）这条**结构性**收益路径。
 
 #### Added
 
@@ -23,8 +72,10 @@
   - `--index` + `--input` = **追加**；`--index` 单独给出 = 仅加载后重存（往返诊断）；
   - `--output` 缺省**原地覆盖 `--index`**，给出则另存（沿用 `helix compact` 的先例）；
   - **幂等**：已存在的文档被 `content_hashes` 双保险挡在 `pending` 之外 ⇒
-    重复追加不改变文档数 / 分片数 / 词项总数，且**不耗 ONNX 推理**
-    （这正是增量的收益来源：`content_hashes` 随快照持久化，`load` 之后仍可用）；
+    重复追加不改变文档数 / 分片数 / 词项总数，且**不耗 ONNX 推理**；
+  - ⚠️ **增量收益的来源是 `load` 复用快照里的 `raw_vectors` + 图**（`load` 根本不调用
+    `embed_documents`），**不是查重** —— 查重保证的是**重复追加的幂等**（S6-T3），是另一个性质。
+    实测那次「去重跳过 0」恰好证明收益与查重无关（PR #43 评审 P3-2）；
   - `--input` 与 `--index` 都不给时由 clap 的 `required_unless_present` 拒绝；
   - ⚠️ **不是 upsert-by-source**：同一 `source` 内容变了就是**一篇新文档**，旧文档仍在。
     需要替换语义请显式 `remove` 后再 `compact`（设计 §4.5.5，已由测试钉住）。
