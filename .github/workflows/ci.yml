@@ -4,7 +4,10 @@ name: CI
 #
 # 设计依据：docs/devel/v1-finish-design.md 第 5 节
 #   - fmt / lint / test / deny 对应项目的阶段门槛（make all）
-#   - deny 是 **NFR-09 依赖许可合规**的自动化守门
+#   - deny 是 **NFR-09 依赖许可合规** + **依赖安全公告漂移**（拟登记 R42）的自动化守门
+#     ⚠️ 2026-09-12（PR #41）起 deny 还跑 `advisories`，并 **pin 检查器版本 0.20.2**：
+#        这道门有两个漂移源（RustSec 数据库 / 检查器本身），pin 掉后者后
+#        「变红」只剩「新增公告」一个原因，归因成本最低
 #   - doc job 用 RUSTDOCFLAGS=-D warnings 守 rustdoc 质量
 #     （配合 core 的 #![deny(missing_docs)] 才是完整守门，见 V1-02）
 #   - msrv job **独立安装 1.90.0**，不继承 rust-toolchain.toml——
@@ -82,10 +85,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-deny
+          # ⚠️ 必须 pin：检查器版本决定默认 lint / 配置字段语义 / ignore 解析行为，
+          #    浮动会让「本地 make deny 绿 ⇒ CI 绿」的等价性失效。
+          #    0.20.2 与 docs/devel/thirdparty.md 记录的项目工具版本一致。
+          tool: cargo-deny@0.20.2
       # 2026-09-12：纳入 advisories（deny.toml 已对两条无升级路径的 `unmaintained`
-      # 精确到 ID 地 ignore）。⚠️ 这条门依赖外部 RustSec 数据库 ⇒ **数据库新增条目时
-      # CI 会无缘无故变红**，此时应重新判一次、必要时补 ignore 并在 deny.toml 记复核条件。
+      # 精确到 ID 地 ignore，每条带「核实日期 + 可判定的解除条件」）。
+      # ⚠️ 这条门依赖外部 RustSec 数据库 ⇒ **数据库新增条目时 CI 会无缘无故变红**，
+      #    届时重新判一次、必要时补 ignore 并在 deny.toml 记复核条件
+      #    （允许在同一 PR 内做，提交信息带 `Refs #25`）。
+      #    复核当前生效的 ignore 与理由：`cargo deny -L info check advisories`
       - run: cargo deny check advisories licenses bans sources
 
   # ------------------------------------------------------------ 文档
