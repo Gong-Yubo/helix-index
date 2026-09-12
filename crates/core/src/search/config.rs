@@ -314,7 +314,9 @@ impl SearchIndexBuilder {
 ///
 /// ⚠️ **按 PR #43 评审 P3-5 收敛为私有**（原为 `pub`）：它只为单测注入而存在，
 /// 公开出去会被误当成受稳定承诺保护的 API（原形态一次导出 3 个公开项，而生产只用
-/// 到其中 1 个）。公开面收敛为 [`required_local_embedder`] + [`default_embedder`] 两个入口。
+/// 到其中 1 个）。入口收敛为 [`required_local_embedder`]（**公开**，供 CLI 的
+/// `--vectors`）+ [`default_embedder`]（**私有**，供零配置装配）两处
+/// —— 即**公开面只有 1 个**（PR #43 第 2 轮评审 P3 的措辞更正）。
 type EmbedderCtor = fn() -> Result<Arc<dyn Embedder>>;
 
 /// 默认本地 embedder 的真实构造器（`local-embed` feature）。
