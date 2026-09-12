@@ -214,6 +214,21 @@ jobs:
           grep -qE "新增 0 / 去重跳过" /tmp/incr-second.log
           ./target/release/helix build --index /tmp/incr.snapshot
           ./target/release/helix search --index /tmp/incr.snapshot --mode bm25 "向量检索"
+      # 半向量守卫（P1）必须在**构造 embedder 之前**拒绝：纯 BM25 快照 + `--vectors`。
+      # 🔑 这一条**不需要模型** —— 预检只读快照指纹（`embedder_id` 为空）就判定，
+      #    所以这条原先在 S6-T14 注释里承认「覆盖不到」的 CLI 接线，现在进了 CI
+      #    （PR #43 第 2 轮评审 P3 的「第二份收益」）。
+      # ⚠️ 依赖上一步留下的 /tmp/incr.snapshot（纯 BM25）。
+      # ⚠️ 断言的是**预检**那句文案 ⇒ 若将来预检被移除，这里会变红（正是我们要的）。
+      - name: 半向量守卫必须拒绝
+        run: |
+          if ./target/release/helix build --index /tmp/incr.snapshot --vectors \
+               > /tmp/half.log 2>&1; then
+            echo "错误：纯 BM25 快照 + --vectors 应当被拒绝" >&2
+            exit 1
+          fi
+          cat /tmp/half.log
+          grep -q "配置指纹显示它" /tmp/half.log
       # `--input` 与 `--index` 都不给必须报错（clap 的 required_unless_present）。
       - name: build 参数缺失必须被拒绝
         run: |

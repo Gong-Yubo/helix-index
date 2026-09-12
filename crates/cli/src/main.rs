@@ -350,8 +350,65 @@ fn require_local_embedder() -> Result<Arc<dyn Embedder>> {
     )
 }
 
+/// 半向量场景的**共用文案**（预检与权威判据共用一份，避免两处措辞漂移）。
+///
+/// `detail` 说明「本次是怎么发现快照没有向量的」，其余是给用户的可执行指引。
+fn partial_vectors_hint(detail: &str) -> String {
+    format!(
+        "{detail}：带 --vectors 追加/重存会落盘一个「半向量」快照——\n  \
+         · `--mode vector` 只召回本次新增的文档，老文档静默缺席；\n  \
+         · 快照指纹会被改写成「含向量」且不可逆，之后不带 --vectors 的装配会被 ConfigMismatch 拒绝。\n\
+         要覆盖全集的向量索引，请从语料**全量重建**；只想要 BM25 增量，请去掉 --vectors。"
+    )
+}
+
+/// **构造 embedder 之前**的预检：快照指纹的 `embedder_id` 为空 ⇒ 该快照本来就不含向量。
+///
+/// 判据 = 快照指纹（`ConfigFingerprint.embedder_id`，空串 = 纯 BM25），用**现成的公开
+/// reader** `storage::load_with_crc` ⇒ **不新增任何 API**。
+///
+/// ⚠️ 这是**预检**而非权威判据：
+/// - 读不到 / 解不开 ⇒ 直接放行，交给正常路径报错（保持**单一错误来源**）；
+/// - 指纹非空却 `raw_vectors < chunks_alive`（**部分向量**，指纹看不出来）⇒ 预检放行，
+///   由 [`build_into_existing`] 里拿到 `tombstone_stats()` 后的守卫兜住。
+///
+/// ⚠️ 代价：一次快照解析（release / 12K 档 ≈150 ms，相对 23.7 s 的追加 ≈0.63%）。
+/// 解析结果在本函数返回前即释放，**不与**随后那次真正的 `load` 并存 ⇒ 不抬高峰值 RSS。
+/// 只读不写 ⇒「拒绝时磁盘上的原快照不变、不留半成品」的性质不受影响。
+fn reject_vectorless_snapshot(idx: &Path) -> Result<()> {
+    let embedder_id = {
+        let Ok((_, _, fp, _)) = helix_core::storage::load_with_crc(idx) else {
+            return Ok(());
+        };
+        fp.embedder_id
+    };
+    if embedder_id.is_empty() {
+        bail!(
+            "{}",
+            partial_vectors_hint(&format!(
+                "快照 {} 的配置指纹显示它**不含向量**（embedder_id 为空）",
+                idx.display()
+            ))
+        );
+    }
+    Ok(())
+}
+
 fn build(args: BuildArgs) -> Result<()> {
     let started = std::time::Instant::now();
+
+    // ⚠️ P3（PR #43 第 2 轮评审）：把「快照本来就不含向量」挡在**构造 embedder 之前**。
+    // 权威判据在 `build_into_existing` 里（要 `tombstone_stats()`），但它晚于
+    // `configured_builder()` ⇒ 在拿不到模型的机器上，「半向量」这条更该看的错误会被
+    // 「模型没拿到」盖住，且为一个**注定失败**的命令仍会去构造（首次即触发 ~49 s 下载）。
+    // 预检之后这条 CLI 接线**不再需要真模型** ⇒ 第一次进得了 CI（`CLI smoke` 的
+    // 「半向量守卫必须拒绝」）。
+    if args.vectors {
+        if let Some(idx) = args.index.as_deref() {
+            reject_vectorless_snapshot(idx)?;
+        }
+    }
+
     let builder = configured_builder(&args)?;
 
     match (&args.index, args.input.as_deref()) {
@@ -401,7 +458,9 @@ fn build(args: BuildArgs) -> Result<()> {
 ///   （指纹还会被改写成「含向量」且**不可逆**，下游 `compact --dry-run` 会把它当健康态）。
 ///   `--mode vector` 则静默只回答 delta 那部分语料 —— 与 `search --index` **不同构**
 ///   （那只是只读的、进程结束即消失，不污染磁盘）。
-///   ⇒ 在 `add_documents` **之前**判「装配有向量、快照无向量」并 `bail!`。
+///   ⇒ **两层**：`build()` 里先做**预检**（只读指纹、不进 embedder 构造，见
+///   [`reject_vectorless_snapshot`]）挡住「快照本来就不含向量」；这里再用
+///   `tombstone_stats()` 做**权威判据**，兜住指纹看不出来的**部分向量**。
 ///   ⚠️ **不加放行开关**：D-S6-05 已按评审 Q6 拍板「不额外加兼容开关」。
 fn build_into_existing(
     args: &BuildArgs,
@@ -435,13 +494,11 @@ fn build_into_existing(
         let st = index.tombstone_stats();
         if st.raw_vectors < st.chunks_alive {
             bail!(
-                "快照里的存活分片没有向量（raw_vectors {} < chunks_alive {}）：\
-                 带 --vectors 追加/重存会落盘一个「半向量」快照——\n\
-                 · `--mode vector` 只召回本次新增的文档，老文档静默缺席；\n\
-                 · 快照指纹会被改写成「含向量」且不可逆，之后不带 --vectors 的装配会被 ConfigMismatch 拒绝。\n\
-                 要覆盖全集的向量索引，请从语料**全量重建**；只想要 BM25 增量，请去掉 --vectors。",
-                st.raw_vectors,
-                st.chunks_alive
+                "{}",
+                partial_vectors_hint(&format!(
+                    "快照里的存活分片没有向量（raw_vectors {} < chunks_alive {}）",
+                    st.raw_vectors, st.chunks_alive
+                ))
             );
         }
     }
