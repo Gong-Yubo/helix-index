@@ -93,7 +93,7 @@ if [[ $REGEN -eq 1 || ! -f "$CORPUS" || ! -f "$QUERY_FILE" || ! -f "$LEVELS_JSON
     "$PY" scripts/gen_synth_corpus.py --n "$N" --queries "$QUERIES"
 else
     echo
-    echo "==> 复用已有 fixture：$CORPUS（加 --regen 强制重生成）"
+    echo "==> 复用已有 fixture：${CORPUS}（加 --regen 强制重生成）"
 fi
 
 # ---------------------------------------------------------------- 快照
@@ -108,7 +108,7 @@ fi
 
 # ---------------------------------------------------------------- 档位扫描
 echo
-echo "==> 扫描过滤档位（modes=$MODES，reps=$REPS）"
+echo "==> 扫描过滤档位（modes=${MODES}，reps=${REPS}）"
 
 # 从 filters.json 读档位；--levels 传了就只跑指定档位（逗号分隔的 name）
 # ⚠️ 分隔符用 `|` 不能用 tab：tab 属 IFS 空白字符，空字段（无过滤档位的 spec

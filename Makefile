@@ -1,6 +1,6 @@
-.PHONY: all fmt lint test deny doc tree clean eval-quality eval-perf report
+.PHONY: all fmt lint test deny shell doc tree clean eval-quality eval-perf report
 
-all: fmt lint test deny
+all: fmt lint test deny shell
 
 fmt:
 	cargo fmt --all
@@ -16,6 +16,13 @@ deny:
 	@command -v cargo-deny >/dev/null 2>&1 || \
 	  (echo "==> 首次安装 cargo-deny（约 2~5 分钟）..." && cargo install cargo-deny --locked)
 	cargo deny check licenses bans sources
+
+# 静态检查：scripts/*.sh 里的 `$VAR` 紧跟非 ASCII 字符
+# 原因：bash 3.2（macOS 自带）在多字节 locale 下不把非 ASCII 字节当作变量名终止符，
+#       `"$VAR（"` 会被解析成一个变量名 ⇒ `set -u` 报 unbound variable 并中止；
+#       `LC_ALL=C` 下不触发，故本地裸跑可能漏掉，须进守门
+shell:
+	python3 scripts/check_shell_expansion.py
 
 doc:
 	cargo doc --workspace --no-deps

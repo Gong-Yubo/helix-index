@@ -54,7 +54,7 @@ for a in "$@"; do
             exit 0
             ;;
         *)
-            echo "未知参数：$a（可用 --coreml / --coreml-static-shapes）" >&2
+            echo "未知参数：${a}（可用 --coreml / --coreml-static-shapes）" >&2
             exit 2
             ;;
     esac
@@ -62,7 +62,7 @@ done
 
 # 参数守卫（评审 K/L）：BSD/macOS 的 `seq 1 0` 输出 "1 0"（倒序）⇒ ROUNDS=0 会白跑两波
 if [[ "$TEXTS" -lt 1 || "$ROUNDS" -lt 1 || "$WARMUP" -lt 0 ]]; then
-    echo "参数越界：需 TEXTS ≥ 1、ROUNDS ≥ 1、WARMUP ≥ 0（实得 TEXTS=$TEXTS ROUNDS=$ROUNDS WARMUP=$WARMUP）" >&2
+    echo "参数越界：需 TEXTS ≥ 1、ROUNDS ≥ 1、WARMUP ≥ 0（实得 TEXTS=$TEXTS ROUNDS=$ROUNDS WARMUP=${WARMUP}）" >&2
     exit 2
 fi
 
@@ -77,7 +77,9 @@ else
     exit 1
 fi
 
-RUN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/s6-embed-XXXXXX")"
+TMP_ROOT="${TMPDIR:-/tmp}"
+TMP_ROOT="${TMP_ROOT%/}"
+RUN_DIR="$(mktemp -d "$TMP_ROOT/s6-embed-XXXXXX")"
 mkdir -p "$RUN_DIR/logs"
 
 phys_bytes() {
@@ -87,8 +89,9 @@ phys_bytes() {
         awk '/MemTotal/{print $2*1024}' /proc/meminfo
     fi
 }
-PHYS_GB=$(python3 -c "print(f'{$(phys_bytes) / 1024 / 1024 / 1024:.0f}')")
-RSS_MAX_GB=$(python3 -c "print(f'{int($PHYS_GB) * 0.9:.1f}')")
+PHYS_BYTES=$(phys_bytes)
+PHYS_GB=$(python3 -c "print(f'{$PHYS_BYTES / 1024 / 1024 / 1024:.0f}')")
+RSS_MAX_GB=$(python3 -c "print(f'{$PHYS_BYTES * 0.9 / 1024 / 1024 / 1024:.1f}')")
 
 CFGS_CPU="e1,e2-2,e2-4"
 CFGS_COREML="e1,e2-2,e2-4,e3-coreml"
@@ -126,7 +129,7 @@ run_one() {
     printf '%s\n' "$raw" >"$log"
 
     if [[ $rc -ne 0 ]]; then
-        echo "作废：$cfg 退出码 $rc（详见 $log）" >&2
+        echo "作废：$cfg 退出码 ${rc}（详见 ${log}）" >&2
         return 1
     fi
 
@@ -155,19 +158,19 @@ if len(secs) != 1 or secs[0] <= 0:
     raise SystemExit(f"rounds_secs 异常：{secs}")
 PY
     then
-        echo "作废：$cfg 的 JSON 未通过校验（详见 $log）" >&2
+        echo "作废：$cfg 的 JSON 未通过校验（详见 ${log}）" >&2
         return 1
     fi
 
     rss=$(echo "$raw" | grep -iE "maximum resident" | grep -oE '[0-9]+' | head -1 || true)
     if [[ -z "$rss" ]]; then
-        echo "作废：$cfg 未能解析峰值 RSS（详见 $log）" >&2
+        echo "作废：$cfg 未能解析峰值 RSS（详见 ${log}）" >&2
         return 1
     fi
     gb=$(rss_to_gb "$rss")
     # RSS 量级区间：太低 ⇒ 解析错；太高 ⇒ 多半是 OOM 前的异常态（评审 F1）
     if ! python3 -c "import sys; sys.exit(0 if $RSS_MIN_GB <= $gb <= $RSS_MAX_GB else 1)"; then
-        echo "作废：$cfg 峰值 RSS ${gb}GB 落在合理区间 [${RSS_MIN_GB}, ${RSS_MAX_GB}] 之外（详见 $log）" >&2
+        echo "作废：$cfg 峰值 RSS ${gb}GB 落在合理区间 [${RSS_MIN_GB}, ${RSS_MAX_GB}] 之外（详见 ${log}）" >&2
         return 1
     fi
     [[ "$record" == "1" ]] && printf '%s\t%s\n' "$cfg" "$gb" >>"$RUN_DIR/${label}-rss.tsv"
@@ -184,7 +187,7 @@ run_variant() {
     local label="$1" feature="$2" cfgs="$3"
     echo
     echo "=============================================================="
-    echo "== 变体：$label（--features ${feature:-<none>}；coreml_static_shapes=$STATIC_SHAPES）"
+    echo "== 变体：${label}（--features ${feature:-<none>}；coreml_static_shapes=${STATIC_SHAPES}）"
     echo "=============================================================="
 
     local feat_arg=()
@@ -223,7 +226,7 @@ run_variant() {
     done
 
     echo
-    echo "---- 汇总（$label）｜语料 ${TEXTS} 段 ｜ 波数 ${ROUNDS} ｜ 每档位样本量 = ${ROUNDS} ----"
+    echo "---- 汇总（${label}）｜语料 ${TEXTS} 段 ｜ 波数 ${ROUNDS} ｜ 每档位样本量 = ${ROUNDS} ----"
     python3 - "$RUN_DIR" "$label" "$ROUNDS" "$cfgs" <<'PY'
 import json, os, statistics, sys
 run_dir, label, rounds, cfgs = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4].split(",")

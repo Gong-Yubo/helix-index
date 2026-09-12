@@ -48,7 +48,7 @@ if ! has_arg "--queries" "$@" && ! has_arg "-q" "$@"; then
 fi
 
 for f in "$CORPUS" "$QUERIES"; do
-    [[ -f "$f" ]] || { echo "错误：缺少数据文件 $f（应已随仓库入库）" >&2; exit 2; }
+    [[ -f "$f" ]] || { echo "错误：缺少数据文件 ${f}（应已随仓库入库）" >&2; exit 2; }
 done
 
 echo "==> 构建 release 二进制（helix）..."
