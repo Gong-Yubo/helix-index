@@ -9,6 +9,27 @@
 
 ## [Unreleased]
 
+### 工程 · 横切 T7-24 工程卫生：CI 触发放开 + `.gitignore` 补图 sidecar（Refs #25，2026-09-14）
+
+> **横切任务**（`plan-v2.md` §4「横切任务」/ §附-3 执行顺序第 2 位），**独立 PR**、不属任何 Step。
+> 本次交付其中的 **① ②**（代码面）；**③ 清理远端分支**是操作动作、不产生 diff，另办。
+
+#### 🔴 Fixed
+
+- **① 堆叠 PR 永远跑不到 CI**：`.github/workflows/ci.yml` 原写 `pull_request.branches: [main]`
+  ⇒ 只让 **base = main** 的 PR 触发，**base ≠ main 的堆叠 PR 完全没有 CI**
+  （Step 2 的 #13/#14 已吃过亏，当时只能拿本地守门代替）。
+  现**去掉 `pull_request` 的 `branches` 过滤** ⇒ **任何 PR 都有 CI**；并补 `workflow_dispatch`（可手动跑）。
+  ⚠️ **刻意不采用** issue 里并列的另一个方案「`push: branches-ignore: [main]`」—— 本仓库是 **private**、
+  Actions 走**账号配额**，逐分支 push 触发会与 PR 触发**重复计费**，而「每个 PR 都有 CI」只用放开
+  `pull_request` 就能达成。
+- **② `.gitignore` 漏掉图 sidecar 本体**：实测 `data/t2-index.idx.hnsw.{graph,data,manifest}`
+  原先**可被 `git add`**（**31MB 级**误提交风险）—— 既有的 `*.idx.tmp` 只能覆盖 **tmp 变体**，
+  非 tmp 的本体一直裸着。现补 `*.hnsw.graph` / `*.hnsw.data` / `*.hnsw.manifest`。
+  ⚠️ 用 `*.hnsw.<ext>` 而非 `*.idx.hnsw.<ext>`：`file_dump(dir, "foo.idx")` 会**自行追加**后缀
+  （`REFERENCE.md` 的 basename 铁律），basename 未必以 `.idx` 结尾。
+  复验：修复前三条均 `TRACKABLE`、修复后均 `IGNORED`，且仓库内**无**已跟踪的 `*.hnsw.*`（无误伤）。
+
 ### 文档 · V2 Step 6 收尾 · 评审响应（DeepSeek Harness 复审：3×P2 + 3×P3，全部收口）（Refs #2，2026-09-13）
 
 > 复审由 **DeepSeek Harness**（`--profile headless`，模型 `glm-5.3-flash`）**独立于作者**完成：
