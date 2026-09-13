@@ -1,6 +1,6 @@
 # cargo-deny 配置
 #
-# 追溯：**NFR-09**（依赖许可合规）+ **依赖安全公告漂移**（拟登记 R42，见下）
+# 追溯：**NFR-09**（依赖许可合规）+ **依赖安全公告漂移**（**R42**，架构 §14.4，见下）
 # 运行：`make deny`（= advisories + licenses + bans + sources）
 #
 # ⚠️ **本目标需要联网**：advisories 检查会拉取 RustSec 数据库（缓存在 `~/.cargo/advisory-db`）。

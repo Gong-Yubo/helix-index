@@ -11,7 +11,7 @@ lint:
 test:
 	cargo test --workspace
 
-# ADR-008 / NFR-09（依赖 License 白名单）+ 依赖安全公告（拟登记 R42）校验。
+# ADR-008 / NFR-09（依赖 License 白名单）+ 依赖安全公告（**已登记 R42**，架构 §14.4）校验。
 # 首次运行会自动安装 cargo-deny（约 2~5 分钟）。
 #
 # ⚠️ 2026-09-12：**把 advisories 也纳入这道门**。此前它被排除在外，而 main 上
