@@ -50,7 +50,7 @@ enum Command {
     /// 墓碑物理回收（V2 Step 4：compaction 重新物化 + ID 重编号）
     Compact(CompactArgs),
     /// 效果评测（P5 实现）
-    Bench(bench::BenchArgs),
+    Bench(Box<bench::BenchArgs>),
 }
 
 #[derive(clap::Args)]
@@ -155,7 +155,7 @@ fn main() -> Result<()> {
         Command::Search(args) => search(args),
         Command::Compare(args) => compare(args),
         Command::Compact(args) => compact(args),
-        Command::Bench(args) => bench::run(args),
+        Command::Bench(args) => bench::run(*args),
     }
 }
 

@@ -229,6 +229,54 @@ jobs:
           fi
           cat /tmp/half.log
           grep -q "配置指纹显示它" /tmp/half.log
+      # S6-T12（V2 Step 6 / T7-17）：`bench --threads 1`（默认）必须与不传该参数**行为完全一致**
+      # —— 即**不新增任何输出阶段**。用 `--no-latency` 把输出限定在确定性部分（效果指标），
+      # 只屏蔽「快照加载 耗时」这一行计时，其余**逐字比对**。
+      # 🔑 走 BM25（**不需要模型**）⇒ 可进 CI。
+      #
+      # ⚠️ **每条断言都必须自证「真的跑到了」**（PR #44 评审 P2-3）：空文件之间的 `diff`
+      #    同样 exit 0，只 grep 阶段表头也不等于产出了数据行。所以本步：
+      #      ① 先断言比对对象**非空且含效果表**，再 diff；
+      #      ② 用 `--json` 断言 `--threads 1` **没有** `threads` 键（比 grep stdout 更强）；
+      #      ③ 反向自证落到**数据行**（`NFR-10` 判定行 + JSON `n_total` 精确值），
+      #         而不是仅 `grep "并发吞吐"` 这个在任何行之前就打印的标题。
+      # ⚠️ 依赖前面的 /tmp/incr.snapshot（纯 BM25，来自 data/corpus.jsonl）。
+      - name: bench --threads 1 与默认一致
+        run: |
+          python3 -c "import json,pathlib;srcs=[json.loads(l)['source'] for l in pathlib.Path('data/corpus.jsonl').read_text(encoding='utf-8').splitlines() if l.strip()];rows=[{'qid':'t%d'%i,'query':'检索 文档%d'%i,'type':'exact','relevance':[{'grade':3 if j==i else 0,'source':s} for j,s in enumerate(srcs[:8])]} for i in range(8)];pathlib.Path('/tmp/bq.jsonl').write_text('\n'.join(json.dumps(r,ensure_ascii=False) for r in rows)+'\n',encoding='utf-8')"
+          B=./target/release/helix
+          S=/tmp/incr.snapshot
+          Q=/tmp/bq.jsonl
+          # --- ① 默认 vs --threads 1：确定性输出逐字一致 --------------------------
+          $B bench --index $S --queries $Q --modes bm25 --no-latency            > /tmp/b-default.out 2>&1
+          $B bench --index $S --queries $Q --modes bm25 --no-latency --threads 1 > /tmp/b-t1.out    2>&1
+          # 自证「真的跑到了」：效果表在、且有 bm25 数据行（否则下面的 diff 是空转通过）
+          grep -q "效果评测" /tmp/b-default.out
+          grep -qE "^bm25 " /tmp/b-default.out
+          grep -v "快照加载 耗时" /tmp/b-default.out > /tmp/b-d.txt
+          grep -v "快照加载 耗时" /tmp/b-t1.out    > /tmp/b-1.txt
+          [ "$(wc -l < /tmp/b-d.txt)" -ge 5 ]
+          [ "$(wc -l < /tmp/b-1.txt)" -ge 5 ]
+          diff /tmp/b-d.txt /tmp/b-1.txt
+          # --- ② `--threads 1` 不产生 B2：**必须不加 `--no-latency`** ------------
+          #     ⚠️ 阶段 B2 与延迟同受 `--no-latency` 管辖 ⇒ 加了它这条断言必然通过（空转）。
+          #     2026-09-13 **自查发现**并修正：此处原先带着 `--no-latency`，是假判据。
+          $B bench --index $S --queries $Q --modes bm25 --threads 1 \
+            --json /tmp/b-t1.json > /tmp/b-t1-nl.out 2>&1
+          if grep -q "并发吞吐" /tmp/b-t1-nl.out; then
+            echo "错误：--threads 1 不应出现并发阶段" >&2; exit 1
+          fi
+          python3 -c "import json,sys; d=json.load(open('/tmp/b-t1.json')); sys.exit(0 if 'threads' not in d else 1)"
+          # --- ③ 反向自证：含 >1 档时必须产出**数据行**（不只是阶段标题）---------
+          #     档位取 1,2,4 而非 1,2：只有同时测到 1 与 4 才会打印 NFR-10 判定行。
+          $B bench --index $S --queries $Q --modes bm25 --threads 1,2,4 --reps 2 \
+            --json /tmp/b-t124.json > /tmp/b-t124.out 2>&1
+          grep -q "并发吞吐" /tmp/b-t124.out
+          # ⚠️ 别用 `grep "NFR-10"`：阶段标题里就含 `NFR-10`（`== 并发吞吐（… / NFR-10 方案 A）==`），
+          #    实测 `--threads 1,2`（无 t=4 ⇒ 不给判定）也会「通过」。必须用**固定串**钉判定行。
+          grep -qE "^  [1-4] +[0-9]" /tmp/b-t124.out   # 表里真的有数据行
+          grep -qF "QPS(4)/QPS(1)"   /tmp/b-t124.out   # 真的给出了 NFR-10 判定
+          python3 -c "import json; d=json.load(open('/tmp/b-t124.json'))['threads']['bm25']; got=[d[str(t)]['n_total'] for t in (1,2,4)]; assert got==[16,32,64], got; print('threads n_total 校验通过:', got)"
       # `--input` 与 `--index` 都不给必须报错（clap 的 required_unless_present）。
       - name: build 参数缺失必须被拒绝
         run: |

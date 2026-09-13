@@ -3,7 +3,12 @@
 //! # 执行流程（7.4）
 //!
 //! 加载快照（或 --input 重建）→ 加载 judgments（source 校验）→
-//! 阶段 A【效果】→ 阶段 B【延迟】→（--grid）阶段 C【网格】→ 输出。
+//! 阶段 A【效果】→ 阶段 B【延迟】→ 阶段 B2【并发吞吐，仅 `--threads` 含 >1 档时】
+//! →（--grid）阶段 C【网格】→ 输出。
+//!
+//! - `--threads N[,N...]`：V2 Step 6 的 **T7-17 / NFR-10 采集点**。默认 `1` ⇒
+//!   **不新增任何输出阶段**（与不传该参数逐字一致，S6-T12 的回归防护）；
+//!   含 >1 的档位时才跑阶段 B2。
 //!
 //! # 关键口径
 //!
@@ -22,7 +27,9 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::thread;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
@@ -116,7 +123,10 @@ pub struct BenchArgs {
     /// 机器可读 JSON 输出路径（per-query 明细 + 网格表；T5-03 验收必需）
     #[arg(long)]
     pub json: Option<PathBuf>,
-    /// 跳过延迟测量（只跑效果；网格搜索时用）
+    /// 跳过**所有性能测量阶段**（延迟与并发吞吐），只跑效果（可与 `--grid` 同用）
+    // 实现提示（2026-09-13 自查）：阶段 B2【并发吞吐】与延迟阶段同在 `if !args.no_latency`
+    // 块内 ⇒ 任何「`--threads 1` 不该产出 B2」的断言**不能**配 `--no-latency` 跑
+    // （那样必然通过 = 空转）。CI 里那两条断言已按此修正。
     #[arg(long)]
     pub no_latency: bool,
     /// 过滤档位（`field=value` / `field>=v` / `field<v`，逗号分隔；可重复传）。
@@ -135,6 +145,22 @@ pub struct BenchArgs {
     /// 即使传入也只会被收敛到 5000 而非 panic，见 `oracle_depth_for`）
     #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..=500))]
     pub oracle_depth: u64,
+    /// **并发检索的线程数档位**（逗号分隔；V2 Step 6 · T7-17 / NFR-10 的采集点）。
+    ///
+    /// - 默认 `1` ⇒ **行为与不传该参数完全一致**（不新增输出阶段；S6-T12 的回归防护）
+    /// - 含 >1 的档位（如 `--threads 1,2,4,8`）⇒ 额外跑**阶段 B2【并发吞吐】**：
+    ///   每档 N 个 worker 用 `&` 共享同一个 searcher，各自跑**同一批 query 的同一顺序**
+    ///   （`QueryExecutor: Sync`，**无需 `Arc`、无需改内核**）。
+    /// - 输出：总 QPS、每线程 P50/P99、全局 P50/P99、相对**首档**的加速比；
+    ///   同时给出 NFR-10 方案 A 的判定（首档=1 且含 4 时）。
+    ///
+    /// 口径（设计 §4.6.2 / D-S6-09）：**先跑一趟预热扫描并丢弃**，再测第二趟
+    /// （= 预热丢弃 + 顺序交错）；QPS 用**进程内**墙钟（spawn→join），不含进程启动与快照加载。
+    /// ⚠️ 并发下的 per-query 延迟**含排队**，不得与 NFR-02（单线程口径）横比。
+    /// ⚠️ **正确性是前置条件**：所有档位、所有 worker 的 hits（`chunk_id` + `score`）
+    /// 必须**逐位一致**，否则直接 `Err` —— 读取路径本应纯不可变，不一致即真 bug（S6-T11）。
+    #[arg(long, default_value = "1", value_name = "N[,N...]")]
+    pub threads: String,
     /// 精确兜底阈值（V2 Step 5 / D-S5-02 / S5-04）：**A/B 的唯一开关**。
     ///
     /// - 不传 ⇒ 用内核默认（`HnswRsIndex` 的 `BRUTE_FALLBACK_MAX_ALLOWED`）
@@ -232,6 +258,8 @@ pub fn run(args: BenchArgs) -> Result<()> {
     }
 
     let modes = parse_modes(&args.modes)?;
+    // `--threads 1`（默认）⇒ None ⇒ **不跑阶段 B2**，输出与不传该参数逐字一致（S6-T12）
+    let thread_levels = parse_thread_levels(&args.threads)?;
     let need_vector = modes.contains(&SearchMode::Vector) || modes.contains(&SearchMode::Hybrid);
     // 默认值来自 Bm25Params::default()（P5 定稿 k1=1.5/b=0.75），CLI 仅覆盖显式传入项
     let mut bm25_params = Bm25Params::default();
@@ -569,6 +597,23 @@ pub fn run(args: BenchArgs) -> Result<()> {
             );
         }
         json["latency"] = latency.into();
+
+        // ---- 3.2 阶段 B2：并发吞吐（T7-17 / NFR-10；仅 --threads 含 >1 档时）----
+        if let Some(levels) = &thread_levels {
+            json["threads"] = run_concurrent_stage(
+                &setup,
+                SearchAssembly {
+                    bm25_params,
+                    rrf_k,
+                    rrf_weights: &rrf_weights,
+                },
+                &modes,
+                &judgments,
+                &args,
+                levels,
+                filter.as_ref(),
+            )?;
+        }
     }
 
     // ---- 3.5 阶段 D：过滤求值耗时对照（T13，仅 --filter-cost）----
@@ -1228,6 +1273,485 @@ fn eval_latency(
 }
 
 // ---------------------------------------------------------------------------
+// 阶段 B2：并发检索吞吐（V2 Step 6 · T7-17 / NFR-10 方案 A）
+// ---------------------------------------------------------------------------
+
+/// NFR-10（方案 A，评审 Q4 已拍板）的相对提升阈值：
+/// `--threads 4` 的 QPS ≥ `--threads 1` 的 QPS × 本值（近线性，允许 40% 折损）。
+///
+/// ⚠️ 需求文档里这个数值仍标「**拟**」，待 S6-08 实测后定稿（同 Step 5 的 NFR-13 先例）。
+/// ⚠️ **不得**把它当绝对 QPS 目标（评审明确反对方案 B：绝对 QPS 与机器强耦合）。
+const NFR10_MIN_SPEEDUP: f64 = 2.5;
+
+/// 档位上界：每档会**真的 `spawn` 这么多 OS 线程**，误传大数（如 `--threads 100000`）
+/// 会直接耗尽进程资源。上界给得比任何真实机器都宽，只用来挡住明显的误输入（评审 P3-5）。
+const MAX_THREAD_LEVEL: usize = 256;
+
+/// 解析 `--threads` 的档位列表（逗号分隔，去重保序）。
+///
+/// 返回 `None` 表示「**只有一档、且为 1**」⇒ **不跑阶段 B2**，
+/// `bench --threads 1` 的输出与不传该参数**逐字一致**（S6-T12 的回归防护）。
+fn parse_thread_levels(spec: &str) -> Result<Option<Vec<usize>>> {
+    let mut levels: Vec<usize> = Vec::new();
+    for part in spec.split(',') {
+        let t = part.trim().parse::<usize>().with_context(|| {
+            format!("--threads 解析失败：`{part}` 不是非负整数（原串 `{spec}`）")
+        })?;
+        if t == 0 {
+            bail!("--threads 至少为 1（收到 0；原串 `{spec}`）");
+        }
+        if t > MAX_THREAD_LEVEL {
+            bail!(
+                "--threads 档位 {t} 超过上限 {MAX_THREAD_LEVEL}（原串 `{spec}`）\
+                 —— 每档会真的 spawn 同等数量的 OS 线程，请改用与核数同量级的档位"
+            );
+        }
+        if !levels.contains(&t) {
+            levels.push(t);
+        }
+    }
+    if levels.len() == 1 && levels[0] == 1 {
+        return Ok(None);
+    }
+    Ok(Some(levels))
+}
+
+/// 单个 worker 的产出。
+///
+/// **不跨线程共享可变状态**：每个 worker 自己攒样本、自己算签名 ⇒ 无需锁，
+/// 也就不会有「锁顺序导致的非确定性」污染 NFR-10 的正确性前置条件。
+struct WorkerOut {
+    /// 每次检索的耗时（ms；**不含预热**）
+    samples: Vec<f64>,
+    /// hits 的**逐位签名**（`chunk_id` + `score.to_bits()`，按 query / reps 顺序；
+    /// 命中条数也入签名，否则「少返回一条」不会改变签名）
+    signature: u64,
+    /// 本 worker **计时窗内**的墙钟（s）—— 从 barrier 放行起算，**不含预热**
+    measured_secs: f64,
+    /// 计时窗内**失败**的检索次数
+    ///
+    /// ⚠️ 必须显式计数：签名只吃成功响应，若把 `Err` 静默丢弃，「全部失败」时每个
+    /// worker 的签名都会退化成同一个**空哈希常量**，于是「各档签名一致」这条前置
+    /// 条件被**空满足**（评审 P1-1）。
+    n_err: usize,
+    /// 计时窗内成功检索返回的**命中总条数**（= 0 ⇒ 一条都没搜到，「一致」无信息量）
+    n_hits: u64,
+    /// 首个失败的原因（诊断用；只留第一条，避免刷屏）
+    first_err: Option<String>,
+}
+
+/// 一档线程数的并发测量结果。
+struct ThreadLevelReport {
+    threads: usize,
+    /// 计入 QPS 的检索总次数（`threads × queries × reps`，**不含预热**）
+    n_total: usize,
+    /// 墙钟（s）——**进程内**读数：`spawn → join`，不含进程启动与快照加载
+    wall_secs: f64,
+    /// 每 worker 的 `(P50, P99)`（ms）——「吞吐上去了但尾延迟炸了」靠它发现（D-S6-09 辅指标）
+    per_thread: Vec<(f64, f64)>,
+    /// 全样本合并后的 `(P50, P99)`（ms）
+    global: (f64, f64),
+    /// **每个 worker** 的 hits 签名 ⇒ 正确性前置条件的证据（集合大小必须为 1）
+    worker_signatures: Vec<u64>,
+    /// 本档位**失败**的检索次数（> 0 ⇒ 前置条件不成立，绝不出表）
+    n_err: usize,
+    /// 本档位成功检索返回的**命中总条数**（= 0 ⇒ 「一条都没搜到」）
+    n_hits: u64,
+    /// 首个失败原因（诊断用）
+    first_err: Option<String>,
+}
+
+impl ThreadLevelReport {
+    fn qps(&self) -> f64 {
+        if self.wall_secs > 0.0 {
+            self.n_total as f64 / self.wall_secs
+        } else {
+            f64::NAN
+        }
+    }
+}
+
+/// 一次并发批量的规格：**「同一批 query 的同一顺序」**这层语义的名字。
+///
+/// 收成结构体不是为了让签名好看：`--k/--reps/--warmup/--filter` 四者必须**在同一个档位的
+/// 所有 worker 上完全一致**（否则各 worker 跑的就不是同一批），把它们绑在一起可以让
+/// 「不一致」在类型层面写不出来。
+#[derive(Clone, Copy)]
+struct BatchSpec<'a> {
+    mode: SearchMode,
+    k: usize,
+    warmup: usize,
+    reps: usize,
+    filter: Option<&'a Filter>,
+}
+
+/// 构造 searcher 所需的装配参数（与 [`make_searcher`] 一一对应）。
+#[derive(Clone, Copy)]
+struct SearchAssembly<'a> {
+    bm25_params: Bm25Params,
+    rrf_k: f32,
+    rrf_weights: &'a [f32],
+}
+
+/// 跑**一档**线程数：N 个 worker 用 `&` 共享 `searcher`，各自跑**同一批 query 的同一顺序**。
+///
+/// 共享可行性已由 `tests::queryexecutor可跨线程共享` 在编译期钉住（`QueryExecutor: Sync`）
+/// ⇒ **不需要 `Arc`、不需要改内核**（设计 §4.6.1）。
+fn concurrent_batch(
+    searcher: &QueryExecutor,
+    judgments: &[Judgment],
+    spec: BatchSpec<'_>,
+    threads: usize,
+) -> Result<ThreadLevelReport> {
+    let BatchSpec {
+        mode,
+        k,
+        warmup,
+        reps,
+        filter,
+    } = spec;
+    // 所有 worker 的热身都做完再一起放行 —— 否则「先热完的 worker」的计时窗会被
+    // 「后热完的 worker」的预热流量污染，各 worker 的窗也不同步（评审 P2-1）。
+    let barrier = std::sync::Barrier::new(threads);
+    let outs: Vec<WorkerOut> = thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| {
+                    // ① 预热：所有 query 各跑 `warmup` 次后**丢弃**。
+                    //    ⚠️ 这段**必须**落在计时窗之外：旧实现把它套在 `t0..t0+wall` 里，
+                    //    而 `n_total` 只算 reps ⇒ 分子分母口径不一致，QPS 被系统性低估
+                    //    `reps/(warmup+reps)`（默认 20/23 ≈ 13%；评审 P2-1）。
+                    for j in judgments {
+                        for _ in 0..warmup {
+                            let _ = run_once(searcher, &j.query, mode, k, filter);
+                        }
+                    }
+                    // ② 同步点：N 个 worker 全部热完，计时窗从此刻开始
+                    barrier.wait();
+                    let t0 = Instant::now();
+                    let mut samples = Vec::with_capacity(judgments.len() * reps);
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    let mut n_err = 0usize;
+                    let mut n_hits = 0u64;
+                    let mut first_err: Option<String> = None;
+                    for j in judgments {
+                        for _ in 0..reps {
+                            let t = Instant::now();
+                            let r = run_once(searcher, &j.query, mode, k, filter);
+                            samples.push(t.elapsed().as_secs_f64() * 1000.0);
+                            // 正确性签名：只吃**成功的**响应、按 query/reps 顺序
+                            // ⇒ 与线程数无关，可跨档、跨 worker 逐位比对（S6-T11）
+                            match r {
+                                Ok(resp) => {
+                                    n_hits += resp.hits.len() as u64;
+                                    resp.hits.len().hash(&mut hasher);
+                                    for h in &resp.hits {
+                                        h.chunk_id.hash(&mut hasher);
+                                        h.score.to_bits().hash(&mut hasher);
+                                    }
+                                }
+                                // ⚠️ 失败**不能**静默丢弃（评审 P1-1）：全部失败时签名会
+                                // 退化成同一个空哈希常量 ⇒ 前置条件被**空满足**。这里
+                                // 计数 + 留因，由 check_concurrency_precondition 统一拒绝。
+                                Err(e) => {
+                                    n_err += 1;
+                                    if first_err.is_none() {
+                                        first_err = Some(e.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    WorkerOut {
+                        samples,
+                        signature: hasher.finish(),
+                        measured_secs: t0.elapsed().as_secs_f64(),
+                        n_err,
+                        n_hits,
+                        first_err,
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("worker 只做只读检索，不应 panic"))
+            .collect()
+    });
+    // 并发窗口 = 各 worker 计时窗的**最大值**（它们都从 barrier 放行起算）
+    let wall_secs = outs.iter().map(|o| o.measured_secs).fold(0.0_f64, f64::max);
+
+    let mut per_thread = Vec::with_capacity(threads);
+    let mut worker_signatures = Vec::with_capacity(threads);
+    let mut all: Vec<f64> = Vec::with_capacity(threads * judgments.len() * reps);
+    let mut n_err = 0usize;
+    let mut n_hits = 0u64;
+    let mut first_err: Option<String> = None;
+    for mut o in outs {
+        o.samples
+            .sort_by(|a, b| a.partial_cmp(b).expect("延迟样本无 NaN"));
+        per_thread.push((
+            bench::percentile(&o.samples, 50.0),
+            bench::percentile(&o.samples, 99.0),
+        ));
+        worker_signatures.push(o.signature);
+        n_err += o.n_err;
+        n_hits += o.n_hits;
+        first_err = first_err.or(o.first_err);
+        all.extend(o.samples);
+    }
+    all.sort_by(|a, b| a.partial_cmp(b).expect("延迟样本无 NaN"));
+    Ok(ThreadLevelReport {
+        threads,
+        n_total: threads * judgments.len() * reps,
+        wall_secs,
+        per_thread,
+        global: (bench::percentile(&all, 50.0), bench::percentile(&all, 99.0)),
+        worker_signatures,
+        n_err,
+        n_hits,
+        first_err,
+    })
+}
+
+/// 并发正确性**前置条件**的统一判据（S6-T11；评审 P1-1 收口）。
+///
+/// 三条缺一不可 —— 少了任何一条，这组检查都能被「什么都没测到」**空满足**：
+///
+/// 1. **每一次检索都必须成功**：签名只吃成功响应 ⇒ 若把 `Err` 静默丢弃，「全部
+///    失败」时每个 worker 的签名都等于同一个**空哈希常量**，第 3 条会被空满足；
+/// 2. **至少要有命中**：query 与快照完全对不上（`--queries` / `--filter` / 模式
+///    不匹配）时「各档结果一致」毫无信息量 —— 全空同样一致；
+/// 3. **所有档位、所有 worker 的签名完全相同**：读路径纯不可变（设计 §2.6），
+///    这条**应当**成立；不成立即真 bug（浮点环境变量 / 锁顺序 / 分配器非确定性）。
+///
+/// 抽成独立函数（而不是留在 `run_concurrent_stage` 里）是为了让三条判据都能被
+/// **合成数据直接单测** —— 否则「全失败 / 全空」这两条只能靠造真实故障来覆盖。
+fn check_concurrency_precondition(mode: SearchMode, rows: &[ThreadLevelReport]) -> Result<()> {
+    let n_err: usize = rows.iter().map(|r| r.n_err).sum();
+    if n_err > 0 {
+        let detail = rows
+            .iter()
+            .find_map(|r| r.first_err.clone())
+            .unwrap_or_else(|| "（无错误详情）".into());
+        bail!(
+            "并发测量出现**检索失败**：mode={} 共 {n_err} 次失败。失败的检索不可计入 QPS \
+             （它既没有结果、耗时也不代表检索成本）⇒ 本次吞吐数字不予采信。首个错误：{detail}",
+            mode_name(mode)
+        );
+    }
+    let n_hits: u64 = rows.iter().map(|r| r.n_hits).sum();
+    if n_hits == 0 {
+        bail!(
+            "并发测量**未取到任何命中**（mode={}，共 {} 次检索全部返回 0 条）。\
+             此时「各档 hits 逐位一致」不构成任何正确性证据（全空也一致）⇒ 前置条件被空满足。\
+             请检查 --queries / --filter / --modes 是否与快照匹配。",
+            mode_name(mode),
+            rows.iter().map(|r| r.n_total).sum::<usize>()
+        );
+    }
+    let sigs: HashSet<u64> = rows
+        .iter()
+        .flat_map(|r| r.worker_signatures.iter().copied())
+        .collect();
+    if sigs.len() != 1 {
+        let detail: Vec<String> = rows
+            .iter()
+            .map(|r| format!("{} 线程 → {:?}", r.threads, r.worker_signatures))
+            .collect();
+        bail!(
+            "并发正确性前置条件不成立（S6-T11）：mode={} 的 hits 签名不一致 \
+             —— 读路径本应纯不可变，出现差异即真 bug（吞吐数字不予采信）。各档签名：{}",
+            mode_name(mode),
+            detail.join(" ｜ ")
+        );
+    }
+    Ok(())
+}
+
+/// 档位给不出 NFR-10 判定时的说明文案（评审 P3-6；**复审 P3-11 修正**）。
+///
+/// 三种情形**必须分开说** —— 旧实现把三条路径都写成「档位不含 t=1 ⇒ 缺单线程锚点」，
+/// 而 `--threads 1,2` 明明有 t=1 的**数据行**在表里、缺的是**分子** `QPS(4)`；
+/// 把同一句「缺锚点」用在缺口完全不同的场景上属**诊断失实**。
+fn no_verdict_notice(levels: &[usize]) -> &'static str {
+    match (levels.contains(&1), levels.contains(&4)) {
+        (true, false) => {
+            "\n  ⚠️ 档位不含 t=4 ⇒ **无 NFR-10 判定**（缺分子 `QPS(4)`）；\
+             单线程锚点 t=1 在场，签名一致仍可作 S6-T11 的证据。"
+        }
+        (false, true) => {
+            "\n  ⚠️ 档位不含 t=1 ⇒ **缺单线程锚点**：以上签名一致只能证明各并发档之间一致，\
+             **不能**替代「与 1 线程逐位一致」（S6-T11）；同时无 NFR-10 判定（缺分母 `QPS(1)`）。"
+        }
+        (false, false) => {
+            "\n  ⚠️ 档位既不含 t=1 也不含 t=4 ⇒ **无 NFR-10 判定**（分子与分母都不存在），\
+             且**缺单线程锚点**：签名一致只能证明各并发档之间一致，\
+             **不能**替代「与 1 线程逐位一致」（S6-T11）。"
+        }
+        // 同时含 1 与 4 时调用点走的是 `if let` 分支、不会到这里；这里留空串而非 `unreachable!`，
+        // 避免把一个「不该发生」变成一个能把整段评测打断的路径。
+        (true, true) => "",
+    }
+}
+
+/// 跑「并发吞吐」阶段，返回可并入 `--json` 的对象。
+///
+/// 顺序：每档**先跑一趟预热扫描并丢弃**，再按 `levels` 顺序测第二趟
+/// —— 这同时满足评审要求的「预热丢弃首轮」与「顺序交错」两条口径（§4.6.2 / D-S6-08）。
+///
+/// ⚠️ 各 mode 的表**先攒进 `report` 再统一吐**（评审 P3-9）：任一模态的前置条件不成立
+/// 就直接 `Err`，此时 stdout 上**不留**前序 mode「看起来正常」的 QPS 表。
+fn run_concurrent_stage(
+    setup: &Setup,
+    asm: SearchAssembly<'_>,
+    modes: &[SearchMode],
+    judgments: &[Judgment],
+    args: &BenchArgs,
+    levels: &[usize],
+    filter: Option<&Filter>,
+) -> Result<serde_json::Value> {
+    use std::fmt::Write as _;
+
+    println!("\n== 并发吞吐（V2 Step 6 · T7-17 / NFR-10 方案 A）==");
+    println!(
+        "  档位 {levels:?}（加速比相对**首档 {}**）；每档 N 个 worker 共享同一 searcher，\
+         各自跑**同一批 query 的同一顺序**（{} 条 × {} reps）。",
+        levels[0],
+        judgments.len(),
+        args.reps
+    );
+    println!(
+        "  口径：先跑一趟预热扫描并丢弃，再测第二趟；QPS 用**进程内**墙钟，每个 worker 在自己的\
+         **预热完成同步点**之后起算、到 join 为止 ⇒ **不含**进程启动、快照加载与预热。"
+    );
+    println!("  ⚠️ 并发下 per-query 延迟**含排队**，不得与 NFR-02（单线程口径）横比。");
+
+    // 各 mode 的表先攒后吐（理由见函数 doc）
+    let mut report = String::new();
+    let mut out = serde_json::Map::new();
+    for &mode in modes {
+        let searcher = make_searcher(setup, asm.bm25_params, asm.rrf_k, asm.rrf_weights, mode)?;
+        let spec = BatchSpec {
+            mode,
+            k: args.k,
+            warmup: args.warmup,
+            reps: args.reps,
+            filter,
+        };
+        // 预热扫描（丢弃）
+        for &t in levels {
+            let _ = concurrent_batch(&searcher, judgments, spec, t)?;
+        }
+        let mut rows = Vec::with_capacity(levels.len());
+        for &t in levels {
+            rows.push(concurrent_batch(&searcher, judgments, spec, t)?);
+        }
+
+        // ⚠️ 正确性是**前置条件**（先正确、后吞吐；评审对 D-S6-08 的补充 ①），判据见
+        //    `check_concurrency_precondition` —— 「无失败 / 有命中 / 签名一致」三条缺一
+        //    不可，否则会被「什么都没测到」**空满足**（评审 P1-1）。
+        check_concurrency_precondition(mode, &rows)?;
+
+        let _ = writeln!(report, "\n  mode={}", mode_name(mode));
+        let _ = writeln!(
+            report,
+            "  {:<8} {:>12} {:>10} {:>22} {:>13} {:>13}",
+            "threads", "QPS", "加速比", "每线程P50(ms)范围", "全局P50(ms)", "全局P99(ms)"
+        );
+        let base_qps = rows[0].qps();
+        let mut mode_json = serde_json::Map::new();
+        for r in &rows {
+            let q = r.qps();
+            let speedup = if base_qps > 0.0 {
+                q / base_qps
+            } else {
+                f64::NAN
+            };
+            let lo = r
+                .per_thread
+                .iter()
+                .map(|x| x.0)
+                .fold(f64::INFINITY, f64::min);
+            let hi = r
+                .per_thread
+                .iter()
+                .map(|x| x.0)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let _ = writeln!(
+                report,
+                "  {:<8} {:>12.1} {:>9.2}× {:>22} {:>13.3} {:>13.3}",
+                r.threads,
+                q,
+                speedup,
+                format!("[{lo:.3}, {hi:.3}]"),
+                r.global.0,
+                r.global.1
+            );
+            let per_thread: Vec<String> = r
+                .per_thread
+                .iter()
+                .enumerate()
+                .map(|(i, (p50, p99))| format!("w{i}: P50={p50:.3} P99={p99:.3}"))
+                .collect();
+            let _ = writeln!(report, "      {}", per_thread.join(" ｜ "));
+            mode_json.insert(
+                r.threads.to_string(),
+                serde_json::json!({
+                    "threads": r.threads,
+                    "qps": q,
+                    "speedup_vs_first_level": speedup,
+                    "wall_secs": r.wall_secs,
+                    "n_total": r.n_total,
+                    "per_thread_p50_ms": r.per_thread.iter().map(|x| x.0).collect::<Vec<_>>(),
+                    "per_thread_p99_ms": r.per_thread.iter().map(|x| x.1).collect::<Vec<_>>(),
+                    "global_p50_ms": r.global.0,
+                    "global_p99_ms": r.global.1,
+                    "hits_signature": r.worker_signatures.first().copied().unwrap_or(0),
+                }),
+            );
+        }
+
+        // NFR-10（方案 A）判定：只在**同时测到 1 与 4** 时给（否则分母不存在）
+        let q1 = rows.iter().find(|r| r.threads == 1).map(|r| r.qps());
+        let q4 = rows.iter().find(|r| r.threads == 4).map(|r| r.qps());
+        if let (Some(q1), Some(q4)) = (q1, q4) {
+            let ratio = q4 / q1;
+            let pass = ratio >= NFR10_MIN_SPEEDUP;
+            let _ = writeln!(
+                report,
+                "\n  NFR-10（方案 A / D-S6-08）：QPS(4)/QPS(1) = {ratio:.2}，阈值 {NFR10_MIN_SPEEDUP:.1} ⇒ {}",
+                if pass { "✅ PASS" } else { "❌ FAIL" }
+            );
+            mode_json.insert(
+                "nfr10".into(),
+                serde_json::json!({
+                    "qps_threads_1": q1,
+                    "qps_threads_4": q4,
+                    "ratio": ratio,
+                    "threshold": NFR10_MIN_SPEEDUP,
+                    "verdict": if pass { "pass" } else { "fail" },
+                }),
+            );
+        } else {
+            // 给不出判定（缺 t=1 或 t=4）。三种情形**分开说**（复审 P3-11：旧版把
+            // `--threads 1,2` 也说成「缺单线程锚点」，而该场景 t=1 的数据行就在表里）。
+            // 不断言失败（`--threads 2,4` 的探索性用法仍可用），但必须把缺口说准。
+            debug_assert!(
+                !(levels.contains(&1) && levels.contains(&4)),
+                "if-let 的 else 分支不可能同时含 1 与 4"
+            );
+            let _ = writeln!(report, "{}", no_verdict_notice(levels));
+        }
+        mode_json.insert("baseline_threads".into(), serde_json::json!(levels[0]));
+        out.insert(mode_name(mode).to_string(), mode_json.into());
+    }
+    // 所有 mode 的前置条件都过了 ⇒ 一次性吐出（见函数 doc 的「先攒后吐」）
+    print!("{report}");
+    Ok(out.into())
+}
+
+// ---------------------------------------------------------------------------
 // 阶段 D：过滤求值耗时对照（T13）
 // ---------------------------------------------------------------------------
 
@@ -1489,6 +2013,266 @@ fn mode_to_json(r: &ModeResult) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use helix_core::document::DocRecord;
+
+    /// S6-T12 + 边界：`--threads` 的档位解析。
+    ///
+    /// 🔑 最关键的是第一条 `"1" -> None`：**只有一档且为 1 时不跑阶段 B2** ——
+    /// 这正是「`bench --threads 1` 的输出与不传该参数**逐字一致**」的结构性保证
+    /// （端到端逐字比对另见 CI 的 `bench --threads 1 与默认一致` 一步）。
+    #[test]
+    fn 并发档位解析() {
+        assert_eq!(
+            parse_thread_levels("1").unwrap(),
+            None,
+            "单档 1 ⇒ 不跑并发阶段"
+        );
+        assert_eq!(parse_thread_levels("4").unwrap(), Some(vec![4]));
+        assert_eq!(
+            parse_thread_levels("1,2,4,8").unwrap(),
+            Some(vec![1, 2, 4, 8])
+        );
+        // 去重**保序**（顺序即「交错扫描」的顺序，不可重排）
+        assert_eq!(parse_thread_levels("4,2,4").unwrap(), Some(vec![4, 2]));
+        // 宽容空白
+        assert_eq!(parse_thread_levels(" 2 , 2 ").unwrap(), Some(vec![2]));
+        // 非法：0 / 非数字 / 空串
+        for bad in ["0", "1,0", "a", "1,a", ""] {
+            assert!(parse_thread_levels(bad).is_err(), "`{bad}` 应被拒绝");
+        }
+        // 非法：超过档位上界（评审 P3-5）—— 误传大数会真的 spawn 这么多 OS 线程
+        for bad in ["257", "1,100000"] {
+            let e = parse_thread_levels(bad).expect_err("超过上界必须被拒绝");
+            assert!(
+                e.to_string().contains("超过上限"),
+                "`{bad}` 的错误信息应点明上限，实得：{e}"
+            );
+        }
+        // 边界：恰好等于上界应被接受（上界是「含」）
+        assert_eq!(
+            parse_thread_levels(&MAX_THREAD_LEVEL.to_string()).unwrap(),
+            Some(vec![MAX_THREAD_LEVEL])
+        );
+    }
+
+    /// 合成一个档位报告（供 [`并发前置条件三条判据都有牙齿`] 直接构造判据输入）。
+    fn 合成档位(
+        threads: usize,
+        n_err: usize,
+        n_hits: u64,
+        signatures: Vec<u64>,
+    ) -> ThreadLevelReport {
+        ThreadLevelReport {
+            threads,
+            n_total: threads * 6 * 3,
+            wall_secs: 1.0,
+            per_thread: vec![(1.0, 1.0); threads],
+            global: (1.0, 1.0),
+            worker_signatures: signatures,
+            n_err,
+            n_hits,
+            first_err: if n_err > 0 {
+                Some("合成错误：检索失败".into())
+            } else {
+                None
+            },
+        }
+    }
+
+    /// 🔴 评审 **P1-1**：并发前置条件的三条判据**都**必须有牙齿。
+    ///
+    /// 每条判据都各自能被「什么都没测到」**空满足**，所以本测试为每种空满足各造一个
+    /// 合成样本、逐条要求 `Err`，再用一个健康样本要求 `Ok`（否则「永远报错」也会变绿）。
+    /// 与被测实现同构的只有 [`check_concurrency_precondition`] 本身，**不含**并发调度
+    /// ⇒ 秒级、无模型、可进 CI。
+    #[test]
+    fn 并发前置条件三条判据都有牙齿() {
+        use std::collections::hash_map::DefaultHasher;
+
+        // 「全失败」时每个 worker 的签名 = `DefaultHasher` 无输入时的 `finish()`。
+        // 现算而非常量：换工具链也不会让本测试失效，且**把机制写在测试里**。
+        let empty_sig = DefaultHasher::new().finish();
+
+        // ① 健康样本：无失败 + 有命中 + 签名一致 ⇒ 必须 Ok
+        let healthy = vec![
+            合成档位(1, 0, 60, vec![7]),
+            合成档位(4, 0, 60, vec![7, 7, 7, 7]),
+        ];
+        assert!(
+            check_concurrency_precondition(SearchMode::Bm25, &healthy).is_ok(),
+            "健康样本必须通过 —— 否则下面的「都必须 Err」只是「永远 Err」"
+        );
+
+        // ② 全部检索失败：**这正是旧实现被空满足的场景**。先反证「只看签名集合大小
+        //    会判通过」，再要求新判据把它拦下。
+        let all_err = vec![
+            合成档位(1, 0, 60, vec![empty_sig]),
+            合成档位(4, 36, 0, vec![empty_sig; 4]),
+        ];
+        let sigs: HashSet<u64> = all_err
+            .iter()
+            .flat_map(|r| r.worker_signatures.iter().copied())
+            .collect();
+        assert_eq!(
+            sigs.len(),
+            1,
+            "空满足场景下「签名集合大小为 1」确实成立 —— 只靠这一条判据会被骗（P1-1 的机理）"
+        );
+        let e = check_concurrency_precondition(SearchMode::Vector, &all_err)
+            .expect_err("存在失败检索时必须拒绝");
+        assert!(
+            e.to_string().contains("检索失败") && e.to_string().contains("合成错误"),
+            "必须报出「检索失败」并带首个错误原因，实得：{e}"
+        );
+
+        // ③ 全部成功但**一条命中都没有** ⇒ 「各档一致」毫无信息量，同样必须拒绝
+        let no_hits = vec![合成档位(1, 0, 0, vec![7]), 合成档位(4, 0, 0, vec![7; 4])];
+        let e = check_concurrency_precondition(SearchMode::Bm25, &no_hits)
+            .expect_err("零命中时必须拒绝（前置条件被空满足）");
+        assert!(
+            e.to_string().contains("未取到任何命中"),
+            "必须报出「未取到任何命中」，实得：{e}"
+        );
+
+        // ④ 签名跨档不一致 ⇒ 真 bug，必须拒绝
+        let mismatch = vec![
+            合成档位(1, 0, 60, vec![7]),
+            合成档位(4, 0, 60, vec![7, 7, 8, 7]),
+        ];
+        let e = check_concurrency_precondition(SearchMode::Hybrid, &mismatch)
+            .expect_err("签名不一致时必须拒绝");
+        assert!(
+            e.to_string().contains("签名不一致"),
+            "必须报出「签名不一致」，实得：{e}"
+        );
+    }
+
+    /// S6-T11：**同一批 query 在 1 / 4 线程下的 `hits` 必须逐位一致**。
+    ///
+    /// 三个断言缺一不可，否则「两档都调用了同一个错函数」也能让它变绿：
+    /// 1. 同一档内 N 个 worker 的签名互相一致；
+    /// 2. 4 线程的签名 == 1 线程的签名（跨档，S6-T11 的原文判据）；
+    /// 3. 两者都 == **手写朴素单线程循环**的签名 —— 这一条是本测试的**独立性来源**
+    ///    （变异验证正是打它：把签名的算法改错，只有第 3 条会红）。
+    ///
+    /// 复审 P3-11：**档位缺口的说明必须分三种情形**，不能共用一句话。
+    ///
+    /// 旧实现把 `--threads 1,2`（t=1 在场、缺的是分子 `QPS(4)`）也说成
+    /// 「档位不含 t=1 ⇒ 缺单线程锚点」，与表里真实存在的 t=1 数据行矛盾 ⇒ 诊断失实。
+    /// 变异点：把 `(true, false)` 分支改成与 `(false, true)` 相同文案 ⇒ 第 ① 组断言报红。
+    #[test]
+    fn 无判定档位的说明分三种情形() {
+        // ① 有 t=1、无 t=4 ⇒ 只说「缺分子」，**不得**出现「缺单线程锚点」
+        let a = no_verdict_notice(&[1, 2]);
+        assert!(a.contains("不含 t=4") && a.contains("缺分子"), "{a}");
+        assert!(
+            !a.contains("缺单线程锚点"),
+            "t=1 数据行在场时不应报「缺锚点」，否则与表内容矛盾：{a}"
+        );
+        // ② 有 t=4、无 t=1 ⇒ 必须同时点明「缺锚点」与「缺分母」
+        let b = no_verdict_notice(&[2, 4]);
+        assert!(
+            b.contains("不含 t=1") && b.contains("缺单线程锚点") && b.contains("缺分母"),
+            "{b}"
+        );
+        // ③ 两者皆无 ⇒ 锚点缺失与判定缺失都要说
+        let c = no_verdict_notice(&[2]);
+        assert!(
+            c.contains("既不含 t=1 也不含 t=4") && c.contains("缺单线程锚点"),
+            "{c}"
+        );
+        // ④ 1 与 4 都在 ⇒ 调用点走 if 分支、不会到这里；返回空串而非 panic（不制造打断点）
+        assert!(no_verdict_notice(&[1, 2, 4]).is_empty());
+    }
+
+    /// 走 BM25（**不需要模型**）⇒ 秒级、可进 CI（设计 §7 对 S6-T11 的「✅（小语料）」）。
+    #[test]
+    fn 并发检索结果逐位一致() {
+        let analyzer = MixedAnalyzer::new();
+        let chunker = Chunker::default();
+        let mut index = Index::new();
+        for i in 0..40 {
+            let doc = DocRecord {
+                doc_id: 0,
+                source: format!("doc-{i}.md"),
+                metadata: serde_json::json!({}),
+                content_hash: 0,
+            };
+            // 文本单调递增 ⇒ 各 query 的命中集不同，签名才有区分度
+            let text = format!("检索 文档编号 {i} 并发 词条{i}");
+            index.add(doc, chunker.chunk(0, &text), &analyzer).unwrap();
+        }
+        let searcher = QueryExecutor::new(&index, &analyzer);
+        let judgments: Vec<Judgment> = (0..6)
+            .map(|i| Judgment {
+                qid: format!("q{i}"),
+                query: format!("词条{i}"),
+                qtype: "exact".into(),
+                relevance: Vec::new(),
+            })
+            .collect();
+
+        let sigs = |threads: usize| {
+            concurrent_batch(
+                &searcher,
+                &judgments,
+                BatchSpec {
+                    mode: SearchMode::Bm25,
+                    k: 10,
+                    warmup: 1,
+                    reps: 3,
+                    filter: None,
+                },
+                threads,
+            )
+            .unwrap()
+            .worker_signatures
+        };
+        let s1 = sigs(1);
+        let s4 = sigs(4);
+        assert_eq!(s1.len(), 1, "1 档应有 1 个 worker");
+        assert_eq!(s4.len(), 4, "4 档应有 4 个 worker");
+        assert!(
+            s4.iter().all(|x| *x == s4[0]),
+            "同一档内 4 个 worker 的结果必须一致：{s4:?}"
+        );
+        assert_eq!(
+            s1[0], s4[0],
+            "4 线程的 hits 必须与 1 线程逐位一致（S6-T11）"
+        );
+
+        // 3) 手写朴素单线程循环（非并发路径、非被测函数）算同一签名
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for j in &judgments {
+            for _ in 0..3 {
+                let r = run_once(&searcher, &j.query, SearchMode::Bm25, 10, None).unwrap();
+                r.hits.len().hash(&mut hasher);
+                for h in &r.hits {
+                    h.chunk_id.hash(&mut hasher);
+                    h.score.to_bits().hash(&mut hasher);
+                }
+            }
+        }
+        assert_eq!(
+            hasher.finish(),
+            s1[0],
+            "并发签名的算法必须与「朴素单线程循环」一致（否则 1、2 两条断言可能是同错互证）"
+        );
+    }
+
+    /// T7-17 的前提：`QueryExecutor` 必须 `Sync`，N 个 worker 才能用 `&` 共享它
+    /// （**无需改内核**、也无须 `Arc`）。
+    ///
+    /// 门面层的 owned `Searcher` 已在 `search/searcher.rs` 断言
+    /// `Clone + Send + Sync + 'static`；但 bench 实际共享的是这个**借用的逃生舱类型**
+    /// （`QueryExecutor<'a>`，为了注入 `--k1/--b/--rrf-k/--ef-search/--brute-fallback`），
+    /// 它此前**没有任何断言** ⇒ 一旦某个字段引入非 `Sync` 的 `Box<dyn ...>`，
+    /// 并发阶段会在编译期以外的地方静默退化。这里把它钉住。
+    #[test]
+    fn queryexecutor可跨线程共享() {
+        fn assert_sync<T: Sync>() {}
+        assert_sync::<QueryExecutor<'static>>();
+    }
 
     /// issue #9：`k × oracle_depth > ORACLE_MAX_DEPTH` 时 `clamp(min, max)`
     /// 的 min > max 无条件 panic。修复后下界先被上限夹住，任何参数组合都不 panic。
