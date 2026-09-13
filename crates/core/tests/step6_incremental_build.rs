@@ -1,5 +1,8 @@
-//! V2 Step 6 / PR 5 的**门面层集成测试**：S6-T1 / T2 / T3 / T8 / T9 / T13
+//! V2 Step 6 的**门面层集成测试**：S6-T1 / T2 / T3 / T8 / T9 / **T10** / T13 / **T14**
 //! + 一条语义边界测试（同名 `source` 不替换）。
+//!
+//! ⚠️ **T10 / T14 由 S6-10 收尾补入**（原属 PR 5 / PR 6 的承诺，实现期漏做；
+//! 详见各自用例的文档注释与 `v2-step6-design.md` §7 的末列状态、§11.6）。
 //!
 //! 这些用例模拟 `helix build --index <快照> --input <delta>` 的**追加语义**
 //! （`load` → `add_documents` → `commit` → `save`），但**不走 CLI**：CLI 只是
@@ -444,5 +447,70 @@ fn S6_T14_半向量判据的前提在两方向上都成立() {
         "P1 守卫的判据必须在此形态下成立（{} < {}）——否则守卫形同虚设",
         stb.raw_vectors,
         stb.chunks_alive
+    );
+}
+
+// ---------------------------------------------------------------------------
+// S6-T10：追加后 `save → load` 往返 —— 检索结果与追加后一致（NFR-06 不破）
+// ---------------------------------------------------------------------------
+
+/// **设计 §7 承诺过、实现期漏做，由 S6-10 收尾补齐**（评审流程外的自查发现）。
+///
+/// 测的是「**追加**与**持久化**的交互」——既不是单点函数，也不是纯 load 往返：
+/// 1. base 落盘 → `load` 追加 delta → commit → `save`；
+/// 2. 取**追加后、未经重载**的内存真值作为基准（`into_searcher()` 交出读端）；
+/// 3. 从同一快照**连续加载两次**；
+/// 4. 两次加载的序列必须**互相逐位一致**（NFR-06），且都等于 (2)（**往返不丢信息**）。
+///
+/// ⚠️ 口径（沿用文件头 §4.5.3）：断言**不比 `chunk_id`** —— 追加语义下 ID 的分配顺序
+/// 与全量重建不保证相同。但 `(source, score)` 的**序列与顺序**必须完全保持，
+/// 故它仍能抓住「重载后顺序变了 / 少了一条 / 分数漂了」这类回归。
+#[test]
+fn S6_T10_追加后往返检索结果一致() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t10.idx");
+
+    build_base(&path, 8);
+    let mut inc = bm25_builder().load(&path).unwrap();
+    inc.add_documents(corpus(8..12)).unwrap();
+    inc.commit().unwrap();
+    inc.save(&path).unwrap();
+
+    // (2) 追加后的内存真值：`into_searcher()` 交出可反复检索的读端
+    let mem = inc.into_searcher().unwrap();
+    // (3) 同一快照连续加载两次
+    let a = bm25_builder().load(&path).unwrap().into_searcher().unwrap();
+    let b = bm25_builder().load(&path).unwrap().into_searcher().unwrap();
+
+    for q in ["公共词", "词条1", "词条11"] {
+        let truth = bm25_sequence(&mem, q, 12);
+        let seq_a = bm25_sequence(&a, q, 12);
+        let seq_b = bm25_sequence(&b, q, 12);
+
+        // ③ 反向自证（**先证两侧真的跑到了**）：既有教训 —— 「两文件一致」类的断言
+        //    若序列为空会变成「空 == 空」的假通过 ⇒ 先钉非空
+        assert!(
+            !truth.is_empty(),
+            "query={q:?} 应有命中，否则下面的『一致』没有意义"
+        );
+
+        // ① NFR-06：同一快照两次加载**逐位一致**（含 score）
+        assert_eq!(
+            seq_a, seq_b,
+            "query={q:?}：同快照两次加载必须逐位一致（NFR-06）"
+        );
+
+        // ② 往返不丢信息：落盘-重载后的序列 == 追加后的内存真值（**含顺序**）
+        assert_eq!(
+            seq_a, truth,
+            "query={q:?}：追加后 save→load 往返必须保持 (source, score) 序列与顺序"
+        );
+    }
+
+    // 覆盖度自证：全命中查询应真的把 12 篇都取回来（8 base + 4 追加）
+    assert_eq!(
+        bm25_sequence(&mem, "公共词", 12).len(),
+        12,
+        "12 篇（8 base + 4 追加）应全部命中"
     );
 }
