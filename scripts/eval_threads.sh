@@ -58,8 +58,15 @@ if [[ -z "${SNAPSHOT}" ]]; then
     if [[ ! -f "${SNAPSHOT}" ]]; then
         echo "==> 构建 ${SIZE} 篇快照（含向量；首次含模型加载，分钟级）"
         # 与 eval_perf.sh / eval_incremental.sh 同口径：--single-chunk ⇒ 1 篇 == 1 chunk
-        "${BIN}" build --input "${CORPUS}" --output "${SNAPSHOT}" \
-            --single-chunk --vectors > "${WORK}/build.log" 2>&1
+        # ⚠️ 不要让它被 `set -e` 静默带走：失败必须把日志尾部打出来
+        # （与下面的 bench 段同一原则 —— 评审 P3-7：脚本自述「失败要给可诊断输出」，
+        #  但 build 段此前没做到）
+        if ! "${BIN}" build --input "${CORPUS}" --output "${SNAPSHOT}" \
+                --single-chunk --vectors > "${WORK}/build.log" 2>&1; then
+            echo "    ❌ build 失败（exit≠0），日志尾部：" >&2
+            tail -20 "${WORK}/build.log" | sed 's/^/      /' >&2
+            exit 1
+        fi
         tail -3 "${WORK}/build.log" | sed 's/^/    /'
     else
         echo "==> 复用已有快照 ${SNAPSHOT}"
@@ -132,9 +139,27 @@ for mode, lv in d.items():
         )
     print()
 
-all_pass = bool(verdicts) and all(v["verdict"] == "pass" for v in verdicts.values())
+# ⚠️ 区分「**未判定**」与「判定 FAIL」（评审 P3-1）：
+#     `nfr10` 键只在档位**同时含 1 与 4** 时才有 ⇒ 缩减档位（冒烟，如 LEVELS=1,2）
+#     算不出 QPS(4)/QPS(1)。旧实现把这种情况当成「未全部达标」并 exit 1，会把
+#     一次冒烟误报成判据失败，还会把 `all_pass:false` 写进机器可读结果。
+if not verdicts:
+    verdict = "undetermined"
+elif all(v["verdict"] == "pass" for v in verdicts.values()):
+    verdict = "pass"
+else:
+    verdict = "fail"
+
 print("  " + "=" * 62)
-print(f"  总判定: {'✅ PASS（全部模式达标）' if all_pass else '❌ 未全部达标'}")
+if verdict == "undetermined":
+    print(
+        "  总判定: ⚠️ **未判定** —— 档位未同时包含 1 与 4，算不出 QPS(4)/QPS(1)"
+        "（这**不是** FAIL；要判定请用 LEVELS=1,2,4,8）"
+    )
+elif verdict == "pass":
+    print("  总判定: ✅ PASS（全部模式达标）")
+else:
+    print("  总判定: ❌ 未全部达标")
 if len(levels) > 1:
     print("  ⚠️ 加速比是**相对首档**（本脚本首档为 %d）——不是跨机可引用指标（D-S6-08 反对方案 B）。" % levels[0])
 print("  ⚠️ 并发下 per-query 延迟含排队，**不得**与 NFR-02（单线程口径）横比。")
@@ -145,7 +170,11 @@ print("=========================================================================
         {
             "run_scope": {"cores": cores, "power": power, "in_ci": in_ci, "reps": reps, "levels": levels},
             "modes": d,
-            "all_pass": all_pass,
+            # `all_pass` 只在真判定时才是布尔：未判定用 `null`，别让它冒充 false
+            "verdict": verdict,
+            "all_pass": True if verdict == "pass" else (False if verdict == "fail" else None),
+            "n_judged_modes": len(verdicts),
+            "n_modes": len(d),
         },
         indent=2,
         ensure_ascii=False,
@@ -153,5 +182,6 @@ print("=========================================================================
     encoding="utf-8",
 )
 print(f"机器可读结果：{work / 'result.json'}")
-sys.exit(0 if all_pass else 1)
+# 只有**真判定且未全过**才退 1；「未判定」退 0（它是缺输入，不是判据失败）
+sys.exit(1 if verdict == "fail" else 0)
 PY
