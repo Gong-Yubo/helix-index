@@ -258,12 +258,14 @@ jobs:
           [ "$(wc -l < /tmp/b-d.txt)" -ge 5 ]
           [ "$(wc -l < /tmp/b-1.txt)" -ge 5 ]
           diff /tmp/b-d.txt /tmp/b-1.txt
-          if grep -q "并发吞吐" /tmp/b-t1.out; then
+          # --- ② `--threads 1` 不产生 B2：**必须不加 `--no-latency`** ------------
+          #     ⚠️ 阶段 B2 与延迟同受 `--no-latency` 管辖 ⇒ 加了它这条断言必然通过（空转）。
+          #     2026-09-13 **自查发现**并修正：此处原先带着 `--no-latency`，是假判据。
+          $B bench --index $S --queries $Q --modes bm25 --threads 1 \
+            --json /tmp/b-t1.json > /tmp/b-t1-nl.out 2>&1
+          if grep -q "并发吞吐" /tmp/b-t1-nl.out; then
             echo "错误：--threads 1 不应出现并发阶段" >&2; exit 1
           fi
-          # --- ② 更强的判据：--threads 1 的 JSON 里根本没有 `threads` 段 ---------
-          $B bench --index $S --queries $Q --modes bm25 --no-latency --threads 1 \
-            --json /tmp/b-t1.json > /dev/null 2>&1
           python3 -c "import json,sys; d=json.load(open('/tmp/b-t1.json')); sys.exit(0 if 'threads' not in d else 1)"
           # --- ③ 反向自证：含 >1 档时必须产出**数据行**（不只是阶段标题）---------
           #     档位取 1,2,4 而非 1,2：只有同时测到 1 与 4 才会打印 NFR-10 判定行。

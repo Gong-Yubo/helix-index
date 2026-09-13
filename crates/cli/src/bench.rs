@@ -123,7 +123,10 @@ pub struct BenchArgs {
     /// 机器可读 JSON 输出路径（per-query 明细 + 网格表；T5-03 验收必需）
     #[arg(long)]
     pub json: Option<PathBuf>,
-    /// 跳过延迟测量（只跑效果；网格搜索时用）
+    /// 跳过**所有性能测量阶段**（延迟与并发吞吐），只跑效果（可与 `--grid` 同用）
+    // 实现提示（2026-09-13 自查）：阶段 B2【并发吞吐】与延迟阶段同在 `if !args.no_latency`
+    // 块内 ⇒ 任何「`--threads 1` 不该产出 B2」的断言**不能**配 `--no-latency` 跑
+    // （那样必然通过 = 空转）。CI 里那两条断言已按此修正。
     #[arg(long)]
     pub no_latency: bool,
     /// 过滤档位（`field=value` / `field>=v` / `field<v`，逗号分隔；可重复传）。
@@ -1566,6 +1569,32 @@ fn check_concurrency_precondition(mode: SearchMode, rows: &[ThreadLevelReport]) 
     Ok(())
 }
 
+/// 档位给不出 NFR-10 判定时的说明文案（评审 P3-6；**复审 P3-11 修正**）。
+///
+/// 三种情形**必须分开说** —— 旧实现把三条路径都写成「档位不含 t=1 ⇒ 缺单线程锚点」，
+/// 而 `--threads 1,2` 明明有 t=1 的**数据行**在表里、缺的是**分子** `QPS(4)`；
+/// 把同一句「缺锚点」用在缺口完全不同的场景上属**诊断失实**。
+fn no_verdict_notice(levels: &[usize]) -> &'static str {
+    match (levels.contains(&1), levels.contains(&4)) {
+        (true, false) => {
+            "\n  ⚠️ 档位不含 t=4 ⇒ **无 NFR-10 判定**（缺分子 `QPS(4)`）；\
+             单线程锚点 t=1 在场，签名一致仍可作 S6-T11 的证据。"
+        }
+        (false, true) => {
+            "\n  ⚠️ 档位不含 t=1 ⇒ **缺单线程锚点**：以上签名一致只能证明各并发档之间一致，\
+             **不能**替代「与 1 线程逐位一致」（S6-T11）；同时无 NFR-10 判定（缺分母 `QPS(1)`）。"
+        }
+        (false, false) => {
+            "\n  ⚠️ 档位既不含 t=1 也不含 t=4 ⇒ **无 NFR-10 判定**（分子与分母都不存在），\
+             且**缺单线程锚点**：签名一致只能证明各并发档之间一致，\
+             **不能**替代「与 1 线程逐位一致」（S6-T11）。"
+        }
+        // 同时含 1 与 4 时调用点走的是 `if let` 分支、不会到这里；这里留空串而非 `unreachable!`，
+        // 避免把一个「不该发生」变成一个能把整段评测打断的路径。
+        (true, true) => "",
+    }
+}
+
 /// 跑「并发吞吐」阶段，返回可并入 `--json` 的对象。
 ///
 /// 顺序：每档**先跑一趟预热扫描并丢弃**，再按 `levels` 顺序测第二趟
@@ -1705,14 +1734,14 @@ fn run_concurrent_stage(
                 }),
             );
         } else {
-            // 缺 t=1 ⇒ 没有**单线程锚点**：此时的「签名一致」只证明各并发档互相同意，
-            // 不能替代 S6-T11 原文的「与 1 线程逐位一致」（评审 P3-6）。不断言失败
-            // （`--threads 2,4` 的探索性用法仍可用），但必须把这点说清楚。
-            let _ = writeln!(
-                report,
-                "\n  ⚠️ 档位不含 t=1 ⇒ **缺单线程锚点**：以上签名一致只能证明各并发档之间一致，\
-                 **不能**替代「与 1 线程逐位一致」（S6-T11）；本档位也无 NFR-10 判定（分母不存在）。"
+            // 给不出判定（缺 t=1 或 t=4）。三种情形**分开说**（复审 P3-11：旧版把
+            // `--threads 1,2` 也说成「缺单线程锚点」，而该场景 t=1 的数据行就在表里）。
+            // 不断言失败（`--threads 2,4` 的探索性用法仍可用），但必须把缺口说准。
+            debug_assert!(
+                !(levels.contains(&1) && levels.contains(&4)),
+                "if-let 的 else 分支不可能同时含 1 与 4"
             );
+            let _ = writeln!(report, "{}", no_verdict_notice(levels));
         }
         mode_json.insert("baseline_threads".into(), serde_json::json!(levels[0]));
         out.insert(mode_name(mode).to_string(), mode_json.into());
@@ -2126,6 +2155,36 @@ mod tests {
     /// 3. 两者都 == **手写朴素单线程循环**的签名 —— 这一条是本测试的**独立性来源**
     ///    （变异验证正是打它：把签名的算法改错，只有第 3 条会红）。
     ///
+    /// 复审 P3-11：**档位缺口的说明必须分三种情形**，不能共用一句话。
+    ///
+    /// 旧实现把 `--threads 1,2`（t=1 在场、缺的是分子 `QPS(4)`）也说成
+    /// 「档位不含 t=1 ⇒ 缺单线程锚点」，与表里真实存在的 t=1 数据行矛盾 ⇒ 诊断失实。
+    /// 变异点：把 `(true, false)` 分支改成与 `(false, true)` 相同文案 ⇒ 第 ① 组断言报红。
+    #[test]
+    fn 无判定档位的说明分三种情形() {
+        // ① 有 t=1、无 t=4 ⇒ 只说「缺分子」，**不得**出现「缺单线程锚点」
+        let a = no_verdict_notice(&[1, 2]);
+        assert!(a.contains("不含 t=4") && a.contains("缺分子"), "{a}");
+        assert!(
+            !a.contains("缺单线程锚点"),
+            "t=1 数据行在场时不应报「缺锚点」，否则与表内容矛盾：{a}"
+        );
+        // ② 有 t=4、无 t=1 ⇒ 必须同时点明「缺锚点」与「缺分母」
+        let b = no_verdict_notice(&[2, 4]);
+        assert!(
+            b.contains("不含 t=1") && b.contains("缺单线程锚点") && b.contains("缺分母"),
+            "{b}"
+        );
+        // ③ 两者皆无 ⇒ 锚点缺失与判定缺失都要说
+        let c = no_verdict_notice(&[2]);
+        assert!(
+            c.contains("既不含 t=1 也不含 t=4") && c.contains("缺单线程锚点"),
+            "{c}"
+        );
+        // ④ 1 与 4 都在 ⇒ 调用点走 if 分支、不会到这里；返回空串而非 panic（不制造打断点）
+        assert!(no_verdict_notice(&[1, 2, 4]).is_empty());
+    }
+
     /// 走 BM25（**不需要模型**）⇒ 秒级、可进 CI（设计 §7 对 S6-T11 的「✅（小语料）」）。
     #[test]
     fn 并发检索结果逐位一致() {
