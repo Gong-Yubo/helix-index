@@ -2,9 +2,9 @@
 
 | 项 | 内容 |
 | --- | --- |
-| 版本 | **v0.1（2026-09-14，首版，待评审）** |
+| 版本 | **v0.2（2026-09-14，评审收口版）** |
 | 日期 | 2026-09-14 |
-| 状态 | **设计已出，待评审**——回答 **H3（精排窗口）** 并给出 **NFR-12** 的口径形态（数值标「拟」、待 S7-05 标定回填，同 **NFR-13 先例**：v1.10 落「拟 ≤20ms」→ v1.12 定稿）。**D-S7-04（精排默认开/关）/ D-S7-05（`Hit.score` 语义）/ D-S7-01（默认 R）/ D-S7-08（`max_length`）四处需评审拍板**，其余按建议处理 |
+| 状态 | **评审已收口（v0.2，2026-09-14）**——回答 **H3（精排窗口）** 并给出 **NFR-12** 的口径形态（数值标「拟」、待 **S7-04 标定（决策门 §4.6.4）、S7-05 回填**，同 **NFR-13 先例**：v1.10 落「拟」→ v1.12 定稿）。**四处拍板 D-S7-04 / D-S7-05 / D-S7-01 / D-S7-08 —— 评审全部同意本文建议**（2026-09-14 第 1 轮：1 条 `COMMENTED` + 6 条行内）。**F1~F6 六条意见全部采纳**：**F1**（P1）`plan-v2` §8 残留块与 **D-S7-02** 矛盾（含我自己同类漏改）／**F2**（P2）S7-04/S7-05 归属 **8 处**不一致／**F3**（P2）NFR-12 标定语料误写「10 万级」／**F4**（P2）「≤500ms（拟）」无出处且与 §4.2.2 粗估相抵／**F5**（P3）附录 C `impl.rs` 行号整段漂移（**语义属实**，只改行号）／**F6**（P3）两处笔误（§8 标题 + **§3.6「重复声明会报错」不成立**，作者已独立实测复现）。⚠️ **本轮不改任何决策、预算与风险条目**（R44~R48 一字未动）；评审另**代答**了附录 C 的「fastembed 是否重导出」未核实项，作者已复核属实 |
 | 上游 | `plan-v2.md` §4 Step 7 / §4.0 **H3**；issue **#23**（V2-Step7；开工前置 ① ② **已完成**，结论见 `#issuecomment-5654947790` 与 `#issuecomment-5658037231`）；`requirements-spec.md` **v1.16**（**NFR-12** 落「拟」口径 / **NFR-05** 补口径限定词）/ `architecture-design.md` **v1.15**（§5.7 / §5.8 / **§14.5 R44~R48**）/ `eval-report.md` §3.1（P5 基线）、§8.12~§8.13（并发与对照） |
 | 范围 | **T7-01** Reranker 接入（fastembed `TextRerank` + `RerankerModel::BGERerankerV2M3`，D-J2）+ **精排候选窗口放开到可配 `R`** |
 | 非范围 | 自适应融合 / paraphrase 桶稀释（**Step 9**，T7-14）；跨编码器以外的小模型选型（如 `bge-reranker-base` / jina 系）；**多 session 精排池化**（**明确不做**，理由见 §4.4.2）；精排器的**训练 / 微调**；`bm25` 打分改造；V2.1 的 prefilter；**评测集换代**（仍是 T2Ranking 12K / 320 query，`#23` 的 Agent query 集在 Step 9） |
@@ -12,16 +12,20 @@
 
 ---
 
-## ⚠️ PR 正文必须前置的「需评审拍板」清单
+## ⚠️ 「需评审拍板」清单 —— ✅ **已获评审同意（2026-09-14 第 1 轮）**
+
+> 下方四行是**原始清单**（保留当时的「建议 / 不同意会怎样」，便于追溯）。**评审结论：四处全部同意本文建议。**
 
 | # | 需拍板的事 | 本文建议 | 不同意会怎样 |
 | --- | --- | --- | --- |
 | **D-S7-04** | **精排默认「关」还是「开」** | ✅ **默认关**（零配置仍是 `NoOpReranker`；精排需显式装配 / CLI 传 `--rerank-window`） | 若改「默认开」⇒ 所有既有调用方的**端到端 P99 从 ~3ms 涨到百毫秒级**，NFR-02（20ms）名义失效；且首次运行要下 **2.19GB** 模型 |
 | **D-S7-05** | **`Hit.score` 在精排生效时代表什么** | ✅ **`σ(logit)`**（保持「按 score 降序」契约），融合分保留在 `explain.fused_score`，并**新增 `Explain.rerank_score`（原始 logit）** | 若维持「score 恒为融合分」⇒ `hits` **不再按 score 降序**，与 `SearchResponse.hits` 的既有文档承诺直接矛盾 |
-| **D-S7-01** | **默认窗口 `R`** | ✅ 形态定、**默认值 20（拟）**，由 S7-05 标定回填 | 若不允许「拟」值 ⇒ NFR-12 与 `--rerank-window` 的默认档都悬空，本 Step 无法合并 |
+| **D-S7-01** | **默认窗口 `R`** | ✅ 形态定、**默认值 20（拟）**，由 **S7-04** 标定、S7-05 回填 | 若不允许「拟」值 ⇒ NFR-12 与 `--rerank-window` 的默认档都悬空，本 Step 无法合并 |
 | **D-S7-08** | **`max_length`（512 token 截断）** | ✅ **保持库默认 512**，标定实验加 `1024` 对照档，是否调大**由数据定** | 若现在就调大 ⇒ 每对前向成本近似平方增长，且**无数据支撑**（R48） |
 
 其余 6 条决策（D-S7-02 / 03 / 06 / 07 / 09 / 10）为工程取舍，本文按建议执行；评审若反对，改的是**一段代码 + 一段文档**，不动需求面。
+
+> ✅ **2026-09-14 评审结论（第 1 轮）**：四处拍板**全部同意本文建议**；D-S7-02 / 03 / 06 / 07 / 09 / 10 六条工程取舍**无异议**。
 
 ---
 
@@ -29,7 +33,7 @@
 
 | # | 决策点 | 建议 | 定值来源 |
 | --- | --- | --- | --- |
-| **D-S7-01** | **H3：精排窗口的形态与默认值** | ✅ 建议：**可配 `R`**（`--rerank-window`），语义 = 「希望拿到前 `max(k, R)` 条候选」；**默认 `R = 20`（拟）** | §4.2 / S7-05 标定回填 |
+| **D-S7-01** | **H3：精排窗口的形态与默认值** | ✅ 建议：**可配 `R`**（`--rerank-window`），语义 = 「希望拿到前 `max(k, R)` 条候选」；**默认 `R = 20`（拟）** | §4.2 / **S7-04** 标定、S7-05 回填 |
 | **D-S7-02** | 窗口的接口形态 | ✅ 建议：`Reranker` trait 新增 **provided** 方法 `candidate_window(&self, k: usize) -> usize`（默认 `k`）——**非破坏性**，与 D-S5-01「策略归后端」同构 | §4.2 / 附录 A |
 | **D-S7-03** | 候选池是否联动 | ✅ 建议：**必须联动** —— `candidate_k = max(3k, window, 10)`，且必须在两路召回**之前**算 | §4.3.1 |
 | **D-S7-04** | **精排默认开 / 关** | 🔴 **需拍板**：✅ 建议**默认关**（`Config.reranker` 保持 `NoOpReranker`） | §5 / PR 正文 |
@@ -48,7 +52,7 @@
 | --- | --- | --- | --- |
 | ① | **先复现基线** | ✅ **已完成** | 复现协议 = `./scripts/eval_quality.sh --runs 3`（与 P5 同协议）。**关键结论**：`bm25` 三项**逐位复现（Δ = 0）**，而 `hybrid MRR@10(1)` = **0.68815 vs 记录 0.69220（−0.586%）**；跨图 NDCG 极差 hybrid **0.0024**（P5 fixture 自带 0.0023）⇒ **锚点自身带 ~0.6% 图漂移** ⇒ **任何 <~1% 的「提升」无法与噪声区分**。⇒ 本文 **§3.1** 把「A/B 必须在同一张冻结图上做」写成**第一条设计约束** |
 | ② | **模型下载可行性** | ✅ **已完成** | fastembed 映射的仓库是 **`rozgo/bge-reranker-v2-m3`**（`fastembed-6.0.2/src/models/reranking.rs:28-33`，⚠️ **非** BAAI 官方库——官方库没有 ONNX）；合计 **≈2,187 MB**（`model.onnx.data` **2,271,088,656 B**），已**实下载并验 sha256** `84b66c78…8945`（与仓库声明的 LFS oid 一致）；本地**未缓存**。⇒ 本文 **§3.5 / R44** 据此写「不进 CI + 独立内存预算」 |
-| ③ | **H3（窗口）+ NFR-12** | ⏳ **本文回答** | **形式上的「待拍板」已收敛为 4 个具体选项**（见上方清单）；**形态**（可配 `R` + 默认小值）**D-S7-01 建议采纳**，**数值**留 S7-05 标定回填 |
+| ③ | **H3（窗口）+ NFR-12** | ⏳ **本文回答** | **形式上的「待拍板」已收敛为 4 个具体选项**（见上方清单）；**形态**（可配 `R` + 默认小值）**D-S7-01 建议采纳**，**数值**留 **S7-04** 标定、S7-05 回填 |
 
 > ⚠️ **前置 ① 的另一条读数**（对本文有用）：`--input` 路径的 **HNSW 图重建 12,000 条约 38.7~39.3 s**（逐点 `add()`，不吃 T7-21 的并行默认）。⇒ **标定实验若走 `--input`，每跑一档要多付 ~39s 且换一张图** ⇒ 本文 §4.6 **一律走 `--index`（冻结图）**。
 
@@ -155,7 +159,7 @@ pub trait Reranker: Send + Sync {
 
 ⇒ 窗口从 `k=10` 放到 `R=100`，**这一段就 ×10**。而它服务的东西（`Explain`）**只有最终 ≤k 条会被下游读到** ⇒ **`R−k` 条的 `matched_terms` 是纯浪费**。
 
-⚠️ **成本未实测**（本文不猜数）：`analyze_doc` 对 76K 字符段落跑一次的量级、以及它在 `took` 中的占比，**S7-05 必须分别计时**（这正是要把「组装」与「精排」分开的原因）。⇒ **D-S7-06：把 `matched_terms` + lane rank 的组装推迟到精排截断之后。**
+⚠️ **成本未实测**（本文不猜数）：`analyze_doc` 对 76K 字符段落跑一次的量级、以及它在 `took` 中的占比，**S7-04 必须分别计时**（这正是要把「组装」与「精排」分开的原因）。⇒ **D-S7-06：把 `matched_terms` + lane rank 的组装推迟到精排截断之后。**
 
 ### 2.5 【设计期新发现 C】fastembed 的 `rerank` 用 `PaddingStrategy::BatchLongest`
 
@@ -165,7 +169,7 @@ pub trait Reranker: Send + Sync {
 .with_padding(Some(PaddingParams { strategy: PaddingStrategy::BatchLongest, pad_token, pad_id, .. }))
 ```
 
-而 `reranking/impl.rs:134-181` 是**按 `documents.chunks(batch_size)` 分批**编码（`batch_size` 默认 **256**，`reranking/mod.rs:2`），批内**padding 到该批最长序列**，再 `Array::from_shape_vec((batch_size, encoding_length), …)`。
+而 `reranking/impl.rs:143-212` 是**按 `documents.chunks(batch_size)` 分批**编码（`batch_size` 默认 **256**，`reranking/mod.rs:2`），批内**padding 到该批最长序列**，再 `Array::from_shape_vec((batch_size, encoding_length), …)`。
 
 ⇒ **同一个 `(query, doc)` 对，在不同「批次组成」下的 padding 长度不同** ⇒ 虽然 attention mask 会遮住 pad，但**矩阵形状变了** ⇒ 浮点结果**不保证逐位相同**。
 
@@ -177,7 +181,7 @@ pub trait Reranker: Send + Sync {
 
 ### 2.6 【设计期新发现 D】`TextRerank::rerank` 返回**全量排序**，但 tie-break 是「输入顺序」
 
-`reranking/impl.rs:186-198`：
+`reranking/impl.rs:215-224`：
 
 ```rust
 top_n_result.sort_by(|a, b| a.score.total_cmp(&b.score).reverse());   // 全部文档，不是 top_n
@@ -189,7 +193,7 @@ top_n_result.sort_by(|a, b| a.score.total_cmp(&b.score).reverse());   // 全部�
 
 ### 2.7 【设计期新发现 E】512 token 截断 + T2Ranking 的长段落
 
-`RerankInitOptions = InitOptionsWithLength<RerankerModel>`，而 `impl HasMaxLength for RerankerModel { const MAX_LENGTH: usize = 512; }`（`reranking/init.rs:16-18`）。⇒ **`query + passage` 合计只保留前 512 token**。
+`RerankInitOptions = InitOptionsWithLength<RerankerModel>`，而 `impl HasMaxLength for RerankerModel { const MAX_LENGTH: usize = 512; }`（`reranking/init.rs:17-19`）。⇒ **`query + passage` 合计只保留前 512 token**。
 
 而评测语料是 **T2Ranking 段落级**（最长 **76,895 字符**）。⇒ **精排只看得到长段落的前 ~512 token** ⇒ 若「答案句」落在后面，精排会**给无关分数**。后果不是「精排没用」，而是**「精排可能在评测集上被系统性低估」** ⇒ 这直接威胁验收标准 3 的**可解释性**（一个「没提升」的结论可能是截断造成的，不是方法不行）。⇒ **R48**，并在 §4.6 的标定里加 `max_length = 1024` 的对照档。
 
@@ -229,7 +233,7 @@ top_n_result.sort_by(|a, b| a.score.total_cmp(&b.score).reverse());   // 全部�
 
 - `Config: Send + Sync`（`search/config.rs:28-34`）⇒ `Arc<dyn Reranker>` 要求 `Reranker: Send + Sync`（已是）。
 - `Searcher` 是 `'static + Clone + Send + Sync`（`search/searcher.rs:20-30, 249-252`）且**并发读**被 NFR-10 覆盖 ⇒ 精排器**必须能在 `&self` 下推理**。
-- `TextRerank::rerank` 需要 `&mut self`（`reranking/impl.rs:110`）⇒ 与 `LocalEmbedder` 同款：**`Mutex<TextRerank>`**（`embed/local.rs:34-37` 是可直接照抄的先例）。
+- `TextRerank::rerank` 需要 `&mut self`（`reranking/impl.rs:126-132`）⇒ 与 `LocalEmbedder` 同款：**`Mutex<TextRerank>`**（`embed/local.rs:34-37` 是可直接照抄的先例）。
 
 ⚠️ **这会立刻撞上 R43**：`Mutex` 会让「并发检索 + 精排」退化成串行编码。⇒ **§4.4.2 明确「本 Step 不做精排池化」**，并把窗口与默认关闭作为**上游的缓解**（R45）。
 
@@ -247,7 +251,8 @@ top_n_result.sort_by(|a, b| a.score.total_cmp(&b.score).reverse());   // 全部�
 
 ### 3.6 `local-rerank` 用独立 feature（不塞进 `local-embed`）
 
-`local-embed` 是**默认 feature**（`crates/core/Cargo.toml` `default = ["local-embed"]`）。精排模型 2.19GB ⇒ 不能让它跟着默认 feature 一起被拉进构建/下载路径。⇒ 新增 **`local-rerank = ["local-embed", "dep:fastembed"]`**（复用同一个 `fastembed` 依赖，**不新增依赖树节点**）。⚠️ `dep:fastembed` 已被 `local-embed` 启用 ⇒ 只需 `local-rerank = ["local-embed"]` 即可，**显式写 `dep:fastembed` 会报重复**（写进附录 C 的实现注意）。
+`local-embed` 是**默认 feature**（`crates/core/Cargo.toml` `default = ["local-embed"]`）。精排模型 2.19GB ⇒ 不能让它跟着默认 feature 一起被拉进构建/下载路径。⇒ 新增 **`local-rerank = ["local-embed"]`**（复用同一个 `fastembed` 依赖，**不新增依赖树节点**）。⚠️ `dep:fastembed` 已被 `local-embed` 启用 ⇒ **无需**再写一遍。
+⚠️ **本文初版写「显式写 `dep:fastembed` 会报重复」—— 该断言不成立（评审 F6②，作者已独立实测复现）**：`local-rerank = ["local-embed", "dep:fastembed"]` 在 `cargo metadata --features local-rerank` 下 **exit 0**，feature 被记为 `['local-embed','dep:fastembed']` —— **冗余但合法**（`fastembed` 是 **optional** 依赖 ⇒ `dep:` 语法成立）。真正会报错的是把 `dep:` 用在**非 optional** 依赖上（**对照实测**：`dep:bincode` ⇒ exit **101**，`feature \`local-rerank\` includes \`dep:bincode\`, but \`bincode\` is not an optional dependency`）。⇒ 结论：**统一只写 `["local-embed"]`**（与 §4.4.5 的 toml 块一致），并把这条实测**写进附录 C**。
 
 ---
 
@@ -308,7 +313,12 @@ pub trait Reranker: Send + Sync {
 | **20（拟默认）** | 窗口翻倍 ⇒ 给精排 10 条「新面孔」 | ~1s |
 | 50 / 100 / 200 | 业界常见档 | ~2.5s / ~5s / ~10s |
 
-⚠️ **上表的「秒」是量级示意，不是实测**（`#23` 前置 ② 的估算是「单对 20~50ms」，但那是在 512 token 满长、CPU、未批处理的假设下）。**真实值由 S7-05 实测**，而**默认 `R` 由决策门（§4.6.4）定**。⇒ 本文的 `20` 是**「拟」值**、**可回退**（同 NFR-13 的先例）。
+⚠️ **上表的「秒」是量级示意，不是实测**（`#23` 前置 ② 的估算是「单对 20~50ms」，但那是在 512 token 满长、CPU、未批处理的假设下）。**真实值由 S7-04 实测**，而**默认 `R` 由决策门（§4.6.4）定**。⇒ 本文的 `20` 是**「拟」值**、**可回退**（同 NFR-13 的先例）。
+
+> 🔑 **「500ms」这个拟阈值的出处，以及它与默认 `R` 的联动（回应评审 F4）**：
+> 需求 NFR-12 落的「精排段 P99 **≤ 500ms（拟）**」**对应的是上表 `k = 10` 档的量级上界（≈0.5s）**，**不是 `R = 20` 的** —— 按上表，`R = 20` 粗估 **≈1s，会超过该拟阈值**。
+> ⇒ **两个「拟」必须联动**：§4.6.4 的决策门选出 `R*` 后，**要么** `R*` 使 `rerank_elapsed` P99 落回 500ms 内（拟阈值沿用），**要么** 按 `R*` 的实测**重新取阈值**（那就同时改需求 NFR-12 的数值）。
+> ⚠️ **不得把「默认 `R`」与「500ms」各自独立引用** —— 那会得出「默认配置必然违约」的自相矛盾结论。
 
 #### 4.2.3 与 `candidate_k` 的关系（写进 rustdoc 的不变式）
 
@@ -434,7 +444,7 @@ fn rerank(&self, query: &str, hits: Vec<Hit>, top_n: usize) -> Result<Vec<Hit>> 
 }
 ```
 
-⚠️ **必须按 `RerankResult::index` 回填**：`RerankResult { document: Option<String>, score: f32, index: usize }`（`reranking/init.rs:150-155`）的 `index` 是**输入切片中的下标**。**不能**假设「返回顺序 = 输入顺序」（它按分数降序）⇒ 若按位置 zip，会把分数配到错误的 chunk 上，**静默错排**。⇒ **S7-T5 用「分数量级与 id 反序」的假精排器专钉这一点**。
+⚠️ **必须按 `RerankResult::index` 回填**：`RerankResult { document: Option<String>, score: f32, index: usize }`（`reranking/init.rs:152-156`）的 `index` 是**输入切片中的下标**。**不能**假设「返回顺序 = 输入顺序」（它按分数降序）⇒ 若按位置 zip，会把分数配到错误的 chunk 上，**静默错排**。⇒ **S7-T5 用「分数量级与 id 反序」的假精排器专钉这一点**。
 
 **`batch = None` ⇒ 库默认 `256`**（`reranking/mod.rs:2`）。⚠️ **不做多 session 池化**：
 
@@ -475,7 +485,8 @@ Explain.rerank_score = Some(logit)                        // 模型原始输出�
 # crates/core/Cargo.toml
 [features]
 # ⚠️ 独立于 local-embed：模型 2.19GB 不能被默认 feature 拉进构建/下载路径。
-#    `dep:fastembed` 已由 local-embed 启用 ⇒ 这里**只写 local-embed**（重复声明会报错）。
+#    `dep:fastembed` 已由 local-embed 启用 ⇒ 这里**只写 local-embed**；
+#    再写一遍是「**冗余但合法**」（非报错）——实测见 §3.6 与附录 C。
 local-rerank = ["local-embed"]
 ```
 
@@ -507,7 +518,7 @@ rerank_window: Option<usize>,
 1. **`--runs > 1` + `--rerank-window`**：`--runs` 的重建逻辑在 `bench.rs:380-390` 刻意传 `None` 跳过 sidecar ⇒ 每轮一张新图 ⇒ **精排 A/B 的差值被图漂移污染 0.6%**（§3.1）⇒ **`bail!` 报错**（不静默、不取其一）。
 2. **`--rerank-window` 在未编译 `local-rerank` 时**：报错并提示重编（照抄 `--analyzer charabia` 的既有做法，`bench.rs:661-663`）——**不得**静默退回 NoOp（那会让「精排档位跑通了」的结论建立在空转上）。
 
-### 4.6 H3 + NFR-12 的标定实验设计（S7-05 的输入）
+### 4.6 H3 + NFR-12 的标定实验设计（**S7-04** 的输入；结论由 **S7-05** 回填）
 
 #### 4.6.1 协议（对齐 `perf-ab-calibration` 的四条抗噪声规则）
 
@@ -544,7 +555,7 @@ rerank_window: Option<usize>,
 | **效果** | `hybrid MRR@10(1)` 的**提升 > 抖动带** | 抖动带 = **同一冻结图**上把同一档位跑 2~3 遍的极差（**先测出来再比**，不预设） |
 | **归因** | 分别报告 `Δ(MR, 精排 vs NoOp)` 与 `Δ(MR, R=20 vs R=10)` | 前者含模型+窗口，后者**纯窗口** |
 | **窗口拐点** | 取「MRR 相对 `R=10` 的增量 < 抖动带」的**最小** `R` | 即「再加窗口没意义」的点 |
-| **延迟** | 端到端 `took` P50/P99 **与** `rerank_elapsed` P50/P99 分列 | ⚠️ 只报 `took` 无法归因；只有 `rerank_elapsed` 才是 NFR-12 |
+| **延迟** | 端到端 `took` P50/P99 **与** `rerank_elapsed` P50/P99 分列 | ⚠️ 只报 `took` 无法归因；只有 `rerank_elapsed` 才是 NFR-12。**NFR-12 拟阈值（≤500ms）的出处与「与默认 `R` 联动」见 §4.2.2 补记** |
 | **内存** | 峰值 RSS（`/usr/bin/time -l` **直接包二进制**） | R44 的读数；⚠️ 不可包 `cargo run`（会量到 cargo 的 RSS，既有教训） |
 | **不可横比声明** | **不同 `R` 的 `score` 不可逐位横比**（§2.5 的 `BatchLongest`） | 只比**序数指标**（MRR / NDCG / Recall）与**条数** |
 
@@ -579,7 +590,7 @@ rerank_window: Option<usize>,
 ### D-S7-01 H3：精排窗口的形态与默认值 ✅ 建议：可配 `R`，默认 **20（拟）**
 
 - **形态**（可配 `R`，不写死 `candidate_k`）**定案**：`candidate_k`(3k) 会让 rerank 成本 ≈ `O(3k)` 次 568M 参数前向，交互场景不可行（`#23` 前置 ③ 的算术）。
-- **数值**：`R = 20` 是**「拟」值**，**由 S7-05 的决策门（§4.6.4）回填**。先例：NFR-13（v1.10 落「拟 ≤20ms」→ v1.12 定稿）。
+- **数值**：`R = 20` 是**「拟」值**，**由 S7-04 的决策门（§4.6.4）标定、S7-05 回填**。先例：NFR-13（v1.10 落「拟 ≤20ms」→ v1.12 定稿）。
 - **可回退**：若评审认为不该先落数值，改为「默认 = `k`（等于不放开）+ 要求显式给 `R`」——代价是所有效果结论都要求用户必须传参，且 NFR-12 的默认档悬空。
 
 ### D-S7-02 窗口的接口形态 ✅ 建议：trait provided 方法
@@ -672,7 +683,7 @@ rerank_window: Option<usize>,
 
 ---
 
-## 8. 实施任务拆分（S7-01 ~ S7-06）
+## 8. 实施任务拆分（S7-01 ~ S7-05）
 
 | # | 任务 | 依赖 | 量级 | PR 切分建议 |
 | --- | --- | --- | --- | --- |
@@ -686,6 +697,7 @@ rerank_window: Option<usize>,
 > ① **内核与编排分开**——S7-02 是本 Step 唯一会碰热路径的改动，单独一个 PR 便于「零回归」被逐行检查；
 > ② **数据与结论同 PR**（S7-04），但**结论不改代码**（默认 `R` 的「拟」值已在设计里落，回填的是**数值**）；
 > ③ ⚠️ **不要让 S7-04 与 S7-01/02 绑在一个 PR 里**——那会让「精排在本评测集上无提升」这个可能的结论**无法合并**（Step 6 的 A2 就是这么改过来的）。
+> ④ 🔑 **S7-04 标定 → S7-05 回填（分工口径，全文统一；评审 F2）**：凡「**标定 / 实测 / 决策门 / 分别计时**」一律属 **S7-04**；凡「**定义面回写 / NFR-12 数值定稿**」一律属 **S7-05**。
 
 ---
 
@@ -699,7 +711,7 @@ rerank_window: Option<usize>,
 | **R45** | **精排延迟主导**：窗口放开后成本 ≈ `O(R)` 次 cross-encoder 前向；若默认开，端到端 P99 从 ~3ms 涨到百毫秒级 ⇒ NFR-02 名义失效 | 交互体验（NFR-02 / 「Agent 关键路径几十次调用」） | ① 默认关（D-S7-04）；② **NFR-12 独立口径**（不并入 NFR-02）；③ 默认 `R` 由标定（§4.6.4）决定；④ 精排器与查询侧编码共享 `Mutex` 串行瓶颈（同 R43）⇒ **明确不做池化** | ⚠️ **保持开放**：`R` 与延迟的取舍是**用户侧**决策；本 Step 只给「可配 + 有数据」 |
 | **R46** | **`Hit.score` 的语义随开关而变**（融合分 → `σ(logit)`），且 `hits` 的**并列次序**规则也随之改变 | 下游若用 `score` 设阈值 / 跨配置比较 / 缓存排序结果 ⇒ **静默失准**；与 R35 一族（对外可观测的破坏性变更） | ① `Explain.rerank_score` 让变换**可观测**（D-S7-05，NFR-07 精神）；② CHANGELOG 显式 `⚠️ 破坏性`；③ `Hit.score` 的 rustdoc 重写为「**当前排序依据**」并写明三种 mode × 精排开关的取值 | ⚠️ **识别成本仍在用户侧**：内核只能说清「这次 `score` 是什么」，无法阻止下游误用 |
 | **R47** | **精排数值的可复现性未证实**：tokenizer 用 `PaddingStrategy::BatchLongest`（`common.rs:174-180`）⇒ **同一 `(query, doc)` 在不同批次组成下 padding 长度不同** ⇒ 浮点结果**可能不逐位相同**；ONNX 多线程归约亦然 | ① NFR-06（相同 query → 完全相同结果）**可能不成立**；② 标定实验的**分数轴不可横比**（只能比序数指标） | ① §4.7 三个层次探针 P1/P2/P3（S7-T8 / T9）；② §4.6.3 的「不可横比声明」；③ 若 P1/P2 出反例 ⇒ NFR-06 加限定词「不含精排」并升需求版本 | ⚠️ **测了才知道**：P3 的反例**不必修**（数学等价），但**改变报告怎么读** |
-| **R48** | **512 token 截断使长段落的精排判据失真**：`HasMaxLength for RerankerModel = 512`（`reranking/init.rs:16-18`），而 T2Ranking 段落最长 **76,895 字符**（`bench.rs:697`）⇒ 精排只看得到段落前段 | **可能把「方法不行」错判为「精排无提升」**（结论错，而代码没错）；反过来若调大 `max_length`，成本近似平方增长 | ① D-S7-08（保持 512 起步 + `1024` 对照档）；② §4.6.4 的判据②明写「拐点不可识别时要如实记入局限」；③ `max_length` 进精排器**身份字符串**（D-S7-08/§4.4.4） | ⏳ **开放**：截断对长段落的定量影响要等标定；若确认为主因，**为评测集单独调大**（而不是改产品默认） |
+| **R48** | **512 token 截断使长段落的精排判据失真**：`HasMaxLength for RerankerModel = 512`（`reranking/init.rs:17-19`），而 T2Ranking 段落最长 **76,895 字符**（`bench.rs:697`）⇒ 精排只看得到段落前段 | **可能把「方法不行」错判为「精排无提升」**（结论错，而代码没错）；反过来若调大 `max_length`，成本近似平方增长 | ① D-S7-08（保持 512 起步 + `1024` 对照档）；② §4.6.4 的判据②明写「拐点不可识别时要如实记入局限」；③ `max_length` 进精排器**身份字符串**（D-S7-08/§4.4.4） | ⏳ **开放**：截断对长段落的定量影响要等标定；若确认为主因，**为评测集单独调大**（而不是改产品默认） |
 
 ### 9.2 未决问题
 
@@ -828,22 +840,25 @@ cargo run -p helix --release -- bench --index /tmp/t2-frozen.idx --runs 1 \
 | `src/models/reranking.rs:6-11` | `RerankerModel` 枚举：`BGERerankerBase`（默认）/**`BGERerankerV2M3`**/`JINARerankerV1TurboEn`/`JINARerankerV2BaseMultiligual` |
 | `src/models/reranking.rs:28-33` | `BGERerankerV2M3` ⇒ `model_code = "rozgo/bge-reranker-v2-m3"`、`model_file = "model.onnx"`、**`additional_files = ["model.onnx.data"]`**（⚠️ **非 BAAI 官方库**；官方库**没有** ONNX） |
 | `src/reranking/mod.rs:1-2` | `DEFAULT_MAX_LENGTH = 512` / **`DEFAULT_BATCH_SIZE = 256`** |
-| `src/reranking/init.rs:14-19` | `pub struct TextRerank { tokenizer, session, need_token_type_ids }`；`impl HasMaxLength for RerankerModel { MAX_LENGTH = 512 }` |
-| `src/reranking/init.rs:21` | `pub type RerankInitOptions = InitOptionsWithLength<RerankerModel>` |
-| `src/reranking/init.rs:149-155` | **`pub struct RerankResult { document: Option<String>, score: f32, index: usize }`**（`index` = 输入切片下标 ⇒ 回填必须用它） |
+| `src/reranking/init.rs:11-19` | `pub struct TextRerank { tokenizer, session, need_token_type_ids }`；`impl HasMaxLength for RerankerModel { MAX_LENGTH = 512 }` |
+| `src/reranking/init.rs:22` | `pub type RerankInitOptions = InitOptionsWithLength<RerankerModel>` |
+| `src/reranking/init.rs:152-156` | **`pub struct RerankResult { document: Option<String>, score: f32, index: usize }`**（`index` = 输入切片下标 ⇒ 回填必须用它） |
 | `src/reranking/impl.rs:44` | `pub fn try_new(options: RerankInitOptions) -> Result<TextRerank>`（`hf-hub` feature 下） |
-| `src/reranking/impl.rs:110` | `pub fn rerank<S: AsRef<str> + Send + Sync>(&mut self, query: S, documents: impl AsRef<[S]>, return_documents: bool, batch_size: Option<usize>)` —— ⚠️ **`&mut self`** ⇒ 必须 `Mutex` |
-| `src/reranking/impl.rs:118` | `batch_size.unwrap_or(DEFAULT_BATCH_SIZE)` ⇒ 传 `None` = **256** |
-| `src/reranking/impl.rs:127-132` | `documents.chunks(batch_size)` ⇒ **按批编码**（批次组成影响 padding 长度） |
-| `src/reranking/impl.rs:134-141` | `tokenizer.encode_batch(inputs, true)` + `encodings.first().len()` ⇒ **批内等长**（依赖 padding 已配） |
-| `src/reranking/impl.rs:186-198` | `top_n_result` 由**全部** scores 构造并 `sort_by(\|a,b\| a.score.total_cmp(&b.score).reverse())` ⇒ **返回全量排序**；`sort_by` 稳定 ⇒ 并列保持**输入顺序** |
+| `src/reranking/impl.rs:126-132` | `pub fn rerank<S: AsRef<str> + Send + Sync>(&mut self, query: S, documents: impl AsRef<[S]>, return_documents: bool, batch_size: Option<usize>)` —— ⚠️ **`&mut self`** ⇒ 必须 `Mutex` |
+| `src/reranking/impl.rs:134` | `batch_size.unwrap_or(DEFAULT_BATCH_SIZE)` ⇒ 传 `None` = **256** |
+| `src/reranking/impl.rs:143` | `documents.chunks(batch_size)` ⇒ **按批编码**（批次组成影响 padding 长度） |
+| `src/reranking/impl.rs:145-148` | `tokenizer.encode_batch(inputs, true)` + `encodings.first().len()` ⇒ **批内等长**（依赖 padding 已配） |
+| `src/reranking/impl.rs:215-224` | `top_n_result` 由**全部** scores 构造并 `sort_by(\|a,b\| a.score.total_cmp(&b.score).reverse())` ⇒ **返回全量排序**；`sort_by` 稳定 ⇒ 并列保持**输入顺序** |
 | `src/common.rs:174-180` | **`.with_padding(PaddingParams { strategy: PaddingStrategy::BatchLongest, … })`** ⇒ ⚠️ **批内 padding 到最长** ⇒ 同 (query,doc) 在不同批次组成下 logit 可能不逐位相同（R47） |
 | `src/common.rs:181-185` | `.with_truncation(TruncationParams { max_length, .. })` ⇒ `max_length` 生效位置 |
 | `src/common.rs:262-270` | `init_session_builder(execution_providers, intra_threads)`：`None` ⇒ `available_parallelism()` = **用满所有核** |
-| `src/init.rs:63-70` / `:106-113` | `InitOptionsWithLength` 的 `with_max_length` / `with_cache_dir` / `with_show_download_progress`（`RerankInitOptions` 可用） |
+| `src/init.rs:61-101`（`impl InitOptionsWithLength`）的 **`:71`** / **`:77`** / **`:100`** | `with_max_length` / `with_cache_dir` / `with_show_download_progress`（`RerankInitOptions = InitOptionsWithLength<RerankerModel>` 走这份）。⚠️ 同名方法另有一份在 `:106-140` 的 `impl InitOptions`（**不是**我们走的路径） |
 
-> ⚠️ **`fastembed` 重导出了 `TextRerank` / `RerankerModel` 吗**（决定 `use` 路径）—— ⚠️ **本文未核实**：`lib.rs` 的重导出清单需在 **S7-01 开工时先查**（`grep -nE "TextRerank|RerankerModel|RerankInitOptions" <fastembed>/src/lib.rs`），**不要信本文**。
-> 已核实的旁证：`embed/local.rs:9` 的 `use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};` 说明这三个是从 **crate root** 重导出的；精排侧的对应符号**大概率**同款，但**属未核实**。
+> ⚠️ **行号更正（2026-09-14 评审 F5）**：本表初版的 `impl.rs` 行号整段漂移（`rerank` 记作 `:110`、`unwrap_or` 记作 `:118`、`chunks` 记作 `:127-132`、`encode_batch` 记作 `:134-141`、`top_n_result`/`sort_by` 记作 `:186-198`）⇒ **已按本机 `fastembed-6.0.2` registry 实测更正**（`:126-132` / `:134` / `:143` / `:145-148` / `:215-224`；该文件共 **227** 行）。**语义全部未变**（`&mut self`、全量稳定排序不截断、`index` 回填、`BatchLongest` 均已复核）。§2.5 / §2.6 正文引用的 `:134-181` / `:186-198` 同源偏移，已一并更正为 `:143-212` / `:215-224`。
+> ⚠️ **同类漂移不止 `impl.rs`** —— 作者按「**一类缺陷要全仓扫**」把本文**全部 fastembed 行号引用**核了一遍，另更正 **`reranking/init.rs` 3 处**（`:14-19` → **`:11-19`**、`:16-18` → **`:17-19`**、`:21` → **`:22`**、`:149-155` → **`:152-156`**，共 4 处）与 **`src/init.rs` 1 处**（`:63-70` / `:106-113` → **`:61-101` 的 `:71` / `:77` / `:100`**），以及 §3.3 正文的 `impl.rs:110` → **`:126-132`**（评审 F5 未点到、由作者全仓扫描发现）。**核过仍准确、未改的**：`reranking/mod.rs:1-2`、`impl.rs:44`、`common.rs:174-180` / `:181-185` / `:262-270`、`lib.rs:130` / `:132`、`models/reranking.rs:6-11` / `:28-33`。
+>
+> ✅ **`fastembed` 重导出了 `TextRerank` / `RerankerModel` 吗**（决定 `use` 路径）—— **已核实（2026-09-14）**：本机 registry 实测 **`src/lib.rs:130` `pub use crate::models::reranking::RerankerModel;`**、**`src/lib.rs:132`** 起 `pub use crate::reranking::{ OnnxSource, **RerankInitOptions**, RerankInitOptionsUserDefined, **RerankResult**, **TextRerank**, UserDefinedRerankingModel };`**（注释 `// For Reranking` 在 `:129`）⇒ **与 embedder 侧同款，都是从 crate root 重导出**。**S7-01 可直接 `use fastembed::{RerankerModel, RerankInitOptions, RerankResult, TextRerank};`**。
+> ⚠️ 本条初版标「**本文未核实**」并嘱咐开工时先 grep —— **评审已代答，作者已独立复核属实**；原「旁证推理」段（用 `embed/local.rs:9` 反推）已不再需要，删除。
 
 **本地缓存 / 体积**（前置 ② 的实测）
 
