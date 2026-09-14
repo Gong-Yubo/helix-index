@@ -79,7 +79,17 @@ pub(crate) fn sigmoid(logit: f32) -> Score {
 /// | 情形 | dev（`debug_assertions`） | release | 为什么这样分 |
 /// | --- | --- | --- | --- |
 /// | `index` **越界** | `debug_assert!` 失败（快速失败） | 忽略该项 + `tracing::warn!` | **结构违反**：分数会被写到**错的 hit** 上 ⇒ 没有「可解释的退化」可言（同 `query/searcher.rs` 的 `dispatch_vector` 先例：优雅退化 + `debug_assert` 指出） |
-/// | **覆盖不足**（少给打分） | —— | 该项**保持输入（融合）分** + `tracing::warn!` | 有明确可解释的语义（见下），**且要可测** ⇒ 不加 `debug_assert` 才能让单测钉住它 |
+/// | **未覆盖**（少给打分 / `index` **重复**） | —— | 该候选**保持输入（融合）分** + `tracing::warn!` | 有明确可解释的语义（见下），**且要可测** ⇒ 不加 `debug_assert` 才能让单测钉住它 |
+///
+/// ⚠️ **「覆盖」的判定口径 = 有效且去重后的 `index` 集合**（[`uncovered_count`]），
+/// **不是**条数比较 —— 只比 `scored.len()` 会漏掉「重复 `index` + 漏一个」（条数相等）。
+/// 第 2 轮评审「新 2」。
+///
+/// ⚠️ **两条护栏各自都有牙齿**：越界 `debug_assert!` 由
+/// `越界index在dev构建下被debug_assert拦住`（`#[cfg(debug_assertions)]` + `should_panic`）钉住；
+/// 覆盖判定由 `scoring::tests::未覆盖条数看集合不看条数` 直接钉住。
+/// 只证「**容忍**路径在 debug 下不可测」是不够的 —— 第 2 轮评审「新 1」（删掉越界护栏后
+/// 整库 `223 passed / 0 failed`，即该护栏此前**零覆盖**）。
 ///
 /// # 为什么「未覆盖项」保持融合分，而**不是**丢弃或取最低分
 ///
@@ -99,14 +109,6 @@ pub(crate) fn apply_scores(
     scored: &[ScoredCandidate],
     top_n: usize,
 ) -> Vec<Hit> {
-    if scored.len() != hits.len() {
-        tracing::warn!(
-            scored = scored.len(),
-            candidates = hits.len(),
-            "精排覆盖不足：未覆盖的候选保持输入（融合）分数（见 apply_scores 的 rustdoc）"
-        );
-    }
-
     for item in scored {
         // REFERENCE ⑥：非有限值在本题材里是**静默**的（`σ(NaN) == NaN`，排序仍有确定序
         // 但结果无意义）⇒ 用 debug_assert 在测试/调试构建里立即可见。
@@ -132,6 +134,20 @@ pub(crate) fn apply_scores(
         }
     }
 
+    // 覆盖判定：看「**哪些 `index` 被真的写入**」，而不是只看条数（第 2 轮评审「新 2」）——
+    // 只比 `scored.len() != hits.len()` 会漏掉「**重复 `index` + 漏一个**」（条数相等 ⇒ 不报），
+    // 而那正是本函数要消灭的那类**静默**。判定抽成 [`uncovered_count`]，以便**不依赖 tracing
+    // subscriber 就能单测**（本仓无该 dev 依赖 ⇒ 断言不了 `warn!` 本身）。
+    let uncovered = uncovered_count(scored, hits.len());
+    if uncovered > 0 || scored.len() != hits.len() {
+        tracing::warn!(
+            scored = scored.len(),
+            candidates = hits.len(),
+            uncovered = uncovered,
+            "精排覆盖不恰好：未覆盖的候选保持输入（融合）分数（见 apply_scores 的 rustdoc）"
+        );
+    }
+
     // `total_cmp`（与全项目一致，REFERENCE ⑧）：NaN 也有确定序，不像 `partial_cmp`
     // 那样需要 `unwrap_or(Equal)` 而这种兜底会让「不可比」静默变成「相等」。
     // 降序 `score`，并列时**升序 `chunk_id`**（D-S7-07）——不沿用 fastembed 的
@@ -144,6 +160,28 @@ pub(crate) fn apply_scores(
     });
     hits.truncate(top_n);
     hits
+}
+
+/// `scored` **没有**覆盖到的候选条数 —— 「恰好覆盖」判定的**唯一**实现。
+///
+/// 判定口径 = **有效且去重后的 `index` 集合**（越界 `index` 不计入覆盖）。⚠️ 只比
+/// `scored.len()` 会漏掉「**重复 `index` + 漏一个**」这一情形（条数相等 ⇒ 判定不出）
+/// —— 第 2 轮评审「新 2」。
+///
+/// ⚠️ 抽成独立函数是**为了可测**：覆盖判定不经过 `tracing` 就能被单测直接钉住
+/// （本仓无 tracing subscriber dev 依赖 ⇒ 断言不了 `warn!` 本身）。
+///
+/// 成本：一次 `O(候选数)` 的 `Vec<bool>` 分配 + 两趟线性扫描。候选数 = 精排窗口（≤ 几百）
+/// ⇒ 与一次 ONNX 前向（设计粗估几十毫秒/条）相比可忽略；且精排**默认关**（D-S7-04），
+/// 不在无精排的热路径上。
+pub(crate) fn uncovered_count(scored: &[ScoredCandidate], candidates: usize) -> usize {
+    let mut covered = vec![false; candidates];
+    for item in scored {
+        if let Some(slot) = covered.get_mut(item.index) {
+            *slot = true;
+        }
+    }
+    covered.iter().filter(|covered| !**covered).count()
 }
 
 /// 精排器**身份字符串**（D-S7-08 / D-S7-10，设计 §4.4.4）。
@@ -392,5 +430,101 @@ mod tests {
         assert_eq!(ids(&out), vec![5, 2, 7], "σ(6)≈0.9975 > 0.95 > 0.30");
         // 反向自证：按位置 zip 会得到 [7, 2, 5]
         assert_ne!(ids(&out), vec![7, 2, 5], "按位置 zip 的顺序必须与之不同");
+    }
+
+    /// **第 2 轮评审「新 2」**：覆盖判定 = **有效且去重后的 `index` 集合**，不是条数比较。
+    ///
+    /// 本用例直接钉住 [`uncovered_count`]（而不依赖 `warn!` 的可见性 —— 本仓无 tracing
+    /// subscriber dev 依赖 ⇒ 断言不了日志）：
+    /// ① 完整覆盖 ⇒ 0（含乱序）
+    /// ② 少给一条 ⇒ 1
+    /// ③ **条数相等但重复 `index`**（`[{0},{0}]` / 2 条候选）⇒ **1** ← 只比条数会判成 0，这就是本条的落点
+    /// ④ 越界 `index` 不计入覆盖（且不 panic）
+    /// ⑤ 空 `scored` ⇒ 全部未覆盖
+    #[test]
+    fn 未覆盖条数看集合不看条数() {
+        let full = [
+            ScoredCandidate {
+                index: 2,
+                logit: 1.0,
+            },
+            ScoredCandidate {
+                index: 0,
+                logit: 2.0,
+            },
+            ScoredCandidate {
+                index: 1,
+                logit: 3.0,
+            },
+        ];
+        assert_eq!(uncovered_count(&full, 3), 0, "① 乱序的完整覆盖 ⇒ 0");
+
+        let missing = [ScoredCandidate {
+            index: 0,
+            logit: 1.0,
+        }];
+        assert_eq!(uncovered_count(&missing, 2), 1, "② 少给一条 ⇒ 1");
+
+        // ③ 条数相等（2 == 2）但 index 重复 ⇒ 必须判出 1 条未覆盖
+        let dup = [
+            ScoredCandidate {
+                index: 0,
+                logit: 1.0,
+            },
+            ScoredCandidate {
+                index: 0,
+                logit: -1.0,
+            },
+        ];
+        assert_eq!(
+            dup.len(),
+            2,
+            "前提自证：条数与候选数相等 ⇒ 旧口径（只比条数）必然判不出"
+        );
+        assert_eq!(
+            uncovered_count(&dup, 2),
+            1,
+            "③ 重复 index ⇒ 1（旧口径会判 0）"
+        );
+
+        let oob = [
+            ScoredCandidate {
+                index: 99,
+                logit: 1.0,
+            },
+            ScoredCandidate {
+                index: 0,
+                logit: 2.0,
+            },
+        ];
+        assert_eq!(uncovered_count(&oob, 2), 1, "④ 越界不计入覆盖");
+
+        assert_eq!(uncovered_count(&[], 2), 2, "⑤ 空 scored ⇒ 全未覆盖");
+        assert_eq!(
+            uncovered_count(&[], 0),
+            0,
+            "⑤ 无候选 ⇒ 0（不出现 0−0 之类）"
+        );
+    }
+
+    /// **第 2 轮评审「新 1」**：越界**护栏本身**必须有覆盖 —— 只证「容忍路径在 debug 下不可测」不够。
+    ///
+    /// 实测（本轮复核）：删掉 `apply_scores` 里那句越界 `debug_assert!` 整块后，
+    /// `cargo test -p helix-core --lib` ⇒ **223 passed / 0 failed** ⇒ 该护栏此前**零覆盖**。
+    ///
+    /// ⚠️ `#[cfg(debug_assertions)]` 保证 `cargo test --release` **不会**因「没 panic」而**假红**
+    /// （仓内 cfg 先例：`crates/core/src/bitmap.rs` 的 `count_ones_slow` / `debug_check`）。
+    /// ⚠️ 本仓**首个** `should_panic` 用例（此前全仓 grep = 0）—— 「新护栏必须有牙齿」的代价。
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "精排返回越界 index")]
+    fn 越界index在dev构建下被debug_assert拦住() {
+        let hits = vec![hit(1)];
+        let scored = [ScoredCandidate {
+            index: 9,
+            logit: 1.0,
+        }];
+        // 越界 ⇒ dev 下必须 panic（release 下则退化为「忽略 + warn」）
+        let _ = apply_scores(hits, &scored, 10);
     }
 }

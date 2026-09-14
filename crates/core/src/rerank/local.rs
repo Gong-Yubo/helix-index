@@ -14,7 +14,7 @@
 //!
 //! ① `with_max_length(self, …)` **无法**按设计写成「构造后 builder」：`max_length` 在
 //!    `TextRerank::try_new` 时就烧进 tokenizer 的 `TruncationParams`
-//!    （`common.rs:181-185`）⇒ 构造后再改字段只会得到「断言仍绿但没生效」的假象。
+//!    （`fastembed/src/common.rs:181-184`）⇒ 构造后再改字段只会得到「断言仍绿但没生效」的假象。
 //!    改为**构造期**入口 [`LocalReranker::with_params`]。
 //! ② 单条候选**不早退**（设计 §4.4.2 第 1 步写的是「零/单条早退」）：否则
 //!    「`score` 是否被精排替换」会依赖候选条数，与 D-S7-05 的
