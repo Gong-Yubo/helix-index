@@ -9,6 +9,89 @@
 
 ## [Unreleased]
 
+### 文档 · V2 Step 7（精排）详细设计 —— 设计 PR（待评审）（Refs #23，2026-09-14）
+
+> ⚠️ **本 PR 只含文档，零 `.rs` 改动**（设计 PR 的既定纪律，同 Step 3/4/5/6 的设计 PR）。
+> 交付：新增 **`docs/devel/v2-step7-design.md` v0.1** + **四处定义面回写**
+> （需求 **v1.16** / 架构 **v1.15** / `plan-v2.md` **v0.16** / `docs/README.md`）。
+
+#### Added
+
+- **`docs/devel/v2-step7-design.md`（v0.1）** —— 精排接入的完整设计（T7-01 / FR-18 / NFR-12）：
+  - **§0 开工前置三条的结账单**：① **基线已复现**，且复现出这一定性事实 —— P5 锚点
+    `hybrid MRR@10(1) = 0.6922` 本次为 **0.68815**（Δ ≈ **0.6%**），而**对照组的 bm25 三项逐位复现 Δ = 0**
+    ⇒ 唯一变量是**未播种的 HNSW 图**（`StdRng::from_os_rng()`）⇒ **Step 7 的 A/B 必须钉在「同一张冻结图」上**
+    （`--index` 读快照 + **`--runs 1`**）；② **模型已实下载并验 sha256** ——
+    **`rozgo/bge-reranker-v2-m3`**（⚠️ **非 BAAI 官方**；官方库**没有 ONNX 导出**）、
+    `model.onnx.data` **2,271,088,656 B（≈2.19 GB，FP32）**、sha256 `84b66c78…8945`；
+    ③ **H3 取形** —— **可配 `R`、默认 20（拟）**（数值由 S7-04 标定回填，同 NFR-13 / NFR-10 先例）。
+  - **§2 五个设计期新发现（A~E）**：**A** 候选池必须与 `candidate_k` **联动**，否则 `R > 3k` 时窗口被
+    **静默夹到 `3k`**（R=100 在 k=10 时退化成 30）；**B** 候选回捞组装成本随窗口**线性放大**
+    （`matched_terms` 对全段文本跑 `analyze_doc`，`query/explain.rs:13-17`）；**C** `TextRerank` 用
+    `PaddingStrategy::BatchLongest` ⇒ **跨 batch 组成的分数不可逐位复现**；**D** `rerank()` 返回**全量排序**，
+    需自行 `take(top_n)` 并按 `RerankResult.index` 回填（tie-break 是输入顺序）；**E** **512 token 截断** vs
+    T2Ranking 最长段落 **76,895 字符**（`bench.rs:697`）。
+  - **§4 详细设计**：`Reranker::candidate_window(&self, k) -> usize`（**provided、默认 `k` ⇒ 既有实现一行不改**）；
+    `candidate_k = max(3k, window, 10)` 联动 + `take_n`；**`explain` 组装推迟**到最后 ≤ k 条（D-S7-06，
+    代价 = 精排器看不到 `explain`，写进 trait rustdoc）；**`LocalReranker`**（`rerank/local.rs`，
+    gate `feature = "local-rerank"`，未启用时**编译期不存在**）；`Metrics.rerank_window` / `rerank_elapsed`；
+    `Explain.rerank_score`；CLI `--rerank-window <R>`（两条脚枪显式 `bail!`：`--runs > 1` 与 feature 未编译）；
+    **标定实验设计**（对齐「四条抗噪声规则」+ 二层控制组 + 可证伪决策门）；**确定性探针 P1/P2/P3**。
+  - **§5 D-S7-01~10**、**§7 S7-T1~T12**（含 `#[ignore]` 口径与「未跑不得写成已覆盖」）、
+    **§8 S7-01~05** 与 PR 切分（内核 / 编排 / CLI / 数据 / 收尾）、**§9 风险 R44~R48 + 未决 Q1~Q7**、
+    **附录 A（API 一览 + 三条不变式）/ B（执行命令）/ C（依赖源码核实）/ D（项目内证据）**。
+
+#### 🔴 Fixed（定义面勘误 —— 评审时请重点核对这三条）
+
+- **`take(k)` 的行号已漂移**：`plan-v2.md` §4.0 **H3** 与 issue **#23** 均记作
+  `query/searcher.rs:196`，**实测在 `:286`**（`candidate_k` 定义在 **`:118`**、`parts.reranker.rerank(...)`
+  调用在 **`:316`**、`SearchResponse` 字面量在 `:323-329` 与空响应 `:498-514`）。
+  已同步更正 `plan-v2.md`（§4.0 H3 行内 + §附-1 证据清单）。
+- **FR-18 的模型来源更正**：fastembed 6.0.2 的 `RerankerModel::BGERerankerV2M3` 指向
+  **`rozgo/bge-reranker-v2-m3`**，**不是** BAAI 官方 —— **BAAI 官方库没有 ONNX 导出**。
+  已回写需求 FR-18（描述行 + 验收行）与 `plan-v2.md` §4 Step 7。
+- **`plan-v2.md` 的「main 现为 `8f4d08c`」已过期**（2 处「现为」的陈述：头部版本行与状态行）⇒
+  更正为 **`516b2c7`**（**PR #48** T7-24 工程卫生 → `e756bcc`、**PR #49** T7-21 默认翻转 → `516b2c7`）；
+  ⚠️ 另 2 处 `8f4d08c` 是「PR #44 的历史落点」、**属准确记录，未动**。
+
+#### 📄 Docs
+
+- **`requirements-spec.md`：v1.15 → v1.16**（**本 Step 唯一触碰 FR/NFR 的改动**）：
+  - **NFR-12 由「一行、无阈值、无测量口径、无质量判据」补齐为三部分** ——
+    ① **延迟判据（双列，均标「拟」）**：**端到端 `took` P50/P99** + **精排段 `rerank_elapsed` P50/P99**
+    （先落 **≤ 500ms（拟）**，由 S7-04 回填；口径 = **仅 `rerank()` 调用本身**，**不含**回捞与 `explain` 组装）；
+    **独立口径、不并入 NFR-02**（精排开启后 NFR-02 的 20ms **名义失效**）；
+    ② **质量判据** = hybrid **MRR@10(1)** 相对**同图**基线**可测提升**；③ **可观测** =
+    `Metrics.rerank_window` / `rerank_elapsed` + `Explain.rerank_score.is_some()`。
+    ⚠️ 并**写明 A/B 必须在同一张冻结图上做**（P5 锚点自带 ~0.6% 图漂移，bm25 三项 Δ=0 作对照）。
+  - **NFR-05 补口径限定词「不含精排器」**（`model.onnx.data` ≈2,187MB 常驻 ⇒ 精排内存**单独立为架构 R44**，
+    数值待 S7-04 回填；**不并入** 372MB 基线，理由同 R41）。
+  - **NFR-06 补精排确定性注记**（score 是**二次单调变换**、`chunk_id` 序不变 ⇒ 判据仍是「同一快照两次加载逐位一致」；
+    ⚠️ 但**不得**升级为「跨 batch 组成仍逐位一致」——`BatchLongest` 使 padding 长度随批内最长文本变化）。
+  - **NFR-07 补精排可观测字段**（`Metrics.rerank_window` / `rerank_elapsed`）。
+  - **FR-18 补设计锚点 + 模型来源更正**；§1.1 版本表与附录 C 各增 **v1.16** 行。
+- **`architecture-design.md`：v1.14 → v1.15**：
+  - **§14.5 新增 R44~R48**（R44 精排器**查询路径常驻内存** ≈2.19GB / R45 **精排延迟主导 + 窗口静默夹取** /
+    R46 **`Hit.score` 语义随开关而变**（R35 一族）/ R47 **精排数值可复现性未证实** /
+    R48 **512 token 截断使长段落判据失真**）+ §14 导读补 §14.5 指引与两条纪律（**R44 ≠ R41**、**R47 反例不必修**）。
+  - **§5.7 `Reranker`**：新增 **provided 方法 `candidate_window`（默认 `k`）**；契约收紧
+    「`rerank` **不得依赖** `hits[i].explain`」；补三条不变式与 `LocalReranker` 实现说明。
+  - **§5.8**：`Explain` 新增 **`rerank_score: Option<Score>`（⚠️ 破坏性）**、
+    `Metrics` 新增 **`rerank_elapsed` / `rerank_window`（纯加法，保持 `Copy`）**；
+    `Hit.score` 精排生效时 **= `σ(logit)`**（单调 ⇒ 排序零损失）；§1.1 与 §15.2 各增 **v1.15** 行。
+- **`plan-v2.md`：v0.15 → v0.16**：头部版本/日期/状态三行；**§4 Step 7 补「设计已出」块 + 开工前置结账单 +
+  设计期源码复核更正表（5 处）**；§4.0 **H3 状态**改为「已取形」+ **行号更正**；§5 NFR-12 / FR-18 行；
+  §6 门槛 Step 7；§7 进度表（Step 7 → 🟩 设计已出待评审；**横切 T7-21 / T7-24 → ✅ 已完成并合并**）；
+  §8（标题改 Step 1~7 + 需求侧/架构侧各补 Step 7 条目）；§附-1 行号更正；§附-3 执行顺序第 7 位。
+- **`docs/README.md`**：新增 `devel/v2-step7-design.md` 索引行；文档间关系的风险范围 **R1~R43 → R1~R48**。
+
+#### ⏭️ 待评审拍板（4 项，详见设计 §1 的前置清单与 §5）
+
+- **D-S7-04** 精排**默认开 / 关**（建议**默认关**：2.19GB 下载 + NFR-02 名义失效）；
+- **D-S7-05** `Hit.score` 的语义（建议 **`σ(logit)`** + `Explain.rerank_score`）；
+- **D-S7-01** 默认 `R` 的取值（建议 **20（拟）**，或改为「默认 = `k`，要求显式传参」）；
+- **D-S7-08** `max_length`（建议**保持 512** + `1024` 对照档）。
+
 ### 构建 · 横切 T7-21 评审响应（独立复审：1×P2 + 3×P3，全部收口）（Refs #24，2026-09-14）
 
 > 复审**不采信 PR 描述**，独立读码逐路径核对 + 本地 `cargo test -p helix-core --lib search::config`（7/7 绿）。
