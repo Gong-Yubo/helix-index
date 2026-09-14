@@ -51,6 +51,13 @@ pub enum Error {
     #[error("未启用任何 Embedder 实现，请开启 local-embed 或 remote-embed feature")]
     NoEmbedder,
 
+    /// 精排模型初始化或推理失败（V2 Step 7 / S7-01）
+    ///
+    /// ⚠️ 与 [`Self::Embedding`] 分开是刻意的：两者的**落点与代价**完全不同
+    /// （embedder 96MB / 精排 2.19GB），混在一起会让「哪一步炸了」只能靠读字符串猜。
+    #[error("精排模型错误: {0}")]
+    Rerank(String),
+
     /// 分词器内部错误
     #[error("分词错误: {0}")]
     Analyze(String),

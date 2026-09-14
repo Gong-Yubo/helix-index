@@ -13,6 +13,10 @@ mod remote;
 pub use cached::CachedEmbedder;
 #[cfg(feature = "local-embed")]
 pub use local::LocalEmbedder;
+// 只服务 `rerank::local`（设计 §4.4.1 的「复用同一缓存根」）⇒ 与它**同 gate**，
+// 否则默认构建下这是一条无人使用的再导出。
+#[cfg(feature = "local-rerank")]
+pub(crate) use local::default_cache_dir;
 #[cfg(feature = "remote-embed")]
 pub use remote::RemoteEmbedder;
 

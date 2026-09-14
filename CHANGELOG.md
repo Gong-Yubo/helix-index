@@ -9,6 +9,248 @@
 
 ## [Unreleased]
 
+### 构建 · V2 Step 7 PR 1 评审响应（**第 2 轮**：仍无阻塞项 + 1×P2 + 2×P3 + 1 细枝，**全部收口**）（Refs #23，2026-09-14）
+
+> 评审落点：`pulls/52/reviews` **1 条 `COMMENTED`（3276 字，`09:04:30Z`）+ 行内 4 条**；
+> 落在我 head `dbbc175` **之后** ⇒ 真·新一轮（作者判据仍用**时间戳**）。
+> **总评：第 1 轮 5 条意见「全部收口」（4 条实装、1 条按我的取舍改形），评审**重跑**了我的全部复核；
+> 本轮新发现 4 条**，其中 1 条 P2（**新护栏零覆盖**）是我的自查漏项。
+
+#### 🟡 Fixed（P2 —— 新护栏零覆盖，第 2 轮「新 1」）
+
+- **越界护栏此前「零覆盖」**：评审实测「删掉 `apply_scores` 里那句越界 `debug_assert!` 整块后
+  `cargo test -p helix-core --lib` ⇒ **223 passed / 0 failed**」；**我独立复现属实**。
+  ⇒ 新增用例 **`越界index在dev构建下被debug_assert拦住`**：`#[cfg(debug_assertions)]` +
+  **`#[should_panic(expected = "精排返回越界 index")]`**。
+  ⚠️ 这是**本仓首个 `should_panic`**（此前全仓 grep = 0）—— 「新护栏必须有牙齿」的代价；
+  `#[cfg(debug_assertions)]` 保证 `cargo test --release` 不会因「没 panic」而**假红**
+  （cfg 先例：`crates/core/src/bitmap.rs` 的 `count_ones_slow` / `debug_check`）。
+  ⚠️ 我第 1 轮的论证只覆盖了「**容忍**路径在 debug 下不可测」，**漏了「护栏本身是可测的」**这一半。
+
+#### 🟡 Fixed（P3 —— 覆盖判定只比条数，第 2 轮「新 2」）
+
+- **`scored.len() != hits.len()` 挡不住「重复 `index` + 漏一个」**（条数相等 ⇒ `warn!` 不发，
+  而该候选**静默**保留融合分）：把判定精确化为 **有效且去重后的 `index` 集合**，
+  抽成**纯函数** `rerank::scoring::uncovered_count`（⇒ **不依赖 tracing subscriber 就能单测**）。
+  `apply_scores` 改为按「未覆盖条数」告警（`warn!` 增加 `uncovered` 字段）。
+  新增用例 `未覆盖条数看集合不看条数`（5 组：完整/少给/重复 `index`/越界/空）。
+  ⚠️ 成本如实登记：一次 `O(候选数)` 的 `Vec<bool>` 分配（候选数 = 精排窗口 ≤ 几百），
+  与一次 ONNX 前向相比可忽略；且精排默认关、不在无精排的热路径上。
+
+#### 🟢 Fixed（P3 —— 「全仓扫描」的结论漏了一个，第 2 轮「新 3」）
+
+- **`architecture-design.md:1628`（§14.5 **R48**）的 `fastembed/src/reranking/init.rs:16-18` 同为旧值**
+  （应为 **`17-19`**），该行由 **`1859dbf`（#51）** 引入（`git log -S` 仅此一个提交）⇒ **同样属
+  「Step 7 引入的锚点」**。⇒ **更正我第 1 轮的结论**：当时写「Step 7 引入的锚点里**只有一处**
+  （`plan-v2.md:462`）漏网」—— **实际是两处**。已作为**第 3、4 项**补进设计文档的 **S7-05 回写清单**。
+  🔴 **根因（已记入教训）**：我的全仓扫描**确实命中了**该行，但工具把它截断成
+  `[Omitted long matching line]` 而我**没有回读** ⇒ **凡「Omitted」的命中必须逐条回读**。
+  （顺带核过：同行 `:1627` 的 R47 锚点 `common.rs:174-180` 是正确的，不动。）
+
+#### 🟢 Fixed（细枝 —— 同一锚点两个值）
+
+- **`common.rs:181-184` 与 `181-185` 统一为 `181-184`**：`181` = `.with_truncation(Some(TruncationParams {`、
+  `184` = `}))`、`185` = `.map_err(…)`（同一条 builder 链上的错误映射）⇒ 精确锚点是 **181-184**。
+  改 `crates/core/src/rerank/local.rs` 的模块文档 + 设计文档**附录 C** 的表格与「核过仍准确」清单。
+  ⚠️ **历史条目不改写**：第 1 轮的 CHANGELOG 条目与 #51 的 F5 条目里保留原引文（符合「被推翻的旧值也要留引文」）。
+
+#### 🔵 与评审的**不同**之处
+
+1. **「新 2」我没走他给的两条路（debug-only `HashSet` 断言 / 降级措辞 + 登记盲区），选了更强的第三条**：
+   **release 与 debug 都精确化**（纯函数 `uncovered_count`），因为它**同时**满足「release 侧不再静默」与
+   「不依赖 tracing subscriber 就能单测」；他给的 ① 只修 debug 侧、② 只是登记。
+2. **「新 1」的形态与他给的一致**（`#[cfg(debug_assertions)] + should_panic`），未额外引入 `catch_unwind`。
+
+#### 变异验证（新护栏必须有牙齿）
+
+| 变异 | 注入 | 结果 |
+| --- | --- | --- |
+| **m5** | **删掉**越界 `debug_assert!` 整块 | ✅ `越界index在dev构建下被debug_assert拦住 – should panic` **FAILED**（正是评审「新 1」的复现） |
+| **m6** | `uncovered_count` 退回「只比条数」（`candidates.saturating_sub(scored.len())`） | ✅ `未覆盖条数看集合不看条数` **FAILED**（③「重复 `index`」那组） |
+
+还原后 `md5` 与注入前**逐字节一致**（`8fb5b3af…`）。
+
+#### 守门（本地，逐条标运行范围）
+
+`fmt` ✅ / `clippy --workspace --all-targets -D warnings` ✅ / `cargo test --workspace` ✅ /
+`make shell` ✅ / MSRV 1.90 ✅ / rustdoc `-D warnings` ✅ / `--no-default-features` ✅ /
+`--features charabia` ✅ / `--features local-rerank` ✅ / `cargo deny check advisories licenses bans sources` ✅。
+**新增用例 2 个**（越界护栏 `should_panic` + `uncovered_count` 纯函数单测）⇒ 默认特性 `302 → 304 passed`。
+
+### 构建 · V2 Step 7 PR 1 评审响应（第二方独立评审：**无阻塞项** + 2×P2 + 3×P3，**全部收口**）（Refs #23，2026-09-14）
+
+> 评审落点：`pulls/52/reviews` **1 条 `COMMENTED`（5469 字）+ 行内 6 条**；`issues/52/comments` 只有作者自己的
+> CI 记录评论 ⇒ **本轮评审不在 issue 评论里**（与上一步相反，见「评审落点会一轮一轮变」）。
+> **总评：三处设计偏差 + `Error::Rerank` 全部同意；CI 新增步建议保留；5 条意见**（3 条属本 PR，2 条可留 PR 2 / PR 5）。
+
+#### 🟡 Fixed（P2 —— 接口写侧契约，意见 1）
+
+- **`Reranker::rerank` 的 rustdoc 补「出参（写侧）契约」**（`crates/core/src/rerank/mod.rs`）：
+  返回类型 `Vec<Hit>` 里只有 `explain` 能携带额外信息，而 **`σ` 不可逆** ⇒ 编排层**自己算不出**原始分
+  ⇒ 实现**可以且应当**通过**写** `hits[i].explain` 归还（`LocalReranker` 将在 **S7-02** 写 `rerank_score`）。
+  ⚠️ **「不得依赖 `explain`」只约束读侧**；并写明**编排层的义务**：按 D-S7-06 在精排后补齐 `explain` 时
+  **必须保留**精排器写入的字段（否则「谁后写谁生效」会把该信号冲掉）。
+  同时把原句「（`LocalReranker` 的做法是 … 进 explain）」由**现在时**改为**将来时 + S7-02 落点**（原措辞今天还不成立）。
+
+#### 🟡 Fixed（P2 —— 静默失效，意见 2）
+
+- **`apply_scores` 的「未覆盖项」从静默改成有护栏、有语义、有测试**（`crates/core/src/rerank/scoring.rs`）：
+  ① 契约写明「`scored` 应**恰好覆盖** `hits`」，并给出**两条防御路径刻意不同**的分支表：
+  **`index` 越界**（结构违反）= `debug_assert!`（dev 快速失败）+ `tracing::warn!` + 忽略；
+  **覆盖不足** = 保持输入（融合）分 + `tracing::warn!`（**不加** `debug_assert`）；
+  ② 新增单测「**部分覆盖时未覆盖项保持输入分**」，并**替换**掉原先那条「越界」用例 ——
+  后者经**实测无鉴别力**（它的每条 hit 都被覆盖且 `index == 位置` ⇒ 在「按位置 zip」变异下**仍然通过**，已复核）；
+  ③ 顺带把「覆盖不足」这条路径接上可观测面（NFR-07 的「降级不得静默」）。
+
+#### 🟡 Fixed（P2 —— 文档—代码漂移，意见 3）
+
+- **`docs/devel/v2-step7-design.md` 就地勘误 `E1`~`E6`**（本 Step 的**实现依据**，PR 2~5 会照它写）：
+  §4.4.1 / 附录 A 的 API 块（`with_max_length` → `with_params`）、§4.4.2 第 1 步（「零/单条早退」→ 只有空输入）、
+  §4.4.2 第 5 步（补两条防御路径）、§4.4.3（`score ∈ (0,1)` → **`[0,1]`**）、§7 S7-T9 落点、**§6 影响面表补列 `Error::Rerank`**
+  + `Reranker::rerank` 行补**写侧契约**；并在头部加了「S7-01 实现期勘误」块与 **S7-05 回写清单**。
+  ⚠️ **版本号刻意不升（仍 v0.2）**：勘误**不含**决策/预算/风险变更，而升版会让 4 处定义面的
+  「依据 `v2-step7-design.md` v0.2」引用**连带漂移** ⇒ 正式升版 + 定义面回写随 **S7-05**。
+  ⚠️ **同时更正**：PR 正文原写「本 PR 不碰任何定义面」并列举四处 —— **漏了本文档**（评审指出），已在正文更正。
+
+#### 🟢 Fixed（P3 —— 断言口径不自洽，意见 4）
+
+- **`σ` 的值域是闭区间 `[0,1]`**（f32 下**精确饱和**）。三处口径统一为闭区间并写清机制：
+  `scoring.rs` 的 `sigmoid` rustdoc（附两端机制与 bits）、`scoring.rs` 单测（**新增饱和端点断言**
+  `σ(16.7) == 1.0` / `σ(−89.0) == 0.0` / `σ(−88.0) > 0`）、`tests/step7_rerank_local.rs` 的 `t10`
+  （开区间 → **闭**区间；「模型是否进饱和区」改成**打印的观测量**，随 §8.14 落报告）。
+  理由：`t10` 是**本 PR 尚未跑过**的那一类（需 2.19GB 模型）⇒ 开区间会给一个**假失败**、污染 S7-04 的标定结论。
+
+#### 🟢 Fixed（P3 —— 行内意见：`with_window` 与偏差 A 看似冲突）
+
+- **`LocalReranker::with_window` 的 rustdoc 补「两者性质不同」的对照表**：`max_length` **烧进模型的 tokenizer**
+  （构造后改不生效 ⇒ 只能构造期给）；`window` **只被 `candidate_window` / `id()` 读、不触碰模型** ⇒ 构造后改**生效**。
+
+#### 🔵 与评审意见**不同**的地方（两类都写）
+
+1. **意见 2 的取舍：未覆盖项「保持输入分」，而非评审建议的「丢弃或压到最低」。** 评审的关切（两个量纲同台排序、
+   错排方向随 `mode` 而变）**成立**，但三个候选里我选「保持 + 可见」，理由（已写进 rustdoc）：
+   **丢弃**会静默改变**条数契约**（本函数只做排序 + 截断，不做过滤）；**压到最低（`0.0`）**会**伪造**一个分数，
+   而 σ 在 f32 下**会精确饱和到 `0.0`**（`σ(−89) == 0.0`，正是本轮意见 4 的事实）⇒ 伪造值与真值**不可区分**；
+   **保持**则可由 `explain.rerank_score == None` **识别**（这正是 D-S7-05 的 `is_some()` 信号的定义）。
+   ⇒ 结论：把这条路径做成**可解释的异常**，而不是「伪造的分数」或「少一条结果」。
+2. **「覆盖不足」刻意不加 `debug_assert`**（评审建议是「越界/未覆盖都加」）：加了之后该语义在 debug 下**不可测**
+   （与意见 2 的 ② 直接冲突）⇒ 只在 `index` 越界（**无**可解释退化可言的结构违反）上加 assert。
+   ⚠️ 代价如实登记：**release 下的容忍 + `warn!` 是盲区**（无 tracing subscriber 依赖 ⇒ 不单测），已写进 rustdoc。
+3. **意见 5（NFR-06 注记机制句反向）不在本 PR 改**：`requirements-spec.md` 属**已评审的定义面**，本项目纪律是
+   「别在飞行中改定义面，留给收尾项（S7-05）同批回写」⇒ **裁定「以 D-S7-07 为准」+ 记入 S7-05 清单**（评审给的另一选项）。
+
+#### ✅ 独立复核为属实的评审事实（评审的验证表也逐条重跑）
+
+| # | 评审主张 | 我的复核 |
+| --- | --- | --- |
+| 1 | `σ(16.7) == 1.0` / `σ(−89.0) == 0.0`（**精确**，故值域是闭区间） | ✅ **真 f32 复现**（`rustc` 直编同形函数）：bits `3f800000` / `00000000`；机制 = `1 + e^(−16.7)` 被舍回 1.0（f32 在 1.0 处半 ULP ≈ 5.96e-8、余量 6%）、`e^89` 上溢到 `inf` |
+| 2 | 原「越界」用例对「按位置 zip」变异**无鉴别力** | ✅ **复现**：注入 M2 后该用例**仍通过**（`2 passed`）⇒ 已由新的「部分覆盖」用例取代 |
+| 3 | `common.rs:181-184` 的 `with_truncation` 在 `try_new` 内 ⇒ 构造后改 `max_length` 不生效 | ✅ 实读源码属实（`load_tokenizer` 内 `.with_truncation(Some(TruncationParams{ max_length, .. }))`） |
+| 4 | fastembed 取的是**原始 `logits`**、没替我们 sigmoid ⇒ `σ` 必需 | ✅ `impl.rs:195-198` 的 `.get("logits")` 属实（这条救掉了 D-S7-05 的重写） |
+| 5 | `impl.rs:224` 的 `sort_by` 是 stable ⇒ 并列保持**输入顺序** | ✅ 属实（`sort_by(\|a,b\| a.score.total_cmp(&b.score).reverse())`） |
+| 6 | 设计 §6 表 **12 行、无 `Error` 行** | ✅ 属实 ⇒ 已补列（E6） |
+| 7 | NFR-06 精排注记的机制句与 D-S7-07 **相反** | ✅ 属实（`requirements-spec.md:388`）⇒ 裁定 + 记入 S7-05 清单 |
+| 8 | 计数口径 302 / 288 = 302 − 14 一致 | ✅ 属实（少的那 14 行 = `helix-cli` 的 lib 测试） |
+
+> 🔍 **本轮按「一类缺陷要全仓扫」自检出评审未点到的一处**：#51 的 **F5**（`impl.rs` 行号整段漂移）只改了
+> **设计文档**，而 **`plan-v2.md:462`（Step 7 自己的锚点）仍是旧值**（`:110` / `:186-198`，应为 `:126-132` / `:215-224`）
+> ⇒ 这是「跨定义面」这个**第三个载体**。已全仓扫描全部 fastembed 锚点，结论：**Step 7 引入的锚点里只有这一处漏网**；
+> 另 `plan-v2.md:380` / `:659` 的 `src/init.rs:30-33` 属 2026-09-07 的旧锚点（指 `InitOptions<M>`，我们走
+> `InitOptionsWithLength` 的 `:20`），但同文件 `:671-680` **已有「以上一律以 `v2-step6-design.md` 附录 C 为准」的
+> 取代指针** ⇒ 属**刻意保留的历史记录**，**不建议改**（同「被推翻的旧值也要留引文」的纪律）。
+
+#### 变异验证（新门必须有牙齿）
+
+| 变异 | 注入 | 结果 |
+| --- | --- | --- |
+| **M1'** | `apply_scores` 的回填改成**按位置 zip**（`for (idx, item) in scored.iter().enumerate()` + `hits.get_mut(idx)`） | ✅ **新用例「部分覆盖时未覆盖项保持输入分」报红**（`3 failed`，含它 + 回填 + σ 两条）—— 而**旧**的「越界」用例在**同一变异**下**仍通过**（已复核）⇒ 换掉它是必要的 |
+| **M2'** | `sigmoid` 改成走 **f64 中间值**（`(1.0f64 / (1.0f64 + f64::from(-logit).exp())) as f32`） | ✅ `分数等于sigmoid_logit且单调有界` **报红** ⇒ 饱和端点断言确实**钉住「f32 算术」这一契约**（不是「碰巧相等」） |
+| **M3'** | 默认 `candidate_window` 改成 `k + 1` | ✅ `默认窗口等于k` **报红**（沿用 PR 1 的既有变异，回归确认） |
+
+还原后 `md5` 与注入前**逐字节一致**（`b00b9c03…` / `ceb3afc7…`）。
+
+⚠️ **本轮的变异盲区（如实登记）**：`tests/step7_rerank_local.rs` 的 `t10` 闭区间断言**无法本地变异验证**
+（需 2.19GB 模型 ⇒ `#[ignore]`）⇒ 该断言保真的依据是**「σ 在 f32 下会饱和」这一实测事实**（bits `3f800000` /
+`00000000`），而不是「改一行代码它会红」。同理 release 下「越界容忍 + `warn!`」也是盲区（debug 被
+`debug_assert!` 拦住、且无 tracing subscriber 依赖 ⇒ 不单测）。
+
+#### 守门（本地，逐条标运行范围）
+
+`cargo fmt --all -- --check` ✅ / `clippy --workspace --all-targets -D warnings` ✅ /
+`cargo test --workspace` ✅ / `make shell` ✅ / MSRV 1.90 ✅ / rustdoc `-D warnings` ✅ /
+`--no-default-features` ✅ / `--features charabia` ✅ / **`--features local-rerank`** ✅ /
+`cargo deny check advisories licenses bans sources` ✅。**新增/改写用例 2 个**（`部分覆盖时未覆盖项保持输入分`
++ `分数等于sigmoid_logit且单调有界` 的饱和端点断言）；**删掉 1 个无鉴别力用例**（`越界index被忽略…`）。
+
+### 新增 · V2 Step 7 PR 1 —— 精排内核：`Reranker::candidate_window` + `LocalReranker`（S7-01）（Refs #23，2026-09-14）
+
+> 本 PR **只做内核**（设计 §8 的 PR 切分 ①：内核与编排分开）：**不碰编排层**
+> （`query/searcher.rs` 一行未改）⇒ 交付后**没有任何既有行为变化**（`LocalReranker`
+> 尚未被任何入口装配；CLI 接线是 PR 3）。对应设计任务 **S7-01**，覆盖
+> **S7-T5 / T8 / T9 / T10 / T12** 的 PR 1 部分。
+
+#### Added
+
+- **`Reranker::candidate_window(&self, k: usize) -> usize`（provided，默认 `k`）** —— 精排器
+  → 编排层的**单向窗口通道**（D-S7-01 / D-S7-02）。**非破坏性**：`NoOpReranker` 与下游
+  自定义实现**一行不改**，未装精排器时 `candidate_k` / 截断 / `hits` 与之前逐位一致。
+  `Reranker::rerank` 的 rustdoc 补了**两条入参契约**：`hits` 长度是**候选窗口**（可 > `top_n`）、
+  实现**不得依赖** `hits[i].explain`（`explain` 的组装按 D-S7-06 推迟到精排截断之后）。
+- **`crates/core/src/rerank/local.rs`：`LocalReranker`**（feature **`local-rerank`**）——
+  fastembed `TextRerank` + `RerankerModel::BGERerankerV2M3`（`rozgo/bge-reranker-v2-m3`，
+  ⚠️ **非** BAAI 官方库——官方库没有 ONNX；`sha256:84b66c78…8945` / 2026-09-14）。
+  `Mutex<TextRerank>`（`rerank` 需 `&mut self`，同 `LocalEmbedder` 先例）；模型缓存目录
+  与 embedder **复用同一个函数**；`pub const DEFAULT_RERANK_WINDOW = 20`（**「拟」值**，
+  待 S7-04 标定 / S7-05 回填）、`DEFAULT_RERANK_MAX_LENGTH = 512`（= 库默认，D-S7-08）。
+  **不做**多 session 池化（设计 §4.4.2）。
+- **`crates/core/src/rerank/scoring.rs`：精排的纯策略层（注入接缝）** ——
+  `sigmoid` / `ScoredCandidate` / `apply_scores`（**按 `index` 回填** + 排序 + 截断）/
+  `reranker_identity`。**不依赖 fastembed** ⇒ 策略能在 CI 里用**可控打分序列**秒级钉住
+  （设计 §3.5 的可测性要求；同 Step 6 的 `EmbedderCtor` 动机）。
+  编译范围 = `cfg(any(feature = "local-rerank", test))`（默认非测试构建不编译它，不留无用代码面）。
+- **`local-rerank = ["local-embed"]`**（`crates/core/Cargo.toml`）—— **不新增依赖树节点**
+  （同一个 fastembed 已提供 `TextEmbedding` 与 `TextRerank`）。模型 ≈2.19GB ⇒ **不进默认
+  feature**（设计 §3.6 / R44）；未启用时 `LocalReranker` **不存在**（编译期），不是「运行时
+  静默退化」。
+- **`.github/workflows/ci.yml`：features job 新增 `cargo test -p helix-core --features local-rerank`**
+  —— 让这个**非默认** feature 也进守门，否则重蹈 `coreml` 的腐化（只在本地用、CI 不覆盖）。
+  真模型用例一律 `#[ignore]` ⇒ **该步不下载任何模型**。
+- **测试**：`rerank::scoring` 单测 6 个（**进 CI**：`σ` 单调有界、按 `index` 回填而非按位置
+  zip、并列按 `chunk_id` 升序、截断、越界 index、身份字符串随参数变化）+ `rerank` 单测 2 个
+  （默认窗口 `== k`、空输入不 panic）；`tests/step7_rerank_local.rs` 真模型用例 4 个
+  （`#[ignore]`：P1 同进程逐位一致 / **P2 跨进程逐位一致（真的 spawn 子进程）** /
+  T10 重排与截断契约）。
+- `Error::Rerank(String)`（`crates/core/src/error.rs`）—— 精排失败与 `Embedding` **分开**：
+  两者的落点与代价差一个数量级（96MB vs 2.19GB），混在一起会让「哪一步炸了」只能靠读字符串猜。
+
+#### ⚠️ 破坏性
+
+- **`Error::Rerank` 是新增的枚举变体**，而 `Error` **不是** `#[non_exhaustive]` ⇒ 下游若对它做
+  **穷尽 `match`** 会编译失败。刻意与 `Error::Embedding` 分开（理由见上）。
+  ⚠️ 这一条**不在设计 §6 的影响面表里**（该表未涉及 `Error`）—— 属实现期发现的**新增面**，已写进 PR 正文报评审。
+
+#### 🔵 与设计文档 §4.4.1 / §4.4.2 的**三处偏差**（实现期实测，已在 PR 正文逐条报评审）
+
+1. **`with_max_length(self, …)` 无法写成「构造后 builder」** ⇒ 改为**构造期**入口
+   `LocalReranker::with_params(window, max_length) -> Result<Self>`。理由：`max_length` 在
+   `TextRerank::try_new` 时就烧进 tokenizer 的 `TruncationParams`（`fastembed/src/common.rs:181-185`），
+   构造后再改字段**只会得到一个「断言仍绿但没生效」的假象**（正是本项目最忌讳的静默失效）。
+2. **单条候选不早退**（设计 §4.4.2 第 1 步写的是「零/单条早退」）⇒ 只有**空输入**早退
+   （fastembed 对空输入报 `EmptyTokenizations`）。理由：否则「`score` 是否被精排替换」会**依赖
+   候选条数**，与 D-S7-05 的 `explain.rerank_score.is_some()` 信号自相矛盾（R46 关注的正是
+   score 语义的可判定性）。
+3. **P3（批组成敏感性）用例落在 `rerank/local.rs` 模块内部**（设计 §7 写的是
+   `tests/step7_rerank_local.rs`）。理由：公开 API 只暴露 `σ(logit)`，而 σ 是**多对一**的浮点
+   映射 ⇒ 用 `score.to_bits()` 相等**不能**证明 **logit** 逐位相同；该用例直接读模型原始输出。
+
+#### 明确不在本 PR 范围
+
+- **编排层窗口打通**（`candidate_k` 联动 / `take_n` / `explain` 推迟 / `Metrics.rerank_window` /
+  `Metrics.rerank_elapsed` / `Explain.rerank_score`）= **S7-02（PR 2）**。⚠️ 因此 **S7-T5 / T12 的
+  「经编排层」那一半**（假精排器在 `search_parts` 里被喂到多少条、`is_some() ⟺ 精排生效`）
+  **随 PR 2 落地**；本 PR 覆盖的是它们的**接口侧**（trait 语义与纯策略）。
+- CLI `--rerank-window` / 两条脚枪拦截 = S7-03；标定 = S7-04；定义面回写 = S7-05。
+
 ### 文档 · V2 Step 7 详细设计 —— 评审响应（F1~F6 全部采纳 + 四处拍板获同意）（Refs #23，2026-09-14）
 
 > 评审落点：**1 条正式评审（`COMMENTED`）+ 6 条行内**，`issues/51/comments` = **0**。

@@ -16,7 +16,10 @@ use super::Embedder;
 pub const BGE_ZH_QUERY_PREFIX: &str = "为这个句子生成表示以用于检索相关文章：";
 
 /// 默认缓存目录（仓库外）。
-fn default_cache_dir() -> std::path::PathBuf {
+///
+/// ⚠️ `pub(crate)` 是给 **`rerank::local`** 复用的（设计 §4.4.1）：精排与向量化必须
+/// 用**同一个**缓存根，否则两处路径漂移会让「模型下到哪去了」变成谜。
+pub(crate) fn default_cache_dir() -> std::path::PathBuf {
     dirs_home()
         .join(".cache")
         .join("helix-index")

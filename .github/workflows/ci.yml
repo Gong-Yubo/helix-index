@@ -153,6 +153,16 @@ jobs:
       # 防止分支在无人使用时悄悄腐化
       - name: charabia feature
         run: cargo test -p helix-core --features charabia
+      # V2 Step 7 / S7-01：`local-rerank`（本地精排）同样是**非默认** feature ——
+      # 模型合计 ≈2.19GB ⇒ 不能进默认构建 / 下载路径（设计 §3.6 / R44）。
+      # 但本 crate 又必须**编译并测**它，否则重蹈 `coreml` 的腐化：
+      # 只在本地用、CI 不覆盖 ⇒ 随依赖升级悄悄坏掉（见 core/Cargo.toml 的注释）。
+      # ⚠️ 真模型用例一律 `#[ignore]`（`tests/step7_rerank_local.rs`）⇒ **本步不下载
+      #    任何模型**。精排的**策略**（σ 变换 / 按 index 回填 / tie-break / 截断）落在
+      #    不依赖 fastembed 的 `rerank::scoring`，默认 `cargo test` 就跑到（`cfg(test)`）。
+      #    本步覆盖的是「`LocalReranker` 这个适配层仍然编得过、非模型的单测仍然过」。
+      - name: local-rerank feature
+        run: cargo test -p helix-core --features local-rerank
       # local-embed 必须真的可选（远程 embedding 场景会关掉它）
       - name: no-default-features
         run: cargo check -p helix-core --no-default-features
