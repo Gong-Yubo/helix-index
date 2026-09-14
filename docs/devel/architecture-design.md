@@ -4,9 +4,9 @@
 
 | 项目   | 内容                   |
 | ---- | -------------------- |
-| 文档版本 | v1.14                |
+| 文档版本 | v1.16                |
 | 创建日期 | 2026-09-02           |
-| 状态   | **V2.0 Step 1~6 已并入 `main`**（main 现为 **`8f4d08c`**——Step 6 实现 PR 6 **#44** 已 squash 合并；Step 5 收尾 PR #37 → `590315d`；PR #39「T13 质量门 → 同图可归因不变式」→ `bb23553`）；**Step 6 已完整收尾（S6-10，2026-09-13）**——实现任务 **S6-01~S6-09 全部开工完毕**（**S6-04 / S6-05 判「不投」**），`v2-step6-design.md` 升 **v0.4**（实现期 v0.3 → 收尾回写 v0.4）；**§14.4 扩为 R36~R43**（R36/R37 消解、R38/R39 关闭、R40 上锁、新增 R41/R42/R43）；**本步无 trait / 结构变更**；Step 7 未开工。步骤编号映射见 `plan-v2.md` §附-2 |
+| 状态   | **V2.0 Step 1~6 + 横切 T7-21/T7-24 已并入 `main`；Step 7 详细设计**已出并完成评审收口（`v2-step7-design.md` **v0.2**，2026-09-14：评审 **4 项拍板全部同意**、**F1~F6 全部采纳**；**本文档无实质变更 —— §14.5 的 R44~R48、§5.7 / §5.8 的新增 API 一字未改**，本行为版本面同步）**（main 现为 **`516b2c7`**——Step 6 实现 PR 6 **#44** 曾 squash 合并为 `8f4d08c`，其后 **PR #48**（T7-24 工程卫生）→ `e756bcc`、**PR #49**（T7-21 `parallel_build` 默认翻转）→ `516b2c7`；Step 5 收尾 PR #37 → `590315d`；PR #39「T13 质量门 → 同图可归因不变式」→ `bb23553`）；**Step 6 已完整收尾（S6-10，2026-09-13）**——实现任务 **S6-01~S6-09 全部开工完毕**（**S6-04 / S6-05 判「不投」**），`v2-step6-design.md` 升 **v0.4**（实现期 v0.3 → 收尾回写 v0.4）；**§14.4 扩为 R36~R43**（R36/R37 消解、R38/R39 关闭、R40 上锁、新增 R41/R42/R43）；**Step 6 本步无 trait / 结构变更**。**Step 7（精排）详细设计已出、待评审**（`v2-step7-design.md` **v0.1**，2026-09-14）——**§14.5 新增 R44~R48**；**§5.7 补 `candidate_window`（provided，默认 `k` ⇒ 零破坏）** + **§5.8 补 `Explain.rerank_score`（⚠️ 破坏性）与 `Metrics.rerank_elapsed` / `rerank_window`（纯加法）**；精排器 = `rozgo/bge-reranker-v2-m3`（**非** BAAI 官方）；H3 取形为**可配 `R`、默认 20（拟）**。步骤编号映射见 `plan-v2.md` §附-2 |
 | 技术栈  | Rust 1.90+ / 2021 edition |
 | 文件名   | `architecture-design.md` |
 | 配套文档 | `requirements-spec.md`（需求分析说明书） |
@@ -34,6 +34,8 @@
 | v1.12 | 2026-09-11 | 已定稿 | **V2 Step 6 详细设计回写**（依据 `v2-step6-design.md` v0.1，D-S6-01~09 待评审）：**§14.4 新增 R36~R40** —— 多 session 内存峰值（R36，**条件性**）/ CoreML EP 改变向量数值致效果基线不可横比（R37，**条件性**）/ `default_embedder()` 静默降级（R38，**今天就存在**）/ 追加路径漏发图 manifest（R39，与 Step 4 同一坑）/ ID 复用致幽灵向量（R40，与 Q-C1 同族、成因相反）；§14 导读补 R36~R40 指引与「R36/R37 为条件性」的说明。⚠️ **本 Step 不引入任何 trait / 结构变更**（`Embedder` trait 一字不改、`ConfigFingerprint` 结构不动——EP 配置改用 `embedder_id` 编码，理由同 R35 的破坏性变更判定），故不触碰 §5.x / §8.x / §10.x；**也不触碰任何 FR / NFR**（NFR-10 的数值目标缺失问题登记为 `v2-step6-design.md` §9.2 Q4，待评审拍板后才修订需求文档） |
 | v1.13 | 2026-09-11 | 已定稿 | **V2 Step 6 设计评审收口：架构侧无实质变更，本行仅为版本面同步**（设计文档升 **v0.2**；PR #38 的 7 条评审意见 F1~F7 全部采纳，**D-S6-05 / D-S6-08 拍板**、Q4~Q7 收口）——**未新增或修改任何风险条目（R36~R40 保持原样）、trait、结构**：R38 的「应对」本就指向 D-S6-05 方案 A，本次只是把该决策正式拍板；**未触碰任何 FR / NFR**——NFR-10 的口径修订属**需求面**，落在 `requirements-spec.md` **v1.14**。评审对本文档的复核结论：§14.4 R36~R40 的登记与「R36/R37 条件性」判定**成立** |
 | v1.14 | 2026-09-13 | 已定稿 | **V2 Step 6 收尾（S6-10）回写 —— §14.4 由「R36~R40」扩为「R36~R43」**：① **R36 / R37 消解**——T7-09 判「不投」（E2 增益 +11.7%/+16.0% 而峰值 RSS **+96.4%/+289.2%**；E3 调优后仅 **+1.2%**）⇒ 多 session / CoreML EP 均不落地，条件性风险**不发生**（R36 的峰值代价已被数据钉死，不是「没人碰」）；② **R38 / R39 在 Step 6 内关闭**（S6-09：`--vectors` 显式请求向量**硬失败** + 内部测试接缝；S6-T13：追加后冷启动 `Loaded` 且 manifest `nb_point` 吻合）；③ **R40 已上锁、残余仍在**（S6-T8 不变式测试锁住 ID 单调，但「不冲突」的证明仍依赖三条隐含前提）；④ **新增 R41**（**建库路径峰值 RSS 2.32~3.33GB 与 NFR-05 的 372MB 差一个数量级** ⇒ 预算形态按 `batch × 序列长度` 给、**只给形态不给数**；NFR-05 已补限定词「（检索路径，batch 1）」，需求 v1.15）/ **R42**（**依赖安全公告漂移**：`bincode` `RUSTSEC-2025-0141` 两条路径 + `paste` `RUSTSEC-2024-0436`，均无升级路径、**长期开放**）/ **R43**（**查询侧编码把并发吞吐封顶**：`crates/core/src/embed/local.rs:35` 的 `Mutex<TextEmbedding>`；实测 4 线程 vector **1.88×** / hybrid **1.63×**，临时把 `embed_query` 移出被测路径 ⇒ vector **3.15×** ⇒ **阈值本身可达、卡在实现**；**保持打开**，复审触发条件 = 查询侧会话池落地时，届时须先答挂起的 Q3）；⑤ **§14.4 表头状态**由「设计已出、实现未开工」改为「实现完成 + S6-10 收尾回写」。⚠️ **无 trait / 结构变更**（`Embedder` 一字不改、`ConfigFingerprint` 不扩）；NFR-10 / NFR-05 的口径修订属**需求面**，落在 `requirements-spec.md` **v1.15** |
+| v1.15 | 2026-09-14 | 待评审 | **V2 Step 7（精排）详细设计回写**（依据 `v2-step7-design.md` **v0.1**，D-S7-01~10 待评审）—— **① §14.5 新增 R44~R48**：R44 **精排器常驻内存**（`model.onnx.data` **≈2.19 GB FP32** ⇒ NFR-05 的 372MB 在精排开启时失效；⚠️ 与 **R41 不是同一件事**：R41 是**建库**路径峰值、R44 是**查询**路径**常驻**增量）/ R45 **精排延迟主导 + 窗口与 `candidate_k` 的静默夹取** / R46 **`Hit.score` 语义随开关而变**（R35 一族）/ R47 **精排数值可复现性未证实**（`PaddingStrategy::BatchLongest` ⇒ 跨 batch 组成的分数可能不逐位相同）/ R48 **512 token 截断使长段落判据失真**（T2Ranking 最长段落 **76,895 字符**）。**② §5.7 `Reranker`**：新增 **provided 方法 `candidate_window(&self, k) -> usize`（默认 `k`）** ⇒ 既有实现**一行不改**、NoOp 路径**逐位零回归**；契约收紧「`rerank` **不得依赖** `hits[i].explain`」（**编译期无感**，D-S7-06 的接口收缩）；新增 **`LocalReranker`**（gate `feature = "local-rerank"`，⚠️ **未启用时编译期不存在**、非运行时静默退化）。**③ §5.8**：`Explain` 新增 **`rerank_score: Option<Score>`（⚠️ 破坏性）**、`Metrics` 新增 **`rerank_elapsed: Duration` / `rerank_window: usize`（纯加法，保持 `Copy`）**；`Hit.score` 在精排生效时 **= `σ(logit)`**（单调 ⇒ 排序零损失，融合分仍留 `Explain.fused_score`）。**④ §14 导读**补 §14.5 指引。⚠️ **本步不引入 trait 破坏**（只加 provided 方法）；**不进 `ConfigFingerprint`**（精排不改索引内容，D-S7-10）；NFR-12 / NFR-05 / NFR-06 / NFR-07 与 FR-18 的修订属**需求面**，落在 `requirements-spec.md` **v1.16** |
+| v1.16 | 2026-09-14 | 待评审 | **V2 Step 7 设计评审收口：架构侧无实质变更，本行仅为版本面同步**（设计升 **v0.2**）—— 评审 **4 项拍板（D-S7-04/05/01/08）全部同意建议**、**F1~F6 全部采纳**；**§14.5 的 R44~R48 条目一字未改**（评审逐条核过 R46 / R48 的实际登记内容，确认与设计一致）；**§5.7 / §5.8 的新增 / 变更 API 一字未改**。评审唯一触及架构语义的条目是 **F1**：`plan-v2` §8 曾把窗口写成「`Config` 新增字段」（与 **D-S7-02**「`Config` / `SearchParts` 一律不改」矛盾）⇒ 已在 `plan-v2` 更正，**架构侧无需改动**。NFR-12 的措辞更正属**需求面**，落在 `requirements-spec.md` **v1.17** |
 
 ### 1.2 读者
 
@@ -492,13 +494,36 @@ pub trait FusionStrategy: Send + Sync {
 }
 ```
 
-### 5.7 Reranker（v1 仅留位，FR-18）
+### 5.7 Reranker（FR-18；V2 Step 1 留位 → **V2 Step 7 接入，设计已出、待评审**）
 
 ```rust
 pub trait Reranker: Send + Sync {
+    /// 【V2 Step 7 新增，provided】精排**希望拿到**的候选条数（供编排层在召回**之前**决定候选池）。
+    ///
+    /// 语义：返回 `w` 表示「请把融合结果的前 `max(k, w)` 条交给我」。**默认实现返回 `k`**
+    /// —— 即**不放开窗口**：既有实现（`NoOpReranker` 与下游自定义实现）**一行不改**，
+    /// 且未装精排器时 `candidate_k` / 截断 / `hits` 与 Step 6 **逐位一致**。
+    ///
+    /// ⚠️ 上层会与 `candidate_k = max(3k, w, 10)`（`query/searcher.rs:118`）**联动**：
+    /// 返回 `w > 3k` 时候选池随之放大，否则窗口被**静默封顶**（见 §14.5 R45）。
+    fn candidate_window(&self, k: usize) -> usize { k }
+
+    /// ⚠️ 【V2 Step 7 契约收紧】**不得依赖** `hits[i].explain`——`matched_terms` 与 lane
+    /// rank/score 在精排**之后**才填（编排层把 `explain` 组装推迟到最终 ≤ k 条，D-S7-06），
+    /// 入参里可能**只有** `fused_score`；需要正文请用 `hits[i].text`。
     fn rerank(&self, query: &str, hits: Vec<Hit>, top_n: usize) -> Result<Vec<Hit>>;
 }
 ```
+
+**不变式（V2 Step 7，写入 rustdoc，三条）**：
+
+1. `take_n = min(max(k, candidate_window(k)), fused.len())`，且 `candidate_k = max(3k, candidate_window(k), 10) ≥ take_n` ⇒ 窗口**不会被候选池静默封顶**；
+2. `Reranker::rerank` **不得依赖** `hits[i].explain`（`explain` 在精排**之后**才组装，D-S7-06）；
+3. 精排生效时 `hits` 按 `score` **严格不增**、并列按 `chunk_id` **升序**（D-S7-07）；且 `hit.explain.rerank_score.is_some()` 是「`score` 已被精排替换」的**唯一**信号（D-S7-05）。
+
+**实现（V2 Step 7）**：`NoOpReranker` **无改动**（`rerank/noop.rs`，`take(top_n)` 直通，仍是默认与逃生舱）；**新增 `LocalReranker`**（`rerank/local.rs`，gate **`feature = "local-rerank"`**）——`Mutex<TextRerank>` + `window` + `max_length`，模型 = fastembed `RerankerModel::BGERerankerV2M3` ⇒ **`rozgo/bge-reranker-v2-m3`（⚠️ **非** BAAI 官方；官方库**没有 ONNX 导出**）**，`model.onnx.data` **≈2.19 GB FP32**（内存后果见 §14.5 **R44**）；`id()` 返回 **`String`**（**不是** `&'static str`——`max_length` / `window` 属运行期参数）。⚠️ **未启用 feature 时 `LocalReranker` 编译期不存在**（不是运行时静默退化，同 Step 6 D-S6-05 的硬失败纪律）。**不进 `ConfigFingerprint`**（精排不改索引内容，D-S7-10）；默认窗口 **`R = 20`（「拟」值，由 S7-04 标定回填）**。
+
+> 详细设计见 `docs/devel/v2-step7-design.md`（**v0.1**，待评审）；风险见 **§14.5 R44~R48**。
 
 ### 5.8 返回类型
 
@@ -525,6 +550,10 @@ pub struct Explain {
     pub vector_score: Option<Score>,
     pub vector_rank:  Option<u32>,
     pub fused_score: Score,
+    /// 【V2 Step 7 新增，**破坏性**】精排生效时为**模型原始 logit**；
+    /// `None` ⟺ 本次 `score` 是**融合分**（D-S7-05）。
+    /// **这是「`score` 已被精排替换」的唯一信号**（NFR-07 的「不得静默」，见 §14.5 R46）。
+    pub rerank_score: Option<Score>,
 }
 
 pub struct SearchResponse {
@@ -549,6 +578,8 @@ pub enum EmptyReason {
 > 【**V2 Step 5**，设计已定稿、实现未开工】新增 `metrics: Metrics` 是**对外破坏性变更**（字段全 `pub`
 > ⇒ 外部字面量构造会编译失败，见 **R35**）。不变式：`metrics.took == took`（口径自洽），
 > 且 `metrics.vector_route` 是「兜底是否真的生效」的唯一直接判据（D-S5-07）。
+>
+> 【**V2 Step 7**，设计已出、待评审】`Explain` 新增 **`rerank_score: Option<Score>`**（**对外破坏性**，与 `metrics` 同属 **R35** 一族）+ `Metrics` 新增 **`rerank_elapsed: Duration` / `rerank_window: usize`**（**纯加法**，保持 `Copy`）。⚠️ **`Hit.score` 的语义随精排开关变化**（D-S7-05）：精排生效时 `= σ(logit) ∈ (0,1)`——**单调变换 ⇒ 排序信息零损失**；融合分**不丢**（仍在 `Explain.fused_score`）、原始 logit 进 `Explain.rerank_score`。`rerank_window == k` ⟺ 窗口**没被放开**（放开是否真的生效的直接证据）。**不进 `ConfigFingerprint`**（精排不改索引内容，D-S7-10）。
 
 ---
 
@@ -1511,6 +1542,10 @@ pub enum Error {
 > 完整触发条件与未决问题见 `v2-step6-design.md` §9。⚠️ 本 Step **不承诺**把 NFR-03 ① 从 225.5s 压到 120s（D-J8 已判定不可达）。
 > ⚠️ **R11 / R13 / R17 / R18 不得标「已解决」**：Step 5 的精确路径只覆盖**低选择度子集**
 > （`allowed ≤ 阈值`），`allowed >` 阈值时仍回路径 B ⇒ 只能标「低选择度子集已绕过」（设计文档 §4.4）。
+> V2 Step 7（精排）的 **R44~R48** 见 §14.5，完整触发条件与未决问题见 `v2-step7-design.md` §9。
+> ⚠️ **R44 与 R41 不是同一件事**：R41 是**建库**路径峰值 RSS，R44 是**查询**路径的**常驻**增量。
+> ⚠️ **R47 的结论「测了才知道」**：探针若出反例**不必修**（数学上等价），但它**改变报告怎么读**
+> （不同 `R` 的 `score` 不可逐位横比，只能比序数指标）。
 
 #### 14.1 V2 Step 2 引入的风险（R19 ~ R25）
 
@@ -1576,6 +1611,24 @@ pub enum Error {
 
 ---
 
+#### 14.5 V2 Step 7 引入的风险（R44 ~ R48）
+
+> **状态：设计已出、待评审**（`v2-step7-design.md` **v0.1**，2026-09-14；实现任务 S7-01~S7-05，PR 切分见其 §8）。
+> ⚠️ **本步无 trait 破坏**——`Reranker` 只**新增 provided 方法** `candidate_window`（默认 `k`）⇒ 自定义实现**一行不改**；
+> **`Explain` 加字段属对外破坏性变更**（R35 一族，D-S7-05）；`Metrics` 加两字段是**纯加法**、保持 `Copy`。
+> ⚠️ **R44 与 R41 不是同一件事**（建库 vs 查询 / 峰值 vs 常驻）；**R45 包含「窗口被 `candidate_k` 静默夹取」这一空转陷阱**。
+> 完整触发条件与未决问题见 `v2-step7-design.md` §9；NFR-12 的标定协议与决策门见其 §4.6。
+
+| # | 风险 | 影响 | 应对 | 残余 |
+| --- | --- | --- | --- | --- |
+| **R44** | **精排器常驻内存远超检索路径预算**：`bge-reranker-v2-m3` FP32 权重 **≈2.19 GB**（`model.onnx.data` **2,271,088,656 B**，sha256 已核 `84b66c78…8945`）+ 激活 | NFR-05 的「峰值 RSS **372MB**（检索路径，batch 1）」**在精排开启时失效**（差一个数量级）⇒ 用户按 372MB 选机器会在开启精排后被 **OOM kill** | ① 需求侧 NFR-05 补限定词「**不含精排器**」（同 Step 6 的 Q8 方案 C 先例，已回写 `requirements-spec.md` **v1.16**）；② 精排**默认关**（D-S7-04）⇒ 不开就不付；③ S7-04 实测峰值 RSS 入 `eval-report.md` **§8.14** | ⏳ **长期开放**：不给精排侧的独立 RSS 预算（与 R41 同族，**只给形态不给数**）。⚠️ 与 R41 的区别：R41 是**建库**路径峰值，R44 是**查询**路径**常驻**增量 |
+| **R45** | **精排延迟主导 + 窗口静默封顶**：① 窗口放开后成本 ≈ `O(R)` 次 cross-encoder 前向，若默认开端到端 P99 从 ~3ms 涨到**百毫秒级** ⇒ NFR-02 **名义失效**；② ⚠️ **只改 `take(k)` 而不联动 `candidate_k`** ⇒ `R > 3k` 时窗口**被静默夹到 `3k`**（R=100 在 k=10 时退化成 30）⇒ **「窗口已放开」的结论建立在空转上** | 交互体验（NFR-02 / Agent 关键路径几十次调用） | ① 默认关（D-S7-04）；② **NFR-12 独立口径**（不并入 NFR-02）；③ 默认 `R` 由标定（设计 §4.6.4）决定；④ **候选池联动写进 rustdoc 不变式**（`candidate_k = max(3k, w, 10) ≥ take_n`）+ S7-T3 断言「间谍向量后端收到的 `k` ≥ `window`」；⑤ 精排器与查询侧编码共享 `Mutex` 串行瓶颈（同 R43）⇒ **明确不做池化** | ⚠️ **保持开放**：`R` 与延迟的取舍是**用户侧**决策；本 Step 只给「可配 + 有数据」 |
+| **R46** | **`Hit.score` 的语义随开关而变**（融合分 → `σ(logit)`），且 `hits` 的**并列次序**规则随之改变 | 下游若用 `score` 设阈值 / 跨配置比较 / 缓存排序结果 ⇒ **静默失准**；与 R35 一族（对外可观测的破坏性变更） | ① `Explain.rerank_score` 让变换**可观测**（D-S7-05，NFR-07 精神）；② CHANGELOG 显式 `⚠️ 破坏性`；③ `Hit.score` 的 rustdoc 重写为「**当前排序依据**」并写明三种 mode × 精排开关的取值 | ⚠️ **识别成本仍在用户侧**：内核只能说清「这次 `score` 是什么」，无法阻止下游误用 |
+| **R47** | **精排数值的可复现性未证实**：tokenizer 用 `PaddingStrategy::BatchLongest`（`fastembed/src/common.rs:174-180`）⇒ **同一 `(query, doc)` 在不同批次组成下 padding 长度不同** ⇒ 浮点结果**可能不逐位相同**；ONNX 多线程归约亦然 | ① NFR-06（相同 query → 完全相同结果）**可能不成立**；② 标定实验的**分数轴不可横比**（只能比序数指标） | ① 设计 §4.7 三个层次探针 **P1/P2/P3**（S7-T8 / T9）；② 设计 §4.6.3 的「不可横比声明」；③ 若 P1/P2 出反例 ⇒ NFR-06 加限定词「**不含精排**」并**升需求版本** | ⚠️ **测了才知道**：P3 的反例**不必修**（数学等价），但**改变报告怎么读** |
+| **R48** | **512 token 截断使长段落的精排判据失真**：`HasMaxLength for RerankerModel = 512`（`fastembed/src/reranking/init.rs:16-18`），而 T2Ranking 段落最长 **76,895 字符**（`crates/cli/src/bench.rs:697`）⇒ 精排**只看得到段落前段** | **可能把「方法不行」错判为「精排无提升」**（**结论错、而代码没错**）；反过来若调大 `max_length`，成本近似**平方**增长 | ① D-S7-08（保持 512 起步 + `1024` 对照档）；② 设计 §4.6.4 的判据②明写「拐点不可识别时要**如实记入局限**」；③ `max_length` 进精排器**身份字符串**（`id()`，D-S7-08 / 设计 §4.4.4） | ⏳ **开放**：截断对长段落的定量影响要等标定；若确认为主因，**为评测集单独调大**（而不是改产品默认） |
+
+---
+
 ## 15. 附录
 
 ### 15.1 参考资料
@@ -1604,3 +1657,5 @@ pub enum Error {
 | v1.12 | 2026-09-11 | **V2 Step 6 详细设计回写**（`v2-step6-design.md` v0.1，D-S6-01~09 待评审）：**§14.4 新增 R36~R40**（多 session 内存峰值 / CoreML EP 改变向量数值 / `default_embedder()` 静默降级 / 追加漏发图 manifest / ID 复用致幽灵向量），其中 **R36、R37 标注为条件性**（取决于 embed 并行 spike 的「投 / 不投」判定）；§14 导读同步。**不触碰任何 trait / 结构 / FR / NFR**（NFR-10 数值目标缺失登记为设计文档 §9.2 Q4） |
 | v1.13 | 2026-09-11 | **V2 Step 6 设计评审收口（版本面同步）**：设计文档升 **v0.2**——PR #38 的 7 条评审意见（F1~F7）全部采纳，**D-S6-05 / D-S6-08 拍板**、Q4~Q7 收口。**本文档无风险条目 / trait / 结构变更**：§14.4 R36~R40 保持原样（R38 的「应对」仍指向 D-S6-05 方案 A，本次仅是正式拍板）。NFR-10 的口径修订属**需求面**，落在 `requirements-spec.md` **v1.14** |
 | v1.14 | 2026-09-13 | **V2 Step 6 收尾（S6-10）回写：§14.4 由「R36~R40」扩为「R36~R43」** —— ① **R36 / R37 消解**——T7-09 判「不投」（E2 +11.7%/+16.0% 而峰值 RSS **+96.4%/+289.2%**；E3 调优后 +1.2%）⇒ 多 session / CoreML EP 均不落地；② **R38 / R39 关闭**（S6-09 硬失败 + 内部测试接缝；S6-T13 断言追加后冷启动 `Loaded` 且 manifest `nb_point` 吻合）；③ **R40 上锁、残余仍在**（S6-T8 锁 ID 单调，但「不冲突」的证明仍依赖三条隐含前提）；④ **新增 R41**（**建库路径峰值 RSS 2.32~3.33GB 与 NFR-05 的 372MB 差一个数量级**；预算按 `batch × 序列长度` 给、**只给形态不给数**）/ **R42**（**依赖安全公告漂移**：`bincode` / `paste` 两条无升级路径的 unmaintained，**长期开放**）/ **R43**（**查询侧编码封顶并发**：`embed/local.rs:35` 的 `Mutex<TextEmbedding>`；实测 4 线程 vector **1.88×** / hybrid **1.63×**，临时移出编码后 vector **3.15×** ⇒ **阈值可达、卡在实现**；**保持打开**）；⑤ §14.4 表头状态改为「实现完成 + 收尾回写」。**无 trait / 结构变更**；NFR-10 / NFR-05 的口径修订属**需求面**，落在 `requirements-spec.md` **v1.15** |
+| v1.15 | 2026-09-14 | **V2 Step 7（精排）详细设计回写**（`v2-step7-design.md` **v0.1**，D-S7-01~10 待评审）—— ① **§14.5 新增 R44~R48**（精排器常驻内存 ≈2.19GB / 精排延迟主导 + 窗口静默夹取 / `Hit.score` 语义随开关而变 / 精排数值可复现性未证实 / 512 token 截断使长段落判据失真）；② **§5.7 `Reranker` 新增 provided 方法 `candidate_window`（默认 `k`）** ⇒ → 既有实现一行不改、NoOp 逐位零回归；契约收紧「`rerank` 不得依赖 `hits[i].explain`」；新增 **`LocalReranker`**（gate `feature = "local-rerank"`，未启用时编译期不存在）；③ **§5.8** `Explain` 新增 **`rerank_score: Option<Score>`（⚠️ 破坏性）**、`Metrics` 新增 **`rerank_elapsed` / `rerank_window`（纯加法）**，`Hit.score` 精排生效时 **= `σ(logit)`**；④ **§14 导读**补 §14.5 指引与「R44 ≠ R41」「R47 反例不必修」两条纪律。⚠️ **本步不引入 trait 破坏**；**不进 `ConfigFingerprint`**（D-S7-10）。NFR-12 / NFR-05 / NFR-06 / NFR-07 与 FR-18 的修订属**需求面**，落在 `requirements-spec.md` **v1.16** |
+| v1.16 | 2026-09-14 | **V2 Step 7 设计评审收口（纯版本面同步）**：设计文档升 **v0.2** —— 评审 **4 项拍板全部同意**、**F1~F6 全部采纳**。**本文档无风险条目 / trait / 结构变更**（**§14.5 的 R44~R48 一字未改**；评审已逐条核实 R46 = `Hit.score` 语义随开关而变、R48 = 512 token 截断使长段落判据失真，与登记一致）。评审 **F1** 指向的 `plan-v2` §8「`Config` 新增字段」与 **D-S7-02** 矛盾，已在 `plan-v2` 更正，**不涉本文档**。NFR-12 的措辞更正属**需求面**，落在 `requirements-spec.md` **v1.17** |
