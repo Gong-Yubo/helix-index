@@ -10,7 +10,7 @@
 | 非范围 | 自适应融合 / paraphrase 桶稀释（**Step 9**，T7-14）；跨编码器以外的小模型选型（如 `bge-reranker-base` / jina 系）；**多 session 精排池化**（**明确不做**，理由见 §4.4.2）；精排器的**训练 / 微调**；`bm25` 打分改造；V2.1 的 prefilter；**评测集换代**（仍是 T2Ranking 12K / 320 query，`#23` 的 Agent query 集在 Step 9） |
 | 交付物 | ① `crates/core/src/rerank/local.rs`（`LocalReranker`）② `Reranker` trait 的 `candidate_window` ③ 编排层窗口打通 + `Metrics` 采集点 + `Explain.rerank_score` ④ CLI `--rerank-window`（`search` / `bench`）⑤ `scripts/eval_rerank.sh` ⑥ `eval-report.md` **§8.14** ⑦ 四处定义面回写 |
 
-> ## 🔧 S7-01 实现期勘误（E1~E6，2026-09-14，**PR #52 评审意见 3 的落地**）
+> ## 🔧 S7-01 实现期勘误（**E1~E7**，2026-09-14；E1~E6 = **PR #52 第 1 轮评审意见 3 的落地**，E7 = **第 2 轮「新 1 / 新 2」的落地**）
 >
 > **本节不触碰决策 / 预算 / 风险面**（D-S7-01~10、NFR-12/05/06/07、R44~R48 **一字未动**），
 > 只把「**已实装的事实**」同步回本文 —— 依据 = PR #52 评审：三处偏差**已实装**、而本文仍是旧文本，
@@ -22,8 +22,9 @@
 > | **E2** | §4.4.2 第 1 步 | 「零/**单条**早退」→ **只有空输入**早退（**单条不早退**）：否则「`score` 是否被替换」会**依赖候选条数**，与 **D-S7-05** 的 `explain.rerank_score.is_some()` 信号自相矛盾（R46 关心的正是 score 语义的可判定性） |
 > | **E3** | §7 **S7-T9** 落点 | `tests/step7_rerank_local.rs` → **`rerank/local.rs` 模块内部**：公开面只暴露 `σ(logit)`，而 σ 是**多对一**的浮点映射 ⇒ `score.to_bits()` 相等**证明不了 logit 逐位相同** |
 > | **E4** | §4.4.3 | `Hit.score ∈ (0, 1)` → **`∈ [0, 1]`**：f32 下 σ **精确饱和**（实测 `σ(16.7) == 1.0`（`1 + e^(−16.7)` 被舍回 1.0）/ `σ(−89.0) == 0.0`（`e^89` 上溢到 `inf`））；饱和处不再严格单调，但**序不增/不减**仍成立 ⇒ D-S7-05 依赖的是单调、不是单射 |
-> | **E5** | §4.4.2 第 5 步 | 回填的**契约与两条防御路径**写实：`scored` 应**恰好覆盖** `hits`；`index` 越界 = 结构违反 ⇒ `debug_assert!`（dev）+ `warn!` + 忽略；**覆盖不足** = 保持**输入（融合）分** + `warn!`（不加 `debug_assert`，否则该语义**不可测**） |
+> | **E5** | §4.4.2 第 5 步 | 回填的**契约与两条防御路径**写实：`scored` 应**恰好覆盖** `hits`；`index` 越界 = 结构违反 ⇒ `debug_assert!`（dev）+ `warn!` + 忽略；**覆盖不足** = 保持**输入（融合）分** + `warn!`（不加 `debug_assert`，否则该语义**不可测**）。⚠️ **第 2 轮补记**：契约里「恰好覆盖」的**判定口径**也在实现期定死了（见 **E7**） |
 > | **E6** | §6 影响面表 | **补列 `Error::Rerank`**（设计期**漏列**的新增公开面）+ `Reranker::rerank` 行补**写侧契约**（PR #52 评审意见 1） |
+> | **E7** | §4.4.2 第 5 步（**第 2 轮评审「新 1 / 新 2」**） | ① 「恰好覆盖」的**判定口径** = **有效且去重后的 `index` 集合**（`rerank::scoring::uncovered_count`），**不是条数比较** —— 只比 `scored.len()` 漏掉「**重复 `index` + 漏一个**」（条数相等 ⇒ 判不出）；② **两条护栏各自有用例钉住**：越界 `debug_assert!` 用 `#[cfg(debug_assertions)] + #[should_panic]`（**本仓首个 `should_panic`**，全仓此前 0 处），覆盖判定用**纯函数单测**（不依赖 tracing subscriber） |
 >
 > ⚠️ **版本号刻意不升（仍 v0.2）**：本节**不含**决策/预算/风险变更，而升版会让 4 处定义面的
 > 「依据 `v2-step7-design.md` v0.2」引用**连带漂移** —— 那属 **S7-05** 的回写范围。
@@ -38,11 +39,21 @@
 >    **NFR-06 的结论不受影响**（重排仍是逐位确定的）。**裁定：以 D-S7-07 为准**（评审 #52 意见 5）。
 > 2. **`plan-v2.md:462` 的 fastembed 锚点仍是 F5 更正前的旧值**（`impl.rs:110` / `:186-198`，
 >    应为 **`:126-132`** / **`:215-224`**）—— #51 的 F5 只改了本文 ⇒ 这是「一类缺陷」的
->    **第三个载体（跨定义面）**。本次已按该纪律**全仓扫描全部 fastembed 锚点**：
->    **Step 7 引入的锚点里只有这一处漏网**；另 `plan-v2.md:380` / `:659` 的 `src/init.rs:30-33`
->    属 **2026-09-07 的旧锚点**（指 `InitOptions<M>`，我们走的是 `InitOptionsWithLength` 的 `:20`），
->    但 `plan-v2.md:671-680` **已有「以上一律以 `v2-step6-design.md` 附录 C 为准」的取代指针**
->    ⇒ 属**刻意保留的历史记录**（同「被推翻的旧值也要留引文」的纪律），**不建议改**。
+>    **第三个载体（跨定义面）**。
+> 3. **`architecture-design.md:1628`（§14.5 **R48**）的 `fastembed/src/reranking/init.rs:16-18` 同为旧值**
+>    （应为 **`17-19`**）—— 该行由 **`1859dbf`（#51）** 引入（`git log -S "init.rs:16-18"` ⇒ 仅此一个提交）
+>    ⇒ **同样属「Step 7 引入的锚点」**。
+>    ⚠️ **本条更正了我第 1 轮的结论**：当时写「Step 7 引入的锚点里**只有这一处**（`plan-v2.md:462`）漏网」
+>    ⇒ **实际是两处**（第 2 轮评审「新 3」指出）。**根因（已记入教训）**：我的全仓扫描**确实命中了**该行，
+>    但工具把它截断成 `[Omitted long matching line]` 而我**没有回读** ⇒ **凡「Omitted」的命中必须逐条回读**。
+>    （顺带核过：同行 `:1627` 的 R47 锚点 `common.rs:174-180` **是正确的**，不动。）
+> 4. 上述**跨定义面的同类漂移一次性修完**（#51 的 F5 只落在本文）—— 第 2、3 项同因同源。
+>
+> **核过仍准确、未改的**（免得后人分不清「没核」与「核了没事」）：`plan-v2.md:380` / `:659` 的
+> `src/init.rs:30-33` 属 **2026-09-07 的旧锚点**（指 `InitOptions<M>`，我们走的是
+> `InitOptionsWithLength` 的 `:20`），但 `plan-v2.md:671-680` **已有「以上一律以
+> `v2-step6-design.md` 附录 C 为准」的取代指针** ⇒ 属**刻意保留的历史记录**
+> （同「被推翻的旧值也要留引文」的纪律），**不建议改**。
 
 ---
 
@@ -903,12 +914,12 @@ cargo run -p helix --release -- bench --index /tmp/t2-frozen.idx --runs 1 \
 | `src/reranking/impl.rs:145-148` | `tokenizer.encode_batch(inputs, true)` + `encodings.first().len()` ⇒ **批内等长**（依赖 padding 已配） |
 | `src/reranking/impl.rs:215-224` | `top_n_result` 由**全部** scores 构造并 `sort_by(\|a,b\| a.score.total_cmp(&b.score).reverse())` ⇒ **返回全量排序**；`sort_by` 稳定 ⇒ 并列保持**输入顺序** |
 | `src/common.rs:174-180` | **`.with_padding(PaddingParams { strategy: PaddingStrategy::BatchLongest, … })`** ⇒ ⚠️ **批内 padding 到最长** ⇒ 同 (query,doc) 在不同批次组成下 logit 可能不逐位相同（R47） |
-| `src/common.rs:181-185` | `.with_truncation(TruncationParams { max_length, .. })` ⇒ `max_length` 生效位置 |
+| `src/common.rs:181-184` | `.with_truncation(TruncationParams { max_length, .. })` ⇒ `max_length` 生效位置（⚠️ **第 2 轮统一**：原写 `181-185`，`185` 是同一 builder 链上的 `.map_err`；现与 E1 / `crates/core/src/rerank/local.rs` 对齐为 **`181-184`**） |
 | `src/common.rs:262-270` | `init_session_builder(execution_providers, intra_threads)`：`None` ⇒ `available_parallelism()` = **用满所有核** |
 | `src/init.rs:61-101`（`impl InitOptionsWithLength`）的 **`:71`** / **`:77`** / **`:100`** | `with_max_length` / `with_cache_dir` / `with_show_download_progress`（`RerankInitOptions = InitOptionsWithLength<RerankerModel>` 走这份）。⚠️ 同名方法另有一份在 `:106-140` 的 `impl InitOptions`（**不是**我们走的路径） |
 
 > ⚠️ **行号更正（2026-09-14 评审 F5）**：本表初版的 `impl.rs` 行号整段漂移（`rerank` 记作 `:110`、`unwrap_or` 记作 `:118`、`chunks` 记作 `:127-132`、`encode_batch` 记作 `:134-141`、`top_n_result`/`sort_by` 记作 `:186-198`）⇒ **已按本机 `fastembed-6.0.2` registry 实测更正**（`:126-132` / `:134` / `:143` / `:145-148` / `:215-224`；该文件共 **227** 行）。**语义全部未变**（`&mut self`、全量稳定排序不截断、`index` 回填、`BatchLongest` 均已复核）。§2.5 / §2.6 正文引用的 `:134-181` / `:186-198` 同源偏移，已一并更正为 `:143-212` / `:215-224`。
-> ⚠️ **同类漂移不止 `impl.rs`** —— 作者按「**一类缺陷要全仓扫**」把本文**全部 fastembed 行号引用**核了一遍，另更正 **`reranking/init.rs` 3 处**（`:14-19` → **`:11-19`**、`:16-18` → **`:17-19`**、`:21` → **`:22`**、`:149-155` → **`:152-156`**，共 4 处）与 **`src/init.rs` 1 处**（`:63-70` / `:106-113` → **`:61-101` 的 `:71` / `:77` / `:100`**），以及 §3.3 正文的 `impl.rs:110` → **`:126-132`**（评审 F5 未点到、由作者全仓扫描发现）。**核过仍准确、未改的**：`reranking/mod.rs:1-2`、`impl.rs:44`、`common.rs:174-180` / `:181-185` / `:262-270`、`lib.rs:130` / `:132`、`models/reranking.rs:6-11` / `:28-33`。
+> ⚠️ **同类漂移不止 `impl.rs`** —— 作者按「**一类缺陷要全仓扫**」把本文**全部 fastembed 行号引用**核了一遍，另更正 **`reranking/init.rs` 3 处**（`:14-19` → **`:11-19`**、`:16-18` → **`:17-19`**、`:21` → **`:22`**、`:149-155` → **`:152-156`**，共 4 处）与 **`src/init.rs` 1 处**（`:63-70` / `:106-113` → **`:61-101` 的 `:71` / `:77` / `:100`**），以及 §3.3 正文的 `impl.rs:110` → **`:126-132`**（评审 F5 未点到、由作者全仓扫描发现）。**核过仍准确、未改的**：`reranking/mod.rs:1-2`、`impl.rs:44`、`common.rs:174-180` / **`:181-184`**（第 2 轮统一，原 `181-185`）/ `:262-270`、`lib.rs:130` / `:132`、`models/reranking.rs:6-11` / `:28-33`。
 >
 > ✅ **`fastembed` 重导出了 `TextRerank` / `RerankerModel` 吗**（决定 `use` 路径）—— **已核实（2026-09-14）**：本机 registry 实测 **`src/lib.rs:130` `pub use crate::models::reranking::RerankerModel;`**、**`src/lib.rs:132`** 起 `pub use crate::reranking::{ OnnxSource, **RerankInitOptions**, RerankInitOptionsUserDefined, **RerankResult**, **TextRerank**, UserDefinedRerankingModel };`**（注释 `// For Reranking` 在 `:129`）⇒ **与 embedder 侧同款，都是从 crate root 重导出**。**S7-01 可直接 `use fastembed::{RerankerModel, RerankInitOptions, RerankResult, TextRerank};`**。
 > ⚠️ 本条初版标「**本文未核实**」并嘱咐开工时先 grep —— **评审已代答，作者已独立复核属实**；原「旁证推理」段（用 `embed/local.rs:9` 反推）已不再需要，删除。

@@ -9,6 +9,74 @@
 
 ## [Unreleased]
 
+### 构建 · V2 Step 7 PR 1 评审响应（**第 2 轮**：仍无阻塞项 + 1×P2 + 2×P3 + 1 细枝，**全部收口**）（Refs #23，2026-09-14）
+
+> 评审落点：`pulls/52/reviews` **1 条 `COMMENTED`（3276 字，`09:04:30Z`）+ 行内 4 条**；
+> 落在我 head `dbbc175` **之后** ⇒ 真·新一轮（作者判据仍用**时间戳**）。
+> **总评：第 1 轮 5 条意见「全部收口」（4 条实装、1 条按我的取舍改形），评审**重跑**了我的全部复核；
+> 本轮新发现 4 条**，其中 1 条 P2（**新护栏零覆盖**）是我的自查漏项。
+
+#### 🟡 Fixed（P2 —— 新护栏零覆盖，第 2 轮「新 1」）
+
+- **越界护栏此前「零覆盖」**：评审实测「删掉 `apply_scores` 里那句越界 `debug_assert!` 整块后
+  `cargo test -p helix-core --lib` ⇒ **223 passed / 0 failed**」；**我独立复现属实**。
+  ⇒ 新增用例 **`越界index在dev构建下被debug_assert拦住`**：`#[cfg(debug_assertions)]` +
+  **`#[should_panic(expected = "精排返回越界 index")]`**。
+  ⚠️ 这是**本仓首个 `should_panic`**（此前全仓 grep = 0）—— 「新护栏必须有牙齿」的代价；
+  `#[cfg(debug_assertions)]` 保证 `cargo test --release` 不会因「没 panic」而**假红**
+  （cfg 先例：`crates/core/src/bitmap.rs` 的 `count_ones_slow` / `debug_check`）。
+  ⚠️ 我第 1 轮的论证只覆盖了「**容忍**路径在 debug 下不可测」，**漏了「护栏本身是可测的」**这一半。
+
+#### 🟡 Fixed（P3 —— 覆盖判定只比条数，第 2 轮「新 2」）
+
+- **`scored.len() != hits.len()` 挡不住「重复 `index` + 漏一个」**（条数相等 ⇒ `warn!` 不发，
+  而该候选**静默**保留融合分）：把判定精确化为 **有效且去重后的 `index` 集合**，
+  抽成**纯函数** `rerank::scoring::uncovered_count`（⇒ **不依赖 tracing subscriber 就能单测**）。
+  `apply_scores` 改为按「未覆盖条数」告警（`warn!` 增加 `uncovered` 字段）。
+  新增用例 `未覆盖条数看集合不看条数`（5 组：完整/少给/重复 `index`/越界/空）。
+  ⚠️ 成本如实登记：一次 `O(候选数)` 的 `Vec<bool>` 分配（候选数 = 精排窗口 ≤ 几百），
+  与一次 ONNX 前向相比可忽略；且精排默认关、不在无精排的热路径上。
+
+#### 🟢 Fixed（P3 —— 「全仓扫描」的结论漏了一个，第 2 轮「新 3」）
+
+- **`architecture-design.md:1628`（§14.5 **R48**）的 `fastembed/src/reranking/init.rs:16-18` 同为旧值**
+  （应为 **`17-19`**），该行由 **`1859dbf`（#51）** 引入（`git log -S` 仅此一个提交）⇒ **同样属
+  「Step 7 引入的锚点」**。⇒ **更正我第 1 轮的结论**：当时写「Step 7 引入的锚点里**只有一处**
+  （`plan-v2.md:462`）漏网」—— **实际是两处**。已作为**第 3、4 项**补进设计文档的 **S7-05 回写清单**。
+  🔴 **根因（已记入教训）**：我的全仓扫描**确实命中了**该行，但工具把它截断成
+  `[Omitted long matching line]` 而我**没有回读** ⇒ **凡「Omitted」的命中必须逐条回读**。
+  （顺带核过：同行 `:1627` 的 R47 锚点 `common.rs:174-180` 是正确的，不动。）
+
+#### 🟢 Fixed（细枝 —— 同一锚点两个值）
+
+- **`common.rs:181-184` 与 `181-185` 统一为 `181-184`**：`181` = `.with_truncation(Some(TruncationParams {`、
+  `184` = `}))`、`185` = `.map_err(…)`（同一条 builder 链上的错误映射）⇒ 精确锚点是 **181-184**。
+  改 `crates/core/src/rerank/local.rs` 的模块文档 + 设计文档**附录 C** 的表格与「核过仍准确」清单。
+  ⚠️ **历史条目不改写**：第 1 轮的 CHANGELOG 条目与 #51 的 F5 条目里保留原引文（符合「被推翻的旧值也要留引文」）。
+
+#### 🔵 与评审的**不同**之处
+
+1. **「新 2」我没走他给的两条路（debug-only `HashSet` 断言 / 降级措辞 + 登记盲区），选了更强的第三条**：
+   **release 与 debug 都精确化**（纯函数 `uncovered_count`），因为它**同时**满足「release 侧不再静默」与
+   「不依赖 tracing subscriber 就能单测」；他给的 ① 只修 debug 侧、② 只是登记。
+2. **「新 1」的形态与他给的一致**（`#[cfg(debug_assertions)] + should_panic`），未额外引入 `catch_unwind`。
+
+#### 变异验证（新护栏必须有牙齿）
+
+| 变异 | 注入 | 结果 |
+| --- | --- | --- |
+| **m5** | **删掉**越界 `debug_assert!` 整块 | ✅ `越界index在dev构建下被debug_assert拦住 – should panic` **FAILED**（正是评审「新 1」的复现） |
+| **m6** | `uncovered_count` 退回「只比条数」（`candidates.saturating_sub(scored.len())`） | ✅ `未覆盖条数看集合不看条数` **FAILED**（③「重复 `index`」那组） |
+
+还原后 `md5` 与注入前**逐字节一致**（`8fb5b3af…`）。
+
+#### 守门（本地，逐条标运行范围）
+
+`fmt` ✅ / `clippy --workspace --all-targets -D warnings` ✅ / `cargo test --workspace` ✅ /
+`make shell` ✅ / MSRV 1.90 ✅ / rustdoc `-D warnings` ✅ / `--no-default-features` ✅ /
+`--features charabia` ✅ / `--features local-rerank` ✅ / `cargo deny check advisories licenses bans sources` ✅。
+**新增用例 2 个**（越界护栏 `should_panic` + `uncovered_count` 纯函数单测）⇒ 默认特性 `302 → 304 passed`。
+
 ### 构建 · V2 Step 7 PR 1 评审响应（第二方独立评审：**无阻塞项** + 2×P2 + 3×P3，**全部收口**）（Refs #23，2026-09-14）
 
 > 评审落点：`pulls/52/reviews` **1 条 `COMMENTED`（5469 字）+ 行内 6 条**；`issues/52/comments` 只有作者自己的
