@@ -91,6 +91,14 @@ impl LocalReranker {
     }
 
     /// 覆盖窗口 `R`（**运行期**参数，不重新加载模型）。
+    ///
+    /// ⚠️ **为什么这里留了一个「构造后 builder」，而 `max_length` 没有**（见模块文档偏差 ①）：
+    /// 两者**性质不同**，不是遗漏 ——
+    ///
+    /// | 参数 | 落点 | 构造后改字段？ |
+    /// | --- | --- | --- |
+    /// | `max_length` | **烧进模型的 tokenizer**（`TruncationParams`，`TextRerank::try_new` 时生效） | ❌ **撒谎**（改了不生效）⇒ 只能构造期给（[`Self::with_params`]） |
+    /// | `window` | **只被** [`Reranker::candidate_window`] 与 [`Self::id`] 读，不触碰模型 | ✅ **生效** |
     pub fn with_window(mut self, window: usize) -> Self {
         self.window = window;
         self

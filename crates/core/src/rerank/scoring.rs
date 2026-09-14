@@ -38,7 +38,7 @@ pub(crate) struct ScoredCandidate {
     pub(crate) logit: f32,
 }
 
-/// 模型原始 logit → `(0, 1)` 的**单调**变换（D-S7-05）。
+/// 模型原始 logit → **`[0, 1]`** 的**单调**变换（D-S7-05）。
 ///
 /// `σ(x) = 1 / (1 + e^(−x))`。单调 ⇒ **排序信息零损失**；原始 logit 不丢
 /// （进 `Explain.rerank_score`）。
@@ -47,22 +47,66 @@ pub(crate) struct ScoredCandidate {
 /// 量（bm25 分 / 余弦 ∈ [−1,1] / RRF ∈ (0, 0.04]），塞进无界、可负、量级 ±10 的
 /// logit 会让下游「用 score 设阈值」的代码以完全不同的量纲工作（设计 §4.4.3）。
 ///
-/// 数值边界：`logit → +∞` 时 `e^(−logit) → 0` ⇒ `σ → 1`；`logit → −∞` 时
-/// `e^(−logit) → +∞` ⇒ `σ → 0`。**两端都不产生 NaN**（`1 / (1 + inf) == 0`）。
+/// # ⚠️ 值域是**闭**区间：f32 下 σ 会**精确饱和**到端点
+///
+/// 两端都**不产生 NaN**，但**会取到端点本身**（两点均已实测，bits 见下）：
+///
+/// | 端 | 机制 | 实测 |
+/// | --- | --- | --- |
+/// | `logit ≳ 16.7 ⇒ σ == 1.0` | `1.0 + e^(−16.7)`（≈`5.59e-8`）**被舍入回 `1.0`**（f32 在 1.0 处的半个 ULP ≈ `5.96e-8`，余量仅 6%） | `σ(16.7).to_bits() == 0x3f800000` |
+/// | `logit ≲ −89.0 ⇒ σ == 0.0` | `e^89`（≈`4.5e38`）**上溢到 `inf`** ⇒ `1 / (1 + inf) == 0` | `σ(−89.0).to_bits() == 0x00000000` |
+///
+/// ⇒ 饱和处**不再严格单调**（`σ(16.7) == σ(1000.0)`），但**序不增/不减**仍成立 ——
+/// D-S7-05 依赖的是**单调**、不是单射，故「排序信息零损失」**不受影响**。
+/// ⚠️ 由此推出一条实现纪律：**`0.0` / `1.0` 是可达的真值** ⇒ 任何「用 `0.0` 当哨兵
+/// 表示『没打分』」的方案都会与真值**不可区分**（`apply_scores` 的「未覆盖项」因此
+/// 保持输入分而非取最低分，见该函数 rustdoc）。
 pub(crate) fn sigmoid(logit: f32) -> Score {
     1.0 / (1.0 + (-logit).exp())
 }
 
 /// 精排结果**回填 + 排序 + 截断**（设计 §4.4.2 的第 5~7 步）。
 ///
-/// 语义见模块文档的三条行为。越界的 `index` 只可能来自上游 bug：这里**不 panic**
-/// （检索主路径不留 panic 分支）但**也不静默错配**——直接忽略该项（对应 hit 保持
-/// 输入分数）。
+/// 语义见模块文档的三条行为。
+///
+/// # 契约：`scored` 应**恰好覆盖** `hits`
+///
+/// 即「每一条候选恰好一项、每项 `index` 都在 `hits` 范围内」（`fastembed` 的
+/// `rerank` 满足这一点：它对**每个**输入文档返回一条 `RerankResult`，
+/// `fastembed-6.0.2/src/reranking/impl.rs:215-224` 由全部 scores 构造）。
+/// 违反时**不得静默**（NFR-07）——两条防御路径的处理刻意**不同**：
+///
+/// | 情形 | dev（`debug_assertions`） | release | 为什么这样分 |
+/// | --- | --- | --- | --- |
+/// | `index` **越界** | `debug_assert!` 失败（快速失败） | 忽略该项 + `tracing::warn!` | **结构违反**：分数会被写到**错的 hit** 上 ⇒ 没有「可解释的退化」可言（同 `query/searcher.rs` 的 `dispatch_vector` 先例：优雅退化 + `debug_assert` 指出） |
+/// | **覆盖不足**（少给打分） | —— | 该项**保持输入（融合）分** + `tracing::warn!` | 有明确可解释的语义（见下），**且要可测** ⇒ 不加 `debug_assert` 才能让单测钉住它 |
+///
+/// # 为什么「未覆盖项」保持融合分，而**不是**丢弃或取最低分
+///
+/// - **丢弃** ⇒ 静默改变**条数契约**：本函数的职责是「排序 + 截断」，不是过滤
+///   （`hits` 是编排层按窗口 `take_n` 捞来的，丢一条就等于少一条结果）；
+/// - **取最低分**（如 `0.0`）⇒ **伪造**一个分数，而 σ 在 f32 下**会精确饱和到端点**
+///   （`σ(−89) == 0.0`，见 [`sigmoid`]）⇒ 伪造值与**真值不可区分**；
+/// - **保持** ⇒ 不伪造、不丢分，且该条在 S7-02 之后可由
+///   `explain.rerank_score == None` **识别出来** —— 而这**正好**就是 D-S7-05 的
+///   `is_some()` 信号的定义（「`score` 是不是精排给的」）⇒ 「混了两个量纲」这件事是
+///   **可观测**的，而不是静默的。
+///
+/// ⚠️ **可达性**：当前后端（`LocalReranker` + `fastembed`）下**两种违反都不可达**，
+/// 属防御路径；上面两条分支的存在是为了「上游换了 / 将来有人接别的精排器」时不静默。
 pub(crate) fn apply_scores(
     mut hits: Vec<Hit>,
     scored: &[ScoredCandidate],
     top_n: usize,
 ) -> Vec<Hit> {
+    if scored.len() != hits.len() {
+        tracing::warn!(
+            scored = scored.len(),
+            candidates = hits.len(),
+            "精排覆盖不足：未覆盖的候选保持输入（融合）分数（见 apply_scores 的 rustdoc）"
+        );
+    }
+
     for item in scored {
         // REFERENCE ⑥：非有限值在本题材里是**静默**的（`σ(NaN) == NaN`，排序仍有确定序
         // 但结果无意义）⇒ 用 debug_assert 在测试/调试构建里立即可见。
@@ -71,8 +115,20 @@ pub(crate) fn apply_scores(
             "精排 logit 非有限值（index={}）",
             item.index
         );
-        if let Some(hit) = hits.get_mut(item.index) {
-            hit.score = sigmoid(item.logit);
+        // 越界 = 结构违反（会把分数写到错的 hit 上）⇒ dev 快速失败；release 容忍但**可见**。
+        debug_assert!(
+            item.index < hits.len(),
+            "精排返回越界 index：index={}，候选数={}",
+            item.index,
+            hits.len()
+        );
+        match hits.get_mut(item.index) {
+            Some(hit) => hit.score = sigmoid(item.logit),
+            None => tracing::warn!(
+                index = item.index,
+                candidates = hits.len(),
+                "精排返回的 index 越界，本条已忽略（该候选保持输入分数）"
+            ),
         }
     }
 
@@ -229,17 +285,32 @@ mod tests {
         assert_eq!(ids(&out), vec![2, 3], "先排序再截断（chunk 2 分最高）");
     }
 
-    /// **S7-T12（前半）**：`score == σ(logit)`，且 `σ` 单调、有界、两端不溢出。
+    /// **S7-T12（前半）**：`score == σ(logit)`，且 `σ` 单调、值域是**闭**区间 `[0,1]`。
     #[test]
     fn 分数等于sigmoid_logit且单调有界() {
         assert_eq!(sigmoid(0.0), 0.5);
         assert!(sigmoid(1.0) > sigmoid(0.0), "单调增");
         assert!(sigmoid(-1.0) < sigmoid(0.0), "单调增");
-        // D-S7-05 的动机：无界 logit → 有界 score，且**不得**出现 NaN/inf。
+        // D-S7-05 的动机：无界 logit → **有界** score，且**不得**出现 NaN/inf。
+        // ⚠️ 用**闭**区间（PR #52 评审意见 4）：f32 下 σ 会**精确饱和**到端点。
         for &l in &[-1000.0f32, -50.0, -1.0, 0.0, 1.0, 50.0, 1000.0] {
             let s = sigmoid(l);
             assert!(s.is_finite() && (0.0..=1.0).contains(&s), "logit={l} ⇒ {s}");
         }
+        // 两个饱和端点（机制见 `sigmoid` 的 rustdoc；bits 已实测：3f800000 / 00000000）
+        assert_eq!(
+            sigmoid(16.7),
+            1.0,
+            "正端：1.0 + e^(−16.7) 被舍回 1.0 ⇒ σ 精确 == 1.0"
+        );
+        assert_eq!(sigmoid(-89.0), 0.0, "负端：e^89 上溢到 inf ⇒ σ 精确 == 0.0");
+        assert!(sigmoid(-88.0) > 0.0, "−88 尚未饱和（是次正规数，不是 0）");
+        // 饱和 ⇒ **不再严格**单调，但序仍不增/不减 —— D-S7-05 依赖的是**单调**、不是单射
+        assert_eq!(
+            sigmoid(16.7),
+            sigmoid(1000.0),
+            "饱和区等值（刻意保留的性质）"
+        );
 
         // 回填后逐条等于 σ(logit)（逐位比较：同一函数、同一输入）。
         let hits = vec![hit(1), hit(2)];
@@ -277,33 +348,49 @@ mod tests {
         );
     }
 
-    /// 越界 `index` 被忽略：不 panic、不产生多余 hit，**其余项照常生效**
-    /// （上游 bug 不得让检索主路径炸掉，也不得让整批回填失效）。
+    /// **S7-T5 补充（PR #52 评审意见 2 的落地）**：**部分覆盖**时未覆盖项保持**输入分**。
+    ///
+    /// 语义见 `apply_scores` 的 rustdoc：「未覆盖」= 精排**没给分**的候选 ⇒ 保持输入
+    /// （融合）分 + `warn!`，且该条在 S7-02 之后可由 `explain.rerank_score == None` 识别
+    /// （正是 D-S7-05 的 `is_some()` 信号的定义）。
+    ///
+    /// ⚠️ **鉴别力是刻意设计的**：`scored` 只覆盖**最后**一条（`index = 2`）⇒ 若实现按
+    /// **位置** zip（把 `index` 当位置用），被覆盖的会变成**第一条** ⇒ 分数与顺序都会变、
+    /// 本用例必红。（原先那条「越界」用例对这一点**没有鉴别力**：它的每条 hit 都被覆盖
+    /// 且 `index == 位置` ⇒ 实测在「按位置 zip」变异下**仍然通过**，故已由本用例取代。）
+    ///
+    /// ⚠️ **越界 `index` 不在这里测**：它是结构违反、被 `apply_scores` 里的
+    /// `debug_assert!` 拦住（debug 下直接 panic）⇒ **debug 构建里不存在可测的容忍路径**；
+    /// release 下的容忍 + `warn!` 是**盲区**（已在该函数 rustdoc 的分支表里写明）。
     #[test]
-    fn 越界index被忽略而其余项照常生效() {
-        let hits = vec![hit(1), hit(2)];
-        let scored = [
-            ScoredCandidate {
-                index: 0,
-                logit: 5.0,
-            },
-            ScoredCandidate {
-                index: 1,
-                logit: -5.0,
-            },
-            ScoredCandidate {
-                index: 99,
-                logit: 999.0,
-            },
-        ];
+    fn 部分覆盖时未覆盖项保持输入分() {
+        let mut hits = vec![hit(7), hit(2), hit(5)];
+        // 输入（融合）分：刻意选在 σ 的值域内、但与 σ(logit) 的**顺序不同**
+        hits[0].score = 0.30;
+        hits[1].score = 0.95;
+        hits[2].score = 0.10;
+        // 只覆盖「第三条」（index 2 = chunk 5）
+        let scored = [ScoredCandidate {
+            index: 2,
+            logit: 6.0,
+        }];
         let out = apply_scores(hits, &scored, 10);
-        assert_eq!(out.len(), 2, "越界项不产生新 hit");
-        assert_eq!(ids(&out), vec![1, 2], "σ(5) > σ(−5)");
+
         let score_of = |id: u32| out.iter().find(|h| h.chunk_id == id).unwrap().score;
         assert_eq!(
-            score_of(1).to_bits(),
-            sigmoid(5.0).to_bits(),
-            "有效项照常回填"
+            score_of(5).to_bits(),
+            sigmoid(6.0).to_bits(),
+            "被覆盖项 → σ(logit)"
         );
+        assert_eq!(
+            score_of(7),
+            0.30,
+            "未覆盖项保持输入分（不丢弃、不取最低分）"
+        );
+        assert_eq!(score_of(2), 0.95, "同上");
+        assert_eq!(out.len(), 3, "不丢弃任何条（条数契约不变）");
+        assert_eq!(ids(&out), vec![5, 2, 7], "σ(6)≈0.9975 > 0.95 > 0.30");
+        // 反向自证：按位置 zip 会得到 [7, 2, 5]
+        assert_ne!(ids(&out), vec![7, 2, 5], "按位置 zip 的顺序必须与之不同");
     }
 }

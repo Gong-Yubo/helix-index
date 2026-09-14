@@ -75,16 +75,30 @@ pub trait Reranker: Send + Sync {
     /// ⚠️ `hits` 的长度是**候选窗口**（`min(max(k, candidate_window(k)), 融合条数)`），
     /// 可能**大于** `top_n`；实现**必须**按自己的打分把结果排好并截到 `top_n`。
     ///
-    /// ⚠️ **不得依赖 `hits[i].explain`**：为了省掉 `(窗口 − k) × 整段分词` 的成本，
-    /// `explain` 的 `matched_terms` / 各 lane 的 rank/score 被**推迟到精排截断之后**
+    /// ⚠️ **读侧**：**不得依赖 `hits[i].explain`**。为了省掉 `(窗口 − k) × 整段分词` 的
+    /// 成本，`explain` 的 `matched_terms` / 各 lane 的 rank/score 被**推迟到精排截断之后**
     /// 才组装（设计 §4.3.3）⇒ 实现拿到的 `explain` 可能**只有 `fused_score`**。
     /// 需要正文请用 `hits[i].text`。这是**有意的接口收缩**，不是遗漏。
     ///
+    /// # 出参契约（**写侧** —— PR #52 评审意见 1 的落地）
+    ///
+    /// 返回类型只有 `Vec<Hit>`，而 `Hit` 里除 `score` 外**唯一能携带额外信息**的字段就是
+    /// `explain` ⇒ 实现**可以且应当**通过**写** `hits[i].explain` 把「原始分」归还编排层
+    /// （`LocalReranker` 的做法见 D-S7-05 / §4.4.3：`score = σ(logit)`，原始 logit 进
+    /// `explain.rerank_score`）。理由是 `σ` **不可逆** ⇒ 编排层**自己算不出来**原始分，
+    /// 必须由实现写回。**「不得依赖 `explain`」只约束读侧**，与本节不冲突。
+    ///
+    /// ⚠️ **编排层的义务**：按 D-S7-06 在精排**之后**补齐 `explain`（`matched_terms` /
+    /// lane rank/score）时，**必须保留**精排器已写入的字段（`rerank_score` 等）——否则
+    /// 「谁后写谁生效」，把精排器写回的信号**冲掉**。本 trait 是 C1 与 C2 之间的**唯一**
+    /// 契约面：C1 = 精排器写、C2 = 编排层补，**顺序固定为 C1 → C2**，C2 不得覆盖 C1 的键。
+    ///
     /// # 分数语义（D-S7-05）
     ///
-    /// 实现若替换了 `Hit::score` 的含义，**必须**让这件事可观测（`LocalReranker` 的做法
-    /// 是 `σ(logit)` + 原始 logit 进 explain，见设计 §4.4.3）——「分数被替换」**不得静默**
-    /// （NFR-07）。
+    /// 实现若替换了 `Hit::score` 的含义，**必须**让这件事可观测 ——「分数被替换」**不得静默**
+    /// （NFR-07）。**信号的定义**：`explain.rerank_score.is_some()` ⟺ 「该条的 `score` 由本
+    /// 实现替换过」；未替换的条（含实现**没给分**的候选）应保持 `rerank_score == None`
+    /// —— 这就是该信号能被下游当作判据的原因。
     fn rerank(&self, query: &str, hits: Vec<Hit>, top_n: usize) -> Result<Vec<Hit>>;
 }
 

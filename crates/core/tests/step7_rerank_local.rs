@@ -208,13 +208,26 @@ fn t10_真模型smoke_重排与截断契约() {
         out.windows(2).all(|w| w[0].score >= w[1].score),
         "hits 必须按 score 严格不增"
     );
+    // ⚠️ 值域是**闭**区间 [0,1]（PR #52 评审意见 4）：f32 下 σ 会**精确饱和**
+    //    （`σ(16.7) == 1.0`、`σ(−89.0) == 0.0`，见 `rerank::scoring::sigmoid` 的 rustdoc）。
+    //    用开区间会把「代码正确但模型进了饱和区」误判成失败 —— 而本用例恰恰是
+    //    **未跑过**的那一类（需 2.19GB 模型）⇒ 假失败会污染 S7-04 的标定结论。
     assert!(
-        out.iter().all(|h| h.score > 0.0 && h.score < 1.0),
-        "σ(logit) 必须落在开区间 (0,1)"
+        out.iter().all(|h| (0.0..=1.0).contains(&h.score)),
+        "σ(logit) 必须落在闭区间 [0,1]（端点可达：f32 饱和）"
     );
     for h in &out {
         assert!(h.score.is_finite(), "chunk {} 的分数非有限值", h.chunk_id);
     }
+
+    // 观测（**不断言**：「模型是否进入饱和区」是待测事实，不是契约）：
+    // 与「增补条数」一起随 §8.14 落 eval-report，供 S7-04 判断 512 截断的影响（R48）。
+    let mn = out.iter().map(|h| h.score).fold(f32::INFINITY, f32::min);
+    let mx = out
+        .iter()
+        .map(|h| h.score)
+        .fold(f32::NEG_INFINITY, f32::max);
+    println!("R = k 时 top-{TOP_N} 的 score 极值 = [{mn}, {mx}]（饱和端点 = 0.0 / 1.0）");
 
     // 观测（**不断言**：「增补」的幅度取决于模型实际打分，不是契约）：
     // 输出是否超出了输入前 k 条 ⇒ 这正是「放开窗口」想要的那部分收益。
