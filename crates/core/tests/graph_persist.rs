@@ -825,7 +825,9 @@ fn T16_图与快照版本错配降级() {
 /// 阈值）；未覆盖门面层透传（`SearchIndexBuilder::parallel_build` → 新建/重建两条路径）
 /// 与 `flush` 是否真把 ≥1000 条交付给 `add_batch`（`batch_size` 耦合）。若门面接线回退，
 /// 本测试会退化成「串行 vs 串行」，而 G1~G4 **与 T22 双双全绿**（T22 自己的注释也写了
-/// 这处盲区）。门面级护栏待 #24（翻转 `parallel_build` 默认值）一并补。
+/// 这处盲区）。**T7-21（#24）已评估过**这条「门面级护栏」：补它需要给 `VectorIndex`
+/// 加公开的可观测读法，结论是**不加**（公开面加法不值得）⇒ **该盲区保留**，
+/// 由 T22 的文档与 `search/config.rs` 中 `parallel_build()` 的文档**双向如实声明**。
 #[test]
 fn T13_并行建图质量等价() {
     const N: usize = 1200;
@@ -869,10 +871,11 @@ fn T13_并行建图质量等价() {
         "basename 拼错会静默降级（P0-1）——降级后本测试全部断言都失去意义"
     );
 
-    // 串行建图（默认）
+    // 串行建图（⚠️ **显式关**：T7-21 / D-J11 之后门面默认已是「开」——若这里仍吃默认，
+    // 本测试会退化成「并行 vs 并行」，正是 T22 文档里警告的那种退化）
     let path_seq = dir.path().join("seq.idx");
     {
-        let mut idx = builder().batch_size(N).build();
+        let mut idx = builder().parallel_build(false).batch_size(N).build();
         for d in &docs {
             idx.add(d.clone()).unwrap();
         }
@@ -1023,6 +1026,25 @@ fn T13_并行建图质量等价() {
 /// T13 依赖「`batch_size` 足够大」这个隐式耦合；一旦耦合被破坏（改默认值、
 /// 改 flush 策略），T13 会退化成「串行 vs 串行」并且**依然全绿**。
 /// 本测试直接钉死 `add_batch` 的分派：不加这个护栏，发现 1 无从暴露。
+///
+/// # T7-21 / D-J11 翻转后的口径（2026-09-14）
+///
+/// 翻转的是**门面默认**（`SearchIndexBuilder` / `Config`），**不是**本测试直接用的低层
+/// 构造子。故本测试两条腿一律**显式传开关**、不依赖任何默认值 ——
+/// 低层 `HnswRsIndex::with_capacity` 的默认值属**实现细节、不作契约**
+/// （门面默认由 `search/config.rs` 的单测 `并行建图默认开且可显式关闭` 钉住）。
+///
+/// # ⚠️ 本测试覆盖不到什么（如实声明）
+///
+/// 它只覆盖**后端分派**（开关 + 阈值）。「门面配置 → 透传到新建 / 重建两条路径 →
+/// `flush` 真把 ≥1000 条交给 `add_batch`」这条**端到端链路不可观测**
+/// （`parallel_inserts()` 只在低层 `HnswRsIndex` 上，门面不暴露该计数）；
+/// T7-21 评估过「为此加公开可观测 API」，结论是**不加**（见 `search/config.rs` 中
+/// `parallel_build()` 的文档）。
+///
+/// ⚠️ 另一条**已知边界**（实测，2026-09-14）：门面默认 `batch_size = 64` < 阈值 1000
+/// ⇒ **增量 `flush` 路径永远走不到并行**；能吃到并行的只有 `rebuild_vector_index` 的
+/// **单次全量**建图（`compact()` 重建 / 冷启动降级重建）。
 #[test]
 fn T22_并行分支真的被走到() {
     let items: Vec<(u32, NormalizedVector)> = (0..1200)
@@ -1034,10 +1056,14 @@ fn T22_并行分支真的被走到() {
         })
         .collect();
 
-    // 开关关 / 批量不足 → 串行
-    let mut off = HnswRsIndex::with_capacity(1200);
+    // 显式关闭 / 批量不足 → 串行（⚠️ 开关显式传，不依赖默认值）
+    let mut off = HnswRsIndex::with_capacity(1200).with_parallel_build(false);
     off.add_batch(&items).unwrap();
-    assert_eq!(off.parallel_inserts(), 0, "默认必须串行（保确定性）");
+    assert_eq!(
+        off.parallel_inserts(),
+        0,
+        "显式关闭 ⇒ 必须串行（保拓扑可复现）"
+    );
 
     let mut small = HnswRsIndex::with_capacity(1200).with_parallel_build(true);
     small.add_batch(&items[..999]).unwrap();
