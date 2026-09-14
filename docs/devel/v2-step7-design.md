@@ -10,6 +10,40 @@
 | 非范围 | 自适应融合 / paraphrase 桶稀释（**Step 9**，T7-14）；跨编码器以外的小模型选型（如 `bge-reranker-base` / jina 系）；**多 session 精排池化**（**明确不做**，理由见 §4.4.2）；精排器的**训练 / 微调**；`bm25` 打分改造；V2.1 的 prefilter；**评测集换代**（仍是 T2Ranking 12K / 320 query，`#23` 的 Agent query 集在 Step 9） |
 | 交付物 | ① `crates/core/src/rerank/local.rs`（`LocalReranker`）② `Reranker` trait 的 `candidate_window` ③ 编排层窗口打通 + `Metrics` 采集点 + `Explain.rerank_score` ④ CLI `--rerank-window`（`search` / `bench`）⑤ `scripts/eval_rerank.sh` ⑥ `eval-report.md` **§8.14** ⑦ 四处定义面回写 |
 
+> ## 🔧 S7-01 实现期勘误（E1~E6，2026-09-14，**PR #52 评审意见 3 的落地**）
+>
+> **本节不触碰决策 / 预算 / 风险面**（D-S7-01~10、NFR-12/05/06/07、R44~R48 **一字未动**），
+> 只把「**已实装的事实**」同步回本文 —— 依据 = PR #52 评审：三处偏差**已实装**、而本文仍是旧文本，
+> 且 **PR 2~5 会照着本文写**（本文才是实现依据）。
+>
+> | # | 位置 | 原文 → **实装** |
+> | --- | --- | --- |
+> | **E1** | §4.4.1 / 附录 A | `with_max_length(self, …) -> Self`（**构造后** builder）→ **`with_params(window, max_length) -> Result<Self>`**（**构造期**）：`max_length` 在 `try_new` 时就烧进 tokenizer 的 `TruncationParams`（`fastembed/src/common.rs:181-184`）⇒ 构造后改字段**不生效**（「断言仍绿但没生效」那类假象） |
+> | **E2** | §4.4.2 第 1 步 | 「零/**单条**早退」→ **只有空输入**早退（**单条不早退**）：否则「`score` 是否被替换」会**依赖候选条数**，与 **D-S7-05** 的 `explain.rerank_score.is_some()` 信号自相矛盾（R46 关心的正是 score 语义的可判定性） |
+> | **E3** | §7 **S7-T9** 落点 | `tests/step7_rerank_local.rs` → **`rerank/local.rs` 模块内部**：公开面只暴露 `σ(logit)`，而 σ 是**多对一**的浮点映射 ⇒ `score.to_bits()` 相等**证明不了 logit 逐位相同** |
+> | **E4** | §4.4.3 | `Hit.score ∈ (0, 1)` → **`∈ [0, 1]`**：f32 下 σ **精确饱和**（实测 `σ(16.7) == 1.0`（`1 + e^(−16.7)` 被舍回 1.0）/ `σ(−89.0) == 0.0`（`e^89` 上溢到 `inf`））；饱和处不再严格单调，但**序不增/不减**仍成立 ⇒ D-S7-05 依赖的是单调、不是单射 |
+> | **E5** | §4.4.2 第 5 步 | 回填的**契约与两条防御路径**写实：`scored` 应**恰好覆盖** `hits`；`index` 越界 = 结构违反 ⇒ `debug_assert!`（dev）+ `warn!` + 忽略；**覆盖不足** = 保持**输入（融合）分** + `warn!`（不加 `debug_assert`，否则该语义**不可测**） |
+> | **E6** | §6 影响面表 | **补列 `Error::Rerank`**（设计期**漏列**的新增公开面）+ `Reranker::rerank` 行补**写侧契约**（PR #52 评审意见 1） |
+>
+> ⚠️ **版本号刻意不升（仍 v0.2）**：本节**不含**决策/预算/风险变更，而升版会让 4 处定义面的
+> 「依据 `v2-step7-design.md` v0.2」引用**连带漂移** —— 那属 **S7-05** 的回写范围。
+> ⇒ **正式升版 + 定义面回写随 S7-05 一并做**（本文只做「实装事实」的就地勘误）。
+>
+> ### 记入 **S7-05** 回写清单（本轮评审发现，**不在本 PR 修**）
+>
+> 1. **`requirements-spec.md` 的 NFR-06 精排注记「机制句」反向**（`requirements-spec.md:388`）：
+>    现写「精排**不改 `chunk_id` 序**（同分时稳定排序保持输入序，`fastembed` … 为 stable sort）」，
+>    而 **D-S7-07 与本实现刻意不沿用**「保持输入序」、改用 **`chunk_id` 升序**
+>    （`crates/core/src/rerank/scoring.rs` 的 `apply_scores`）⇒ 机制描述与设计/实现**相反**。
+>    **NFR-06 的结论不受影响**（重排仍是逐位确定的）。**裁定：以 D-S7-07 为准**（评审 #52 意见 5）。
+> 2. **`plan-v2.md:462` 的 fastembed 锚点仍是 F5 更正前的旧值**（`impl.rs:110` / `:186-198`，
+>    应为 **`:126-132`** / **`:215-224`**）—— #51 的 F5 只改了本文 ⇒ 这是「一类缺陷」的
+>    **第三个载体（跨定义面）**。本次已按该纪律**全仓扫描全部 fastembed 锚点**：
+>    **Step 7 引入的锚点里只有这一处漏网**；另 `plan-v2.md:380` / `:659` 的 `src/init.rs:30-33`
+>    属 **2026-09-07 的旧锚点**（指 `InitOptions<M>`，我们走的是 `InitOptionsWithLength` 的 `:20`），
+>    但 `plan-v2.md:671-680` **已有「以上一律以 `v2-step6-design.md` 附录 C 为准」的取代指针**
+>    ⇒ 属**刻意保留的历史记录**（同「被推翻的旧值也要留引文」的纪律），**不建议改**。
+
 ---
 
 ## ⚠️ 「需评审拍板」清单 —— ✅ **已获评审同意（2026-09-14 第 1 轮）**
@@ -421,7 +455,13 @@ impl LocalReranker {
     /// 构造并触发模型下载（首次 ≈2.19GB，见 #23 前置 ②）。
     pub fn new() -> Result<Self>;                 // window = DEFAULT_RERANK_WINDOW(20)
     pub fn with_window(self, window: usize) -> Self;   // 可配 R（CLI 流入口）
-    pub fn with_max_length(self, max_length: usize) -> Self;  // 标定用
+    pub fn with_params(window: usize, max_length: usize) -> Result<Self>;  // 标定用
+    // ⚠️ **E1（S7-01 实现期改口径）**：此处原写 `pub fn with_max_length(self, max_length: usize) -> Self`
+    //    （构造后 builder）—— **该形态必然撒谎**：`max_length` 在 `TextRerank::try_new` 时就烧进
+    //    tokenizer 的 `TruncationParams`（`fastembed/src/common.rs:181-184`）⇒ 构造后改字段**不生效**。
+    //    ⇒ 改为**构造期**入口 `with_params`（已实装）。
+    //    ⚠️ 而 `with_window` **保留**构造后 builder：`window` 不触碰模型（只被 `candidate_window` /
+    //    `id()` 读）⇒ 构造后改**是**生效的。两者性质不同，不是遗漏。
 }
 
 pub const DEFAULT_RERANK_WINDOW: usize = 20;       // 「拟」值，见 §4.2.2
@@ -434,11 +474,21 @@ pub const DEFAULT_RERANK_MAX_LENGTH: usize = 512;  // = 库默认（HasMaxLength
 
 ```rust
 fn rerank(&self, query: &str, hits: Vec<Hit>, top_n: usize) -> Result<Vec<Hit>> {
-    // 1. 零/单条早退（省掉一次 ONNX 会话调用；也避免 fastembed 对空输入的 EmptyTokenizations）
+    // 1. **空输入**早退（避免 fastembed 对空 documents 报 EmptyTokenizations）
+    //    ⚠️ **E2**：原写「零/单条早退」，实装改为**只有空输入**早退（**单条不早退**）。
+    //       理由：否则「`score` 是否被精排替换」会**依赖候选条数**，与 D-S7-05 的
+    //       `explain.rerank_score.is_some()` 信号自相矛盾（R46）。
     // 2. documents = hits.iter().map(|h| h.text.as_str()).collect()
     // 3. let mut model = self.inner.lock()?;                       // Mutex（R43 同源）
     // 4. let scored = model.rerank(query, &documents, false, None)?;  // batch = None ⇒ 库默认 256
     // 5. 按 `scored[i].index` **回填**到原 hits（⚠️ 不是按顺序 zip —— 见下）
+    //    ⚠️ **E5**：契约 = `scored` **恰好覆盖** `hits`（每项一个、`index` 均在范围内）。
+    //       违反时两条防御路径**刻意不同**：`index` **越界** = 结构违反（分数会写到错的 hit 上）
+    //       ⇒ `debug_assert!`（dev 快速失败）+ `warn!` + 忽略；**覆盖不足** = 保持**输入（融合）分**
+    //       + `warn!` —— **不加** `debug_assert`（加了该语义就**不可测**）。
+    //       为什么「保持」而非「丢弃」或「取最低分」：丢弃会**静默改条数契约**（本函数只做排序+截断）；
+    //       取 `0.0` 会**伪造**一个与 σ 饱和真值（`σ(−89) == 0.0`，E4）**不可区分**的分数；
+    //       保持则可由 `explain.rerank_score == None` 识别（正是 D-S7-05 的信号定义）。
     // 6. 排序：σ(score) 降序，**并列时 chunk_id 升序**（D-S7-07）
     // 7. 截断到 top_n
 }
@@ -459,7 +509,7 @@ fn rerank(&self, query: &str, hits: Vec<Hit>, top_n: usize) -> Result<Vec<Hit>> 
 #### 4.4.3 分数变换（D-S7-05）
 
 ```text
-Hit.score        = σ(logit) = 1 / (1 + e^(−logit))       // ∈ (0, 1)，对外排序契约
+Hit.score        = σ(logit) = 1 / (1 + e^(−logit))       // ∈ [0, 1]（⚠️ E4：闭区间——f32 下精确饱和；对外排序契约）
 Explain.fused_score = 融合分（**不变**）                    // 保留「召回阶段怎么看」
 Explain.rerank_score = Some(logit)                        // 模型原始输出（诊断用）
 ```
@@ -646,7 +696,8 @@ rerank_window: Option<usize>,
 | 面 | 变更 | 破坏性？ | 迁移 |
 | --- | --- | --- | --- |
 | `Reranker` trait | **新增 provided 方法** `candidate_window`（默认 `k`） | **否** | 自定义实现**一行不改**，行为不变 |
-| `Reranker::rerank` 的语义约束 | rustdoc 补「**不得依赖 `hits[i].explain`**」（D-S7-06） | ⚠️ **契约收紧**（编译期无感） | CHANGELOG 说明 + 库内唯一实现自查 |
+| `Reranker::rerank` 的语义约束 | rustdoc 补「**不得依赖 `hits[i].explain`**」（D-S7-06，**读侧**）+ **写侧契约**（⚠️ **E6**，PR #52 评审意见 1）：实现**可以且应当**写 `hits[i].explain` 归还原始分（`σ` 不可逆 ⇒ 编排层自己算不出），且编排层按 D-S7-06 补齐 `explain` 时**必须保留**精排器写入的字段（否则「谁后写谁生效」会把该信号**冲掉**） | ⚠️ **契约收紧**（编译期无感） | CHANGELOG 说明 + 库内唯一实现自查 |
+| **`Error`**（⚠️ **E6**：**设计期漏列**，实现期新增的**公开面**） | 新增变体 **`Rerank(String)`**（精排模型初始化 / 推理失败）；**不复用** `Embedding` —— 两者落点与代价差一个数量级（96MB vs 2.19GB），混在一起会让「哪一步炸了」只能靠读字符串猜 | ⚠️ **是**（`Error` **非** `#[non_exhaustive]` ⇒ 下游若对它**穷尽 `match`** 会编译失败；与 `Explain` 加字段同族 / R35） | CHANGELOG `⚠️ 破坏性` 段。**评审 #52 已同意不补 `#[non_exhaustive]`**（那会让**所有**下游 `match` 都要改，破坏面比新增一个变体更大） |
 | `NoOpReranker` | **无改动** | 否 | — |
 | `LocalReranker` | 新增（gate `local-rerank`） | 否（纯加法） | — |
 | `Metrics` | 新增 `rerank_window` / `rerank_elapsed` | **否**（有 `Default`，保持 `Copy`） | — |
@@ -672,7 +723,7 @@ rerank_window: Option<usize>,
 | **S7-T6** | NoOp 下 `explain` 的五个字段与改动前**逐字段一致** | D-S7-06 的回归护栏 | ✅ | `query/searcher.rs` |
 | **S7-T7** | `Metrics.rerank_window` / `rerank_elapsed` 被填；NoOp 时 `rerank_window == k`；`metrics.took == took` 仍自洽（I7） | NFR-07 / 口径自洽 | ✅ | `tests/step7_rerank_observability.rs`（新）+ 既有 `step5_query_observability.rs` 口径不破 |
 | **S7-T8** | **P1/P2（§4.7）**：同进程重复 N 次 + 跨进程两次 ⇒ (`chunk_id`, `score`) 逐位一致 | R47 / NFR-06 | ⛔ `#[ignore]`（需 2.19GB 模型） | `tests/step7_rerank_local.rs`（新） |
-| **S7-T9** | **P3（§4.7）**：同一 `(query, doc)` 单条 vs 批内 ⇒ logit 是否逐位相同（**记录结论，不预设**） | §2.5 的 `BatchLongest` | ⛔ `#[ignore]` | 同上 |
+| **S7-T9** | **P3（§4.7）**：同一 `(query, doc)` 单条 vs 批内 ⇒ logit 是否逐位相同（**记录结论，不预设**） | §2.5 的 `BatchLongest` | ⛔ `#[ignore]` | ⚠️ **E3**：`rerank/local.rs` **模块内部**（公开面只有 `σ(logit)`，σ **多对一** ⇒ 证明不了 logit 逐位相同） |
 | **S7-T10** | 真模型 smoke：`R = k = 10` ⇒ 集合不变、仅顺序可能变；`R = 50` ⇒ 集合可增补后截断到 `k` | FR-18 的行为基线 | ⛔ `#[ignore]` | 同上 |
 | **S7-T11** | **A/B 前置自证**：冻结图连续两次加载，`bm25` 三项 `Δ = 0` 且 `hybrid` 逐位一致 | §3.1 的空转防护（同 Step 6 F1 一族） | ✅（用**已有**快照 fixture，无精排） | `scripts/eval_rerank.sh` 的前置检查 + `tests/graph_persist.rs` 已有同族用例 |
 | **S7-T12** | `explain.rerank_score.is_some()` ⟺ 精排生效；`score` 与 `rerank_score` 的 `σ` 单调关系 | D-S7-05 | ✅（用假精排器） | `query/searcher.rs` + `rerank/local.rs` |
@@ -746,8 +797,10 @@ pub struct LocalReranker { /* Mutex<TextRerank>, window, max_length */ }
 
 impl LocalReranker {
     pub fn new() -> Result<Self>;
-    pub fn with_window(self, window: usize) -> Self;
-    pub fn with_max_length(self, max_length: usize) -> Self;
+    pub fn with_window(self, window: usize) -> Self;            // 运行期参数（不触碰模型）⇒ 可后置
+    pub fn with_params(window: usize, max_length: usize) -> Result<Self>;
+    // ⚠️ **E1**：`max_length` 只能**构造期**给（烧进 tokenizer）；原写的构造后
+    //    `with_max_length(self, …)` 是「改了不生效」的假象。
     pub fn id(&self) -> String;                                 // ⚠️ String，不是 &'static str
 }
 
