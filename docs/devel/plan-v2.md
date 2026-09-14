@@ -475,6 +475,21 @@
 | **T7-21** `parallel_build` 默认翻转为「开」 | 12K 真实语料 11.676s → 2.182s（**5.35×**），50K 合成 5.26×，真实语料 oracle 重合率无差异（0.995 / 0.995）。⚠️ 必须同步改 **S2-T22**（现断言「默认必须串行」） | **D-J11 / D4** |
 | **T7-24** 工程卫生 | ① **CI 只在 `branches:[main]` 触发** ⇒ 堆叠 PR 至今跑不到 CI（Step 2 已吃过亏）；② `.gitignore` **未覆盖图 sidecar 与 manifest tmp**（31MB 级误提交风险）；③ 清理 11 条已合并远端分支 | 复审 A4-④ |
 
+> **状态（2026-09-14）：两个横切任务均已并入 `main`，本批结清** ——
+> **T7-24 工程卫生** = PR **#48** → **`e756bcc`**：① CI 去掉 `pull_request.branches: [main]`
+> （原写法 ⇒ **堆叠 PR 完全没 CI**）+ 补 `workflow_dispatch` + 补 **`concurrency`**（取消被取代的旧 run，
+> 实测旧 run 结论 = `cancelled`）；② `.gitignore` 补 `*.hnsw.{graph,data,manifest}`（图 sidecar **本体**
+> 原先可被 `git add`）；③ 清理 5 条远端已合并分支 + 陈旧 ref `refs/remotes/pr/40` + 本地对应 5 条。
+> **T7-21 `parallel_build` 默认翻转** = PR **#49** → **`516b2c7`**：只翻**门面**默认
+> （`SearchIndexBuilder` / `Config`），**低层 `HnswRsIndex::with_capacity` 保持 `false`**（11 处构造点）。
+> ⚠️ **评审 P2-1 修正了本条原文的一处错**：并行**不只**对「一次性全量建图」生效 —— 增量 `flush` 交付的是
+> **整个 `pending`**（`add()` 先推全部 chunk 再查阈值）⇒ 批量 = `(batch_size − 1) + k` ⇒
+> **大单文档（`k ≥ 937~1000`，默认 `Chunker(512/64)` 约 42~45 万字符）同样走并行**
+> ⇒ **「增量建库一定可复现拓扑」不成立**。
+> ⚠️ **S2-T22 已同步改为显式构造**（`.with_parallel_build(false)`）—— 否则「串行」臂会静默吃门面默认、
+> 退化成「**并行 vs 并行**」而**断言仍全绿**。
+> ⚠️ 另开 issue **#50**（CLI 缺 `--no-parallel-build` 逃生舱，来源 #49 评审）—— 待办、不属本批。
+
 ### V2.1 —— 读写并发 + 相关性深化 + 场景机制（后续迭代）
 
 #### Step 8 · 读写并发（原 Step 7）
