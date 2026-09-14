@@ -52,10 +52,24 @@ pub trait VectorIndex: Send + Sync {
     /// 增量插入一条向量。当前实现（`HnswRsIndex` / `BruteForceIndex`）均支持。
     fn add(&mut self, id: ChunkId, vec: NormalizedVector) -> Result<()>;
 
-    /// 批量插入（D-S2-05 / S2-11）。默认实现为逐条 `add`（串行）；
+    /// 批量插入（D-S2-05 / S2-11）。默认实现为逐条 `add`（**串行**）；
     /// `HnswRsIndex` 可覆盖为 `parallel_insert_slice`（并行建图开关，
-    /// 由门面层按阈值决定是否走批量路径——**默认串行**，保住与 P5 基线的
-    /// 可比性：并行插入顺序不确定 ⇒ 拓扑不可复现，先出实测再定默认值）。
+    /// 由门面层按阈值决定是否走批量路径）。
+    ///
+    /// ⚠️ **翻转的是「门面」默认、不是本 trait 的默认实现**（评审 #49 P3-2 澄清）：
+    /// `SearchIndexBuilder::parallel_build`（门面默认）自 **T7-21 / D-J11** 起为 `true`；
+    /// 而**本 trait 的默认实现仍逐条串行**、**低层 `HnswRsIndex::with_capacity` 的默认仍为 `false`**
+    /// （后者属实现细节、**不作契约**）。
+    ///
+    /// 代价是并行插入顺序不确定 ⇒ 拓扑不可复现（C8），但 **NFR-06 的口径是
+    /// 「同快照两次**加载**」、不约束建库过程** ⇒ 该代价被接受（实测 12K 真实语料
+    /// 11.676s → 2.182s = **5.35×**，oracle 重合率无差异；见 issue #24）。
+    ///
+    /// ⚠️ **生效范围**：交付点须**一次交够 `PARALLEL_INSERT_THRESHOLD(1000)` 条**才有意义 ——
+    /// `rebuild_vector_index`（`compact()` 重建 / `load_with` 的降级重建）是**单次全量** ⇒ 走并行；
+    /// 而**增量 `flush` 并非「恒串行」**（批量 = 缓冲存量 + 当前文档 chunk 数 k；见评审 #49 P2-1）：
+    /// `k ≥ 937~1000` 的**大单文档**同样会触发并行。完整口径见
+    /// `SearchIndexBuilder::parallel_build` 的文档。
     fn add_batch(&mut self, items: &[(ChunkId, NormalizedVector)]) -> Result<()> {
         for (id, v) in items {
             self.add(*id, v.clone())?;

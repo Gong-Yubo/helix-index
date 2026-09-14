@@ -142,10 +142,10 @@ fn main() -> anyhow::Result<()> {
 
     for (name, parallel) in [("串行", false), ("并行", true)] {
         for r in 0..repeats {
-            let mut idx = HnswRsIndex::with_capacity(n);
-            if parallel {
-                idx = idx.with_parallel_build(true);
-            }
+            // ⚠️ **显式传开关**（评审 #49 P3-1）：低层 `with_capacity` 的默认值是**实现细节**，
+            // 不能拿来当「串行基线」的依据 —— 否则将来有人翻低层默认时，这条基线会**静默**
+            // 退化成「并行 vs 并行」（正是 T13 里已防掉的那类退化）。
+            let mut idx = HnswRsIndex::with_capacity(n).with_parallel_build(parallel);
             let t = Instant::now();
             idx.add_batch(&items)?;
             let elapsed = t.elapsed().as_secs_f64();
