@@ -91,6 +91,56 @@
   这条端到端链路**仍不可观测**（并行计数器只在低层 `HnswRsIndex`，门面不暴露）。
   T7-21 评估过「为此加公开可观测 API」，结论是**不加**（公开面加法不值得）。
 
+### 工程 · 横切 T7-24 评审响应（独立评审：✅ 通过 + 1×P3 已采纳）（Refs #25，2026-09-14）
+
+> 评审**不采信 PR 描述与评论区证据**，在临时 worktree 检出本 PR 的 head **独立复跑**；
+> 结论「**✅ 通过，可合并**」，附 **1 条非阻塞 P3**。**已采纳**（实测证据见 PR 评论区）。
+
+#### 📊 Changed（P3：补 `concurrency`，取消被取代的旧 run）
+
+- 本 PR 的立论是「private 仓库、Actions 走**账号配额**」—— 该维度上只剩一个没堵的口子：
+  **同一 PR 连续 push 时旧 run 不会被取消**（10 个 job，`feature isolation` 与 `test` 各约 4 分钟，全部白跑）。
+  现补：
+
+  ```yaml
+  concurrency:
+    group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+    cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  ```
+
+  - **PR 事件** ⇒ 按 PR 号分组、`cancel-in-progress: true` ⇒ 新 push 立即取消旧 run；
+  - **push 事件（main）** ⇒ `pull_request.number` 为空、回落到 `github.ref` 分组，且
+    `cancel-in-progress` 为 **false** ⇒ **相邻两次合并不会互相砍掉对方的 run**（main 门禁刻意保留）。
+- **取消行为已实测**（连续两次 push，观察旧 run 的 `conclusion`）⇒ 结果记在 PR 评论区，不在此处复述。
+
+#### ✅ 评审的核验项（已在响应里逐条签「属实」）
+
+② 三条 sidecar 规则生效 / tmp 变体无回归 / `data/` 白名单三份语料与 `.gitkeep` **无误伤** /
+**与 `storage/graph.rs` 的三个后缀常量对账 ⇒ 写入路径产物后缀全覆盖** / 连历史怪名
+`foo.idx.hnsw.hnsw.graph` 也兜住（支持不用 issue 原建议的 `*.idx.hnsw.<ext>`）/ ① YAML 语义与 10 个 job /
+「不重复计费」论证 / 行号引用 —— **均属实**。
+
+### 工程 · 横切 T7-24 工程卫生：CI 触发放开 + `.gitignore` 补图 sidecar（Refs #25，2026-09-14）
+
+> **横切任务**（`plan-v2.md` §4「横切任务」/ §附-3 执行顺序第 2 位），**独立 PR**、不属任何 Step。
+> 本次交付其中的 **① ②**（代码面）；**③ 清理远端分支**是操作动作、不产生 diff，另办。
+
+#### 🔴 Fixed
+
+- **① 堆叠 PR 永远跑不到 CI**：`.github/workflows/ci.yml` 原写 `pull_request.branches: [main]`
+  ⇒ 只让 **base = main** 的 PR 触发，**base ≠ main 的堆叠 PR 完全没有 CI**
+  （Step 2 的 #13/#14 已吃过亏，当时只能拿本地守门代替）。
+  现**去掉 `pull_request` 的 `branches` 过滤** ⇒ **任何 PR 都有 CI**；并补 `workflow_dispatch`（可手动跑）。
+  ⚠️ **刻意不采用** issue 里并列的另一个方案「`push: branches-ignore: [main]`」—— 本仓库是 **private**、
+  Actions 走**账号配额**，逐分支 push 触发会与 PR 触发**重复计费**，而「每个 PR 都有 CI」只用放开
+  `pull_request` 就能达成。
+- **② `.gitignore` 漏掉图 sidecar 本体**：实测 `data/t2-index.idx.hnsw.{graph,data,manifest}`
+  原先**可被 `git add`**（**31MB 级**误提交风险）—— 既有的 `*.idx.tmp` 只能覆盖 **tmp 变体**，
+  非 tmp 的本体一直裸着。现补 `*.hnsw.graph` / `*.hnsw.data` / `*.hnsw.manifest`。
+  ⚠️ 用 `*.hnsw.<ext>` 而非 `*.idx.hnsw.<ext>`：`file_dump(dir, "foo.idx")` 会**自行追加**后缀
+  （`REFERENCE.md` 的 basename 铁律），basename 未必以 `.idx` 结尾。
+  复验：修复前三条均 `TRACKABLE`、修复后均 `IGNORED`，且仓库内**无**已跟踪的 `*.hnsw.*`（无误伤）。
+
 ### 文档 · V2 Step 6 收尾 · 评审响应（DeepSeek Harness 复审：3×P2 + 3×P3，全部收口）（Refs #2，2026-09-13）
 
 > 复审由 **DeepSeek Harness**（`--profile headless`，模型 `glm-5.3-flash`）**独立于作者**完成：

@@ -19,8 +19,15 @@
 *.idx
 *.idx.tmp
 # 图 manifest 的 tmp 残留（V2 Step 3 / D-S3-01：追加式命名 foo.idx.hnsw.manifest.tmp）
-# 非 tmp 的图 sidecar（*.hnsw.graph / *.hnsw.data / *.hnsw.manifest）归横切 T7-24（issue #25），此处不越界
 *.manifest.tmp
+# 图 sidecar **本体**（V2 Step 2 的图持久化产物；由横切 **T7-24 / issue #25 之②** 补齐）
+# 实测（2026-09-14）：`data/t2-index.idx.hnsw.graph` / `.data` / `.manifest` 原先**不在忽略名单**里
+# ⇒ `git add .` 会把 31MB 级文件带进仓库（`.idx.tmp` 那条只覆盖 tmp 变体，覆盖不到本体）。
+# ⚠️ 用 `*.hnsw.<ext>` 而非 `*.idx.hnsw.<ext>`：`file_dump(dir,"foo.idx")` 会**自行追加**
+#    后缀（REFERENCE.md 的 basename 铁律），basename 未必以 `.idx` 结尾。
+*.hnsw.graph
+*.hnsw.data
+*.hnsw.manifest
 
 # ---- 语料与评测数据（大文件，P5 单独管理）----
 # 默认忽略 data/ 下的 jsonl/json；但以下三份**必须入库**：

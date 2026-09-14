@@ -23,8 +23,27 @@ name: CI
 on:
   push:
     branches: [main]
+  # ⚠️ T7-24（issue #25 之①）：`pull_request` **刻意不加 `branches` 过滤** ——
+  #    原写法 `branches: [main]` 只让 base=main 的 PR 触发 CI，**base≠main 的堆叠 PR
+  #    永远跑不到 CI**（Step 2 的 #13/#14 已吃过亏，当时只能拿本地守门代替）。
+  #    现在任何 PR 都会跑一遍这套门。
+  #    ⚠️ 这里**刻意不**采用 issue 里并列的另一个方案「push: branches-ignore: [main]」：
+  #       本仓库是 private，Actions 走**账号配额**；逐分支 push 触发会与 PR 触发**重复计费**，
+  #       而「每个 PR 都有 CI」这个目标只用放开 `pull_request` 就能达成。
   pull_request:
-    branches: [main]
+  # 手动触发：用于不产生 PR 的场合（例如验证 workflow 配置本身改对了没）
+  workflow_dispatch:
+
+# ⚠️ T7-24（issue #25 之①）的配套：**同一 PR 连续 push 时取消被取代的旧 run**。
+#    本 PR 的立论是「private 仓库、Actions 走账号配额」—— 那一维度上剩下的口子就是它：
+#    旧 run 的 10 个 job（feature isolation / test 各 ~4m）会全部跑完，纯属浪费。
+#    - PR 事件 ⇒ 按 PR 号分组、`cancel-in-progress: true` ⇒ 新 push 立即取消旧 run；
+#    - push 事件（main）⇒ `pull_request.number` 为空、回落到 `github.ref` 分组，
+#      且 `cancel-in-progress` 为 **false** ⇒ **相邻两次合并不会互相砍掉对方的 run**
+#      （main 的门禁是刻意保留的，不能取消）。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
