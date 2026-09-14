@@ -852,10 +852,11 @@ fn T13_并行建图质量等价() {
     let texts: Vec<String> = docs.iter().map(|d| d.text.clone()).collect();
     let all = Filter::eq("t13", MARK);
 
-    // ⚠️ **并行生效的前提是 `parallel_build(true)` 与 `batch_size(>=1000)` 同时成立**：
-    // `add()` 在 `pending.len() >= batch_size` 时才 flush，默认 batch_size=64 ⇒
-    // `add_batch` 每次最多收到 64 条，永远够不到并行阈值 1000（评审 #13 发现 1）。
-    // 两个库用**同一个** batch_size，保证唯一变量是 parallel_build。
+    // ⚠️ **并行生效的前提是 `parallel_build(true)` 与「一次交够 ≥1000 条」同时成立**：
+    // `add()` 攒够 `batch_size` 才 flush，而 `flush` 交给 `add_batch` 的是**整个 `pending`**
+    // ⇒ 批量 = 存量（≤ batch_size−1）+ 本批各文档的 chunk 数。默认 `batch_size=64` 且文档不大时
+    // 批量 ≪ 1000，够不到并行阈值（评审 #13 发现 1；上界的精确口径见评审 #49 P2-1 的勘误）。
+    // 本测试用**同一个** batch_size，保证唯一变量是 parallel_build。
     let path_par = dir.path().join("par.idx");
     {
         let mut idx = builder().parallel_build(true).batch_size(N).build();
