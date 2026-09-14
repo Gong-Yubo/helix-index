@@ -50,7 +50,7 @@ pub struct Config {
     /// HNSW ef_search（P0-5：图加载后必须回填，全 crate 无 set_ef*；
     /// `None` = 用内核默认 EF_SEARCH=200）
     pub ef_search: Option<usize>,
-    /// 批量建图是否走 `parallel_insert`（D-S2-05，**默认 false** 保确定性）
+    /// 批量建图是否走 `parallel_insert`（D-S2-05；**默认 `true`**，T7-21 / D-J11 翻转）
     pub parallel_build: bool,
 }
 
@@ -132,7 +132,7 @@ pub struct SearchIndexBuilder {
     graph_mode: GraphPersistMode,
     /// 是否持久化图（S2-08 的 `--no-graph-persist` 逃生舱；默认开）
     graph_persist: bool,
-    /// 并行建图（D-S2-05，默认关）
+    /// 并行建图（D-S2-05；**T7-21 / D-J11 起默认开**）
     parallel_build: bool,
 }
 
@@ -150,7 +150,9 @@ impl Default for SearchIndexBuilder {
             ef_search: None,
             graph_mode: GraphPersistMode::Lenient,
             graph_persist: true,
-            parallel_build: false,
+            // T7-21 / D-J11：**默认翻转为开**（原 `false`）。
+            // ⚠️ 它**只对「单次全量建图」路径生效**，见 `parallel_build()` 的文档。
+            parallel_build: true,
         }
     }
 }
@@ -225,17 +227,31 @@ impl SearchIndexBuilder {
         self
     }
 
-    /// 打开并行建图（D-S2-05，**默认关**）。
+    /// 覆写并行建图开关（D-S2-05；**T7-21 / D-J11 起默认开** ⇒ 本方法现在的主要用途是**关掉**它）。
+    ///
+    /// ⚠️ **生效范围（实测勘误，2026-09-14）**：并行分派的条件是
+    /// `parallel_build && items.len() >= PARALLEL_INSERT_THRESHOLD(1000)`
+    /// （`vector/hnsw_rs_index.rs:238`）。门面里只有 **`rebuild_vector_index`
+    /// （`search/index.rs:142`，单次全量 `add_batch`）** 满足这个批量：
+    ///
+    /// | 路径 | 每次 `add_batch` 的批量 | 默认开后 |
+    /// | --- | --- | --- |
+    /// | **`compact()` 重建**（`index.rs:830`） | 全部存活向量（一次） | ✅ **走并行** |
+    /// | **冷启动降级重建**（`index.rs:966`） | 全部向量（一次） | ✅ **走并行** |
+    /// | 增量 `flush`（`index.rs:326`，默认 `batch_size = 64`） | ≤ 64 | ❌ 仍串行（< 1000） |
+    ///
+    /// ⇒ 收益体现在**一次性全量建图**：实测 12K 真实语料 **11.676s → 2.182s（5.35×）**、
+    /// 50K 合成 **5.26×**，oracle 重合率无差异（0.995 / 0.995）—— 复审实测，见 issue #24。
+    /// **首次增量建图不受影响**（那条路径由 embed 主导，不是建图主导）。
     ///
     /// ⚠️ 代价：`parallel_insert_slice` 走 rayon ⇒ 插入顺序不确定 ⇒
     /// **建图拓扑不可复现**（C8）。图落盘后即被冻结，故「同快照两次加载」
-    /// 仍逐位一致；但「同一批向量两次建库」不再一致，与 P5/P6 基线的可比性
-    /// 会受影响。建议只在基准实测（S2-11 / T13）时打开。
+    /// 仍逐位一致（**NFR-06 不受影响**）；但「同一批向量两次建库」不再逐位一致。
+    /// D-J11 已拍板接受该代价（NFR-06 的口径是「同快照两次**加载**」，不约束建库过程）；
+    /// 需要可复现拓扑时用 `.parallel_build(false)` 关掉。
     ///
-    /// ⚠️ **必须配合 `batch_size >= 1000`**（并行阈值）才真的生效：
-    /// 默认 `batch_size = 64` 时每次 `add_batch` 只有 64 条，会静默回落串行，
-    /// 而「并行 vs 串行质量等价」的测试会退化成「串行 vs 串行」还全绿
-    /// （评审 #13 发现 1）。`HnswRsIndex::parallel_inserts()` 可观测实际分派。
+    /// `HnswRsIndex::parallel_inserts()` 可观测后端实际分派（**门面不暴露该计数**，
+    /// 覆盖边界见 `crates/core/tests/graph_persist.rs` 里 T22 的说明）。
     pub fn parallel_build(mut self, parallel_build: bool) -> Self {
         self.parallel_build = parallel_build;
         self
@@ -416,6 +432,28 @@ mod tests {
         assert_eq!(cfg.bm25_params.k1, 1.5);
         assert_eq!(cfg.bm25_params.b, 0.75);
         assert_eq!(cfg.batch_size, DEFAULT_BATCH_SIZE);
+        // T7-21 / D-J11：并行建图**默认已翻转**（门面默认 = 用户可见的默认）
+        assert!(cfg.parallel_build, "门面默认 parallel_build 应为 true");
+    }
+
+    /// **T7-21 / D-J11**：门面默认已翻转为「开」，且**显式关闭仍然有效**（逃生舱不失效）。
+    ///
+    /// ⚠️ 覆盖边界：本测试只钉**配置层**的默认值与覆写。「配置 → 后端真的分派并行」这条
+    /// 端到端链路**不可观测**（并行计数器 `parallel_inserts()` 只在低层 `HnswRsIndex` 上，
+    /// 门面不暴露）⇒ 后端分派那一段由 `tests/graph_persist.rs` 的 **T22** 钉住。
+    #[test]
+    fn 并行建图默认开且可显式关闭() {
+        assert!(
+            SearchIndexBuilder::default().build_config().parallel_build,
+            "门面默认应为 true（T7-21 / D-J11 翻转）"
+        );
+        assert!(
+            !SearchIndexBuilder::default()
+                .parallel_build(false)
+                .build_config()
+                .parallel_build,
+            "显式 false 必须能关掉（需要可复现拓扑时用）"
+        );
     }
 
     #[test]
