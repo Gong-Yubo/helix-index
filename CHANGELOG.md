@@ -9,6 +9,44 @@
 
 ## [Unreleased]
 
+### 构建 · 横切 T7-21 评审响应（独立复审：1×P2 + 3×P3，全部收口）（Refs #24，2026-09-14）
+
+> 复审**不采信 PR 描述**，独立读码逐路径核对 + 本地 `cargo test -p helix-core --lib search::config`（7/7 绿）。
+> 结论「**行为与接线无问题**；建议 P2-1 修正后合入，P3 自行裁量」。**4 条全部采纳、无一条被拒**。
+
+#### 🔴 Fixed（P2-1 —— 我自己新写的绝对化断言不成立）
+
+- **P2-1：删掉「增量 `flush` 每次最多 64 条 / 永远够不到阈值」这一断言**（本 PR 引入，4 处 + 1 处顺带）。
+  评审的反例成立且已独立复核：`add()` 是「**先**把整篇文档的全部 chunk 推进 `pending`、**再**检查阈值」，
+  而 `flush()` 交给 `add_batch` 的是**整个 `pending`** ⇒ 批量上界 = `(batch_size − 1) + k`
+  （`k` = 当前文档 chunk 数），**不是 64**。故 **`k ≥ 937`（缓冲已满）或 `k ≥ 1000`（保证）时
+  增量 `flush` 同样走并行**；默认 `Chunker(512/64)` 步长约 448 字符 ⇒ **单篇约 42~45 万字符**的长文档
+  即可能触发（`Chunker` **无单文档 chunk 数上限**；段落边界切分还会让所需长度更短）。
+  ⚠️ **为什么是 P2 而非措辞问题**：行为没错，但「flush 永远串行」一旦被引用为**增量建库拓扑可复现**
+  的依据，就是一条**会静默失守的承诺** —— 本 PR 的立论方式恰是「逐路径写明生效范围」，不该带同类破绽。
+  落地：`search/index.rs`（灌向量注释）、`search/config.rs`（`parallel_build()` 文档表格）、
+  `vector/mod.rs`（`add_batch` trait 文档）、本 CHANGELOG 的表格；顺带修 `tests/graph_persist.rs` 的既有同款表述。
+
+#### 🟡 顺手修（P3）
+
+- **P3-1**：低层 `with_capacity` 的默认值在翻转后**失去了唯一的测试钉**（T22 第一腿改成显式后），
+  而 `examples/bench_parallel_build.rs` 的「串行」基线臂仍 de-facto 依赖它 ⇒ 改为
+  **显式 `.with_parallel_build(parallel)`**（附注释说明为何不能依赖该默认）。
+- **P3-2**：`VectorIndex::add_batch` 的 trait 文档原写「默认值已翻转为开」，在该位点有歧义
+  ⇒ 明确为「**门面**默认已翻转；**本 trait 的默认实现仍逐条串行**；**低层 `with_capacity` 默认仍为 `false`**」。
+- **P3-3**：rustdoc 里的行号引用已漂移（`index.rs:830` 实际 **833**、`:966` 实际 **969**，各差 3 行）
+  ⇒ **删掉易腐的行号**，改用符号引用（`rebuild_vector_index` / `GraphStatus::Rebuilt` 分支 / `add()` 攒够 `batch_size`）。
+
+#### ✅ 复审的核验项（作者已独立复核，签「属实」）
+
+透传链路（`from_config` / `compact()` / 降级重建 / `try_load_graph`）、`ConfigFingerprint` **不含**
+`parallel_build`（旧快照不受影响）、NFR-06 论证、T13 串行臂显式化的必要性、范围决策与「不加公开 API」的取舍
+—— **逐条属实**。
+
+#### 📌 另开 issue
+
+- 评审指出「CLI 无 `--no-parallel-build`」的缺口**合并后应立即落一个 issue 免得遗失** ⇒ 已开 **#50**。
+
 ### 构建 · 横切 T7-21 `parallel_build` 默认翻转为「开」（Refs #24，2026-09-14）
 
 > **横切任务**（`plan-v2.md` §4「横切任务」/ §附-3 执行顺序第 3 位，D-J11 拍板），**独立 PR**、不属任何 Step。
@@ -20,18 +58,23 @@
 - **`SearchIndexBuilder::default()` 的 `parallel_build`：`false` → `true`**（`search/config.rs`）。
   实测依据（复审实测，见 issue #24）：12K 真实语料 **11.676s → 2.182s = 5.35×**、50K 合成 **5.26×**，
   真实语料 oracle 重合率无差异（0.995 / 0.995）。
-- ⚠️ **生效范围（本次实测勘误 —— issue #24 的表述需修正）**：并行分派条件是
-  `parallel_build && items.len() >= PARALLEL_INSERT_THRESHOLD(1000)`。门面里**只有
-  `rebuild_vector_index`（单次全量 `add_batch`）** 满足该批量：
+- ⚠️ **生效范围（含两处勘误）**：并行分派条件是
+  `parallel_build && items.len() >= PARALLEL_INSERT_THRESHOLD(1000)`
+  ⇒ 交付点须**一次交够 ≥1000 条**才有意义：
 
-  | 路径 | 每次 `add_batch` 的批量 | 默认开后 |
+  | 交付点 | 每次 `add_batch` 的批量 | 默认开后 |
   | --- | --- | --- |
-  | `compact()` 重建 | 全部存活向量（一次） | ✅ **走并行** |
-  | 冷启动降级重建 | 全部向量（一次） | ✅ **走并行** |
-  | 增量 `flush`（默认 `batch_size = 64`） | ≤ 64 | ❌ 仍串行（< 1000） |
+  | `compact()` 的向量索引重建（`rebuild_vector_index`） | 全部存活向量（一次） | ✅ **走并行** |
+  | `load_with` 的降级重建（`GraphStatus::Rebuilt`） | 全部向量（一次） | ✅ **走并行** |
+  | 增量 `flush`（`add()` 攒够 `batch_size` 触发） | 存量（≤ `batch_size`−1）+ **当前文档 chunk 数 k** | ⚠️ `k ≪ 937` 串行；**`k ≥ 937~1000` 同样走并行** |
 
-  ⇒ 受益的是「**一次性全量建图**」（compaction 重建 / 冷启动降级重建）；**首次增量建图不受影响**
-  （那条路径由 embed 主导）。**不是「开了就全线并行」** —— 已在代码文档里逐路径写明。
+  ⇒ ① **issue #24 的表述需修正**：它说「单批最多 64 条 ⇒ 光开开关仍走不到并行」——
+  那**只对短文档成立**（`flush` 交的是**整个 `pending`**，不是按 `batch_size` 切片）；
+  ② **大单文档的增量建图也会走并行**（默认 `Chunker(512/64)` 步长约 448 字符 ⇒
+  单篇约 42~45 万字符即可能触发；`Chunker` **无单文档 chunk 数上限**）
+  ⇒ **「增量建库一定可复现拓扑」不成立** —— 该边界已写进代码文档与测试注释。
+  净收益仍主要在**一次性全量建图**（`compact()` 重建 / 冷启动降级重建）。
+- ⚠️ 另注：`bench --input` 的「内存直建」路径是**逐点 `add()`**、不交付批量 ⇒ **不受本开关影响**。
 - 代价按 D-J11 接受：并行插入顺序不确定 ⇒ **建图拓扑不可复现**（C8）；但 **NFR-06 的口径是
   「同快照两次*加载*」、不约束建库过程** ⇒ **不破 NFR-06**。需要可复现拓扑时用 `.parallel_build(false)`。
 
