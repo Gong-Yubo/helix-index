@@ -12,6 +12,18 @@ local-embed  = ["dep:fastembed"]
 remote-embed = []            # P2 引入 dep:reqwest
 positions    = []            # posting 存储位置信息
 charabia     = ["dep:charabia"]  # T5-09 分词对照实验（feature 隔离）
+# V2 Step 7 / S7-01：本地精排（`bge-reranker-v2-m3`，fastembed `TextRerank`）。
+# ⚠️ **独立于 local-embed**：模型合计 ≈2.19GB（`model.onnx.data` 2,271,088,656 B）
+#    ⇒ 不能被默认 feature 拉进构建 / 下载路径（设计 §3.6 / R44）。
+#    `dep:fastembed` 已由 `local-embed` 启用 ⇒ 这里**只写 local-embed**；
+#    再写一遍是「**冗余但合法**」（实测：`cargo metadata --features local-rerank`
+#    exit 0，feature 记为 ['local-embed','dep:fastembed']）——设计 §3.6 与附录 C。
+#    真正会报错的是把 `dep:` 用在**非 optional** 依赖上（对照实测：`dep:bincode` ⇒ exit 101）。
+#    不新增依赖树节点（同一个 fastembed 已同时提供 TextEmbedding 与 TextRerank）。
+# ⚠️ **CI 必须编译它**（否则重蹈 `coreml` 的腐化：只在本地用、无人守）⇒
+#    `.github/workflows/ci.yml` 的 features job 有一步 `--features local-rerank`。
+#    该步**不下载任何模型**（真模型用例一律 `#[ignore]`）。
+local-rerank = ["local-embed"]
 # ⚠️ coreml 默认关闭，只服务 V2 Step 6 / T7-09 的 E3 spike（bench_embed_session）。
 #    原因：fastembed 6.0.2 **没有** coreml 透传（[features] 只有 directml），
 #    必须由本 crate 直接依赖 ort 才能表达 EP ⇒ 见下方 ort 依赖的注释。
