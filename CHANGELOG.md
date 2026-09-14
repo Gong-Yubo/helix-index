@@ -9,6 +9,75 @@
 
 ## [Unreleased]
 
+### 新增 · V2 Step 7 PR 1 —— 精排内核：`Reranker::candidate_window` + `LocalReranker`（S7-01）（Refs #23，2026-09-14）
+
+> 本 PR **只做内核**（设计 §8 的 PR 切分 ①：内核与编排分开）：**不碰编排层**
+> （`query/searcher.rs` 一行未改）⇒ 交付后**没有任何既有行为变化**（`LocalReranker`
+> 尚未被任何入口装配；CLI 接线是 PR 3）。对应设计任务 **S7-01**，覆盖
+> **S7-T5 / T8 / T9 / T10 / T12** 的 PR 1 部分。
+
+#### Added
+
+- **`Reranker::candidate_window(&self, k: usize) -> usize`（provided，默认 `k`）** —— 精排器
+  → 编排层的**单向窗口通道**（D-S7-01 / D-S7-02）。**非破坏性**：`NoOpReranker` 与下游
+  自定义实现**一行不改**，未装精排器时 `candidate_k` / 截断 / `hits` 与之前逐位一致。
+  `Reranker::rerank` 的 rustdoc 补了**两条入参契约**：`hits` 长度是**候选窗口**（可 > `top_n`）、
+  实现**不得依赖** `hits[i].explain`（`explain` 的组装按 D-S7-06 推迟到精排截断之后）。
+- **`crates/core/src/rerank/local.rs`：`LocalReranker`**（feature **`local-rerank`**）——
+  fastembed `TextRerank` + `RerankerModel::BGERerankerV2M3`（`rozgo/bge-reranker-v2-m3`，
+  ⚠️ **非** BAAI 官方库——官方库没有 ONNX；`sha256:84b66c78…8945` / 2026-09-14）。
+  `Mutex<TextRerank>`（`rerank` 需 `&mut self`，同 `LocalEmbedder` 先例）；模型缓存目录
+  与 embedder **复用同一个函数**；`pub const DEFAULT_RERANK_WINDOW = 20`（**「拟」值**，
+  待 S7-04 标定 / S7-05 回填）、`DEFAULT_RERANK_MAX_LENGTH = 512`（= 库默认，D-S7-08）。
+  **不做**多 session 池化（设计 §4.4.2）。
+- **`crates/core/src/rerank/scoring.rs`：精排的纯策略层（注入接缝）** ——
+  `sigmoid` / `ScoredCandidate` / `apply_scores`（**按 `index` 回填** + 排序 + 截断）/
+  `reranker_identity`。**不依赖 fastembed** ⇒ 策略能在 CI 里用**可控打分序列**秒级钉住
+  （设计 §3.5 的可测性要求；同 Step 6 的 `EmbedderCtor` 动机）。
+  编译范围 = `cfg(any(feature = "local-rerank", test))`（默认非测试构建不编译它，不留无用代码面）。
+- **`local-rerank = ["local-embed"]`**（`crates/core/Cargo.toml`）—— **不新增依赖树节点**
+  （同一个 fastembed 已提供 `TextEmbedding` 与 `TextRerank`）。模型 ≈2.19GB ⇒ **不进默认
+  feature**（设计 §3.6 / R44）；未启用时 `LocalReranker` **不存在**（编译期），不是「运行时
+  静默退化」。
+- **`.github/workflows/ci.yml`：features job 新增 `cargo test -p helix-core --features local-rerank`**
+  —— 让这个**非默认** feature 也进守门，否则重蹈 `coreml` 的腐化（只在本地用、CI 不覆盖）。
+  真模型用例一律 `#[ignore]` ⇒ **该步不下载任何模型**。
+- **测试**：`rerank::scoring` 单测 6 个（**进 CI**：`σ` 单调有界、按 `index` 回填而非按位置
+  zip、并列按 `chunk_id` 升序、截断、越界 index、身份字符串随参数变化）+ `rerank` 单测 2 个
+  （默认窗口 `== k`、空输入不 panic）；`tests/step7_rerank_local.rs` 真模型用例 4 个
+  （`#[ignore]`：P1 同进程逐位一致 / **P2 跨进程逐位一致（真的 spawn 子进程）** /
+  T10 重排与截断契约）。
+- `Error::Rerank(String)`（`crates/core/src/error.rs`）—— 精排失败与 `Embedding` **分开**：
+  两者的落点与代价差一个数量级（96MB vs 2.19GB），混在一起会让「哪一步炸了」只能靠读字符串猜。
+
+#### ⚠️ 破坏性
+
+- **`Error::Rerank` 是新增的枚举变体**，而 `Error` **不是** `#[non_exhaustive]` ⇒ 下游若对它做
+  **穷尽 `match`** 会编译失败。刻意与 `Error::Embedding` 分开（理由见上）。
+  ⚠️ 这一条**不在设计 §6 的影响面表里**（该表未涉及 `Error`）—— 属实现期发现的**新增面**，已写进 PR 正文报评审。
+
+#### 🔵 与设计文档 §4.4.1 / §4.4.2 的**三处偏差**（实现期实测，已在 PR 正文逐条报评审）
+
+1. **`with_max_length(self, …)` 无法写成「构造后 builder」** ⇒ 改为**构造期**入口
+   `LocalReranker::with_params(window, max_length) -> Result<Self>`。理由：`max_length` 在
+   `TextRerank::try_new` 时就烧进 tokenizer 的 `TruncationParams`（`fastembed/src/common.rs:181-185`），
+   构造后再改字段**只会得到一个「断言仍绿但没生效」的假象**（正是本项目最忌讳的静默失效）。
+2. **单条候选不早退**（设计 §4.4.2 第 1 步写的是「零/单条早退」）⇒ 只有**空输入**早退
+   （fastembed 对空输入报 `EmptyTokenizations`）。理由：否则「`score` 是否被精排替换」会**依赖
+   候选条数**，与 D-S7-05 的 `explain.rerank_score.is_some()` 信号自相矛盾（R46 关注的正是
+   score 语义的可判定性）。
+3. **P3（批组成敏感性）用例落在 `rerank/local.rs` 模块内部**（设计 §7 写的是
+   `tests/step7_rerank_local.rs`）。理由：公开 API 只暴露 `σ(logit)`，而 σ 是**多对一**的浮点
+   映射 ⇒ 用 `score.to_bits()` 相等**不能**证明 **logit** 逐位相同；该用例直接读模型原始输出。
+
+#### 明确不在本 PR 范围
+
+- **编排层窗口打通**（`candidate_k` 联动 / `take_n` / `explain` 推迟 / `Metrics.rerank_window` /
+  `Metrics.rerank_elapsed` / `Explain.rerank_score`）= **S7-02（PR 2）**。⚠️ 因此 **S7-T5 / T12 的
+  「经编排层」那一半**（假精排器在 `search_parts` 里被喂到多少条、`is_some() ⟺ 精排生效`）
+  **随 PR 2 落地**；本 PR 覆盖的是它们的**接口侧**（trait 语义与纯策略）。
+- CLI `--rerank-window` / 两条脚枪拦截 = S7-03；标定 = S7-04；定义面回写 = S7-05。
+
 ### 文档 · V2 Step 7 详细设计 —— 评审响应（F1~F6 全部采纳 + 四处拍板获同意）（Refs #23，2026-09-14）
 
 > 评审落点：**1 条正式评审（`COMMENTED`）+ 6 条行内**，`issues/51/comments` = **0**。
