@@ -439,9 +439,12 @@ impl SearchIndex {
         debug_assert_eq!(vecs.len(), texts.len(), "embed 输出条数应与输入一致");
 
         // 归一化 + 灌向量索引 + 记录原始向量（快照用）。
-        // V2 Step 2：改用 `add_batch`——达阈值且开了并行建图开关时由实现走
-        // `parallel_insert_slice`，否则串行（默认，保确定性）。小批量下批量路径
-        // 与逐条 add 行为等价，故无需分支。
+        // V2 Step 2：改用 `add_batch`——达阈值（`PARALLEL_INSERT_THRESHOLD = 1000`）
+        // 且开了并行建图开关时由实现走 `parallel_insert_slice`，否则串行。
+        // ⚠️ T7-21 / D-J11（2026-09-14）后该开关**默认开**，但**本路径永远够不到阈值**
+        // （默认 `batch_size = 64` ⇒ 每次最多 64 条）⇒ 这里实际仍走串行；能吃到并行的
+        // 是 `rebuild_vector_index` 的**单次全量**建图（`compact()` 重建 / 冷启动降级重建）。
+        // 小批量下批量路径与逐条 add 行为等价，故无需分支。
         //
         // V2 Step 4 / S4-01（D-S4-05 / §2.3 / T5）：**整批 embed 之后、入库之前**按
         // liveness 过滤。`add(d)` 在入 `pending` 前就分配了真实 chunk_id，而 `remove(d)`

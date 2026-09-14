@@ -54,8 +54,15 @@ pub trait VectorIndex: Send + Sync {
 
     /// 批量插入（D-S2-05 / S2-11）。默认实现为逐条 `add`（串行）；
     /// `HnswRsIndex` 可覆盖为 `parallel_insert_slice`（并行建图开关，
-    /// 由门面层按阈值决定是否走批量路径——**默认串行**，保住与 P5 基线的
-    /// 可比性：并行插入顺序不确定 ⇒ 拓扑不可复现，先出实测再定默认值）。
+    /// 由门面层按阈值决定是否走批量路径）。
+    ///
+    /// ⚠️ **默认值已于 T7-21 / D-J11 翻转为「开」**（实测数据已出，见 issue #24；
+    /// 实测 12K 真实语料 11.676s → 2.182s = **5.35×**，oracle 重合率无差异）。
+    /// 代价是并行插入顺序不确定 ⇒ 拓扑不可复现（C8），但 **NFR-06 的口径是
+    /// 「同快照两次**加载**」、不约束建库过程** ⇒ 该代价被接受。
+    /// ⚠️ **生效范围有限**：只对「单次全量 `add_batch`」（`rebuild_vector_index`）有效，
+    /// 增量 `flush`（默认 `batch_size = 64` < 阈值 1000）仍串行 —— 详见
+    /// `SearchIndexBuilder::parallel_build` 的文档。
     fn add_batch(&mut self, items: &[(ChunkId, NormalizedVector)]) -> Result<()> {
         for (id, v) in items {
             self.add(*id, v.clone())?;
