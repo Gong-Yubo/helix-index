@@ -9,6 +9,103 @@
 
 ## [Unreleased]
 
+### 新增 · V2 Step 7 PR 2 —— 编排层精排窗口打通（S7-02）（Refs #23，2026-09-14）
+
+> **本 Step 的风险集中点**（设计 §8 的 PR 切分 ②）：唯一动热路径的改动。
+> 依据 = `docs/devel/v2-step7-design.md` §4.3（测试计划 §7 的 **S7-T1~T4 / T6 / T7 / T12 编排层侧**）。
+> **默认配置零行为变化**：`NoOpReranker` 的 `candidate_window` 默认返回 `k`
+> ⇒ `take_n == k`、`candidate_k == max(3k, 10)` **与 PR 1 之前逐位一致**。
+
+#### Added
+
+- **`Metrics.rerank_elapsed` / `Metrics.rerank_window`**（纯加法，保持 `Copy`）：
+  NFR-12 的「精排段 P99」与「本次是否**真的**放开了窗口」的**唯一落点**。
+  理由同 `vector_shortfall` 的 D-S5-05 先例 —— 只经 `tracing` 输出时外部拿不到实例
+  ⇒ 无法单测、无法被 bench 聚合；而端到端 `took` 里混着两路召回与窗口回捞，反推不出精排段。
+  `log()` 同步输出 `rerank_window` / `rerank_ms`。
+- **`Explain.rerank_score: Option<Score>`**：精排器的**原始分**（`LocalReranker` = 原始 logit）。
+  `is_some()` ⟺ 该条的 `Hit.score` 由精排器写入 —— 这是 D-S7-05「分数被替换不得静默」（NFR-07）
+  的**信号定义**。⚠️ 因为 `σ` **不可逆**，原始分只能由精排器**写回**，编排层算不出来。
+
+#### Changed
+
+- **`search_parts` 的窗口打通**（`crates/core/src/query/searcher.rs`）：三条不变式
+  （已写进函数 rustdoc）：
+
+  ```text
+  window                = Reranker::candidate_window(k)   // provided，默认 k
+  candidate_k           = max(3k, window, 10)             // ⚠️ 必须在两路召回**之前**算
+  take_n                = min(max(k, window), 融合条数)     // 实际交给精排的条数
+  metrics.rerank_window = take_n
+  ```
+
+  ⚠️ **`candidate_k` 必须与窗口联动**（D-S7-03）：只把截断从 `k` 改成 `R` 而候选池不动，
+  窗口会被 `candidate_k` **静默封顶**（`R = 100, k = 10` ⇒ 实际只有 30 条）——
+  设计 §2.2 的设计期发现 A，用**四档 `R`** 读「后端实际收到的 `k`」钉住（S7-T3）。
+- **`explain` 组装推迟**（D-S7-06）：窗口内先只填 `text` / `source` / `metadata` / `fused_score`，
+  `matched_terms`（= `analyze_doc(整段)`）与 lane rank/score 推迟到**精排截断之后**、
+  只对最终 ≤ `k` 条算。**结果逐字段不变**（S7-T6），省掉 `(窗口 − k) × 整段分词`。
+  ⚠️ 代价（**有意的接口收缩**）：精排器拿到的 `explain` **只有 `fused_score`**
+  ⇒ `Reranker::rerank` 的**读侧**契约「不得依赖 `hits[i].explain`」；需要正文用 `hits[i].text`。
+- **`Hit.score` 的语义**（D-S7-09）：rustdoc 重写为「**当前排序依据**」并列出
+  「精排关 / 开 × 三种 mode」的取值表 —— 精排开时 `score = σ(logit) ∈ [0, 1]`，
+  **三种 mode 一视同仁**（精排在融合之后）。`SearchResponse.hits` 的 rustdoc 同步补指针。
+
+#### ⚠️ 破坏性
+
+- **`Explain` 新增字段 `rerank_score`**（`Explain` 字段全 `pub`、**非** `#[non_exhaustive]`）
+  ⇒ 下游以**字面量**构造 `Explain` 的代码会编译失败。0.x 阶段按既有约定接受
+  （同 `SearchResponse.metrics` 的先例 / 架构 R35 一族）。
+  库内构造点 **2 处已同步**（`query/searcher.rs` + `rerank/noop.rs` 的测试夹具；
+  后者刻意**显式列出**该字段而非 `..Default::default()`，让破坏性在 diff 里可见）。
+- **语义变更**：`Hit.score` 在精排生效时不再是融合分（**同一 query 的分数与精排前不可横比**）。
+  信号 = `explain.rerank_score.is_some()`；融合分仍可在 `explain.fused_score` 读到。
+
+#### 🔵 实现期新发现（设计文档未写，逐条报评审）
+
+1. **安全网需显式不静默**：设计 §4.3 的伪码里有 `hits.truncate(k)`，但**没写它不得静默**。
+   本实现按 NFR-07 补 `tracing::warn!` —— 触发即表示精排器**违反出参契约**（返回 > `top_n` 条），
+   与 `rerank::scoring::apply_scores` 的两条防御路径同族（「有可解释的退化」才配静默）。
+   用例：`S7_T5b`（变异：去掉安全网 ⇒ 12 ≠ 10 报红）。
+2. **口径变化必须写明**（不写就会读成回归）：窗口变大 ⇒ `candidate_k` 变大 ⇒
+   `Metrics::vector_shortfall` 的**分母**（`candidate_k.min(allowed)`）跟着变
+   ⇒ **跨窗口不可横比**；低选择度 + `--filter` 档位下召回成本随之上升
+   （`allowed ≤ 8192` 走精确扫描、`O(N)`）⇒ **「精排 + 过滤」叠加的延迟不做承诺**（设计 §4.3.1 已登记为非范围）。
+3. **测试夹具的 `lane_score_of` 单一来源**：间谍向量后端返回的是**距离** `d = id × 0.5`，
+   而实现里 `score = 1 − d/2`（`VectorRetriever::to_scored` 还会**按分数重排 lane**）
+   ⇒ 期望值若在多个用例里各算一遍，很容易「测试自己把公式抄错」。故收敛为一个helper。
+
+#### 明确不在本 PR 范围
+
+- `--rerank-window` CLI 接线、两条脚枪拦截、`scripts/eval_rerank.sh` ⇒ **PR 3（S7-03）**；
+- `R` 标定与 `max_length` 对照档、`eval-report.md` §8.14 ⇒ **PR 4（S7-04）**；
+- 四处定义面回写与 NFR-12 数值定稿 ⇒ **PR 5（S7-05）**。
+
+#### 变异验证（新门必须有牙齿）
+
+⚠️ 下表是**实测**结果（不是预判）。两处与我的预判**不同**，据实记录：
+
+| 变异 | 手法 | 实测命中的用例 |
+| --- | --- | --- |
+| **M1** | `Reranker::candidate_window` 的默认实现 `k` → `k + 1` | ✅ `rerank::tests::默认窗口等于k`（**PR 1 既有**）+ **`S7_T4`** + **`S7_T7`**。⚠️ **`S7_T1` 抓不到这个变异**：它那条断言用的是**间谍**（显式声明 `window = k`），走不到默认实现；见下方「覆盖边界」 |
+| **M2** | `candidate_k = max(3k, window, 10)` 去掉 `window` 项 | ✅ `S7_T3` + `S7_T2`。⚠️ **`S7_T5` 抓不到**：间谍向量后端**忽略 `k`** 恒返 12 条 ⇒ `candidate_k` 的变化在它身上不可观测（`S7_T3` 才是专为这条设的读 `k` 判据） |
+| **M3** | 去掉安全网（`if hits.len() > k`） | ✅ `S7_T5b`（12 ≠ 10） |
+| **M4** | C2 补齐时把 `explain.rerank_score` 置回 `None`（覆盖 C1） | ✅ `S7_T12` |
+| **M5** | 跳过 `matched_terms` 的补齐（D-S7-06 第二步不做） | ✅ `S7_T6` + `S7_T12` |
+| **M6** | `take_n` 恒为 `k`（窗口不生效） | ✅ 7 条（`S7_T2`/`T3`/`T4`/`T5`/`T5b`/`T7`/`T12`） |
+
+还原后 `md5` 与注入前**逐字节一致**（`searcher.rs` = `1a32f8f6…b1b9`、`rerank/mod.rs` = `ceb3afc7…b2c0`）。
+
+**覆盖边界（如实登记）**：
+
+- `S7_T1` 的职责是「间谍声明 `window = k` 时链路与 `NoOp` 逐字段一致」，**不是**「默认实现等于 `k`」
+  —— 后者由 `rerank/mod.rs` 的既有用例（PR 1）钉住，两者互补而非重复。
+- 间谍向量后端**忽略 `k`**（固定返回 12 条）⇒ 「候选池是否放大」只能靠
+  `S7_T3` 读「后端实际收到的 `k`」证明，**不能**靠结果差异反推。这是设计 §7 给 S7-T3
+  单独列一条的原因。
+
+---
+
 ### 构建 · V2 Step 7 PR 1 评审响应（**第 2 轮**：仍无阻塞项 + 1×P2 + 2×P3 + 1 细枝，**全部收口**）（Refs #23，2026-09-14）
 
 > 评审落点：`pulls/52/reviews` **1 条 `COMMENTED`（3276 字，`09:04:30Z`）+ 行内 4 条**；
