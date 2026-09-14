@@ -79,10 +79,24 @@ pub struct SearchParts<'a> {
     pub bm25_params: Bm25Params,
 }
 
-/// 编排的唯一实现：两路召回 → 融合前过滤 → 融合 → 回捞 → 精排。
+/// 编排的唯一实现：两路召回 → 融合前过滤 → 融合 → 窗口回捞 → 精排 → 补齐 explain。
 ///
 /// 所有检索入口（`QueryExecutor::search` / 门面 `Searcher::search`）最终都到这里，
 /// 不存在第二份编排逻辑。
+///
+/// # 精排窗口的三条不变式（V2 Step 7 / D-S7-01~03，设计 §4.2.3）
+///
+/// ```text
+/// window            = Reranker::candidate_window(k)      // trait provided，默认 k
+/// candidate_k       = max(3k, window, 10)                // 恒 ≥ window
+/// take_n            = min(max(k, window), 融合条数)        // 实际交给精排的条数
+/// metrics.rerank_window = take_n                         // 上式的可观测落点
+/// ```
+///
+/// 1. `window ≤ candidate_k`（否则窗口被候选池**静默封顶**）；
+/// 2. `metrics.rerank_window ≤ k` ⟺ 本次**没有**可用的额外候选（放开失效）；
+/// 3. 默认实现下 `window == k` ⇒ `take_n == k`、`candidate_k == max(3k, 10)`
+///    ⇒ 与精排引入前**逐位一致**。
 pub fn search_parts(
     parts: &SearchParts<'_>,
     query: &str,
@@ -114,8 +128,22 @@ pub fn search_parts(
         ));
     }
 
-    // 候选预算：融合时多看几倍，给精排留余地
-    let candidate_k = k.saturating_mul(3).max(10);
+    // 候选预算：融合时多看几倍，给精排留余地。
+    //
+    // ⚠️ **顺序是硬要求**：`candidate_k` 被下方**两路召回**（单路分支与 Hybrid 的
+    // `rayon::join` 两臂）与 `fuse(.., candidate_k)` 消费 ⇒ 精排窗口必须在**召回之前**
+    // 问出来，否则窗口拿不到该拿的候选。（此处刻意不写行号：本项目已因行号漂移
+    // 吃过亏，见 `v2-step7-design.md` 附录 C 的锚点纪律。）
+    //
+    // V2 Step 7 / D-S7-01~03：窗口由**精排器**给出（`Reranker::candidate_window`，
+    // trait provided、默认 `k`），且**必须**参与 `candidate_k` 的 `max`：
+    // 只把截断从 `k` 改成 `R` 而候选池不动，窗口会被 `candidate_k` **静默封顶**
+    // （`R = 100, k = 10` ⇒ 实际只有 30 条）—— 设计 §2.2 的设计期新发现 A，
+    // 由 `S7_T3` 用间谍向量后端钉住「候选池真的放大了」。
+    //
+    // ⚠️ 默认 `R = k` ⇒ 本行是**恒等变换**，与精排引入前逐位一致（`S7_T1`）。
+    let window = parts.reranker.candidate_window(k);
+    let candidate_k = k.saturating_mul(3).max(window).max(10);
 
     // 1. 过滤求值 → 候选谓词（**下推的数据源**，只求值一次；空集直接短路）
     let t0 = Instant::now();
@@ -268,7 +296,14 @@ pub fn search_parts(
         return Ok(empty_response(reason, took, metrics));
     }
 
-    // 3. 对 Top-K 做一次正排回捞 + 组装 explain
+    // 3. 对**候选窗口**做一次正排回捞，**只填便宜字段**（D-S7-06 的第一步）
+    //
+    // 窗口 `take_n = min(max(k, R), 融合条数)`：默认 `R == k` ⇒ 与精排引入前逐位一致。
+    //
+    // ⚠️ 这里**刻意不算 `matched_terms`**（= `analyze_doc(整段)`）：它的成本随窗口
+    // **线性放大**（设计 §2.4 的设计期新发现 B），而窗口里被精排截掉的候选（最多
+    // `R − k` 条）算了就白算 ⇒ 推迟到第 5 步、只对最终 ≤ `k` 条算。
+    // 代价是精排器**看不到** `explain` 的这部分（读侧契约，见 `Reranker::rerank`）。
     let lane_rank = |lane: &Option<LaneResults>| -> HashMap<ChunkId, (u32, Score)> {
         lane.as_ref()
             .map(|l| {
@@ -282,8 +317,9 @@ pub fn search_parts(
     let bm25_rank = lane_rank(&bm25_lane);
     let vector_rank = lane_rank(&vector_lane);
 
-    let mut hits = Vec::with_capacity(fused.len().min(k));
-    for (chunk_id, fused_score) in fused.into_iter().take(k) {
+    let take_n = window.max(k).min(fused.len());
+    let mut proto: Vec<Hit> = Vec::with_capacity(take_n);
+    for (chunk_id, fused_score) in fused.into_iter().take(take_n) {
         let Some(chunk) = parts.index.chunk(chunk_id) else {
             continue;
         };
@@ -292,28 +328,58 @@ pub fn search_parts(
             .doc(chunk.doc_id)
             .ok_or(Error::ChunkNotFound(chunk_id))?;
 
-        let explain = Explain {
-            matched_terms: matched_terms(parts.analyzer, query, &chunk.text),
-            bm25_score: bm25_rank.get(&chunk_id).map(|(_, s)| *s),
-            bm25_rank: bm25_rank.get(&chunk_id).map(|(r, _)| *r),
-            vector_score: vector_rank.get(&chunk_id).map(|(_, s)| *s),
-            vector_rank: vector_rank.get(&chunk_id).map(|(r, _)| *r),
-            fused_score,
-        };
-
-        hits.push(Hit {
+        proto.push(Hit {
             chunk_id,
             doc_id: chunk.doc_id,
             score: fused_score,
             text: chunk.text.clone(),
             source: doc.source.clone(),
             metadata: doc.metadata.clone(),
-            explain,
+            // 只带 `fused_score`：`matched_terms` 与 lane rank/score 留空（第 5 步补）。
+            explain: Explain {
+                fused_score,
+                ..Default::default()
+            },
         });
     }
 
-    // 4. 精排（NoOp 留位）
-    let hits = parts.reranker.rerank(query, hits, k)?;
+    // 4. 精排（V2 Step 7）。入参是**候选窗口**（可能 > `k`），出参应 ≤ `k` 条。
+    //
+    // `NoOpReranker`（默认，D-S7-04）= 原样 `take(k)`，且此时 `take_n == k`
+    // ⇒ 全链路零回归。真精排器（`LocalReranker`）在此返回 `σ(logit)` 并把原始分
+    // 写进 `explain.rerank_score`（D-S7-05）。
+    let t_rerank = Instant::now();
+    let mut hits = parts.reranker.rerank(query, proto, k)?;
+    metrics.rerank_elapsed = t_rerank.elapsed();
+    metrics.rerank_window = take_n;
+
+    // 安全网（纵深防御）：出参契约要求精排器自己截到 `top_n`（见 `Reranker::rerank`），
+    // 这里再截一次 ⇒ release 下不留「> k 条」的越界输出。
+    // ⚠️ **不得静默**（NFR-07）：触发即表示上游实现违约，与 `rerank::scoring::apply_scores`
+    // 的两条防御路径同族 —— 那条越界 `index` 走 `debug_assert!` + `warn!`，这条
+    // 没有"可解释的退化"可言（多出来的条数无法判断该丢哪条），故只 `warn!` + 截断。
+    if hits.len() > k {
+        tracing::warn!(
+            returned = hits.len(),
+            k,
+            "精排器返回条数超过 top_n（违反 Reranker::rerank 的出参契约），已截断"
+        );
+        hits.truncate(k);
+    }
+
+    // 5. 补齐 `explain`（D-S7-06 的第二步 / 契约的 C2）
+    //
+    // ⚠️ **C2 不得覆盖 C1**：精排器通过写 `explain` 归还的原始分
+    // （`rerank_score`，σ 不可逆 ⇒ 编排层算不出来）**必须原样保留**，否则
+    // 「谁后写谁生效」会把 D-S7-05 的信号冲掉（`Reranker::rerank` 的出参契约）。
+    // 本循环只写下面 5 个字段 ⇒ 天然不碰 `rerank_score`；`S7_T12` 有用例钉住这一点。
+    for h in &mut hits {
+        h.explain.matched_terms = matched_terms(parts.analyzer, query, &h.text);
+        h.explain.bm25_score = bm25_rank.get(&h.chunk_id).map(|(_, s)| *s);
+        h.explain.bm25_rank = bm25_rank.get(&h.chunk_id).map(|(r, _)| *r);
+        h.explain.vector_score = vector_rank.get(&h.chunk_id).map(|(_, s)| *s);
+        h.explain.vector_rank = vector_rank.get(&h.chunk_id).map(|(r, _)| *r);
+    }
 
     metrics.fused = hits.len();
     let took = started.elapsed();
@@ -1099,4 +1165,5 @@ mod tests {
             );
         }
     }
+
 }

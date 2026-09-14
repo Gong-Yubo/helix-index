@@ -15,7 +15,21 @@ pub struct Hit {
     pub chunk_id: ChunkId,
     /// 所属文档 ID（一个文档可能含多个分片）
     pub doc_id: DocId,
-    /// 融合后分数（Hybrid）/ 单路分数（单路模式）
+    /// **当前排序依据**（`hits` 恒按本字段降序；同分按 `chunk_id` 升序，NFR-06）。
+    ///
+    /// # ⚠️ 取值随「精排开 / 关」而变（V2 Step 7 / D-S7-05 / D-S7-09）
+    ///
+    /// | 精排 | 三种 mode 下的取值 |
+    /// | --- | --- |
+    /// | **关**（默认，D-S7-04） | 融合分（`Hybrid`）/ 单路分（`bm25` / `vector`）—— 与精排引入前**逐位一致** |
+    /// | **开** | `σ(logit)` = `1 / (1 + e^(−logit))` ∈ `[0, 1]`；**三种 mode 一视同仁**（精排在融合之后，D-S7-09） |
+    ///
+    /// ⚠️ **不可逆**：`σ` 不是单射，无法从本字段还原融合分。想知道融合分读
+    /// [`Explain::fused_score`]；想知道精排原始分读 [`Explain::rerank_score`]。
+    ///
+    /// ⚠️ **本次到底换没换，看 [`Explain::rerank_score`]`.is_some()`** —— 「分数被替换」
+    /// **不得静默**（NFR-07）。下游若用本字段设阈值、跨配置比较分数或缓存排序结果，
+    /// **必须先看那个信号**，否则会以完全不同的量纲工作（架构 R46）。
     pub score: Score,
     /// 分片正文
     pub text: String,
@@ -56,14 +70,37 @@ pub struct Explain {
     pub vector_score: Option<Score>,
     /// 向量路排名（从 1 起）；`None` 同 `vector_score`
     pub vector_rank: Option<u32>,
-    /// 融合后的最终分数
+    /// 融合后的最终分数（**恒为融合/单路分，精排不改写它**，D-S7-05）
     pub fused_score: Score,
+    /// 精排器的**原始分**（`LocalReranker` = 原始 logit）；`None` = 本条**未被精排替换**。
+    ///
+    /// # 这是「`score` 语义被替换」的可观测信号（D-S7-05 / NFR-07）
+    ///
+    /// `is_some()` ⟺ 该条的 [`Hit::score`] 由精排器写入。因为 `score = σ(logit)` 而
+    /// **`σ` 不可逆**，原始分只能由精排器**写回**（见 `Reranker::rerank` 的出参契约），
+    /// 编排层**自己算不出来**。
+    ///
+    /// ⚠️ `None` 有两种来源，必须**连看配置**才能区分：
+    /// ① 精排未生效（`NoOpReranker`，D-S7-04 的默认 ⇒ 恒 `None`）；
+    /// ② 精排生效但**该条没被给分**（精排器覆盖不足时走「保持输入分」路径，
+    ///    见 `rerank::scoring::apply_scores`）。
+    ///
+    /// ⚠️ **别用 `0.0` / `1.0` 当「没打分」的哨兵**：σ 在 f32 下会**精确饱和**到这两个值
+    /// （`σ(16.7) == 1.0`、`σ(−89.0) == 0.0`，实测）⇒ 哨兵与真值**不可区分**。
+    ///
+    /// ⚠️ 本字段是**加在公开结构体上的新字段**（`Explain` 字段全 `pub`）⇒ 下游以字面量
+    /// 构造 `Explain` 的代码会编译失败（破坏性，见 CHANGELOG）。库内构造点已同步。
+    pub rerank_score: Option<Score>,
 }
 
 /// 检索响应。
 #[derive(Debug, Clone)]
 pub struct SearchResponse {
     /// 最终命中列表（按分数降序）
+    ///
+    /// ⚠️ 「分数」的含义随精排开关而变（V2 Step 7 / D-S7-09）⇒ 排序**依据**仍是
+    /// [`Hit::score`]，但该字段在精排生效时代表 `σ(logit)` 而非融合分。
+    /// 本次是否替换由 [`Explain::rerank_score`] 判定 —— 详见 [`Hit::score`]。
     pub hits: Vec<Hit>,
     /// 融合阶段看到的候选总数（bm25 候选 + vector 候选去重后）
     ///

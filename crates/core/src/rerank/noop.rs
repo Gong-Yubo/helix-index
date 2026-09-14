@@ -35,6 +35,10 @@ mod tests {
                 vector_score: None,
                 vector_rank: None,
                 fused_score: 1.0,
+                // V2 Step 7 / S7-02：`Explain` 新增字段（破坏性）⇒ 库内构造点同步。
+                // 这里刻意**显式列出**而不是 `..Default::default()`：让「加字段 = 下游
+                // 字面量构造会断」这件事在 diff 里一眼可见（CHANGELOG 的破坏性段引用它）。
+                rerank_score: None,
             },
         }
     }
