@@ -89,6 +89,34 @@ pub struct Metrics {
     /// 向量路耗时（含精确扫描的 `O(N)` 遍历成本，若走了精确路径）。
     /// 语义与重叠关系见 [`Self::bm25_elapsed`]。
     pub vector_elapsed: Duration,
+    /// 精排段耗时（`Reranker::rerank` 调用本身；**不含**窗口内的回捞与 `explain` 组装）。
+    ///
+    /// NFR-12 的「精排段 P99」取的就是本字段。**为什么必须进 `Metrics`**：同
+    /// `vector_shortfall` 的先例（D-S5-05）——只经 `tracing` 输出时外部拿不到实例
+    /// ⇒ 无法单测、无法被 bench 聚合；而端到端 `took` 里混着两路召回与窗口回捞，
+    /// 反推不出精排那一段。
+    ///
+    /// ⚠️ 与 [`Self::bm25_elapsed`] / [`Self::vector_elapsed`] 不同：**本字段不与之重叠**
+    /// （精排在两路召回**之后**串行执行）。
+    pub rerank_elapsed: Duration,
+    /// **实际**交给精排的候选条数（= 窗口 `min(max(k, window), 融合条数)` 内**可回捞**的条数）。
+    ///
+    /// ⚠️ **记的是实际交接值，不是窗口公式值**（PR #53 评审 P3-2）：窗口里若有**陈旧
+    /// `chunk_id`**（图 / 索引不同步，第 3 步的防御路径会跳过它）⇒ 本字段**小于**公式值。
+    /// **两者之差本身是诊断信号**（差 > 0 ⇒ 本次窗口里有已不可回捞的 chunk）。
+    /// 正常路径两者恒等。`k == 0` 时为 `0`（**不把窗口交给精排**，见 `search_parts`）。
+    ///
+    /// 它是「本次是否**真的**放开了窗口」的**直接证据**（NFR-07）。只看精排器的 `R`
+    /// 或 CLI 的 `--rerank-window` 会漏掉两种情况：① 融合结果本身不足 `R` 条；
+    /// ② `candidate_k` 没与窗口联动、窗口被静默封顶（设计 §2.2 的发现 A）。
+    /// 两种情形下本字段都会**如实小于** `R`，而不是"看起来开了"。
+    ///
+    /// ⚠️ **跨窗口不可横比**（与 [`Self::vector_shortfall`] 同族的口径变化）：
+    /// 窗口变大 ⇒ `candidate_k` 变大 ⇒ `vector_shortfall` 的分母
+    /// （`candidate_k.min(allowed)`）跟着变。这不是回归，是口径随配置变。
+    ///
+    /// 早退路径（索引为空 / 过滤排空 / 融合为空）保持默认 `0`，语义 = 「本次没跑精排」。
+    pub rerank_window: usize,
 }
 
 impl Metrics {
@@ -107,6 +135,8 @@ impl Metrics {
             vector_route = ?self.vector_route,
             bm25_ms = self.bm25_elapsed.as_secs_f64() * 1000.0,
             vector_ms = self.vector_elapsed.as_secs_f64() * 1000.0,
+            rerank_window = self.rerank_window,
+            rerank_ms = self.rerank_elapsed.as_secs_f64() * 1000.0,
             "search"
         );
     }
@@ -132,6 +162,10 @@ mod tests {
         assert_eq!(m.vector_elapsed, Duration::ZERO);
         assert_eq!(m.vector_shortfall, 0);
         assert_eq!(m.allowed, 0);
+        // V2 Step 7 / S7-02 的两个新字段：默认值同样必须**不撒谎**。
+        // `rerank_window = 0` 对三条早退路径恰是真话（"本次没跑精排"）。
+        assert_eq!(m.rerank_window, 0, "默认 = 没跑精排");
+        assert_eq!(m.rerank_elapsed, Duration::ZERO);
     }
 
     /// `VectorRoute` 三态齐全且 `Copy`（进 `Metrics` 后不该带来克隆成本）。
@@ -164,6 +198,8 @@ mod tests {
             vector_route: VectorRoute::Exact,
             bm25_elapsed: Duration::from_micros(1400),
             vector_elapsed: Duration::from_micros(6100),
+            rerank_elapsed: Duration::from_micros(900),
+            rerank_window: 20,
         };
         full.log("满指标");
     }

@@ -79,10 +79,26 @@ pub struct SearchParts<'a> {
     pub bm25_params: Bm25Params,
 }
 
-/// 编排的唯一实现：两路召回 → 融合前过滤 → 融合 → 回捞 → 精排。
+/// 编排的唯一实现：两路召回 → 融合前过滤 → 融合 → 窗口回捞 → 精排 → 补齐 explain。
 ///
 /// 所有检索入口（`QueryExecutor::search` / 门面 `Searcher::search`）最终都到这里，
 /// 不存在第二份编排逻辑。
+///
+/// # 精排窗口的三条不变式（V2 Step 7 / D-S7-01~03，设计 §4.2.3）
+///
+/// ```text
+/// window            = Reranker::candidate_window(k)      // trait provided，默认 k
+/// candidate_k       = max(3k, window, 10)                // 恒 ≥ window
+/// take_n            = k == 0 ? 0 : min(max(k, window), 融合条数)
+/// handed            = 窗口内**可回捞**的条数（≤ take_n；陈旧 chunk_id 会让它更小）
+/// metrics.rerank_window = handed                         // ⚠️ 记**实际交接**值，非公式值
+/// ```
+///
+/// 1. `window ≤ candidate_k`（否则窗口被候选池**静默封顶**）；
+/// 2. `metrics.rerank_window ≤ k` ⟺ 本次**没有**可用的额外候选（放开失效）；
+/// 3. 默认实现下 `window == k` ⇒ `handed == take_n == k`、`candidate_k == max(3k, 10)`
+///    ⇒ 与精排引入前**逐位一致**；
+/// 4. `k == 0` 时**一条都不交给精排**（退化输入的浪费护栏，见下文注释）。
 pub fn search_parts(
     parts: &SearchParts<'_>,
     query: &str,
@@ -114,8 +130,22 @@ pub fn search_parts(
         ));
     }
 
-    // 候选预算：融合时多看几倍，给精排留余地
-    let candidate_k = k.saturating_mul(3).max(10);
+    // 候选预算：融合时多看几倍，给精排留余地。
+    //
+    // ⚠️ **顺序是硬要求**：`candidate_k` 被下方**两路召回**（单路分支与 Hybrid 的
+    // `rayon::join` 两臂）与 `fuse(.., candidate_k)` 消费 ⇒ 精排窗口必须在**召回之前**
+    // 问出来，否则窗口拿不到该拿的候选。（此处刻意不写行号：本项目已因行号漂移
+    // 吃过亏，见 `v2-step7-design.md` 附录 C 的锚点纪律。）
+    //
+    // V2 Step 7 / D-S7-01~03：窗口由**精排器**给出（`Reranker::candidate_window`，
+    // trait provided、默认 `k`），且**必须**参与 `candidate_k` 的 `max`：
+    // 只把截断从 `k` 改成 `R` 而候选池不动，窗口会被 `candidate_k` **静默封顶**
+    // （`R = 100, k = 10` ⇒ 实际只有 30 条）—— 设计 §2.2 的设计期新发现 A，
+    // 由 `S7_T3` 用间谍向量后端钉住「候选池真的放大了」。
+    //
+    // ⚠️ 默认 `R = k` ⇒ 本行是**恒等变换**，与精排引入前逐位一致（`S7_T1`）。
+    let window = parts.reranker.candidate_window(k);
+    let candidate_k = k.saturating_mul(3).max(window).max(10);
 
     // 1. 过滤求值 → 候选谓词（**下推的数据源**，只求值一次；空集直接短路）
     let t0 = Instant::now();
@@ -268,7 +298,14 @@ pub fn search_parts(
         return Ok(empty_response(reason, took, metrics));
     }
 
-    // 3. 对 Top-K 做一次正排回捞 + 组装 explain
+    // 3. 对**候选窗口**做一次正排回捞，**只填便宜字段**（D-S7-06 的第一步）
+    //
+    // 窗口 `take_n = min(max(k, R), 融合条数)`：默认 `R == k` ⇒ 与精排引入前逐位一致。
+    //
+    // ⚠️ 这里**刻意不算 `matched_terms`**（= `analyze_doc(整段)`）：它的成本随窗口
+    // **线性放大**（设计 §2.4 的设计期新发现 B），而窗口里被精排截掉的候选（最多
+    // `R − k` 条）算了就白算 ⇒ 推迟到第 5 步、只对最终 ≤ `k` 条算。
+    // 代价是精排器**看不到** `explain` 的这部分（读侧契约，见 `Reranker::rerank`）。
     let lane_rank = |lane: &Option<LaneResults>| -> HashMap<ChunkId, (u32, Score)> {
         lane.as_ref()
             .map(|l| {
@@ -282,9 +319,24 @@ pub fn search_parts(
     let bm25_rank = lane_rank(&bm25_lane);
     let vector_rank = lane_rank(&vector_lane);
 
-    let mut hits = Vec::with_capacity(fused.len().min(k));
-    for (chunk_id, fused_score) in fused.into_iter().take(k) {
+    // ⚠️ **`k == 0` 必须单独挡掉**（PR #53 评审 P3-1）：`window.max(k)` 会让
+    // `take_n == window`（> 0）⇒ 把**整个窗口**交给精排、跑完模型再被安全网截回 0 条
+    // —— 输出对，但成本白花。而 `LocalReranker::candidate_window` **不看 `k`**
+    // （恒返回配置的 `R`）⇒ `k = 0` + `local-rerank` 时**每次查询白跑 `R` 次推理**。
+    // 改动前 `.take(k=0)` 给精排喂的是空 vec，而 `LocalReranker` 对空输入**早退**
+    // ⇒ 近零成本。本 PR 若不挡，会**无意放大这个退化输入的成本**。
+    // 可达性：`helix search --k 0`（`k: usize` 无下界，`SearchRequest::top_n` 也不钳制）。
+    // ⚠️ `window == 0`（trait 契约没写「必须 ≥ 1」）**不需要**额外处理：`max(k)` 已兜底。
+    let take_n = if k == 0 {
+        0
+    } else {
+        window.max(k).min(fused.len())
+    };
+    let mut proto: Vec<Hit> = Vec::with_capacity(take_n);
+    for (chunk_id, fused_score) in fused.into_iter().take(take_n) {
         let Some(chunk) = parts.index.chunk(chunk_id) else {
+            // 陈旧 `chunk_id`（图/索引不同步）⇒ 该条不进 `proto`，故 `proto.len()`
+            // 可能**小于** `take_n`（见下方 `handed` 的记账口径）。
             continue;
         };
         let doc = parts
@@ -292,28 +344,64 @@ pub fn search_parts(
             .doc(chunk.doc_id)
             .ok_or(Error::ChunkNotFound(chunk_id))?;
 
-        let explain = Explain {
-            matched_terms: matched_terms(parts.analyzer, query, &chunk.text),
-            bm25_score: bm25_rank.get(&chunk_id).map(|(_, s)| *s),
-            bm25_rank: bm25_rank.get(&chunk_id).map(|(r, _)| *r),
-            vector_score: vector_rank.get(&chunk_id).map(|(_, s)| *s),
-            vector_rank: vector_rank.get(&chunk_id).map(|(r, _)| *r),
-            fused_score,
-        };
-
-        hits.push(Hit {
+        proto.push(Hit {
             chunk_id,
             doc_id: chunk.doc_id,
             score: fused_score,
             text: chunk.text.clone(),
             source: doc.source.clone(),
             metadata: doc.metadata.clone(),
-            explain,
+            // 只带 `fused_score`：`matched_terms` 与 lane rank/score 留空（第 5 步补）。
+            explain: Explain {
+                fused_score,
+                ..Default::default()
+            },
         });
     }
 
-    // 4. 精排（NoOp 留位）
-    let hits = parts.reranker.rerank(query, hits, k)?;
+    // 4. 精排（V2 Step 7）。入参是**候选窗口**（可能 > `k`），出参应 ≤ `k` 条。
+    //
+    // `NoOpReranker`（默认，D-S7-04）= 原样 `take(k)`，且此时 `take_n == k`
+    // ⇒ 全链路零回归。真精排器（`LocalReranker`）在此返回 `σ(logit)` 并把原始分
+    // 写进 `explain.rerank_score`（D-S7-05）。
+    // ⚠️ **记的是「实际交接条数」`handed`，不是公式值 `take_n`**（PR #53 评审 P3-2）：
+    // 第 3 步的陈旧 `chunk_id` 防御路径会让 `proto.len() < take_n`，而字段自称的是
+    // 「**实际**交给精排的候选条数」⇒ 记公式值会在那条路径上**高报**。
+    // 正常路径两者恒等（所有现有断言不受影响）；**两者之差本身是诊断信号**
+    // （差 > 0 ⇒ 本次窗口里有已不可回捞的 chunk）。
+    let handed = proto.len();
+    let t_rerank = Instant::now();
+    let mut hits = parts.reranker.rerank(query, proto, k)?;
+    metrics.rerank_elapsed = t_rerank.elapsed();
+    metrics.rerank_window = handed;
+
+    // 安全网（纵深防御）：出参契约要求精排器自己截到 `top_n`（见 `Reranker::rerank`），
+    // 这里再截一次 ⇒ release 下不留「> k 条」的越界输出。
+    // ⚠️ **不得静默**（NFR-07）：触发即表示上游实现违约，与 `rerank::scoring::apply_scores`
+    // 的两条防御路径同族 —— 那条越界 `index` 走 `debug_assert!` + `warn!`，这条
+    // 没有"可解释的退化"可言（多出来的条数无法判断该丢哪条），故只 `warn!` + 截断。
+    if hits.len() > k {
+        tracing::warn!(
+            returned = hits.len(),
+            k,
+            "精排器返回条数超过 top_n（违反 Reranker::rerank 的出参契约），已截断"
+        );
+        hits.truncate(k);
+    }
+
+    // 5. 补齐 `explain`（D-S7-06 的第二步 / 契约的 C2）
+    //
+    // ⚠️ **C2 不得覆盖 C1**：精排器通过写 `explain` 归还的原始分
+    // （`rerank_score`，σ 不可逆 ⇒ 编排层算不出来）**必须原样保留**，否则
+    // 「谁后写谁生效」会把 D-S7-05 的信号冲掉（`Reranker::rerank` 的出参契约）。
+    // 本循环只写下面 5 个字段 ⇒ 天然不碰 `rerank_score`；`S7_T12` 有用例钉住这一点。
+    for h in &mut hits {
+        h.explain.matched_terms = matched_terms(parts.analyzer, query, &h.text);
+        h.explain.bm25_score = bm25_rank.get(&h.chunk_id).map(|(_, s)| *s);
+        h.explain.bm25_rank = bm25_rank.get(&h.chunk_id).map(|(r, _)| *r);
+        h.explain.vector_score = vector_rank.get(&h.chunk_id).map(|(_, s)| *s);
+        h.explain.vector_rank = vector_rank.get(&h.chunk_id).map(|(r, _)| *r);
+    }
 
     metrics.fused = hits.len();
     let took = started.elapsed();
@@ -523,6 +611,7 @@ mod tests {
     #![allow(non_snake_case)] // 中文测试名含英文缩写（NoDocuments / AllTermsUnmatched）
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::Arc;
 
     use crate::analyze::MixedAnalyzer;
     use crate::chunk::Chunker;
@@ -819,6 +908,12 @@ mod tests {
         ann_calls: AtomicUsize,
         /// `search_exact_filtered` 被调用次数
         exact_calls: AtomicUsize,
+        /// 两条路径收到的 `k` 参数的**最大值**（V2 Step 7 / `S7_T3` 的空转防护）。
+        ///
+        /// `k` 是候选池大小进后端的**唯一入口**：编排层若只把截断改成窗口 `R` 而没联动
+        /// `candidate_k`，这里读到的就会**小于** `R` ⇒ 判据可证伪（同 Step 6 的 F1 一族：
+        /// 「改对了参数、但被上游的上限吃掉」）。
+        max_k: AtomicUsize,
         /// ANN 路径返回的 id（刻意少于 Exact ⇒ 复现 R11 的召回缺口）
         ann_ids: Vec<ChunkId>,
         /// 精确路径返回的 id（= 全部 allowed ⇒ 结构性无缺口）
@@ -831,6 +926,7 @@ mod tests {
                 exact_by_policy,
                 ann_calls: AtomicUsize::new(0),
                 exact_calls: AtomicUsize::new(0),
+                max_k: AtomicUsize::new(0),
                 ann_ids,
                 exact_ids,
             }
@@ -841,6 +937,11 @@ mod tests {
                 self.ann_calls.load(AtomicOrdering::SeqCst),
                 self.exact_calls.load(AtomicOrdering::SeqCst),
             )
+        }
+
+        /// 后端实际见过的最大 `k`（= 编排层下发的候选池大小）。
+        fn max_k(&self) -> usize {
+            self.max_k.load(AtomicOrdering::SeqCst)
         }
 
         /// 固定距离序列（升序、唯一、与 id 顺序无关地确定性）
@@ -860,20 +961,22 @@ mod tests {
         fn search_filtered(
             &self,
             _query: &crate::vector::NormalizedVector,
-            _k: usize,
+            k: usize,
             _filter: Option<&dyn CandidateFilter>,
         ) -> Result<Vec<(ChunkId, f32)>> {
             self.ann_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.max_k.fetch_max(k, AtomicOrdering::SeqCst);
             Ok(Self::fixed(&self.ann_ids))
         }
 
         fn search_exact_filtered(
             &self,
             _query: &crate::vector::NormalizedVector,
-            _k: usize,
+            k: usize,
             _filter: Option<&dyn CandidateFilter>,
         ) -> Result<Vec<(ChunkId, f32)>> {
             self.exact_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.max_k.fetch_max(k, AtomicOrdering::SeqCst);
             Ok(Self::fixed(&self.exact_ids))
         }
 
@@ -1098,5 +1201,610 @@ mod tests {
                 "{label}：metrics.candidates 与 total_candidates 不一致"
             );
         }
+    }
+
+    // ========================================================================
+    // V2 Step 7 / S7-02：精排窗口打通（`candidate_k` 联动 / `take_n` / `explain` 时机 /
+    // `Metrics` 采集点 / `Explain.rerank_score`）。
+    //
+    // 全部用**间谍**，不装真模型：2.19GB 的 `LocalReranker` 进不了 CI，而且那会把
+    // 「**编排层**做错了」与「模型行为」混在一起 —— 同 `S5_T1` 用间谍向量后端的理由。
+    // 真模型的确定性探针在 `tests/step7_rerank_local.rs`（全 `#[ignore]`）。
+    // ========================================================================
+
+    /// 12 条语料（`chunk_id = 0..12`）+ 间谍向量后端（ANN 返回**全部 12 条**）。
+    ///
+    /// `k = 10` 而融合得 12 条 ⇒ 「精排窗口」与「候选池」的区别才**可观测**
+    /// （若语料 ≤ k，窗口放开与不放开的结果必然相同 ⇒ 用例变空转）。
+    fn build_window_fixture() -> (Index, MixedAnalyzer, SpyVectorIndex) {
+        let texts: Vec<String> = (0..12).map(|i| format!("检索 文档 {i}")).collect();
+        let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        let (index, analyzer) = build_tagged_index(&refs, "kept");
+        let ids: Vec<ChunkId> = (0..12).collect();
+        // 策略为假 ⇒ 走 ANN（单路模式下 `prefers_exact` 看的是 `FilterKind::Alive`）
+        (
+            index,
+            analyzer,
+            SpyVectorIndex::new(false, ids.clone(), ids),
+        )
+    }
+
+    fn ids_of(r: &SearchResponse) -> Vec<ChunkId> {
+        r.hits.iter().map(|h| h.chunk_id).collect()
+    }
+
+    /// 间谍向量后端返回的「距离」是 `d = id × 0.5`，而实现里
+    /// `score = 1 − d/2`（`VectorRetriever::to_scored`）。
+    /// 三处期望值都走这一个函数，避免「测试自己把公式抄错」。
+    fn lane_score_of(chunk_id: ChunkId) -> f32 {
+        1.0 - (chunk_id as f32 * 0.5) / 2.0
+    }
+
+    /// `explain` 的**五字段**快照（D-S7-06 的回归护栏：推迟只改时机、不改结果）。
+    /// `rerank_score` 单列（它是新增的第六个字段，语义不同类）。
+    type ExplainSnapshot = (
+        Vec<String>,
+        Option<Score>,
+        Option<u32>,
+        Option<Score>,
+        Option<u32>,
+        Score,
+    );
+
+    fn explain_snapshot(h: &Hit) -> ExplainSnapshot {
+        (
+            h.explain.matched_terms.clone(),
+            h.explain.bm25_score,
+            h.explain.bm25_rank,
+            h.explain.vector_score,
+            h.explain.vector_rank,
+            h.explain.fused_score,
+        )
+    }
+
+    /// 间谍精排器的**观测窗**：`Arc` 共享 ⇒ 它被装进 `Box<dyn Reranker>` 移走后，
+    /// 测试仍能读到「它看见了什么」。
+    #[derive(Clone, Default)]
+    struct SpyObs {
+        seen_len: Arc<AtomicUsize>,
+        seen_scored_in: Arc<AtomicUsize>,
+    }
+
+    impl SpyObs {
+        /// 最近一次 `rerank` 收到的候选条数（= 编排层算出的 `take_n`）。
+        fn seen_len(&self) -> usize {
+            self.seen_len.load(AtomicOrdering::SeqCst)
+        }
+
+        /// 最近一次 `rerank` 入参里 `explain.rerank_score.is_some()` 的条数。
+        ///
+        /// **恒为 0 就是读侧收缩（D-S7-06）的证据**：编排层在精排**之前**不写
+        /// `rerank_score` ⇒ 精排器拿不到「谁被打分过」。
+        fn seen_scored_in(&self) -> usize {
+            self.seen_scored_in.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    /// 间谍精排器：记录入参，并按开关施加**可预测**的变换。
+    struct SpyReranker {
+        /// `candidate_window` 的返回值（H3 的 `R`）
+        window: usize,
+        /// `true` ⇒ 用「输入位置越靠后 logit 越大」替换 `score = σ(logit)` 并写回
+        /// `explain.rerank_score`（D-S7-05）。这样**窗口外**的候选才有能力翻上来 ——
+        /// 那正是放开窗口想要的那部分收益。
+        promote_tail: bool,
+        /// `true` ⇒ 故意**不截断**（复现「实现违反出参契约」，验编排层的安全网）。
+        violate_contract: bool,
+        obs: SpyObs,
+    }
+
+    impl SpyReranker {
+        /// 返回 `(间谍, 观测窗)`。
+        ///
+        /// ⚠️ 刻意 `sleep(1ms)`：让 `metrics.rerank_elapsed` 的断言**不依赖计时器
+        /// 分辨率**（`> Duration::ZERO` 在粗糙时钟上有假红风险），同时证明该字段包的
+        /// 确实是 `rerank()` 这**一次**调用，而不是别的东西。
+        fn new(window: usize, promote_tail: bool, violate_contract: bool) -> (Self, SpyObs) {
+            let obs = SpyObs::default();
+            (
+                Self {
+                    window,
+                    promote_tail,
+                    violate_contract,
+                    obs: obs.clone(),
+                },
+                obs,
+            )
+        }
+    }
+
+    impl Reranker for SpyReranker {
+        fn candidate_window(&self, _k: usize) -> usize {
+            self.window
+        }
+
+        fn rerank(&self, _query: &str, hits: Vec<Hit>, top_n: usize) -> Result<Vec<Hit>> {
+            self.obs.seen_len.store(hits.len(), AtomicOrdering::SeqCst);
+            self.obs.seen_scored_in.store(
+                hits.iter()
+                    .filter(|h| h.explain.rerank_score.is_some())
+                    .count(),
+                AtomicOrdering::SeqCst,
+            );
+            std::thread::sleep(Duration::from_millis(1));
+
+            let mut out = hits;
+            if self.promote_tail {
+                for (i, h) in out.iter_mut().enumerate() {
+                    // logit 随**输入位置**单调增 ⇒ 与输入序**刻意反序**（否则
+                    // 「按 index 回填」与「按位置 zip」的结果恰好一样，断言没有鉴别力）。
+                    let logit = (i + 1) as f32;
+                    h.explain.rerank_score = Some(logit);
+                    h.score = 1.0 / (1.0 + (-logit).exp());
+                }
+                // D-S7-07：score 降序、并列 chunk_id 升序
+                out.sort_by(|a, b| {
+                    b.score
+                        .total_cmp(&a.score)
+                        .then(a.chunk_id.cmp(&b.chunk_id))
+                });
+            }
+            if !self.violate_contract {
+                out.truncate(top_n);
+            }
+            Ok(out)
+        }
+    }
+
+    /// **S7-T1（D-S7-02 的零回归）**：默认窗口 == `k` ⇒ 候选池与交给精排的条数
+    /// **都不变**；且结果与 `NoOpReranker` 逐字段一致。
+    ///
+    /// ⚠️ 本用例的**牙齿**在 `rerank_window == k` 与 `max_k == 3k` 这两条上，**不在**
+    /// 「结果是否相同」上：若默认实现被改成 `k + 1`，多出来的那条会被精排截掉 ⇒
+    /// 最终 `hits` 看上去一模一样。这正是设计要「钉空转防护」而不是只比结果的原因。
+    #[test]
+    fn S7_T1_默认窗口不放大候选池且与NoOp逐字段一致() {
+        let (index, analyzer, vi) = build_window_fixture();
+        let e = FakeEmbedder;
+
+        // ① 默认装配（`NoOpReranker`）：窗口 = k
+        let s_noop = QueryExecutor::new(&index, &analyzer).with_vector(&e, &vi);
+        let r_noop = s_noop.search("检索", SearchMode::Vector, 10).unwrap();
+
+        // ② 间谍精排器，声明的窗口也 == k（行为等价于 NoOp）
+        let (spy, obs) = SpyReranker::new(10, false, false);
+        let s_spy = QueryExecutor::new(&index, &analyzer)
+            .with_vector(&e, &vi)
+            .with_reranker(Box::new(spy));
+        let r_spy = s_spy.search("检索", SearchMode::Vector, 10).unwrap();
+
+        assert_eq!(r_spy.metrics.rerank_window, 10, "默认窗口必须 == k");
+        assert_eq!(obs.seen_len(), 10, "take_n == k ⇒ 精排只该收到 k 条");
+        assert_eq!(
+            vi.max_k(),
+            30,
+            "candidate_k 必须仍是 max(3k, 10) = 30（窗口未参与放大）"
+        );
+
+        assert_eq!(ids_of(&r_noop), ids_of(&r_spy), "hits 顺序逐位一致");
+        for (a, b) in r_noop.hits.iter().zip(&r_spy.hits) {
+            assert_eq!(a.score.to_bits(), b.score.to_bits(), "分数逐位一致");
+            assert_eq!(
+                explain_snapshot(a),
+                explain_snapshot(b),
+                "explain 五字段逐字段一致"
+            );
+            assert_eq!(a.explain.rerank_score, None);
+            assert_eq!(b.explain.rerank_score, None);
+        }
+    }
+
+    /// **S7-T2（H3 的核心）**：`window = 100 > k = 10` ⇒ 交给精排的是
+    /// `min(max(k, window), 融合条数) = 12` 条，而**返回条数仍 ≤ `k`**。
+    #[test]
+    fn S7_T2_窗口大于k时交给精排的是窗口条数() {
+        let (index, analyzer, vi) = build_window_fixture();
+        let e = FakeEmbedder;
+        let (spy, obs) = SpyReranker::new(100, false, false);
+        let s = QueryExecutor::new(&index, &analyzer)
+            .with_vector(&e, &vi)
+            .with_reranker(Box::new(spy));
+
+        let r = s.search("检索", SearchMode::Vector, 10).unwrap();
+
+        assert_eq!(obs.seen_len(), 12, "take_n = min(max(k, R), 12) = 12");
+        assert_eq!(
+            r.metrics.rerank_window, 12,
+            "NFR-07：实际交给精排的条数必须可观测"
+        );
+        assert_eq!(r.hits.len(), 10, "返回条数仍由 top_n = k 决定");
+        assert_eq!(vi.max_k(), 100, "候选池必须随窗口放大到 ≥ R");
+    }
+
+    /// **S7-T3（D-S7-03 的空转防护）**：`R` 必须真的传导到**向量后端收到的 `k`**。
+    ///
+    /// 用**四档** `R`（< 3k / == 3k / > 3k / 远大于 3k）读后端实际收到的 `k`：
+    /// 只把截断改成 `R` 而 `candidate_k` 不联动时，后两档会立刻暴露
+    /// （后端收到的仍是 30 ⇒ `R = 200` 的窗口被静默封顶）。
+    #[test]
+    fn S7_T3_候选池必须随窗口真的放大() {
+        let (index, analyzer, _) = build_window_fixture();
+        let e = FakeEmbedder;
+        const K: usize = 10;
+
+        for (window, expected_k, label) in [
+            (10usize, 30usize, "R <= 3k：候选池由 3k 兜底"),
+            (30, 30, "R == 3k：正好对齐"),
+            (100, 100, "R > 3k：必须由 R 决定（否则窗口被静默封顶）"),
+            (200, 200, "R >> 3k"),
+        ] {
+            let ids: Vec<ChunkId> = (0..12).collect();
+            let vi = SpyVectorIndex::new(false, ids.clone(), ids);
+            let (spy, _obs) = SpyReranker::new(window, false, false);
+            let s = QueryExecutor::new(&index, &analyzer)
+                .with_vector(&e, &vi)
+                .with_reranker(Box::new(spy));
+            let r = s.search("检索", SearchMode::Vector, K).unwrap();
+
+            assert_eq!(vi.max_k(), expected_k, "{label}：后端收到的 k 参数");
+            assert!(
+                vi.max_k() >= window,
+                "{label}：不变式 `window <= candidate_k` 必须成立"
+            );
+            assert_eq!(
+                r.metrics.rerank_window,
+                window.min(12),
+                "{label}：窗口记账（融合只有 12 条 ⇒ 上界 12）"
+            );
+        }
+    }
+
+    /// **S7-T4**：窗口对 `NoOp` 路径**零影响** —— `R` 取到 `R > 融合条数` 也与默认窗口
+    /// **逐位一致**。
+    ///
+    /// 机制：窗口只让**末尾**多进几条候选，而 `NoOp` 保序 ⇒ 截到 `k` 后前缀不变。
+    #[test]
+    fn S7_T4_窗口对NoOp路径结果零影响() {
+        let (index, analyzer, vi) = build_window_fixture();
+        let e = FakeEmbedder;
+
+        let s_default = QueryExecutor::new(&index, &analyzer).with_vector(&e, &vi);
+        let base = s_default.search("检索", SearchMode::Vector, 10).unwrap();
+        assert_eq!(base.metrics.rerank_window, 10, "基准 = 默认窗口");
+        assert_eq!(base.hits.len(), 10);
+
+        for window in [10usize, 11, 12, 50, 100] {
+            let (spy, obs) = SpyReranker::new(window, false, false);
+            let s = QueryExecutor::new(&index, &analyzer)
+                .with_vector(&e, &vi)
+                .with_reranker(Box::new(spy));
+            let r = s.search("检索", SearchMode::Vector, 10).unwrap();
+
+            assert_eq!(ids_of(&base), ids_of(&r), "R = {window}：hits 顺序必须不变");
+            for (a, b) in base.hits.iter().zip(&r.hits) {
+                assert_eq!(
+                    a.score.to_bits(),
+                    b.score.to_bits(),
+                    "R = {window}：分数必须不变"
+                );
+                assert_eq!(explain_snapshot(a), explain_snapshot(b));
+            }
+            assert_eq!(
+                r.metrics.rerank_window,
+                window.min(12),
+                "R = {window}：窗口如实记账"
+            );
+            // ⚠️ 前提自证：越过 k 的那几档**确实**多给了候选，否则本用例是空转
+            assert_eq!(obs.seen_len(), window.min(12), "R = {window}：入参条数");
+        }
+    }
+
+    /// **S7-T5（编排层侧）**：窗口放开要能**真的改变结果**。
+    ///
+    /// 同一个精排器（「越靠后的候选 logit 越大」）在两档下给出**不同冠军**：
+    /// `R = k = 10` 时只看得到前 10 条 ⇒ 冠军是窗口内最后一条（`chunk_id = 9`）；
+    /// `R = 12` 时看到全部 12 条 ⇒ 冠军变成原本**在窗口外**的 `chunk_id = 11`。
+    /// ⚠️ **两档的结论都要写出来**：只断言「`R = 12` 出 `chunk_id = 11`」无法排除巧合。
+    #[test]
+    fn S7_T5_窗口放开能真的改变最终结果() {
+        let (index, analyzer, vi) = build_window_fixture();
+        let e = FakeEmbedder;
+        let run = |window: usize| -> (Vec<ChunkId>, usize) {
+            let (spy, obs) = SpyReranker::new(window, true, false);
+            let s = QueryExecutor::new(&index, &analyzer)
+                .with_vector(&e, &vi)
+                .with_reranker(Box::new(spy));
+            let r = s.search("检索", SearchMode::Vector, 10).unwrap();
+            (ids_of(&r), obs.seen_len())
+        };
+
+        let (narrow, seen_narrow) = run(10);
+        assert_eq!(seen_narrow, 10, "R = k ⇒ 精排只看得到前 k 条");
+        assert_eq!(
+            narrow[0], 9,
+            "R = k 时冠军只能是窗口内最后一条（chunk_id = 9）"
+        );
+        assert_eq!(narrow.len(), 10);
+
+        let (wide, seen_wide) = run(12);
+        assert_eq!(seen_wide, 12, "R = 12 ⇒ 精排看到全部 12 条");
+        assert_eq!(
+            wide[0], 11,
+            "R = 12 时冠军变成原本在窗口外的那条（chunk_id = 11）"
+        );
+        assert_ne!(narrow[0], wide[0], "本用例的鉴别力：两档冠军必须不同");
+        assert_eq!(wide.len(), 10, "两档都截到 k");
+    }
+
+    /// **S7-T5b（本 PR 新发现的防御路径）**：精排器违反出参契约（返回 > `top_n` 条）时，
+    /// 编排层**截断并告警**，不把越界条数漏给调用方。
+    ///
+    /// ⚠️ 设计 §4.3 的伪码里有 `hits.truncate(k)`（安全网），但**没写它不得静默**；
+    /// 本条按 NFR-07 补上 `warn!`，并在这里用「不截断的间谍」把**效果**钉住。
+    /// 变异：去掉安全网 ⇒ 本条报红（12 ≠ 10）。
+    #[test]
+    fn S7_T5b_精排器违约返回超k条时被安全网截断() {
+        let (index, analyzer, vi) = build_window_fixture();
+        let e = FakeEmbedder;
+        let (spy, obs) = SpyReranker::new(12, false, true); // violate_contract = true
+        let s = QueryExecutor::new(&index, &analyzer)
+            .with_vector(&e, &vi)
+            .with_reranker(Box::new(spy));
+
+        let r = s.search("检索", SearchMode::Vector, 10).unwrap();
+        assert_eq!(obs.seen_len(), 12, "前提自证：精排器确实收到了 12 条");
+        assert_eq!(r.hits.len(), 10, "安全网必须把违约的 12 条截回 k = 10");
+        assert_eq!(
+            r.metrics.fused, 10,
+            "口径自洽：fused 记的是**截断后**的条数"
+        );
+    }
+
+    /// **S7-T6（D-S7-06 的回归护栏）**：`NoOp` 路径下 `explain` 的五个字段与
+    /// 「先组装、再精排」的旧口径**逐字段一致** —— 推迟只改**时机**、不改**结果**。
+    ///
+    /// 用间谍向量后端（返回 id 升序、距离 `d = id × 0.5`）⇒ 每条 hit 的
+    /// `vector_rank` / `vector_score` 都能**精确**断言，而不是"看起来有值"。
+    #[test]
+    fn S7_T6_NoOp下explain五字段口径不变() {
+        let (index, analyzer, vi) = build_window_fixture();
+        let e = FakeEmbedder;
+        let s = QueryExecutor::new(&index, &analyzer).with_vector(&e, &vi);
+        let r = s.search("检索", SearchMode::Vector, 10).unwrap();
+
+        assert_eq!(r.hits.len(), 10);
+        for (i, h) in r.hits.iter().enumerate() {
+            let id = i as ChunkId;
+            assert_eq!(h.chunk_id, id, "NoOp 保序 ⇒ 第 i 条就是 lane 的第 i 条");
+            assert_eq!(
+                h.explain.vector_rank,
+                Some(id + 1),
+                "rank 从 1 起、按 lane 顺序"
+            );
+            assert_eq!(
+                h.explain.vector_score,
+                Some(lane_score_of(id)),
+                "lane 分原样透传"
+            );
+            assert_eq!(h.explain.bm25_rank, None, "Vector 模式没有 BM25 路");
+            assert_eq!(h.explain.bm25_score, None);
+            assert_eq!(
+                h.explain.fused_score.to_bits(),
+                lane_score_of(id).to_bits(),
+                "单路模式下融合分即该路分"
+            );
+            assert_eq!(h.score.to_bits(), h.explain.fused_score.to_bits());
+            assert_eq!(h.explain.rerank_score, None, "NoOp 从不写该信号");
+            assert!(
+                h.explain.matched_terms.contains(&"检索".to_string()),
+                "第 {i} 条：正文含『检索』⇒ matched_terms 必须非空"
+            );
+        }
+    }
+
+    /// **S7-T7（NFR-07 / NFR-12 的前提）**：两个新 `Metrics` 字段被填且口径自洽。
+    #[test]
+    fn S7_T7_Metrics新字段被填且口径自洽() {
+        let (index, analyzer, vi) = build_window_fixture();
+        let e = FakeEmbedder;
+
+        // ── 有结果路径：窗口如实记账；耗时**包住了 `rerank()` 本身** ──
+        let (spy, _obs) = SpyReranker::new(100, false, false);
+        let s = QueryExecutor::new(&index, &analyzer)
+            .with_vector(&e, &vi)
+            .with_reranker(Box::new(spy));
+        let r = s.search("检索", SearchMode::Vector, 10).unwrap();
+        assert_eq!(r.metrics.rerank_window, 12);
+        assert!(
+            r.metrics.rerank_elapsed >= Duration::from_millis(1),
+            "间谍 `sleep(1ms)` ⇒ 该字段必须 ≥ 1ms（证明它包的是 rerank() 本身）"
+        );
+        assert!(
+            r.metrics.rerank_elapsed <= r.metrics.took,
+            "分段耗时不得大于总耗时"
+        );
+        assert_eq!(r.metrics.took, r.took, "I7 仍自洽");
+
+        // ── NoOp + 默认窗：`rerank_window == min(k, 融合条数)` ──
+        let s_noop = QueryExecutor::new(&index, &analyzer).with_vector(&e, &vi);
+        let base = s_noop.search("检索", SearchMode::Vector, 10).unwrap();
+        assert_eq!(base.metrics.rerank_window, 10);
+        assert_eq!(base.metrics.rerank_window, base.hits.len().min(10));
+
+        // ── 不变式 2 的边界：k > 融合条数 ⇒ 窗口只能取到融合条数 ──
+        let r_small = s_noop.search("检索", SearchMode::Vector, 15).unwrap();
+        assert_eq!(
+            r_small.metrics.rerank_window, 12,
+            "融合只有 12 条 ⇒ 窗口封顶在 12（不是 15）"
+        );
+
+        // ── 早退路径：默认值必须**不撒谎**（0 = 本次没跑精排）──
+        let empty_index = Index::new();
+        let analyzer2 = MixedAnalyzer::new();
+        let s_empty = QueryExecutor::new(&empty_index, &analyzer2);
+        let r_empty = s_empty.search("x", SearchMode::Bm25, 10).unwrap();
+        assert_eq!(r_empty.metrics.rerank_window, 0);
+        assert_eq!(r_empty.metrics.rerank_elapsed, Duration::ZERO);
+    }
+
+    /// **S7-T12（D-S7-05 的编排层侧）**：`rerank_score` 信号端到端成立。
+    ///
+    /// ① **读侧收缩**：精排器入参里**没有任何** `rerank_score`（`seen_scored_in == 0`）；
+    /// ② `score` 必须仍是精排器写的 `σ(logit)`（**编排层不得二次改写** ⇒ 用同一公式复算）；
+    /// ③ 融合分**不被改写**（留在 `fused_score`）；
+    /// ④ `hits` 降序 ⟺ `rerank_score` 降序（σ 单调，**非**同一公式复算，防「断言=实现」）；
+    /// ⑤ **C2 不覆盖 C1**：补齐 `matched_terms` / lane rank 之后 `rerank_score` 仍在。
+    #[test]
+    fn S7_T12_rerank_score信号成立且C2不覆盖C1() {
+        let (index, analyzer, vi) = build_window_fixture();
+        let e = FakeEmbedder;
+        let (spy, obs) = SpyReranker::new(12, true, false);
+        let s = QueryExecutor::new(&index, &analyzer)
+            .with_vector(&e, &vi)
+            .with_reranker(Box::new(spy));
+        let r = s.search("检索", SearchMode::Vector, 10).unwrap();
+
+        assert_eq!(
+            obs.seen_scored_in(),
+            0,
+            "① 读侧收缩：编排层在精排**之前**不得写 rerank_score"
+        );
+
+        for h in &r.hits {
+            let logit = h.explain.rerank_score.expect("② 精排器已给每条打分");
+            let expected = 1.0f32 / (1.0f32 + (-logit).exp());
+            assert_eq!(
+                h.score.to_bits(),
+                expected.to_bits(),
+                "② chunk {}：编排层不得二次改写 score",
+                h.chunk_id
+            );
+            assert_eq!(
+                h.explain.fused_score.to_bits(),
+                lane_score_of(h.chunk_id).to_bits(),
+                "③ chunk {}：融合分必须原样保留（D-S7-05）",
+                h.chunk_id
+            );
+            assert_ne!(
+                h.score.to_bits(),
+                h.explain.fused_score.to_bits(),
+                "③ 两套分必须是两个量"
+            );
+            // ⑤ C2 补齐生效，且**没有**冲掉 C1 写的 rerank_score
+            assert!(
+                !h.explain.matched_terms.is_empty(),
+                "C2 必须补齐 matched_terms"
+            );
+            assert_eq!(
+                h.explain.vector_rank,
+                Some(h.chunk_id + 1),
+                "C2 必须补齐 lane rank"
+            );
+        }
+
+        // ④ σ 单调 ⇒ 「score 降序」必须等价于「logit 降序」（换了种算法，不是抄公式）
+        for w in r.hits.windows(2) {
+            let a = w[0].explain.rerank_score.unwrap();
+            let b = w[1].explain.rerank_score.unwrap();
+            assert!(
+                a > b,
+                "σ 单调 ⇒ score 降序必须等价于 logit 降序（{a} vs {b}）"
+            );
+        }
+        assert_eq!(
+            r.hits[0].explain.rerank_score,
+            Some(12.0),
+            "冠军是 logit 最大的那条（最后一个位置的输入）"
+        );
+        assert_eq!(r.hits[0].chunk_id, 11);
+    }
+
+    /// **S7-T13（PR #53 评审 P3-1 的护栏）**：`k == 0` 时**一条都不交给精排**。
+    ///
+    /// 为什么需要这条：`window.max(k)` 在 `k == 0` 时给出 `window`（> 0）⇒ 会把整个窗口
+    /// 交给精排（每条含 `text` / `metadata` 克隆）跑完模型再被安全网截回 0 条 ——
+    /// **输出对、成本白花**。而 `LocalReranker::candidate_window` **不看 `k`**
+    /// （恒返回配置的 `R`）⇒ `k = 0` + `local-rerank` 就是**每次查询白跑 `R` 次推理**。
+    /// 改动前 `.take(0)` 给的是空 vec，而 `LocalReranker` 对空输入**早退** ⇒ 近零成本。
+    ///
+    /// ⚠️ 变异：去掉 `if k == 0 { 0 }` 这个分支 ⇒ 本条报红（`seen_len` / `rerank_window` 都变 12）。
+    #[test]
+    fn S7_T13_k为零时不给精排喂窗口() {
+        let (index, analyzer, vi) = build_window_fixture();
+        let e = FakeEmbedder;
+        let (spy, obs) = SpyReranker::new(12, false, false);
+        let s = QueryExecutor::new(&index, &analyzer)
+            .with_vector(&e, &vi)
+            .with_reranker(Box::new(spy));
+
+        // ── 前提自证（A/B 的 A 档）：k = 1 时窗口确实被放开到 12 ──
+        // 用同一个 searcher、同一个间谍：k=1 ⇒ `take_n = max(1, 12).min(12) = 12`。
+        // 若没有下面那条护栏，k=0 会得到同样的 12 —— 本档就是证明「k=0 的 0 是护栏给的」。
+        let wide = s.search("检索", SearchMode::Vector, 1).unwrap();
+        assert_eq!(
+            obs.seen_len(),
+            12,
+            "k = 1 ⇒ 窗口仍是 12（说明 R = 12 真的生效）"
+        );
+        assert_eq!(wide.metrics.rerank_window, 12);
+
+        let r = s.search("检索", SearchMode::Vector, 0).unwrap();
+        assert_eq!(obs.seen_len(), 0, "k = 0 ⇒ 精排不该收到任何候选");
+        assert_eq!(
+            r.metrics.rerank_window, 0,
+            "口径自洽：实际交接条数为 0（不是窗口值 12）"
+        );
+        assert!(r.hits.is_empty(), "k = 0 ⇒ 输出必然为空");
+        assert_eq!(r.metrics.fused, 0);
+        // 候选池仍按公式算：`candidate_k = max(3*0, 12, 10) = 12`（不是 30）。
+        // ⚠️ 如实说明**残留**：召回那一半在 `k = 0` 时**照样跑**（改动前后都如此，非本 PR 引入）；
+        // 本护栏只挡掉「窗口交给精排」这一半。让 `k = 0` 在 API 边界不可达（CLI `--k` 下界）
+        // 是更治本的做法，归 **PR 3（S7-03）** 的接口面。
+        assert_eq!(vi.max_k(), 12, "candidate_k = max(3*0, 12, 10) = 12");
+    }
+
+    /// **S7-T14（PR #53 评审 P3-2 的护栏）**：`metrics.rerank_window` 记**实际交接**条数，
+    /// 而不是窗口公式值。
+    ///
+    /// 构造：向量后端多返回一个**陈旧 `chunk_id`**（不在 `index` 里，模拟图 / 索引不同步）
+    /// ⇒ 窗口 `take_n = min(max(k,R), 13) = 13`，而第 3 步的防御路径跳过陈旧条
+    /// ⇒ **实际交给精排的是 12 条**。字段自称「**实际**交给精排的候选条数」⇒ 必须记 12。
+    ///
+    /// ⚠️ 变异：把 `metrics.rerank_window = handed` 改回 `= take_n` ⇒ 本条报红（13 ≠ 12）。
+    #[test]
+    fn S7_T14_陈旧chunk_id时记实际交接条数() {
+        let texts: Vec<String> = (0..12).map(|i| format!("检索 文档 {i}")).collect();
+        let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        let (index, analyzer) = build_tagged_index(&refs, "kept");
+
+        let mut ids: Vec<ChunkId> = (0..12).collect();
+        ids.push(999); // 陈旧 chunk_id：不在 index 里
+        let vi = SpyVectorIndex::new(false, ids.clone(), ids);
+        let e = FakeEmbedder;
+
+        let (spy, obs) = SpyReranker::new(100, false, false);
+        let s = QueryExecutor::new(&index, &analyzer)
+            .with_vector(&e, &vi)
+            .with_reranker(Box::new(spy));
+        let r = s.search("检索", SearchMode::Vector, 10).unwrap();
+
+        assert_eq!(
+            r.metrics.candidates, 13,
+            "前提自证：融合结果确实是 13 条（含陈旧条）"
+        );
+        assert_eq!(obs.seen_len(), 12, "陈旧条不得进 `proto`");
+        assert_eq!(
+            r.metrics.rerank_window, 12,
+            "必须记**实际交接**条数（12），不是窗口公式值（13）"
+        );
+        assert_eq!(
+            r.metrics.rerank_window,
+            obs.seen_len(),
+            "口径自洽：字段 == 精排实际入参条数"
+        );
+        assert!(
+            r.hits.iter().all(|h| h.chunk_id != 999),
+            "陈旧条不得出现在结果里"
+        );
     }
 }

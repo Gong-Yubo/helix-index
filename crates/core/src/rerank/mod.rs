@@ -64,6 +64,22 @@ pub trait Reranker: Send + Sync {
     ///
     /// ⚠️ 上层会把它与 `candidate_k = max(3k, w, 10)` **联动**：返回 `w > 3k` 时
     /// 候选池会随之放大 —— 否则窗口被静默封顶（见模块文档）。
+    ///
+    /// # ⚠️ 返回值的上界由**实现**负责（编排层不设防）
+    ///
+    /// 编排层把返回值**原样**放进 `candidate_k` 并**原样下传**给向量后端
+    /// （`S7_T3` 用「后端实际收到的 `k`」钉住了这一点）。因此：
+    ///
+    /// - **返回值应当是合理的候选规模上界**（建议 ≤ 语料规模 `Index::num_chunks()`）；
+    /// - 失控的大数（如 `usize::MAX`）在 **ANN 路径**上会传到 `hnsw_rs`，而那里
+    ///   `ef = ef_arg.max(knbn)` 会把库内的 `ef` 上限（`EF_FILTER_MAX = 256`）
+    ///   **抵消**，进而落在 `BinaryHeap::with_capacity(ef)` 上 —— 实测该算式在
+    ///   `n` 溢出时 debug 直接 panic、`usize::MAX` 时会以极大的容量申请内存
+    ///   （PR #53 评审 P3-3 的加强版：**不是在 `HnswRsIndex` 的 clamp 链上被挡住**）。
+    /// - ⚠️ 该风险**不是本 trait 引入的**：`candidate_k` 在本 trait 存在之前就无上限
+    ///   （`k.saturating_mul(3)`，见 `011bb16`）⇒ 库内两个实现都安全，但**公开 trait 的
+    ///   第三方实现**会走这条路径。运行期钳制**本 PR 不做**（属 `vector/` 模块 + 会与
+    ///   设计 §4.3.1 的公式产生偏差），已单独挂账：**issue #54**。
     fn candidate_window(&self, k: usize) -> usize {
         k
     }
