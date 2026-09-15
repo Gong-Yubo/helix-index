@@ -163,6 +163,13 @@ jobs:
       #    本步覆盖的是「`LocalReranker` 这个适配层仍然编得过、非模型的单测仍然过」。
       - name: local-rerank feature
         run: cargo test -p helix-core --features local-rerank
+      # V2 Step 7 / S7-03：CLI 侧的接线（`--rerank-window` / `--rerank-max-length`
+      # 的参数面 + 守卫 + 装配注入）同样只在 `local-rerank` 下才编得出来那两条
+      # 分支 ⇒ 必须**同批**覆盖，否则 `cli/Cargo.toml` 的 feature 透传会悄悄腐化
+      # （step 失败点会落在「只在你本地才编的分支」上）。
+      # 真模型仍不下载：这一步跑的是 `helix` 的单测（守卫/参数解析，纯函数）。
+      - name: local-rerank feature (cli)
+        run: cargo test -p helix --features local-rerank
       # local-embed 必须真的可选（远程 embedding 场景会关掉它）
       - name: no-default-features
         run: cargo check -p helix-core --no-default-features
@@ -258,6 +265,41 @@ jobs:
           fi
           cat /tmp/half.log
           grep -q "配置指纹显示它" /tmp/half.log
+      # V2 Step 7 / S7-03：精排参数的四条守卫必须拒绝。
+      # 🔑 与上一条同源收益：守卫**前移到加载任何资源之前**（快照 / 模型都不碰）
+      #    ⇒ 本步**不下载 2.19GB 模型**，因此能进 CI。
+      # ⚠️ 用默认构建（**未**编译 `local-rerank`）⇒ 第一条测的是「参数面互斥」：
+      #    它刻意排在 feature 守卫**之前**（见 `bench.rs` 的 `run` 开头注释）——
+      #    若有人把顺序调成「feature 守卫先」，这条会红，正是我们要的。
+      - name: 精排参数守卫必须拒绝
+        run: |
+          B=./target/release/helix
+          S=/tmp/incr.snapshot
+          expect_reject() {
+            local want="$1"; shift
+            if "$B" bench --index "$S" --modes bm25 --no-latency "$@" \
+                 > /tmp/rerank-guard.log 2>&1; then
+              echo "错误：`bench $*` 应当被拒绝但成功了" >&2
+              exit 1
+            fi
+            cat /tmp/rerank-guard.log
+            # ⚠️ 必须 `-e "$want"`：期望串里有以 `-` 开头的（`--rerank-window`），
+            #    直接 `grep -qF "$want"` 会被 grep 当**选项**解析 ⇒
+            #    `grep: unrecognized option` 且退出码非 0 ⇒ 假失败（本地实跑抓到）。
+            if ! grep -qF -e "$want" /tmp/rerank-guard.log; then
+              echo "错误：错误信息里没有 \"$want\"" >&2
+              exit 1
+            fi
+          }
+          # ① `--runs > 1` 与精排互斥（图漂移会污染 A/B）
+          expect_reject "互斥"            --runs 2 --rerank-window 20
+          # ② max_length 是从属参数，单独给无意义
+          expect_reject "--rerank-window" --rerank-max-length 1024
+          # ③ 窗口 0：看起来像「关掉」，实际是「开了但空转」
+          expect_reject "至少为 1"        --rerank-window 0
+          # ④ 未编译 local-rerank：必须报错并提示重编（不得静默退回 NoOp）
+          expect_reject "local-rerank"    --rerank-window 20
+          echo "四条精排参数守卫全部按预期拒绝 ✅"
       # S6-T12（V2 Step 6 / T7-17）：`bench --threads 1`（默认）必须与不传该参数**行为完全一致**
       # —— 即**不新增任何输出阶段**。用 `--no-latency` 把输出限定在确定性部分（效果指标），
       # 只屏蔽「快照加载 耗时」这一行计时，其余**逐字比对**。

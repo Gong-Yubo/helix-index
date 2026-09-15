@@ -22,6 +22,9 @@ use helix_core::document::{content_hash, DocRecord, Document};
 use helix_core::embed::{Embedder, LocalEmbedder};
 use helix_core::index::Index;
 use helix_core::query::{EmptyReason, Hit, SearchMode, SearchResponse};
+use helix_core::rerank::Reranker;
+#[cfg(feature = "local-rerank")]
+use helix_core::rerank::{LocalReranker, DEFAULT_RERANK_MAX_LENGTH};
 use helix_core::schema::Filter;
 use helix_core::search::{required_local_embedder, GraphStatus, SearchIndex, SearchIndexBuilder};
 use helix_core::types::ChunkId;
@@ -97,9 +100,28 @@ struct SearchArgs {
     /// 检索模式
     #[arg(short, long, default_value = "bm25")]
     mode: String,
-    /// 返回条数
+    /// 返回条数。
+    ///
+    /// ⚠️ `0` 是**合法**输入：返回空结果，且**一条都不交给精排**
+    /// （V2 Step 7 / S7-02 的 `take_n` 护栏）。**刻意不加下界** ——
+    /// 「不返回结果」与「参数非法」是两件事；`--k 0` 的成本只在召回侧。
     #[arg(short, long, default_value_t = 10)]
     k: usize,
+    /// 精排窗口 R（V2 Step 7 / S7-03）。**不传 = 关闭精排**（NoOp，与现状逐字一致）。
+    ///
+    /// 传了则装载本地精排器（`bge-reranker-v2-m3`）并把窗口放开到 R：
+    /// 融合后取 `min(max(k, R), 融合条数)` 条交给精排，再由它排序截回 k 条。
+    ///
+    /// ⚠️ 需要以 `--features local-rerank` 编译；模型 ≈2.19GB，首次运行会下载。
+    /// ⚠️ `R = 0` 无意义 ⇒ 报错（要关精排请**不传**本参数）。
+    #[arg(long, value_name = "R")]
+    rerank_window: Option<usize>,
+    /// 精排 tokenizer 的截断长度（默认 512）。
+    ///
+    /// ⚠️ 它**烧进**模型 tokenizer（构造期生效）⇒ 必须与 `--rerank-window`
+    /// 同时给出，单独给会报错（不静默忽略）。服务于 S7-04 的 max_length 对照档。
+    #[arg(long, value_name = "N")]
+    rerank_max_length: Option<usize>,
     /// 元数据过滤（`field=value` 等值 / `field>=v` / `field<v` 数值范围；
     /// 逗号分隔或多次出现，语义为 And）。范围语义是 `[下界, 上界)`，
     /// 故只提供 `>=` 与 `<`；需要闭区间上界请写 `< 上界+1`
@@ -165,6 +187,120 @@ fn parse_mode(s: &str) -> Result<SearchMode> {
         "vector" => Ok(SearchMode::Vector),
         "hybrid" => Ok(SearchMode::Hybrid),
         other => bail!("不支持的 --mode {other:?}（支持 bm25 / vector / hybrid）"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 精排参数（V2 Step 7 / S7-03）
+// ---------------------------------------------------------------------------
+
+/// 精排参数的解析结果。
+///
+/// 「精排开 / 关」**只由 `--rerank-window` 决定**；`--rerank-max-length` 是从属参数
+/// （单独给会报错）⇒「传了 max_length 却没开精排」这种静默无效配置**不可达**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RerankSpec {
+    /// 未给 `--rerank-window` ⇒ 精排**关**（默认装配 `NoOpReranker`，D-S7-04）
+    Off,
+    /// `--rerank-window R`；`max_length` 为 `None` 时取 `DEFAULT_RERANK_MAX_LENGTH`。
+    ///
+    /// ⚠️ 刻意**不在这里**填默认值：真源是
+    /// `helix_core::rerank::DEFAULT_RERANK_MAX_LENGTH`，而它只在 `local-rerank`
+    /// feature 下导得出来 ⇒ 填充推迟到 [`build_reranker`]。
+    On {
+        window: usize,
+        max_length: Option<usize>,
+    },
+}
+
+/// 解析 `--rerank-window` / `--rerank-max-length`（**纯参数面，不碰模型**）。
+///
+/// 三条拒绝规则都是「用户配置错」，与是否编译 feature **无关** ⇒ 必须早于
+/// feature 守卫与任何资源加载，否则同一份错配置在不同构建下会报不同的错。
+///
+/// 1. `--rerank-max-length` 单独给 ⇒ 报错（它只覆盖「已开启」的精排）
+/// 2. `--rerank-window 0` ⇒ 报错（窗口 0 等于让精排空转；关闭精排请不传）
+/// 3. `--rerank-max-length 0` ⇒ 报错（截断到 0 等于给模型喂空输入）
+pub(crate) fn resolve_rerank(
+    window: Option<usize>,
+    max_length: Option<usize>,
+) -> Result<RerankSpec> {
+    let Some(window) = window else {
+        if max_length.is_some() {
+            bail!(
+                "--rerank-max-length 需要与 --rerank-window 同时给出\
+                 （它只覆盖**已开启**的精排的截断长度；关闭精排请两者都不传）"
+            );
+        }
+        return Ok(RerankSpec::Off);
+    };
+    if window == 0 {
+        bail!("--rerank-window 至少为 1（收到 0；要**关闭**精排请不传该参数）");
+    }
+    if max_length == Some(0) {
+        bail!("--rerank-max-length 至少为 1（收到 0：会把输入整段截断成空）");
+    }
+    Ok(RerankSpec::On { window, max_length })
+}
+
+/// `--runs > 1` 与精排**互斥**（`bench` 专用守卫）。
+///
+/// `--runs > 1` 会**刻意重建 HNSW 图**（跳过 sidecar）以观测跨进程抖动，
+/// 而精排 A/B 必须在**同一张冻结图**上看 —— 否则两组差值里混进约 0.6% 的图漂移，
+/// 逐位比较会得到假差异。⇒ 同给时报错，**不静默取其一**。
+pub(crate) fn check_rerank_runs(spec: RerankSpec, runs: usize) -> Result<()> {
+    if runs > 1 && spec != RerankSpec::Off {
+        bail!(
+            "--runs {runs} 与 --rerank-window 互斥：`--runs > 1` 会每轮**重建图**\
+             （刻意跳过 sidecar 以观测跨进程抖动），而精排 A/B 必须在同一张冻结图上看\
+             （图漂移会污染差值）。请改用 `--runs 1`，或去掉精排参数"
+        );
+    }
+    Ok(())
+}
+
+/// 已装载的精排器 + 它的**身份串**。
+///
+/// ⚠️ 身份串在**构造时**（类型还是 `LocalReranker`）就取出来：`Reranker` trait
+/// **没有** `id()` —— 它只在 `LocalReranker` 上 ⇒ 一旦装箱成 `dyn Reranker` 就再也
+/// 取不到。而「装了哪个精排器 / 哪个 `max_length` / 哪个窗口」**必须可见**
+/// （NFR-07；D-S7-08 / D-S7-10）—— 否则「同一 query 两次结果不同」会变成无法排查的谜。
+/// 这与「`&'static str` 表达不了运行期参数」（`reranker_identity` 的既有理由）是同一处设计的另一半。
+pub(crate) struct RerankerHandle {
+    pub reranker: Arc<dyn Reranker>,
+    pub identity: String,
+}
+
+/// 按 [`RerankSpec`] 构造精排器；`Off` ⇒ `None`（= 默认 `NoOpReranker`）。
+///
+/// ⚠️ **这是唯一会加载模型的入口**（≈2.19GB ⇒ 秒级）⇒ 调用点必须在所有参数面
+/// 守卫**之后**。未编译 `local-rerank` 时**报错并提示重编**，绝不静默退回 `Off`
+/// —— 那会让「精排档位跑通了」的结论建立在空转上（同 `--analyzer charabia` 的先例）。
+pub(crate) fn build_reranker(spec: RerankSpec) -> Result<Option<RerankerHandle>> {
+    let RerankSpec::On { window, max_length } = spec else {
+        return Ok(None);
+    };
+    #[cfg(feature = "local-rerank")]
+    {
+        let max_length = max_length.unwrap_or(DEFAULT_RERANK_MAX_LENGTH);
+        let t = std::time::Instant::now();
+        let reranker = LocalReranker::with_params(window, max_length)?;
+        eprintln!(
+            "[精排模型加载 耗时 {:?}（不计入延迟口径）] window={window} max_length={max_length}",
+            t.elapsed()
+        );
+        Ok(Some(RerankerHandle {
+            identity: reranker.id(),
+            reranker: Arc::new(reranker),
+        }))
+    }
+    #[cfg(not(feature = "local-rerank"))]
+    {
+        let _ = (window, max_length);
+        bail!(
+            "--rerank-window 需要以 `cargo build --features local-rerank` 编译 helix\
+             （本地精排 `bge-reranker-v2-m3`，模型 ≈2.19GB，feature 隔离）"
+        )
     }
 }
 
@@ -692,12 +828,27 @@ fn search(args: SearchArgs) -> Result<()> {
     let mode = parse_mode(&args.mode)?;
     let filter = parse_filters(&args.filter)?;
 
-    // --index 与 --input 二选一，经门面层组装
+    // V2 Step 7 / S7-03：精排参数。**参数面守卫在任何资源加载之前**（纯函数，不碰模型）；
+    // `build_reranker` 是唯一会加载模型的入口，排在守卫之后。
+    let spec = resolve_rerank(args.rerank_window, args.rerank_max_length)?;
+    let rerank = build_reranker(spec)?;
+    if let Some(h) = &rerank {
+        // 装了什么必须**可见**（NFR-07）：身份串含模型 + max_length + 窗口。
+        eprintln!("[精排: 开启] {}", h.identity);
+    }
+
+    // --index 与 --input 二选一，经门面层组装。
+    // 精排经 `SearchIndexBuilder::reranker` 注入；不传 ⇒ `NoOpReranker`（D-S7-04）。
+    let with_rerank = |b: SearchIndexBuilder| match &rerank {
+        Some(h) => b.reranker(Arc::clone(&h.reranker)),
+        None => b,
+    };
     let searcher = match (&args.index, &args.input) {
         (Some(idx_path), None) => {
             let t = std::time::Instant::now();
             // 门面层 load（默认装配 + 配置指纹校验，修 B1：不再写死 MixedAnalyzer）
-            let index = SearchIndex::load(idx_path)
+            let index = with_rerank(SearchIndex::builder())
+                .load(idx_path)
                 .with_context(|| format!("加载快照失败: {}", idx_path.display()))?;
             eprintln!("[快照加载 {} 耗时 {:?}]", idx_path.display(), t.elapsed());
             // V2 Step 2：图 sidecar 状态（NFR-07 —— 降级不能静默，必须显式可见）
@@ -706,7 +857,7 @@ fn search(args: SearchArgs) -> Result<()> {
         }
         (None, Some(input)) => {
             // 现场建库（默认装配：MixedAnalyzer + bge + HNSW，向量模式可用）
-            let mut index = SearchIndex::builder().build();
+            let mut index = with_rerank(SearchIndex::builder()).build();
             let docs = read_corpus_documents(input)?;
             index.add_documents(docs)?;
             index.into_searcher()?
@@ -733,11 +884,19 @@ fn search(args: SearchArgs) -> Result<()> {
 /// `缺口` 走精确路径时**通常**为 0，但那不是恒等式（`allowed` 来自 `Index`、扫描枚举
 /// 的是图中的点）：`Exact` + 缺口 > 0 反过来是「图未覆盖全部 allowed」的诊断信号。
 /// 两种读数都必须**连看** `route`（设计 §4.4 推论 1）。
+///
+/// V2 Step 7 / S7-03 补上 `精排` 两列（[`helix_core::query::Metrics::rerank_window`] /
+/// [`helix_core::query::Metrics::rerank_elapsed`]，S7-02 加的字段，此前没有任何 CLI 出口）：
+/// 它是「本次是否**真的**放开了窗口」的直接证据 —— 只看 `--rerank-window` 会漏掉
+/// 「融合结果本身不足」与「候选池没联动」两种静默封顶。
+/// ⚠️ `0条` 有两种来源（早退没跑精排 / [`SearchArgs`] 的 `k = 0`），
+/// 两者都**真的**没有把候选交给精排 ⇒ 按数值报，不加修饰。
 fn print_kernel_metrics(resp: &SearchResponse) {
     let m = &resp.metrics;
     println!(
         "\n[内核指标] route={:?} allowed={} bm25={} vector={} candidates={} 缺口={} | \
-         filter_eval={:.3}ms bm25={:.3}ms vector={:.3}ms | took={:.3}ms",
+         filter_eval={:.3}ms bm25={:.3}ms vector={:.3}ms | took={:.3}ms | \
+         精排={}条/{:.3}ms",
         m.vector_route,
         m.allowed,
         m.bm25,
@@ -748,6 +907,8 @@ fn print_kernel_metrics(resp: &SearchResponse) {
         m.bm25_elapsed.as_secs_f64() * 1000.0,
         m.vector_elapsed.as_secs_f64() * 1000.0,
         m.took.as_secs_f64() * 1000.0,
+        m.rerank_window,
+        m.rerank_elapsed.as_secs_f64() * 1000.0,
     );
 }
 
@@ -1054,7 +1215,7 @@ fn print_hit(rank: usize, hit: &Hit, explain: bool) {
     if explain {
         let e = &hit.explain;
         println!(
-            "    └─ 匹配词: {} | bm25(rank={},score={}) vector(rank={},score={})",
+            "    └─ 匹配词: {} | bm25(rank={},score={}) vector(rank={},score={}) | rerank={}",
             if e.matched_terms.is_empty() {
                 "-".to_string()
             } else {
@@ -1064,6 +1225,10 @@ fn print_hit(rank: usize, hit: &Hit, explain: bool) {
             opt_score(e.bm25_score),
             opt_fmt(e.vector_rank),
             opt_score(e.vector_score),
+            // V2 Step 7 / D-S7-05：精排的**原始 logit**（不是 σ 后的 `score`）。
+            // `score` 是 σ 变换后的量、不可逆 ⇒ 这是下游唯一能拿到原始分的地方；
+            // 精排未生效时为 `-`（该信号即 `is_some()`，见 S7-02 的 C1 契约）。
+            opt_score(e.rerank_score),
         );
     }
 }
@@ -1091,7 +1256,7 @@ mod tests {
     //! （`<=` / `>` 必须在 `<` / `>=` 之前判掉，否则报错信息会误导），
     //! 因此在这里钉住。CI 的 smoke 只覆盖到「跑通不报错」。
 
-    use super::{parse_filters, parse_one_filter};
+    use super::{check_rerank_runs, parse_filters, parse_one_filter, resolve_rerank, RerankSpec};
     use helix_core::schema::Filter;
 
     #[test]
@@ -1158,5 +1323,98 @@ mod tests {
         assert!(parse_one_filter("score<").is_err());
         assert!(parse_one_filter("score>=abc").is_err());
         assert!(parse_one_filter("score").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // V2 Step 7 / S7-03：精排参数（`--rerank-window` / `--rerank-max-length`）
+    //
+    // 这些是**纯参数面**判定 ⇒ 不需要模型、不需要 `local-rerank` feature，
+    // 默认 CI（`cargo test --workspace`）就跑得到。端到端那两条（「未编译 feature
+    // 必须报错」「`--runs > 1` 必须报错」）另由 CI 的 smoke job 覆盖 —— 那里才验
+    // 「守卫**真的**排在加载资源之前」。
+    // -----------------------------------------------------------------------
+
+    /// 不传 `--rerank-window` ⇒ 精排**关**（默认装配 NoOp，D-S7-04）。
+    /// 这是「`--rerank-window` 是唯一开关」的最小证据。
+    #[test]
+    fn 精排默认关闭() {
+        assert_eq!(
+            resolve_rerank(None, None).expect("合法输入不该报错"),
+            RerankSpec::Off
+        );
+    }
+
+    /// `--rerank-max-length` **单独给**必须报错：它只覆盖「已开启」的精排 ⇒
+    /// 静默忽略会让用户以为「改了 max_length」，实际什么都没发生（NFR-07）。
+    #[test]
+    fn max_length单独给被拒绝且点明依赖() {
+        let e = resolve_rerank(None, Some(1024)).expect_err("单独给 max_length 必须报错");
+        assert!(
+            e.to_string().contains("--rerank-window"),
+            "错误信息必须点明「需要与 --rerank-window 同时给」，实得：{e}"
+        );
+    }
+
+    /// 两处 `0` 都必须报错 —— 它们**看起来像**「关掉」，实际是「开了但空转」：
+    /// 窗口 0 ⇒ `take_n = max(k, 0) = k`（白加载模型）；`max_length 0` ⇒ 输入整段截空。
+    /// 要关精排的正确方式是**不传** `--rerank-window`。
+    #[test]
+    fn 窗口与截断长度为零都被拒绝() {
+        for (w, m) in [(Some(0), None), (Some(0), Some(512)), (Some(20), Some(0))] {
+            let e = resolve_rerank(w, m).expect_err("0 必须被拒绝");
+            assert!(
+                e.to_string().contains("至少为 1"),
+                "({w:?}, {m:?}) 的错误信息应点明下界，实得：{e}"
+            );
+        }
+    }
+
+    /// 给了窗口即开启；`max_length` 缺省时**留 `None`**（默认值真源在 core 常量，
+    /// 未编译 feature 时那个常量导不出来 ⇒ 填充推迟到 `build_reranker`）。
+    #[test]
+    fn 窗口单独给即开启且保留缺省标记() {
+        assert_eq!(
+            resolve_rerank(Some(20), None).expect("合法输入"),
+            RerankSpec::On {
+                window: 20,
+                max_length: None
+            }
+        );
+        assert_eq!(
+            resolve_rerank(Some(100), Some(1024)).expect("合法输入"),
+            RerankSpec::On {
+                window: 100,
+                max_length: Some(1024)
+            }
+        );
+    }
+
+    /// `--runs > 1` 与精排**互斥**（bench 专用）。
+    ///
+    /// ⚠️ 三个方向都要钉住，否则「永远报错」也会让本测试变绿：
+    /// `runs = 1` + 精排 ⇒ Ok（这是 A/B 的**正常**用法）；`runs > 1` + 关 ⇒ Ok
+    /// （跨进程抖动披露的既有用法）；只有两者同给才 Err。
+    #[test]
+    fn runs大于1与精排互斥() {
+        let on = RerankSpec::On {
+            window: 20,
+            max_length: None,
+        };
+        assert!(
+            check_rerank_runs(on, 1).is_ok(),
+            "runs=1 是精排 A/B 的正常用法"
+        );
+        assert!(
+            check_rerank_runs(RerankSpec::Off, 3).is_ok(),
+            "关精排时 --runs 照旧"
+        );
+        for runs in [2usize, 3] {
+            let e = check_rerank_runs(on, runs).expect_err("同给必须报错");
+            let msg = e.to_string();
+            assert!(
+                msg.contains("互斥") && msg.contains("冻结图"),
+                "错误信息要点明互斥与理由（冻结图），实得：{msg}"
+            );
+        }
     }
 }

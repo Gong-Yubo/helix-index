@@ -13,6 +13,7 @@
 //! 门面层的 owned `Searcher`（I-05）同样复用 `search_parts`，不复制编排逻辑。
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::analyze::Analyzer;
@@ -496,7 +497,11 @@ pub struct QueryExecutor<'a> {
     embedder: Option<&'a dyn Embedder>,
     vector_index: Option<&'a dyn VectorIndex>,
     fusion: Box<dyn FusionStrategy>,
-    reranker: Box<dyn Reranker>,
+    /// 重排策略。⚠️ 与 `fusion` 的 `Box` 不同，这里是 **`Arc`**（V2 Step 7 / S7-03）：
+    /// 精排器可能持有**需常驻的大对象**（`LocalReranker` 的 ONNX 会话 ≈2.19GB，
+    /// 架构 R44），而 `bench` 会对「每 mode × 每 run」各装配一次 searcher
+    /// ⇒ 必须能**共享同一实例**，否则会重复加载模型（秒级 × N，且内存峰值叠加）。
+    reranker: Arc<dyn Reranker>,
     /// BM25 参数（P5 网格搜索从外部注入；默认 Bm25Params::default()）
     bm25_params: Bm25Params,
 }
@@ -510,7 +515,7 @@ impl<'a> QueryExecutor<'a> {
             embedder: None,
             vector_index: None,
             fusion: Box::new(RrfFusion::default()),
-            reranker: Box::new(NoOpReranker),
+            reranker: Arc::new(NoOpReranker),
             bm25_params: Bm25Params::default(),
         }
     }
@@ -539,7 +544,29 @@ impl<'a> QueryExecutor<'a> {
     }
 
     /// 覆盖重排策略（默认 `NoOpReranker`，P7 再接真实 rerank）。
+    ///
+    /// ⚠️ 本方法**签名与语义一字未改**（V2 Step 7 / S7-03 把内部存储换成 `Arc`
+    /// 属纯实现细节）⇒ 既有调用方（含 `tests`）零改动。
+    ///
+    /// 若精排器是**需共享的重对象**（如 `LocalReranker` 的 2.19GB ONNX 会话），
+    /// 用 [`Self::with_reranker_arc`] 而不是每次新建。
     pub fn with_reranker(mut self, reranker: Box<dyn Reranker>) -> Self {
+        self.reranker = Arc::from(reranker);
+        self
+    }
+
+    /// 覆盖重排策略（**共享**形态：`Arc`）。
+    ///
+    /// # 为什么需要它（V2 Step 7 / S7-03 实现期发现）
+    ///
+    /// `bench` 的装配是「**每 mode × 每 run 各一次** `QueryExecutor`」
+    /// （`crates/cli/src/bench.rs` 的 `make_searcher`，4 处调用点）。而逐 lane
+    /// 自定义组装的逃生舱只有 [`Self::with_reranker`]（收 `Box`）⇒ 想要**复用**
+    /// 同一个精排器实例，只能自己写一个转发 trait 的包装类型 —— 那会在
+    /// [`Reranker`] 将来新增方法时**静默漏转发**（`candidate_window` 漏了就是
+    /// 窗口静默失效，正是 NFR-07 禁止的那类）。⇒ 在库内给出 `Arc` 入口，
+    /// 让「底层组装」与「门面装配」（`Config::reranker` 本就是 `Arc`）同型。
+    pub fn with_reranker_arc(mut self, reranker: Arc<dyn Reranker>) -> Self {
         self.reranker = reranker;
         self
     }
