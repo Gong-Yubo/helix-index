@@ -89,14 +89,16 @@ pub struct SearchParts<'a> {
 /// ```text
 /// window            = Reranker::candidate_window(k)      // trait provided，默认 k
 /// candidate_k       = max(3k, window, 10)                // 恒 ≥ window
-/// take_n            = min(max(k, window), 融合条数)        // 实际交给精排的条数
-/// metrics.rerank_window = take_n                         // 上式的可观测落点
+/// take_n            = k == 0 ? 0 : min(max(k, window), 融合条数)
+/// handed            = 窗口内**可回捞**的条数（≤ take_n；陈旧 chunk_id 会让它更小）
+/// metrics.rerank_window = handed                         // ⚠️ 记**实际交接**值，非公式值
 /// ```
 ///
 /// 1. `window ≤ candidate_k`（否则窗口被候选池**静默封顶**）；
 /// 2. `metrics.rerank_window ≤ k` ⟺ 本次**没有**可用的额外候选（放开失效）；
-/// 3. 默认实现下 `window == k` ⇒ `take_n == k`、`candidate_k == max(3k, 10)`
-///    ⇒ 与精排引入前**逐位一致**。
+/// 3. 默认实现下 `window == k` ⇒ `handed == take_n == k`、`candidate_k == max(3k, 10)`
+///    ⇒ 与精排引入前**逐位一致**；
+/// 4. `k == 0` 时**一条都不交给精排**（退化输入的浪费护栏，见下文注释）。
 pub fn search_parts(
     parts: &SearchParts<'_>,
     query: &str,
@@ -317,10 +319,24 @@ pub fn search_parts(
     let bm25_rank = lane_rank(&bm25_lane);
     let vector_rank = lane_rank(&vector_lane);
 
-    let take_n = window.max(k).min(fused.len());
+    // ⚠️ **`k == 0` 必须单独挡掉**（PR #53 评审 P3-1）：`window.max(k)` 会让
+    // `take_n == window`（> 0）⇒ 把**整个窗口**交给精排、跑完模型再被安全网截回 0 条
+    // —— 输出对，但成本白花。而 `LocalReranker::candidate_window` **不看 `k`**
+    // （恒返回配置的 `R`）⇒ `k = 0` + `local-rerank` 时**每次查询白跑 `R` 次推理**。
+    // 改动前 `.take(k=0)` 给精排喂的是空 vec，而 `LocalReranker` 对空输入**早退**
+    // ⇒ 近零成本。本 PR 若不挡，会**无意放大这个退化输入的成本**。
+    // 可达性：`helix search --k 0`（`k: usize` 无下界，`SearchRequest::top_n` 也不钳制）。
+    // ⚠️ `window == 0`（trait 契约没写「必须 ≥ 1」）**不需要**额外处理：`max(k)` 已兜底。
+    let take_n = if k == 0 {
+        0
+    } else {
+        window.max(k).min(fused.len())
+    };
     let mut proto: Vec<Hit> = Vec::with_capacity(take_n);
     for (chunk_id, fused_score) in fused.into_iter().take(take_n) {
         let Some(chunk) = parts.index.chunk(chunk_id) else {
+            // 陈旧 `chunk_id`（图/索引不同步）⇒ 该条不进 `proto`，故 `proto.len()`
+            // 可能**小于** `take_n`（见下方 `handed` 的记账口径）。
             continue;
         };
         let doc = parts
@@ -348,10 +364,16 @@ pub fn search_parts(
     // `NoOpReranker`（默认，D-S7-04）= 原样 `take(k)`，且此时 `take_n == k`
     // ⇒ 全链路零回归。真精排器（`LocalReranker`）在此返回 `σ(logit)` 并把原始分
     // 写进 `explain.rerank_score`（D-S7-05）。
+    // ⚠️ **记的是「实际交接条数」`handed`，不是公式值 `take_n`**（PR #53 评审 P3-2）：
+    // 第 3 步的陈旧 `chunk_id` 防御路径会让 `proto.len() < take_n`，而字段自称的是
+    // 「**实际**交给精排的候选条数」⇒ 记公式值会在那条路径上**高报**。
+    // 正常路径两者恒等（所有现有断言不受影响）；**两者之差本身是诊断信号**
+    // （差 > 0 ⇒ 本次窗口里有已不可回捞的 chunk）。
+    let handed = proto.len();
     let t_rerank = Instant::now();
     let mut hits = parts.reranker.rerank(query, proto, k)?;
     metrics.rerank_elapsed = t_rerank.elapsed();
-    metrics.rerank_window = take_n;
+    metrics.rerank_window = handed;
 
     // 安全网（纵深防御）：出参契约要求精排器自己截到 `top_n`（见 `Reranker::rerank`），
     // 这里再截一次 ⇒ release 下不留「> k 条」的越界输出。
@@ -1695,5 +1717,94 @@ mod tests {
             "冠军是 logit 最大的那条（最后一个位置的输入）"
         );
         assert_eq!(r.hits[0].chunk_id, 11);
+    }
+
+    /// **S7-T13（PR #53 评审 P3-1 的护栏）**：`k == 0` 时**一条都不交给精排**。
+    ///
+    /// 为什么需要这条：`window.max(k)` 在 `k == 0` 时给出 `window`（> 0）⇒ 会把整个窗口
+    /// 交给精排（每条含 `text` / `metadata` 克隆）跑完模型再被安全网截回 0 条 ——
+    /// **输出对、成本白花**。而 `LocalReranker::candidate_window` **不看 `k`**
+    /// （恒返回配置的 `R`）⇒ `k = 0` + `local-rerank` 就是**每次查询白跑 `R` 次推理**。
+    /// 改动前 `.take(0)` 给的是空 vec，而 `LocalReranker` 对空输入**早退** ⇒ 近零成本。
+    ///
+    /// ⚠️ 变异：去掉 `if k == 0 { 0 }` 这个分支 ⇒ 本条报红（`seen_len` / `rerank_window` 都变 12）。
+    #[test]
+    fn S7_T13_k为零时不给精排喂窗口() {
+        let (index, analyzer, vi) = build_window_fixture();
+        let e = FakeEmbedder;
+        let (spy, obs) = SpyReranker::new(12, false, false);
+        let s = QueryExecutor::new(&index, &analyzer)
+            .with_vector(&e, &vi)
+            .with_reranker(Box::new(spy));
+
+        // ── 前提自证（A/B 的 A 档）：k = 1 时窗口确实被放开到 12 ──
+        // 用同一个 searcher、同一个间谍：k=1 ⇒ `take_n = max(1, 12).min(12) = 12`。
+        // 若没有下面那条护栏，k=0 会得到同样的 12 —— 本档就是证明「k=0 的 0 是护栏给的」。
+        let wide = s.search("检索", SearchMode::Vector, 1).unwrap();
+        assert_eq!(
+            obs.seen_len(),
+            12,
+            "k = 1 ⇒ 窗口仍是 12（说明 R = 12 真的生效）"
+        );
+        assert_eq!(wide.metrics.rerank_window, 12);
+
+        let r = s.search("检索", SearchMode::Vector, 0).unwrap();
+        assert_eq!(obs.seen_len(), 0, "k = 0 ⇒ 精排不该收到任何候选");
+        assert_eq!(
+            r.metrics.rerank_window, 0,
+            "口径自洽：实际交接条数为 0（不是窗口值 12）"
+        );
+        assert!(r.hits.is_empty(), "k = 0 ⇒ 输出必然为空");
+        assert_eq!(r.metrics.fused, 0);
+        // 候选池仍按公式算：`candidate_k = max(3*0, 12, 10) = 12`（不是 30）。
+        // ⚠️ 如实说明**残留**：召回那一半在 `k = 0` 时**照样跑**（改动前后都如此，非本 PR 引入）；
+        // 本护栏只挡掉「窗口交给精排」这一半。让 `k = 0` 在 API 边界不可达（CLI `--k` 下界）
+        // 是更治本的做法，归 **PR 3（S7-03）** 的接口面。
+        assert_eq!(vi.max_k(), 12, "candidate_k = max(3*0, 12, 10) = 12");
+    }
+
+    /// **S7-T14（PR #53 评审 P3-2 的护栏）**：`metrics.rerank_window` 记**实际交接**条数，
+    /// 而不是窗口公式值。
+    ///
+    /// 构造：向量后端多返回一个**陈旧 `chunk_id`**（不在 `index` 里，模拟图 / 索引不同步）
+    /// ⇒ 窗口 `take_n = min(max(k,R), 13) = 13`，而第 3 步的防御路径跳过陈旧条
+    /// ⇒ **实际交给精排的是 12 条**。字段自称「**实际**交给精排的候选条数」⇒ 必须记 12。
+    ///
+    /// ⚠️ 变异：把 `metrics.rerank_window = handed` 改回 `= take_n` ⇒ 本条报红（13 ≠ 12）。
+    #[test]
+    fn S7_T14_陈旧chunk_id时记实际交接条数() {
+        let texts: Vec<String> = (0..12).map(|i| format!("检索 文档 {i}")).collect();
+        let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        let (index, analyzer) = build_tagged_index(&refs, "kept");
+
+        let mut ids: Vec<ChunkId> = (0..12).collect();
+        ids.push(999); // 陈旧 chunk_id：不在 index 里
+        let vi = SpyVectorIndex::new(false, ids.clone(), ids);
+        let e = FakeEmbedder;
+
+        let (spy, obs) = SpyReranker::new(100, false, false);
+        let s = QueryExecutor::new(&index, &analyzer)
+            .with_vector(&e, &vi)
+            .with_reranker(Box::new(spy));
+        let r = s.search("检索", SearchMode::Vector, 10).unwrap();
+
+        assert_eq!(
+            r.metrics.candidates, 13,
+            "前提自证：融合结果确实是 13 条（含陈旧条）"
+        );
+        assert_eq!(obs.seen_len(), 12, "陈旧条不得进 `proto`");
+        assert_eq!(
+            r.metrics.rerank_window, 12,
+            "必须记**实际交接**条数（12），不是窗口公式值（13）"
+        );
+        assert_eq!(
+            r.metrics.rerank_window,
+            obs.seen_len(),
+            "口径自洽：字段 == 精排实际入参条数"
+        );
+        assert!(
+            r.hits.iter().all(|h| h.chunk_id != 999),
+            "陈旧条不得出现在结果里"
+        );
     }
 }
