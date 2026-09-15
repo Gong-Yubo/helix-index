@@ -9,7 +9,11 @@
 #   A/B     A = 精排关（NoOp，效果基线的唯一参照）/ B = R = k（隔离「只看 k 条」与「看更多」）
 #   扫描    R 档位（默认 10/20/50/100/200），**顺序交错**多轮（跨时段漂移不偏向某一档）
 #   R48     max_length 对照档（512 vs 1024）
-#   延迟    固定子集 × --reps/--warmup（精排是百毫秒级 ⇒ 不能全量 × 20 reps）
+#   延迟    **固定子集**（`LAT_QUERIES`，默认 50 条）× `--reps/--warmup`
+#           ⚠️ **必须用子集**：bench 的延迟阶段**没有**子集机制（对全量 judgments 遍历
+#           warmup+reps 次），而 R=200 档每个 pass 会把 200 条交给精排。按实参复算：
+#           320 queries × 23 passes × 200 docs ≈ 1.47M 次文档打分（fastembed 批 256 已计入）
+#           ⇒ **全量跑一档是 2~25 小时**（依每文档有效耗时）。子集把它拉回可跑的量级。
 #
 # 用法：
 #   ./scripts/eval_rerank.sh --index /tmp/t2-frozen.idx            # 全套（需 ≈2.19GB 模型）
@@ -17,6 +21,8 @@
 #   ./scripts/eval_rerank.sh --index X --freeze-only               # 只跑 S7-T11 前置自证
 #   ./scripts/eval_rerank.sh --index X --dry-run                   # 只打印将执行的命令（不跑）
 #   ./scripts/eval_rerank.sh --index X --cross-graph               # 另测跨图抖动（关精排 --runs 3）
+#   ./scripts/eval_rerank.sh --index X --skip-freeze               # 跳过 S7-T11（已自证过时）
+#   ./scripts/eval_rerank.sh --index X --lat-queries 30            # 延迟轴子集大小（默认 50；0 = 全量）
 #
 # 产物（默认 /tmp/helix-rerank/）：
 #   freeze-<i>.json     冻结自证的第 i 次
@@ -50,6 +56,8 @@ WARMUP="${WARMUP:-3}"
 # max_length 对照档固定的窗口（用默认拟值 20：R48 只问「截断是否吃掉了收益」，
 # 与窗口大小是**两个**独立轴 ⇒ 固定一个再扫另一个）。
 ML_WINDOW="${ML_WINDOW:-20}"
+# 延迟轴子集大小（**确定性**：取前 N 条 ⇒ 可复现）。0 = 全量（⚠️ 精排档可能小时级/档位）。
+LAT_QUERIES="${LAT_QUERIES:-50}"
 BUILD=0
 DRY=0
 SKIP_FREEZE=0
@@ -64,6 +72,7 @@ while [[ $# -gt 0 ]]; do
         --k) K="$2"; shift 2 ;;
         --rs) RS="$2"; shift 2 ;;
         --maxlens) MAXLENS="$2"; shift 2 ;;
+        --lat-queries) LAT_QUERIES="$2"; shift 2 ;;
         --rounds) ROUNDS="$2"; shift 2 ;;
         --out) OUT_DIR="$2"; shift 2 ;;
         --reps) REPS="$2"; shift 2 ;;
@@ -75,6 +84,13 @@ while [[ $# -gt 0 ]]; do
         *) echo "未知参数: $1" >&2; exit 2 ;;
     esac
 done
+
+# ⚠️ **就地校验** `FREEZE_N`：冻结自证要比较**至少两次**读数，而那个判据在 Python 里 ——
+# 不在这里拦的话，`FREEZE_N=1` 会先跑完一次 bench（含模型加载）才失败，白等。（评审 P4-1）
+if [[ $SKIP_FREEZE -eq 0 && $FREEZE_N -lt 2 ]]; then
+    echo "错误：FREEZE_N=${FREEZE_N} 至少为 2（冻结自证要比较至少两份读数）" >&2
+    exit 2
+fi
 
 # `run`：dry-run 时只打印（`%q` 逐参数转义 ⇒ 复制的命令可直接粘贴执行）。
 run() {
@@ -216,13 +232,29 @@ for M in $MAXLENS; do
 done
 
 # ---------------------------------------------------------------------------
-# 5. 延迟轴（固定子集 × reps）
+# 5. 延迟轴（**固定子集** × reps）
 # ---------------------------------------------------------------------------
-echo "==> 延迟轴（warmup ${WARMUP} + ${REPS} reps）"
-run "$BIN" bench --index "$INDEX" --queries "$QUERIES" --k "$K" --runs 1 \
-    --modes "$MODES" --json "${OUT_DIR}/lat-A-noop.json"
+# ⚠️ 这里**必须**落地子集：见文件头的复算（全量 × R=200 是小时级/档位）。
+# 子集取 `$QUERIES` 的**前 N 行**（确定性 ⇒ 可复现）；⚠️ 前 N 条的类型分布可能有偏，
+# 但延迟轴只看耗时分布的量级、不做类型细分 ⇒ 可接受。
+# ⚠️ **控制组 A 与各精排档必须用同一子集、同一 reps/warmup** —— 否则「精排 vs NoOp」的
+# Δ 是静默错口径（NFR-07 要防的「看错一行、结论作废」的近亲，而延迟 Δ 正是 NFR-12 的输入）。
+LAT_Q="$QUERIES"
+if [[ "$LAT_QUERIES" == "0" ]]; then
+    echo "    ⚠️ LAT_QUERIES=0 ⇒ 延迟轴跑**全量** queries；精排档可能是小时级/档位（见文件头复算）" >&2
+else
+    LAT_Q="${OUT_DIR}/lat-queries.jsonl"
+    if [[ $DRY -eq 1 ]]; then
+        printf '  + head -n %q %q > %q\n' "$LAT_QUERIES" "$QUERIES" "$LAT_Q"
+    else
+        head -n "$LAT_QUERIES" "$QUERIES" > "$LAT_Q"
+    fi
+fi
+echo "==> 延迟轴（子集 = ${LAT_QUERIES} 条 / 0 表示全量；warmup ${WARMUP} + ${REPS} reps）"
+run "$BIN" bench --index "$INDEX" --queries "$LAT_Q" --k "$K" --runs 1 \
+    --modes "$MODES" --reps "$REPS" --warmup "$WARMUP" --json "${OUT_DIR}/lat-A-noop.json"
 for R in $RS; do
-    run "$BIN" bench --index "$INDEX" --queries "$QUERIES" --k "$K" --runs 1 \
+    run "$BIN" bench --index "$INDEX" --queries "$LAT_Q" --k "$K" --runs 1 \
         --modes "$MODES" --rerank-window "$R" \
         --reps "$REPS" --warmup "$WARMUP" --json "${OUT_DIR}/lat-r${R}.json"
 done
@@ -284,8 +316,16 @@ for r in sorted(rounds):
         for i, t in enumerate(("recall", "mrr", "ndcg")):
             vals = [trio(d, m)[i] for d in docs]
             spread = max(spread, max(vals) - min(vals))
-    # 关精排的读数随 R 应该**逐位不变** ⇒ 这才是「窗口没生效」的判据之一
-    q = docs[0].get("rerank", {})
+    # 「轮间极差」的前提是**各轮真的跑了同一档**：若 OUT_DIR 里残留上一轮的产物、文件串档，
+    # 两个**不同档位**之间的差会被当成「抖动」，直接污染 §4.6.4 的「Δ 首次 < 抖动带」判据。
+    # 这里用 bench 的 `rerank` 块（本 PR 在 bench 侧加的自证出口，id 含窗口与 max_length）
+    # 做**串档检测** —— 比逐位比对读数便宜，且抓的是另一种错。
+    sigs = {json.dumps(d.get("rerank", {}), sort_keys=True) for d in docs}
+    if not docs[0].get("rerank", {}).get("enabled") or len(sigs) != 1:
+        print(
+            f"    ⚠️ R={r}: 各轮 rerank 块不一致或未开启 ⇒ 疑串档/未生效：{sorted(sigs)}",
+            file=sys.stderr,
+        )
     rows.append((f"R={r}", f"轮间极差 {spread:.4f}", acc))
 
 lines = ["# V2 Step 7 精排标定（原始读数；结论由 S7-05 回填）", ""]
