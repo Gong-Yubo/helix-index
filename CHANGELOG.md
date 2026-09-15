@@ -9,6 +9,86 @@
 
 ## [Unreleased]
 
+### 修复 · V2 Step 7 PR 2 评审响应（第二方独立评审：**无阻塞项** + 3×P3，**全部收口**）（Refs #23，2026-09-15）
+
+> 评审落点：`pulls/53/reviews` **1 条 `COMMENTED`（1878 字，`2026-09-14T13:33:04Z`）+ 行内 3 条**；
+> 落在我 head `236b77b` 的 push **之后** ⇒ 真·新一轮（作者判据仍用**时间戳**）；
+> `issues/53/comments` = **只有我自己的 CI 评论**。
+> **总评：0×P1 / 0×P2 / 3×P3，全部不阻塞**；3 条行内**全部采纳**，且其中 1 条的**严重性被低估**
+> （见下「P3-3 的加强结论」）。评审另**独立重跑了**我的复核（9 条新测试 + `fmt --check` +
+> 变异表的 `md5` + 零回归论证 + σ 饱和的数学复核）。
+
+#### 🟢 Fixed（P3-1 —— `k == 0` 白跑精排）
+
+- `take_n = window.max(k).min(fused.len())` 在 `k == 0` 时给出 **`window`（> 0）** ⇒ 把整个窗口
+  （每条含 `text` / `metadata` 克隆）交给精排、跑完模型再被安全网截回 0 条 —— **输出对、成本白花**。
+  而 `LocalReranker::candidate_window` **不看 `k`**（恒返回 `R`）⇒ `k = 0` + `local-rerank`
+  **每次查询白跑 `R` 次推理**。改动前 `.take(0)` 给的是空 vec（`LocalReranker` 对空输入**早退**）
+  ⇒ 本 PR 若不挡，是**无意放大**了这个退化输入的成本。
+- ⇒ `take_n` 改为 `k == 0 ? 0 : min(max(k, window), 融合条数)`；新增用例 **`S7_T13`**（A/B：
+  `k = 1` 时窗口仍放开到 12，`k = 0` 时交接 0 条 ⇒ 证明那 0 是护栏给的，不是窗口本身为 0）。
+- 可达性：`helix search --k 0`（`k: usize` **无下界**，`SearchRequest::top_n` 也不钳制）。
+- ⚠️ **残留（如实登记）**：召回那一半在 `k = 0` 时**照样跑**（改动前后一致，非本 PR 引入）；
+  本护栏只挡掉「窗口交给精排」这一半。让 `k = 0` 在 API 边界不可达（CLI `--k` 下界）归 **PR 3**。
+
+#### 🟢 Fixed（P3-2 —— `rerank_window` 记公式值而非实际值）
+
+- 第 3 步的**陈旧 `chunk_id`** 防御路径会让 `proto.len() < take_n`，而字段自称的是
+  「**实际**交给精排的候选条数」⇒ 记公式值会在这条路径上**高报**。
+- ⇒ 改为记 `handed = proto.len()`；`Metrics::rerank_window` 的 rustdoc 重写为「实际交接值」并写明
+  **两者之差是诊断信号**（差 > 0 ⇒ 本次窗口里有已不可回捞的 chunk）。正常路径两者恒等。
+- 新增用例 **`S7_T14`**（向量后端多返回一个不在 `index` 里的 id ⇒ 融合 13 条 / 实际交接 12 条）。
+
+#### 🔵 Fixed（P3-3 —— 采纳 rustdoc 契约；**并报回一个「严重性被低估」的加强结论**）
+
+- **采纳**：`Reranker::candidate_window` 的 rustdoc 补**上界契约** —— 返回值由**实现**负责是
+  合理的候选规模上界（建议 ≤ `Index::num_chunks()`），编排层**原样下传、不设防**
+  （`S7_T3` 用「后端实际收到的 `k`」钉住了「原样」这一点）。
+- 🔵 **加强结论（评审给的是「可能大分配/abort」，实测更明确）**：
+  hnsw_rs 自己在 `search_filter` 里做 `ef = ef_arg.max(knbn)`（`hnsw.rs:1519`）
+  ⇒ **把 `HnswRsIndex` 库内的 `ef` 上限 `EF_FILTER_MAX = 256` 抵消掉**
+  （`hnsw_rs_index.rs` 的 `.min(EF_FILTER_MAX)` 救不回来），随后
+  `search_layer` 里 `BinaryHeap::with_capacity(ef.max(2))`（`hnsw.rs:931`）会用 `usize::MAX` 申请
+  ⇒ **不是「被 clamp 链兜住」，是会 panic / 申请失败**。
+  决定性实验（复刻两条路径的算式，debug 默认构建）：
+  `path B` 的 `(k * EF_FILTER_FACTOR)` ⇒ **`attempt to multiply with overflow`（panic）**；
+  `path A` 的 `(… + k)` ⇒ **`attempt to add with overflow`（panic）**；
+  release（overflow-checks 关）下 `path A` 的 `knbn` 被 `.min(len).min(1024)` 夹到语料规模、
+  `path B` 的 `ef` 被夹到 256，**但 `path B` 把 `knbn = k` 原样交给 `hnsw_rs`**（ef 又被拉回 `usize::MAX`）。
+- ⚠️ **本 PR 只补契约、不做运行期钳制**，理由两条：① 它是**既有问题**，非本 PR 引入
+  （`git log -S` ⇒ `candidate_k` 自 `011bb16` 起就无上限；本 PR 只是**新增了一个来源**：
+  第三方 `Reranker` 实现）；② 钳制落在 `vector/` 模块、且会与设计 §4.3.1 的公式产生偏差
+  ⇒ 属热路径回归面，不在已评审的「零回归」PR 里混做。**已单独挂账（见 PR 评论）。**
+
+#### 变异验证（新护栏必须有牙齿）
+
+| 变异 | 手法 | 实测命中 |
+| --- | --- | --- |
+| **M7** | 去掉 `k == 0` 分支（`take_n = window.max(k).min(fused.len())`） | ✅ `S7_T13`（`seen_len` / `rerank_window` 都变 12） |
+| **M8** | `metrics.rerank_window` 改回 `= take_n` | ✅ `S7_T14`（13 ≠ 12） |
+
+还原后 `md5` 与注入前**逐字节一致**（`searcher.rs` = `94776610…bff0e`）。
+
+#### 明确不做的
+
+- **运行期钳制 `window` / `k`** ⇒ 见 P3-3 的两条理由，已挂账；
+- ⚠️ 本 PR **不上调 `R` 的默认值**、**不动定义面**（仍是 S7-04 / S7-05 的范围）。
+
+#### 🔧 顺带（**非评审项** —— 环境性，故单列一个提交）
+
+- **修 `RUSTSEC-2026-0285`**（`rustls` TLS 1.3 跨加密层接受握手消息）：
+  `cargo update -p rustls` ⇒ **`0.23.43` → `0.23.45`**（+ 一处连带 `getrandom`），
+  **只动 `Cargo.lock`（3 行）**，无代码改动。
+- ⚠️ **它不是本 PR 引入的**（决定性证据：改之前 `Cargo.lock` 与 `Cargo.toml` 与 `origin/main`
+  **逐字节相同**）—— 是 **RustSec 公告库在本轮之间新收录**了该条 ⇒ **`main` 的下一次 CI 同样会红**
+  （`main` 最近一次 run 是 `2026-09-14T12:40Z` 的 `success`，早于该公告入的库）。
+- 传递路径：`rustls ← ureq ← hf-hub ← fastembed`（**仅在 `local-embed` 下编译**，
+  且只在模型下载路径上真正跑到；本 PR 与测试都不碰网络）。
+  ⇒ 故 CI 的 `cargo-deny` job 依赖的是**公告库的时点**，与代码分支无关；
+  这条修复让本 PR 与后续 PR 都能通过该 job。
+
+---
+
 ### 新增 · V2 Step 7 PR 2 —— 编排层精排窗口打通（S7-02）（Refs #23，2026-09-14）
 
 > **本 Step 的风险集中点**（设计 §8 的 PR 切分 ②）：唯一动热路径的改动。
