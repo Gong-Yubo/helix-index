@@ -1256,7 +1256,7 @@ mod tests {
     //! （`<=` / `>` 必须在 `<` / `>=` 之前判掉，否则报错信息会误导），
     //! 因此在这里钉住。CI 的 smoke 只覆盖到「跑通不报错」。
 
-    use super::{parse_filters, parse_one_filter};
+    use super::{check_rerank_runs, parse_filters, parse_one_filter, resolve_rerank, RerankSpec};
     use helix_core::schema::Filter;
 
     #[test]
@@ -1323,5 +1323,98 @@ mod tests {
         assert!(parse_one_filter("score<").is_err());
         assert!(parse_one_filter("score>=abc").is_err());
         assert!(parse_one_filter("score").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // V2 Step 7 / S7-03：精排参数（`--rerank-window` / `--rerank-max-length`）
+    //
+    // 这些是**纯参数面**判定 ⇒ 不需要模型、不需要 `local-rerank` feature，
+    // 默认 CI（`cargo test --workspace`）就跑得到。端到端那两条（「未编译 feature
+    // 必须报错」「`--runs > 1` 必须报错」）另由 CI 的 smoke job 覆盖 —— 那里才验
+    // 「守卫**真的**排在加载资源之前」。
+    // -----------------------------------------------------------------------
+
+    /// 不传 `--rerank-window` ⇒ 精排**关**（默认装配 NoOp，D-S7-04）。
+    /// 这是「`--rerank-window` 是唯一开关」的最小证据。
+    #[test]
+    fn 精排默认关闭() {
+        assert_eq!(
+            resolve_rerank(None, None).expect("合法输入不该报错"),
+            RerankSpec::Off
+        );
+    }
+
+    /// `--rerank-max-length` **单独给**必须报错：它只覆盖「已开启」的精排 ⇒
+    /// 静默忽略会让用户以为「改了 max_length」，实际什么都没发生（NFR-07）。
+    #[test]
+    fn max_length单独给被拒绝且点明依赖() {
+        let e = resolve_rerank(None, Some(1024)).expect_err("单独给 max_length 必须报错");
+        assert!(
+            e.to_string().contains("--rerank-window"),
+            "错误信息必须点明「需要与 --rerank-window 同时给」，实得：{e}"
+        );
+    }
+
+    /// 两处 `0` 都必须报错 —— 它们**看起来像**「关掉」，实际是「开了但空转」：
+    /// 窗口 0 ⇒ `take_n = max(k, 0) = k`（白加载模型）；`max_length 0` ⇒ 输入整段截空。
+    /// 要关精排的正确方式是**不传** `--rerank-window`。
+    #[test]
+    fn 窗口与截断长度为零都被拒绝() {
+        for (w, m) in [(Some(0), None), (Some(0), Some(512)), (Some(20), Some(0))] {
+            let e = resolve_rerank(w, m).expect_err("0 必须被拒绝");
+            assert!(
+                e.to_string().contains("至少为 1"),
+                "({w:?}, {m:?}) 的错误信息应点明下界，实得：{e}"
+            );
+        }
+    }
+
+    /// 给了窗口即开启；`max_length` 缺省时**留 `None`**（默认值真源在 core 常量，
+    /// 未编译 feature 时那个常量导不出来 ⇒ 填充推迟到 `build_reranker`）。
+    #[test]
+    fn 窗口单独给即开启且保留缺省标记() {
+        assert_eq!(
+            resolve_rerank(Some(20), None).expect("合法输入"),
+            RerankSpec::On {
+                window: 20,
+                max_length: None
+            }
+        );
+        assert_eq!(
+            resolve_rerank(Some(100), Some(1024)).expect("合法输入"),
+            RerankSpec::On {
+                window: 100,
+                max_length: Some(1024)
+            }
+        );
+    }
+
+    /// `--runs > 1` 与精排**互斥**（bench 专用）。
+    ///
+    /// ⚠️ 三个方向都要钉住，否则「永远报错」也会让本测试变绿：
+    /// `runs = 1` + 精排 ⇒ Ok（这是 A/B 的**正常**用法）；`runs > 1` + 关 ⇒ Ok
+    /// （跨进程抖动披露的既有用法）；只有两者同给才 Err。
+    #[test]
+    fn runs大于1与精排互斥() {
+        let on = RerankSpec::On {
+            window: 20,
+            max_length: None,
+        };
+        assert!(
+            check_rerank_runs(on, 1).is_ok(),
+            "runs=1 是精排 A/B 的正常用法"
+        );
+        assert!(
+            check_rerank_runs(RerankSpec::Off, 3).is_ok(),
+            "关精排时 --runs 照旧"
+        );
+        for runs in [2usize, 3] {
+            let e = check_rerank_runs(on, runs).expect_err("同给必须报错");
+            let msg = e.to_string();
+            assert!(
+                msg.contains("互斥") && msg.contains("冻结图"),
+                "错误信息要点明互斥与理由（冻结图），实得：{msg}"
+            );
+        }
     }
 }
