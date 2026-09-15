@@ -282,19 +282,22 @@ pub fn run(args: BenchArgs) -> Result<()> {
         eprintln!("⚠️⚠️⚠️  debug 构建：延迟数字无效！评测必须 cargo run --release  ⚠️⚠️⚠️");
     }
 
-    // V2 Step 7 / S7-03：精排参数。三步都排在**任何资源加载之前**。
+    // V2 Step 7 / S7-03：精排参数。**参数面校验（含四条守卫）全部排在资源加载之前**；
+    // 唯一会加载模型的 `build_reranker` 排在**所有纯参数校验之后**（理由见下）。
     //
-    // ⚠️ **顺序刻意如此**：`resolve` / `check` 是**纯参数面**（与是否编译 feature 无关），
-    //    所以它们先跑 —— 否则同一份错配置在默认构建与 `--features local-rerank` 构建下
-    //    会报**不同的错**，而 CI 用的是默认构建（`feature isolation` 那一步不跑 smoke）
-    //    ⇒ 互斥守卫就会变成「只有本地能测」的断言。`build_reranker` 才可能加载模型。
+    // ⚠️ 顺序刻意如此：① `resolve` / `check` 是纯参数面（与是否编译 feature 无关）⇒ 必须最先，
+    //    否则同一份错配置在默认构建与 `--features local-rerank` 构建下会报不同的错，
+    //    而 CI 的 smoke 走默认构建 ⇒ 互斥守卫会变成「只有本地能测」；
+    //    ② `build_reranker` 排在 `parse_modes` / `parse_thread_levels` 之后：后者也是纯参数
+    //    校验却便宜得多（凭什么叫用户先白等一次 2.19GB 模型加载才看到 `--modes` 拼错？）。
     let rerank_spec = crate::resolve_rerank(args.rerank_window, args.rerank_max_length)?;
     crate::check_rerank_runs(rerank_spec, args.runs)?;
-    let reranker = crate::build_reranker(rerank_spec)?;
 
     let modes = parse_modes(&args.modes)?;
     // `--threads 1`（默认）⇒ None ⇒ **不跑阶段 B2**，输出与不传该参数逐字一致（S6-T12）
     let thread_levels = parse_thread_levels(&args.threads)?;
+    // ⚠️ 唯一会加载模型的入口（≈2.19GB）⇒ 排在所有纯参数校验之后、`load_setup` 之前。
+    let reranker = crate::build_reranker(rerank_spec)?;
     let need_vector = modes.contains(&SearchMode::Vector) || modes.contains(&SearchMode::Hybrid);
     // 默认值来自 Bm25Params::default()（P5 定稿 k1=1.5/b=0.75），CLI 仅覆盖显式传入项
     let mut bm25_params = Bm25Params::default();
