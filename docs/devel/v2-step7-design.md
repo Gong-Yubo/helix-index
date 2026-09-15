@@ -49,7 +49,7 @@
 >    （顺带核过：同行 `:1627` 的 R47 锚点 `common.rs:174-180` **是正确的**，不动。）
 > 4. 上述**跨定义面的同类漂移一次性修完**（#51 的 F5 只落在本文）—— 第 2、3 项同因同源。
 > 5. **（S7-03 新增）`architecture-design.md:1628`（§14.5 R48）里的 `crates/cli/src/bench.rs:697`
->    因本 PR 改动 `bench.rs` 而漂移**（实测 **→ `:757`**）。⚠️ 属**定义面** ⇒ 本 PR **不改**，
+>    因本 PR 改动 `bench.rs` 而漂移**（实测 **→ `:760`**）。⚠️ 属**定义面** ⇒ 本 PR **不改**，
 >    与第 2、3 项并入同一次回写。
 >    **本 PR 已做的部分**：把**本文**全部 `bench.rs` 行号引用按**实测**更新（10 处：
 >    `697→757`、`380-390→436-446`、`655-668→711-724`、`661-663→717-719`、`160-162→178-180`、
@@ -209,7 +209,7 @@ pub trait Reranker: Send + Sync {
 | 步骤 | 成本 |
 | --- | --- |
 | `parts.index.chunk(chunk_id)` + `doc(chunk.doc_id)` | 哈希查找，廉价 |
-| `chunk.text.clone()` / `doc.source.clone()` / `metadata.clone()` | **整段文本拷贝**（T2Ranking 段落最长 **76,895 字符**，见 `crates/cli/src/bench.rs:757` 的注释） |
+| `chunk.text.clone()` / `doc.source.clone()` / `metadata.clone()` | **整段文本拷贝**（T2Ranking 段落最长 **76,895 字符**，见 `crates/cli/src/bench.rs:760` 的注释） |
 | **`matched_terms(analyzer, query, &chunk.text)`**（`:296`） | 内部 `analyzer.analyze_doc(chunk_text)` —— **对整段文本跑一遍分词**（`crates/core/src/query/explain.rs:13-17`） |
 
 ⇒ 窗口从 `k=10` 放到 `R=100`，**这一段就 ×10**。而它服务的东西（`Explain`）**只有最终 ≤k 条会被下游读到** ⇒ **`R−k` 条的 `matched_terms` 是纯浪费**。
@@ -272,7 +272,7 @@ top_n_result.sort_by(|a, b| a.score.total_cmp(&b.score).reverse());   // 全部�
 ⇒ **本 Step 的所有效果结论必须满足**：
 
 1. 走 `--index <快照>`：图从 sidecar 加载、**落盘即冻结**（NFR-06 的口径：「同一快照两次加载逐位一致」）；
-2. **`--runs 1`**：⚠️ `bench` 的 `--runs > 1` **会刻意跳过 sidecar 重建图**（`crates/cli/src/bench.rs:436-446`，注释明写「本处就是要制造跨进程差异」）⇒ **`--runs > 1` 与冻结图互斥**；
+2. **`--runs 1`**：⚠️ `bench` 的 `--runs > 1` **会刻意跳过 sidecar 重建图**（`crates/cli/src/bench.rs:439-449`，注释明写「本处就是要制造跨进程差异」）⇒ **`--runs > 1` 与冻结图互斥**；
 3. 「冻结」本身要**自证**：同一命令跑 2~3 遍，`bm25` 三项 `Δ = 0` 且 `hybrid` 逐位一致（**S7-T11**）。⚠️ 与 Step 6 的 F1 同族——**先证明 A/B 的两臂真的在测同一个东西**，再谈结论。
 
 ### 3.2 新增公开字段/方法 = 对外破坏性变更（R35 一族，本项目已有先例与流程）
@@ -603,8 +603,8 @@ rerank_max_length: Option<usize>,
 | --- | --- | --- | --- |
 | 1 | `--rerank-max-length` **单独给**（没给 `--rerank-window`） | `bail!` | 它只覆盖**已开启**的精排 ⇒ 静默忽略会让用户以为「改了截断长度」而实际什么都没发生（NFR-07） |
 | 2 | `--rerank-window 0` 或 `--rerank-max-length 0` | `bail!` | 「看起来像关掉、实际是开了但空转」：窗口 0 ⇒ `take_n = max(k, 0) = k`（白加载 2.19GB 模型）；长度 0 ⇒ 输入被整段截空。要关精排的正确方式是**不传** `--rerank-window` |
-| 3 | **`--runs > 1` + `--rerank-window`** | `bail!` | ⚠️ **脚枪之一**：`--runs` 的重建逻辑在 `bench.rs:436-446` 刻意传 `None` 跳过 sidecar ⇒ 每轮一张新图 ⇒ **精排 A/B 的差值被图漂移污染 0.6%**（§3.1）⇒ 不静默、不取其一 |
-| 4 | **`--rerank-window` 在未编译 `local-rerank` 时** | `bail!` + 重编提示 | ⚠️ **脚枪之二**：照抄 `--analyzer charabia` 的既有做法（`bench.rs:717-719`）——**不得**静默退回 NoOp（那会让「精排档位跑通了」的结论建立在空转上） |
+| 3 | **`--runs > 1` + `--rerank-window`** | `bail!` | ⚠️ **脚枪之一**：`--runs` 的重建逻辑在 `bench.rs:439-449` 刻意传 `None` 跳过 sidecar ⇒ 每轮一张新图 ⇒ **精排 A/B 的差值被图漂移污染 0.6%**（§3.1）⇒ 不静默、不取其一 |
+| 4 | **`--rerank-window` 在未编译 `local-rerank` 时** | `bail!` + 重编提示 | ⚠️ **脚枪之二**：照抄 `--analyzer charabia` 的既有做法（`bench.rs:720-722`）——**不得**静默退回 NoOp（那会让「精排档位跑通了」的结论建立在空转上） |
 
 🔴 **顺序是硬要求**：**参数面守卫（1~3）必须排在 feature 守卫（4）之前**，且四者都排在加载任何资源（快照 / 模型）之前。两条理由：
 
@@ -618,9 +618,10 @@ rerank_max_length: Option<usize>,
 - **共享接缝（实现期发现）**：`QueryExecutor::with_reranker` 只收 `Box`，而 bench 要**每 mode × 每 run** 装配一次 searcher（4 个入口）⇒ 想要复用同一个 2.19GB 实例，只能自己写转发 trait 的包装类型（`Reranker` 将来加方法会**静默漏转发**，`candidate_window` 漏了就是窗口静默失效）。⇒ 新增 `QueryExecutor::with_reranker_arc(Arc<dyn Reranker>)`（**新增公开方法**，纯加法）；字段 `reranker: Box<dyn Reranker>` → `Arc<dyn Reranker>`（私有字段，不动公开面），`with_reranker(Box)` 的**签名与语义一字未改**。
 - **身份串的可见性（实现期发现）**：`Reranker` trait **没有** `id()`（它只在 `LocalReranker` 上）⇒ 装箱成 `dyn Reranker` 后就取不到。CLI 侧改用 `RerankerHandle` 在**构造时**取出身份串，用于 stderr 一行与 `bench --json` 的 `rerank` 块（A/B 必须自证跑的是哪一档，同 `brute_fallback` 的既有要求）。
 - **⚠️ 用户可见面变化（非本文原设计）**：`bench` 输出新增一行 `精排: …`；`search --metrics` 追加 `| 精排=N条/X.XXXms`（出口 S7-02 已加的 `Metrics.rerank_window` / `rerank_elapsed`，此前**没有任何 CLI 出口**）；`search --explain` 追加 `| rerank=<原始 logit>`（D-S7-05 的对外落点）。
-- **⚠️ 行号引用已同步**：本 PR 改了 `bench.rs`（新增两个参数 + 守卫 + 装配注入）⇒ 全文按**实测**
-  更新了 10 处 `bench.rs` 行号引用（见头部勘误块的 **S7-05 清单第 5 项**，那里同时登记了
-  **定义面**上那处（`architecture-design.md:1628`）的同类漂移与处置）。
+- **⚠️ 行号引用已同步（两轮）**：本 PR **两次**改 `bench.rs` —— ① 接线轮（新增参数 + 守卫 + 装配注入）、
+  ② **响应轮**（把 `build_reranker` 挪到 `parse_modes` / `parse_thread_levels` 之后，理由见该处注释）；
+  每轮都按**实测**重新定位并更新全文引用（接线轮 10 处；响应轮 5 处 **+3**）。**定义面**上那处
+  （`architecture-design.md:1628`）的同类漂移已登记在头部勘误块 **S7-05 清单第 5 项**（含最新目标值）。
 - ⚠️ **版本号仍不升（v0.2）**：本节只同步「**已实装的事实**」，不触碰决策 / 预算 / 风险面 ⇒ 正式升版随 **S7-05**（同 E1~E7 的处置）。
 
 ### 4.6 H3 + NFR-12 的标定实验设计（**S7-04** 的输入；结论由 **S7-05** 回填）
@@ -817,7 +818,7 @@ rerank_max_length: Option<usize>,
 | **R45** | **精排延迟主导**：窗口放开后成本 ≈ `O(R)` 次 cross-encoder 前向；若默认开，端到端 P99 从 ~3ms 涨到百毫秒级 ⇒ NFR-02 名义失效 | 交互体验（NFR-02 / 「Agent 关键路径几十次调用」） | ① 默认关（D-S7-04）；② **NFR-12 独立口径**（不并入 NFR-02）；③ 默认 `R` 由标定（§4.6.4）决定；④ 精排器与查询侧编码共享 `Mutex` 串行瓶颈（同 R43）⇒ **明确不做池化** | ⚠️ **保持开放**：`R` 与延迟的取舍是**用户侧**决策；本 Step 只给「可配 + 有数据」 |
 | **R46** | **`Hit.score` 的语义随开关而变**（融合分 → `σ(logit)`），且 `hits` 的**并列次序**规则也随之改变 | 下游若用 `score` 设阈值 / 跨配置比较 / 缓存排序结果 ⇒ **静默失准**；与 R35 一族（对外可观测的破坏性变更） | ① `Explain.rerank_score` 让变换**可观测**（D-S7-05，NFR-07 精神）；② CHANGELOG 显式 `⚠️ 破坏性`；③ `Hit.score` 的 rustdoc 重写为「**当前排序依据**」并写明三种 mode × 精排开关的取值 | ⚠️ **识别成本仍在用户侧**：内核只能说清「这次 `score` 是什么」，无法阻止下游误用 |
 | **R47** | **精排数值的可复现性未证实**：tokenizer 用 `PaddingStrategy::BatchLongest`（`common.rs:174-180`）⇒ **同一 `(query, doc)` 在不同批次组成下 padding 长度不同** ⇒ 浮点结果**可能不逐位相同**；ONNX 多线程归约亦然 | ① NFR-06（相同 query → 完全相同结果）**可能不成立**；② 标定实验的**分数轴不可横比**（只能比序数指标） | ① §4.7 三个层次探针 P1/P2/P3（S7-T8 / T9）；② §4.6.3 的「不可横比声明」；③ 若 P1/P2 出反例 ⇒ NFR-06 加限定词「不含精排」并升需求版本 | ⚠️ **测了才知道**：P3 的反例**不必修**（数学等价），但**改变报告怎么读** |
-| **R48** | **512 token 截断使长段落的精排判据失真**：`HasMaxLength for RerankerModel = 512`（`reranking/init.rs:17-19`），而 T2Ranking 段落最长 **76,895 字符**（`bench.rs:757`）⇒ 精排只看得到段落前段 | **可能把「方法不行」错判为「精排无提升」**（结论错，而代码没错）；反过来若调大 `max_length`，成本近似平方增长 | ① D-S7-08（保持 512 起步 + `1024` 对照档）；② §4.6.4 的判据②明写「拐点不可识别时要如实记入局限」；③ `max_length` 进精排器**身份字符串**（D-S7-08/§4.4.4） | ⏳ **开放**：截断对长段落的定量影响要等标定；若确认为主因，**为评测集单独调大**（而不是改产品默认） |
+| **R48** | **512 token 截断使长段落的精排判据失真**：`HasMaxLength for RerankerModel = 512`（`reranking/init.rs:17-19`），而 T2Ranking 段落最长 **76,895 字符**（`bench.rs:760`）⇒ 精排只看得到段落前段 | **可能把「方法不行」错判为「精排无提升」**（结论错，而代码没错）；反过来若调大 `max_length`，成本近似平方增长 | ① D-S7-08（保持 512 起步 + `1024` 对照档）；② §4.6.4 的判据②明写「拐点不可识别时要如实记入局限」；③ `max_length` 进精排器**身份字符串**（D-S7-08/§4.4.4） | ⏳ **开放**：截断对长段落的定量影响要等标定；若确认为主因，**为评测集单独调大**（而不是改产品默认） |
 
 ### 9.2 未决问题
 
@@ -916,7 +917,7 @@ for i in 1 2 3; do
 done
 #    判据：三次的 bm25 三项必须 Δ = 0；hybrid 的 MRR/NDCG 必须逐位一致。
 #    若不一致 ⇒ 快照没被真正复用（图每轮重建）⇒ **后面所有数据作废**。
-#    ⚠️ 必须 --runs 1：bench 的 --runs > 1 会**刻意跳过 sidecar 重建图**（bench.rs:436-446）。
+#    ⚠️ 必须 --runs 1：bench 的 --runs > 1 会**刻意跳过 sidecar 重建图**（bench.rs:439-449）。
 
 # 3) 控制组 A：精排**关**（NoOp）——效果基线的唯一参照
 ./scripts/eval_quality.sh --index /tmp/t2-frozen.idx --runs 1 \
@@ -1012,10 +1013,10 @@ cargo run -p helix --release -- bench --index /tmp/t2-frozen.idx --runs 1 \
 | `Score = f32` / `ChunkId = u32` | `crates/core/src/types.rs:7, 10, 16` |
 | `Metrics` 字段与 `Copy` | `crates/core/src/query/metrics.rs:43-92` |
 | `Metrics` 只经 `tracing` 的**历史断链**（T7-23 的由来） | `crates/core/src/query/metrics.rs:1-18` |
-| `--runs > 1` **刻意重建图**（与冻结图互斥） | `crates/cli/src/bench.rs:436-446` |
-| `--analyzer charabia` 的「缺 feature 即报错」先例 | `crates/cli/src/bench.rs:711-724` |
-| T2Ranking 段落最长 76,895 字符 | `crates/cli/src/bench.rs:757` |
-| `--threads` 的逐位一致前置条件（NFR-10 ①） | `crates/cli/src/bench.rs:178-180`；`check_concurrency_precondition` `:1597` |
+| `--runs > 1` **刻意重建图**（与冻结图互斥） | `crates/cli/src/bench.rs:439-449` |
+| `--analyzer charabia` 的「缺 feature 即报错」先例 | `crates/cli/src/bench.rs:714-727` |
+| T2Ranking 段落最长 76,895 字符 | `crates/cli/src/bench.rs:760` |
+| `--threads` 的逐位一致前置条件（NFR-10 ①） | `crates/cli/src/bench.rs:178-180`；`check_concurrency_precondition` `:1600` |
 | P5 基线（hybrid MRR@10(1) = **0.6922**） | `docs/devel/eval-report.md` §3.1 |
 | 图漂移 ~0.6%（`hybrid MRR@10(1) = 0.68815`） | issue **#23** 评论（2026-09-14）/ `eval-report.md` §3.4 |
 | 模型体积 / sha256 / 出处 | issue **#23** 评论（2026-09-14） |
