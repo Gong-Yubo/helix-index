@@ -559,11 +559,22 @@ pub fn run(args: BenchArgs) -> Result<()> {
         );
         if filter.is_some() {
             println!(
-                "{:<8} {:>10} {:>10} {:>10} {:>12} {:>12} {:>10}",
-                "mode", "P50(ms)", "P99(ms)", "平均条数", "缺口(bench)", "缺口(内核)", "精确占比"
+                "{:<8} {:>10} {:>10} {:>10} {:>12} {:>12} {:>10} {:>10} {:>10}",
+                "mode",
+                "P50(ms)",
+                "P99(ms)",
+                "平均条数",
+                "缺口(bench)",
+                "缺口(内核)",
+                "精确占比",
+                "精排P50",
+                "精排P99"
             );
         } else {
-            println!("{:<8} {:>10} {:>10}", "mode", "P50(ms)", "P99(ms)");
+            println!(
+                "{:<8} {:>10} {:>10} {:>10} {:>10}",
+                "mode", "P50(ms)", "P99(ms)", "精排P50", "精排P99"
+            );
         }
         let mut lat_rows: Vec<(SearchMode, LatencyResult)> = Vec::new();
         for &mode in &modes {
@@ -572,9 +583,13 @@ pub fn run(args: BenchArgs) -> Result<()> {
                 &searcher,
                 &judgments,
                 mode,
-                args.k,
-                args.warmup,
-                args.reps,
+                LatencySpec {
+                    k: args.k,
+                    warmup: args.warmup,
+                    reps: args.reps,
+                    // **配置事实**（不是读数）：见 `LatencySpec::collect_rerank`
+                    collect_rerank: args.rerank_window.is_some(),
+                },
                 FilterCtx {
                     filter: filter.as_ref(),
                     bits: bits.as_ref(),
@@ -588,21 +603,25 @@ pub fn run(args: BenchArgs) -> Result<()> {
                 // `min(K, allowed)` 与 `min(candidate_k, allowed)` 之别，不是重复列。
                 // 「精确占比」= `vector_route == Exact` 的响应占比——T7-22 的 A/B 判据。
                 println!(
-                    "{:<8} {:>10.2} {:>10.2} {:>10.2} {:>12.2} {:>12.2} {:>10.3}",
+                    "{:<8} {:>10.2} {:>10.2} {:>10.2} {:>12.2} {:>12.2} {:>10.3} {:>10} {:>10}",
                     mode_name(mode),
                     lat.p50_ms,
                     lat.p99_ms,
                     lat.mean_hits,
                     lat.mean_shortfall,
                     lat.mean_shortfall_kernel,
-                    lat.exact_ratio
+                    lat.exact_ratio,
+                    opt_ms(lat.rerank_p50_ms),
+                    opt_ms(lat.rerank_p99_ms)
                 );
             } else {
                 println!(
-                    "{:<8} {:>10.2} {:>10.2}",
+                    "{:<8} {:>10.2} {:>10.2} {:>10} {:>10}",
                     mode_name(mode),
                     lat.p50_ms,
-                    lat.p99_ms
+                    lat.p99_ms,
+                    opt_ms(lat.rerank_p50_ms),
+                    opt_ms(lat.rerank_p99_ms)
                 );
             }
             latency.insert(
@@ -620,6 +639,13 @@ pub fn run(args: BenchArgs) -> Result<()> {
                     "mean_bm25_ms": lat.mean_bm25_ms,
                     "mean_vector_ms": lat.mean_vector_ms,
                     "n_metrics": lat.n_metrics,
+                    // V2 Step 7 / S7-04：精排口径（NFR-12 判据 + 窗口放开自证）。
+                    // ⚠️ rerank_n 是分母自证：与 n_samples 不等是**正常**的
+                    //   （早退 / 未开精排的响应不算进精排分位数）。
+                    "rerank_n": lat.rerank_n,
+                    "rerank_p50_ms": lat.rerank_p50_ms,
+                    "rerank_p99_ms": lat.rerank_p99_ms,
+                    "mean_rerank_window": lat.mean_rerank_window,
                 }),
             );
             lat_rows.push((mode, lat));
@@ -1239,6 +1265,14 @@ fn sign_compare(hybrid: &ModeResult, other: &ModeResult) -> (usize, usize, usize
 // 阶段 B：延迟
 // ---------------------------------------------------------------------------
 
+/// 格式化可选毫秒值（`None` = 本档位没跑精排 ⇒ 打 `-`）。
+///
+/// ⚠️ **不能把 `None` 打成 `0`**：`0` 与「没跑」在大表里不可区分，而这一列正是
+/// 「本档位到底有没有跑精排」的自证（NFR-07 的一贯要求）。
+fn opt_ms(v: Option<f64>) -> String {
+    v.map_or_else(|| "-".to_string(), |v| format!("{v:.2}"))
+}
+
 struct LatencyResult {
     p50_ms: f64,
     p99_ms: f64,
@@ -1273,17 +1307,80 @@ struct LatencyResult {
     /// 成功取到 `metrics` 的响应数（**分母的自证**：0 表示内核没暴露 metrics，
     /// 那一列的数字就没有意义）
     n_metrics: usize,
+    /// 精排耗时 P50（ms，**只统计真的跑了精排的响应**；`None` = 本档位一次都没跑，
+    /// 如控制组 A `NoOp`）。
+    ///
+    /// ⚠️ **它才是 NFR-12 的口径**（设计 §4.6.3）：`p50_ms` / `p99_ms` 是端到端 `took`，
+    /// 含召回 / 融合 / 回捞 / 组装 —— 只看它无法把精排成本与外层成本分开，而
+    /// 「精排 + 过滤」的低选择度档位正是外层成本会顶穿预算的地方。
+    ///
+    /// **收集判据 = 两个条件同时成立**（⚠️ 实测踩过：只用「耗时 > 0」会被绕过）：
+    /// ① 本档位**传了** `--rerank-window`（配置事实，由 bench 传入，不从读数反推）——
+    ///    `NoOpReranker` 的空调用也有 ~0.5µs 的 `elapsed` ⇒ 单看 `> 0` 会把控制组 A
+    ///    收进来，得到 `rerank_p50 ≈ 0.0005ms` 这种**看起来像精排、其实没跑**的假读数；
+    /// ② `Metrics.rerank_window > 0`（本次真的交接过候选 —— 早退路径该字段保持默认 0）。
+    rerank_p50_ms: Option<f64>,
+    /// 同上（P99）。⚠️ P99 的样本量由 `--reps` 决定：样本太少时它只是个装饰
+    /// （perf-ab-calibration 规则 3）⇒ 与 `rerank_n` 并列输出，让读者自查。
+    rerank_p99_ms: Option<f64>,
+    /// 参与上述分位数的样本数（**分母自证**：0 ⇒ 该档位没跑精排）
+    rerank_n: usize,
+    /// 平均**实际交接**条数（`Metrics.rerank_window`；0 = 没跑精排）。
+    ///
+    /// 它是「窗口真的放开了」的直接证据（S7-02 / D-S7-03）——只看 CLI 的 `R` 会漏掉
+    /// 「候选池没联动、窗口被静默封顶」。
+    mean_rerank_window: f64,
+}
+
+/// 一个档位的**延迟测量规格**（`--k` / `--warmup` / `--reps` + 本档位是否开精排）。
+///
+/// 动机同 [`FilterCtx`]：clippy 的 `too_many_arguments`（阈值 7）。但这两组也确实
+/// 各自成形 —— `FilterCtx` 答「**在什么语料上**跑」，本结构答「**这一次怎么跑**」。
+/// `collect_rerank` 归在这里的关键理由：它**只能由本档位的配置决定**，不能让被调用方
+/// 从读数反推（见字段注释）。
+///
+/// V2 Step 7 / S7-04 引入（`eval_latency` 由此处第 8 个参数触发 clippy 阈值）。
+#[derive(Clone, Copy)]
+struct LatencySpec {
+    /// 取回的 top-k（同时是端到端分位数的口径）
+    k: usize,
+    /// 每 query 的预热轮数（不进分位数）
+    warmup: usize,
+    /// 每 query 的计时轮数
+    reps: usize,
+    /// 本档位是否传了 `--rerank-window`（**配置事实**）。⚠️ 不能用「耗时 > 0」代替：
+    /// `NoOpReranker` 的空调用耗时虽小但非零（实测 ~0.5µs）⇒ 会把控制组 A 收成假样本。
+    collect_rerank: bool,
+}
+
+/// 该响应是否**计入**精排延迟样本（S7-04 的收集判据：**两个条件同时成立**）。
+///
+/// ⚠️ 这不是「可严可松」的风格问题 —— 实测踩过：只用「`rerank_elapsed` 耗时 > 0」
+/// 会把**控制组 A（`NoOp`）也收进来**（`NoOpReranker` 的空调用耗时虽小但**非零**，
+/// 实测 ~0.5µs）⇒ 得到 `rerank_p50 ≈ 0.0005 ms` 这种**看起来在跑精排、其实没跑**
+/// 的假读数，而它恰好是 **NFR-12 判据表**的一行。故：
+///
+/// - `collect_rerank` = **本档位的配置事实**（传了 `--rerank-window`）—— **不从读数反推**；
+/// - `rerank_window > 0` = **本次真的交接过候选**（早退 / 无内容可精排的路径该字段保持默认 `0`）。
+///
+/// 提成纯函数是为了让这条双条件**可被单测钉住**（否则它只能靠昂贵真机跑验证）。
+fn should_collect_rerank(collect_rerank: bool, rerank_window: usize) -> bool {
+    collect_rerank && rerank_window > 0
 }
 
 fn eval_latency(
     searcher: &QueryExecutor,
     judgments: &[Judgment],
     mode: SearchMode,
-    k: usize,
-    warmup: usize,
-    reps: usize,
+    spec: LatencySpec,
     ctx: FilterCtx<'_>,
 ) -> LatencyResult {
+    let LatencySpec {
+        k,
+        warmup,
+        reps,
+        collect_rerank,
+    } = spec;
     let allowed = ctx.allowed;
     let mut samples: Vec<f64> = Vec::with_capacity(judgments.len() * reps);
     let mut hits_sum = 0usize;
@@ -1296,6 +1393,10 @@ fn eval_latency(
     let mut bm25_ms_sum = 0f64;
     let mut vector_ms_sum = 0f64;
     let mut n_metrics = 0usize;
+    // ↓ V2 Step 7 / S7-04：精排口径（NFR-12 的判据；S7-02 已在 `Metrics` 里加好字段，
+    //   此前 bench **没有任何出口** ⇒ 数据取不到，设计 §4.6.3 的「分列」无从落地）
+    let mut rerank_samples: Vec<f64> = Vec::new();
+    let mut rerank_window_sum = 0f64;
     for j in judgments {
         for _ in 0..warmup {
             let _ = run_once(searcher, &j.query, mode, k, ctx.filter);
@@ -1317,6 +1418,12 @@ fn eval_latency(
                 filter_eval_us_sum += m.filter_eval.as_secs_f64() * 1e6;
                 bm25_ms_sum += m.bm25_elapsed.as_secs_f64() * 1000.0;
                 vector_ms_sum += m.vector_elapsed.as_secs_f64() * 1000.0;
+                // 只收「本档位开了精排**且**本次真的交接过候选」的响应
+                // （`rerank_window == 0` = 早退 / 没内容可精排 ⇒ 不是有意义的耗时样本）
+                if should_collect_rerank(collect_rerank, m.rerank_window) {
+                    rerank_samples.push(m.rerank_elapsed.as_secs_f64() * 1000.0);
+                    rerank_window_sum += m.rerank_window as f64;
+                }
                 n_metrics += 1;
             }
         }
@@ -1327,6 +1434,8 @@ fn eval_latency(
     // 内核口径的分母是**观测到 metrics 的响应数**，与 bench 口径的 n_resp 分开记：
     // 若两者不等，说明有响应没带 metrics（内核侧漏填），而不是"指标为 0"
     let kdenom = n_metrics.max(1) as f64;
+    let rerank_n = rerank_samples.len();
+    rerank_samples.sort_by(|a, b| a.partial_cmp(b).expect("精排延迟样本无 NaN"));
     LatencyResult {
         p50_ms: bench::percentile(&samples, 50.0),
         p99_ms: bench::percentile(&samples, 99.0),
@@ -1339,6 +1448,14 @@ fn eval_latency(
         mean_bm25_ms: bm25_ms_sum / kdenom,
         mean_vector_ms: vector_ms_sum / kdenom,
         n_metrics,
+        rerank_p50_ms: (rerank_n > 0).then(|| bench::percentile(&rerank_samples, 50.0)),
+        rerank_p99_ms: (rerank_n > 0).then(|| bench::percentile(&rerank_samples, 99.0)),
+        rerank_n,
+        mean_rerank_window: if rerank_n > 0 {
+            rerank_window_sum / rerank_n as f64
+        } else {
+            0.0
+        },
     }
 }
 
@@ -2386,5 +2503,37 @@ mod tests {
         // floor = 100，clamp → 200，.min(total=2) → 2
         // —— total=2 需要真实语料，空 index 无法构造，此行留作行为文档
         assert_eq!(oracle_depth_for(&index, 0, 3, 7), 21); // 3×7 < cap，早退不截断
+    }
+
+    /// S7-04：`opt_ms` 的语义契约 —— **`None` 打 `-`，不是 `0`**。
+    ///
+    /// 这不是格式偏好：延迟表里的「精排 P50/P99」为 `0` 意味着「精排只花了 0ms」，
+    /// 而 `None` 意味着「本档位**没跑**精排」（控制组 A）。两者混同会让读者以为精排
+    /// 免费 —— 正是 NFR-07 要防的那类静默（同 `vector_shortfall` 的口径纪律）。
+    #[test]
+    fn 可选毫秒的缺失不打成零() {
+        assert_eq!(opt_ms(None), "-");
+        assert_eq!(opt_ms(Some(0.0)), "0.00", "真的 0ms 要如实显示为 0.00");
+        assert_eq!(opt_ms(Some(1.234)), "1.23");
+        assert_eq!(opt_ms(Some(4785.083)), "4785.08");
+    }
+
+    /// S7-04：精排延迟样本的**收集判据必须是「且」**，不是「或」。
+    ///
+    /// 变异验证：把 `&&` 改成 `||` ⇒ 第 2、3 行红；删掉任一半 ⇒ 对应行红。
+    /// 这条判据的真机后果是实打实的：放宽成「耗时 > 0」时，控制组 A 的
+    /// `NoOpReranker` 空调用（~0.5µs）会被收成样本 ⇒ 表里出现 `0.0005 ms` 的假精排行。
+    #[test]
+    fn 精排延迟样本要同时满足配置与交接两条件() {
+        assert!(should_collect_rerank(true, 10), "开了精排且真交接 ⇒ 收");
+        assert!(
+            !should_collect_rerank(true, 0),
+            "开了精排但 window=0（早退）⇒ 不收"
+        );
+        assert!(
+            !should_collect_rerank(false, 10),
+            "没开精排（控制组 A）⇒ 不收，**哪怕** `rerank_elapsed` 非零（NoOp 空调用）"
+        );
+        assert!(!should_collect_rerank(false, 0), "两条都不成立 ⇒ 不收");
     }
 }
