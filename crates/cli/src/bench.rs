@@ -29,6 +29,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
@@ -82,6 +83,23 @@ pub struct BenchArgs {
     /// 检索深度 = 指标 @K
     #[arg(short, long, default_value_t = 10)]
     pub k: usize,
+    /// 精排窗口 R（V2 Step 7 / S7-03）。**不传 = 关闭精排**（NoOp，与现状逐字一致）。
+    ///
+    /// 传了则装载本地精排器（`bge-reranker-v2-m3`）并把窗口放开到 R：
+    /// 融合后取 `min(max(k, R), 融合条数)` 条交给精排，再由它排序截回 k 条。
+    ///
+    /// ⚠️ 需要以 `--features local-rerank` 编译；模型 ≈2.19GB，首次运行会下载。
+    /// ⚠️ 与 `--runs > 1` **互斥**（后者刻意重建图，图漂移会污染精排 A/B 的差值）。
+    /// ⚠️ `R = 0` 无意义 ⇒ 报错（要关精排请**不传**本参数）。
+    #[arg(long, value_name = "R")]
+    pub rerank_window: Option<usize>,
+    /// 精排 tokenizer 的截断长度（默认 512）。
+    ///
+    /// ⚠️ 它**烧进**模型 tokenizer（构造期生效）⇒ 必须与 `--rerank-window`
+    /// 同时给出，单独给会报错（不静默忽略）。服务于 S7-04 的 max_length 对照档
+    /// （512 vs 1024，R48）。
+    #[arg(long, value_name = "N")]
+    pub rerank_max_length: Option<usize>,
     /// 覆盖 BM25 k1
     #[arg(long)]
     pub k1: Option<f32>,
@@ -180,6 +198,13 @@ struct Setup {
     vectors: Vec<(ChunkId, Vec<f32>)>,
     embedder: Option<LocalEmbedder>,
     backend: Option<VectorBackend>,
+    /// 精排器（`None` = 未开启，装配 `NoOpReranker`）。V2 Step 7 / S7-03。
+    ///
+    /// ⚠️ 放在 `Setup` 而不是每次 `make_searcher` 新建：bench 会**每 mode × 每 run**
+    /// 各装配一次 searcher（4 个入口），而精排器可能持有 2.19GB 的常驻 ONNX 会话
+    /// （架构 R44）⇒ 必须用 `Arc` **共享同一实例**（重复加载 = 秒级 × N 且内存峰值叠加）。
+    /// 身份串随之携带（`dyn Reranker` 上取不到，见 `RerankerHandle`）。
+    reranker: Option<crate::RerankerHandle>,
     #[allow(dead_code)]
     vector_kind: String,
 }
@@ -257,6 +282,16 @@ pub fn run(args: BenchArgs) -> Result<()> {
         eprintln!("⚠️⚠️⚠️  debug 构建：延迟数字无效！评测必须 cargo run --release  ⚠️⚠️⚠️");
     }
 
+    // V2 Step 7 / S7-03：精排参数。三步都排在**任何资源加载之前**。
+    //
+    // ⚠️ **顺序刻意如此**：`resolve` / `check` 是**纯参数面**（与是否编译 feature 无关），
+    //    所以它们先跑 —— 否则同一份错配置在默认构建与 `--features local-rerank` 构建下
+    //    会报**不同的错**，而 CI 用的是默认构建（`feature isolation` 那一步不跑 smoke）
+    //    ⇒ 互斥守卫就会变成「只有本地能测」的断言。`build_reranker` 才可能加载模型。
+    let rerank_spec = crate::resolve_rerank(args.rerank_window, args.rerank_max_length)?;
+    crate::check_rerank_runs(rerank_spec, args.runs)?;
+    let reranker = crate::build_reranker(rerank_spec)?;
+
     let modes = parse_modes(&args.modes)?;
     // `--threads 1`（默认）⇒ None ⇒ **不跑阶段 B2**，输出与不传该参数逐字一致（S6-T12）
     let thread_levels = parse_thread_levels(&args.threads)?;
@@ -289,7 +324,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
     }
 
     // ---- 1. 加载 ----
-    let mut setup = load_setup(&args, need_vector)?;
+    let mut setup = load_setup(&args, need_vector, reranker)?;
     let judgments = bench::load_judgments(&args.queries)
         .with_context(|| format!("加载 judgments 失败: {}", args.queries.display()))?;
     bench::validate_sources(&judgments, &setup.index)?;
@@ -314,6 +349,16 @@ pub fn run(args: BenchArgs) -> Result<()> {
         args.ef_search
             .map(|e| format!("(ef_search={e})"))
             .unwrap_or_default()
+    );
+    // V2 Step 7 / S7-03：精排档位必须**显式打印**（A/B 的唯一开关）。
+    // 理由同 `--brute-fallback`：标定时看错一行，会把「精排关」的结果当成「精排无效」。
+    // 身份串含模型 + max_length + 窗口 ⇒ 一次打印即自证跑的是哪一档（D-S7-08/10）。
+    println!(
+        "精排: {}",
+        match &setup.reranker {
+            Some(h) => format!("开启（{}）", h.identity),
+            None => "关（NoOp；用 --rerank-window R 开启）".to_string(),
+        }
     );
     // S5-04：A/B 开关的生效值必须显式打印——「没传」与「off」语义不同，
     // 标定时看错一行就会把"全部退化成 ANN 基线"当成"兜底无效"。
@@ -370,6 +415,17 @@ pub fn run(args: BenchArgs) -> Result<()> {
         Some(None) => "off".to_string(),
         Some(Some(n)) => n.to_string(),
     });
+    // V2 Step 7 / S7-03：精排是**第二个** A/B 唯一开关，同样必须进 JSON ——
+    // 否则两次跑出的文件无法自证跑的是哪一档（`id` 含 max_length 与窗口，
+    // 见 `reranker_identity`；D-S7-08 / D-S7-10 要求它可见）。
+    json["rerank"] = match (&setup.reranker, rerank_spec) {
+        (Some(h), crate::RerankSpec::On { window, .. }) => serde_json::json!({
+            "enabled": true,
+            "id": h.identity,
+            "window": window,
+        }),
+        _ => serde_json::json!({"enabled": false}),
+    };
 
     // ---- 2. 阶段 A：效果（--runs 轮，每轮重建 HNSW 图模拟跨进程差异）----
     let runs = args.runs.max(1);
@@ -668,7 +724,11 @@ fn build_analyzer(args: &BenchArgs) -> Result<Box<dyn Analyzer>> {
     }
 }
 
-fn load_setup(args: &BenchArgs, need_vector: bool) -> Result<Setup> {
+fn load_setup(
+    args: &BenchArgs,
+    need_vector: bool,
+    reranker: Option<crate::RerankerHandle>,
+) -> Result<Setup> {
     let mut graph_src: Option<GraphSource> = None;
     let (index, vectors, analyzer) = match (&args.index, &args.input) {
         (Some(path), None) => {
@@ -752,6 +812,7 @@ fn load_setup(args: &BenchArgs, need_vector: bool) -> Result<Setup> {
         vectors,
         embedder,
         backend,
+        reranker,
         vector_kind: args.vector_index.clone(),
     })
 }
@@ -897,6 +958,12 @@ fn make_searcher<'a>(
         s = s
             .with_vector(e, vi.as_index())
             .with_fusion(Box::new(RrfFusion::new(rrf_k, rrf_weights.to_vec())));
+    }
+    // V2 Step 7 / S7-03：精排注入。`Arc::clone` ⇒ 每 mode × 每 run 装配的 4 个入口
+    // （效果 / 延迟 / 并发 / 网格）共享**同一个**模型实例；未开启时保持默认 NoOp
+    // ⇒ 与不传 `--rerank-window` 逐位一致（S7-02 的「零回归」承诺在 CLI 侧也成立）。
+    if let Some(h) = &setup.reranker {
+        s = s.with_reranker_arc(Arc::clone(&h.reranker));
     }
     Ok(s)
 }

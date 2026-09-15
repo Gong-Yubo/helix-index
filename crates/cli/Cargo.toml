@@ -9,6 +9,10 @@ license.workspace      = true
 [features]
 default = []
 charabia = ["helix-core/charabia"]  # T5-09 分词对照实验（--analyzer charabia）
+# V2 Step 7 / S7-03：本地精排（`--rerank-window`）。
+# ⚠️ **非默认**：模型 ≈2.19GB（`bge-reranker-v2-m3`）⇒ 不给这个 feature 就编不出精排，
+# 传 `--rerank-window` 会**报错并提示重编**（不静默退回 NoOp，同 `--analyzer charabia`）。
+local-rerank = ["helix-core/local-rerank"]
 
 [dependencies]
 # 显式写 version 是为了让 cargo-deny 的 wildcards 检查通过（纯 path 依赖会被判为 wildcard）
