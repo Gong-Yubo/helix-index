@@ -9,6 +9,85 @@
 
 ## [Unreleased]
 
+### 新增 · V2 Step 7 PR 3 —— CLI 接线：`--rerank-window` / `--rerank-max-length` + 四条守卫 + `scripts/eval_rerank.sh`（S7-03）（Refs #23，2026-09-15）
+
+精排**第一次能从命令行使用**（此前只有库接口）。**默认行为零变化**：不传 `--rerank-window`
+⇒ 装配仍是 `NoOpReranker`（D-S7-04）⇒ 索引与结果与之前**逐位一致**。
+
+#### 交付
+
+- **`cli` 的 `local-rerank` feature**（`= ["helix-core/local-rerank"]`，非默认）：不给这个 feature
+  就编不出精排分支；此时传 `--rerank-window` **报错并提示重编**（不静默退回 NoOp —— 那会让
+  「精排跑通了」建立在空转上，同 `--analyzer charabia` 的先例）。
+- **`--rerank-window R` / `--rerank-max-length N`**：`search` 与 `bench` **参数面完全对称**
+  （同一套 `resolve_rerank` / 守卫 / `build_reranker`，不复制语义）。
+- **四条守卫**（顺序固定：参数面 1~3 在 feature 守卫 4 **之前**，四者都在加载任何资源之前）：
+  ① `--rerank-max-length` 单独给 ⇒ `bail!`（它只覆盖**已开启**的精排）；
+  ② `--rerank-window 0` / `--rerank-max-length 0` ⇒ `bail!`（「看起来像关掉、实际是开了但空转」：
+  窗口 0 ⇒ `take_n = max(k, 0) = k`，白加载 ≈2.19GB 模型；长度 0 ⇒ 输入整段截空）；
+  ③ `--runs > 1` + 精排 ⇒ `bail!`（`--runs` 刻意重建图，图漂移污染 A/B，设计 §3.1）；
+  ④ 未编译 `local-rerank` 却传精排参数 ⇒ `bail!` + 重编提示。
+  🔑 **顺序的理由**：CI 的 smoke 走默认构建（未编译 feature）⇒ 只有把参数面守卫放前面，
+  「互斥」这类断言**才能被 CI 覆盖**（守卫前移到模型之前的直接收益，同半向量守卫的先例）。
+- **`scripts/eval_rerank.sh`**：S7-T11 **前置自证**（同一张冻结图连续 N 次 ⇒ 所有 mode 的三项指标
+  **与 per-query 明细逐位一致**；不为 0 即**退出并宣告数据作废**）+ 控制组 A（NoOp）/ B（`R=k`）+
+  档位**交错**扫描 + max_length 对照档（R48）+ 延迟轴 + `--cross-graph`（可选）+ 汇总 `summary.md`。
+  `--dry-run` 只打印将执行的命令（跑之前先看清要跑什么）。
+- **CI**：features job 补 `cargo test -p helix --features local-rerank`（CLI 侧接线同样只在
+  该 feature 下才编得出来 ⇒ 否则 feature 透传会悄悄腐化）；smoke job 补
+  **「精排参数守卫必须拒绝」**（四条断言，**不下载模型**）。
+  ⚠️ 该 step 本地按原样复现时**抓到过一个真 bug**：`grep -qF "$want"` 在期望串以 `-` 开头
+  （`--rerank-window`）时被当成选项 ⇒ 已改 `grep -qF -e "$want"`。
+
+#### 变更（含 **1 处新增公开方法** 与 **3 处用户可见面变化**）
+
+- **`QueryExecutor::with_reranker_arc(Arc<dyn Reranker>)`（⚠️ 新增公开方法，纯加法）**：
+  `with_reranker` 只收 `Box`，而 `bench` 要**每 mode × 每 run** 装配一次 searcher（4 个入口）
+  ⇒ 复用同一个 ≈2.19GB 实例只能自己写转发包装（`Reranker` 将来加方法会**静默漏转发**，
+  `candidate_window` 漏了就是窗口静默失效）。字段 `reranker: Box<dyn Reranker>` → `Arc<dyn Reranker>`
+  （**私有字段**，不动公开面）；`with_reranker(Box)` 的**签名与语义一字未改** ⇒ 既有调用方零改动。
+  ⚠️ 这处**不在设计 §4.5 / §6 的影响面表里**，属实现期新发现。
+- **用户可见面变化**（非设计原文）：`bench` 输出新增一行 `精排: …`（含身份串）；
+  `search --metrics` 追加 `| 精排=N条/X.XXXms`（出口 S7-02 已加的 `Metrics.rerank_window` /
+  `rerank_elapsed`，此前**没有任何 CLI 出口**）；`search --explain` 追加 `| rerank=<原始 logit>`（D-S7-05）。
+- **设计 §4.5 回写**：补 `--rerank-max-length` 的定义（原先只在**附录 B 第 5 步**的命令里出现、
+  §4.5 未定义）+ 把「两条脚枪」扩为「四条守卫」并写明**顺序是硬要求** + 记「实现期口径」。
+- **⚠️ 行号引用同步（本 PR 自造的漂移，已实测处理）**：改了 `bench.rs` ⇒ 设计文档里 10 处
+  `bench.rs` 行号引用按实测更新（`697→757`、`380-390→436-446`、`655-668→711-724`、`661-663→717-719`、
+  `160-162→178-180`、`1530→1597`）。**定义面**上那处（`architecture-design.md:1628` 的 R48 行）
+  属**不能在本 PR 改** ⇒ 记入 **S7-05** 回写清单第 5 项（并建议顺手改成**符号指代**，
+  从根上消掉「一改 CLI 就全体漂移」）。`v2-step5/step2-design.md` 与 CHANGELOG 历史条目里的
+  `bench.rs` 行号**在本 PR 之前就已漂移** ⇒ 按「历史记录不改写」**不动**。
+
+#### 与设计原文的偏差（3 条，报评审）
+
+1. **`--rerank-max-length` 的从属语义**：设计未定义它，本 PR 定为「**必须与 `--rerank-window`
+   同时给**」（而非「给了就自动开精排」）—— 避免「传了 max_length 却没开精排」这种静默无效配置。
+2. **`0` 一律拒绝**（窗口与截断长度）：设计只说「不传 = 关闭」，未规定 `0` ⇒ 本 PR 明确拒绝。
+3. **`RerankerHandle`**：`Reranker` trait 没有 `id()`（只在 `LocalReranker` 上）⇒ 身份串在 CLI 侧于
+   **构造时**取出（装箱成 `dyn` 之后取不到）。未把它提升为 trait 方法（那会破坏下游实现）。
+
+#### 变异验证（新断言必须有牙齿，**按实测填写**）
+
+| 变异 | 手法 | 实测命中 |
+| --- | --- | --- |
+| **M1** | 放行 `--rerank-window 0`（守卫条件恒假） | ✅ `窗口与截断长度为零都被拒绝` FAILED |
+| **M2** | `--runs > 1` 与精排**不**互斥（守卫恒假） | ✅ `runs大于1与精排互斥` FAILED |
+| **M3** | `--rerank-max-length` 单独给时**静默忽略**（退回 Off 而非报错） | ✅ `max_length单独给被拒绝且点明依赖` FAILED |
+| **M4** | `check_rerank_runs` 不看 spec（⇒ 关精排时 `--runs > 1` 也被误拒） | ✅ `runs大于1与精排互斥` FAILED（同一用例的**另一半**断言：`runs=1`/关精排必须放行） |
+
+⚠️ 第一次跑时 **M1 的还原脚本用「删除整块」+ 空串锚点** ⇒ `s.count("")` 返回字符串长度、
+assert 必炸、**文件没还原**，导致 M2~M4 跑在污染基线上（读数不可用）。改用「条件恒假」的
+**可逆**注入后重跑 ⇒ 四次实测 + 每次逐字节还原核对全部通过。
+
+#### 覆盖边界（如实登记）
+
+- **真实模型未经 CLI 跑过**：本 PR 只把接线做通；`--rerank-window` 的真机端到端（含
+  `scripts/eval_rerank.sh` 的实跑）属 **S7-04** 的协议 ⇒ **本地未跑**，不得读成「已覆盖」。
+- `scripts/eval_rerank.sh` 的**静态检查**在 CI（`make shell`）里过；**脚本本体未实跑**
+  （需 ≈2.19GB 模型 + T2Ranking 语料）⇒ 已用 `--dry-run` 自证参数拼装、用**合成数据**实跑了两段
+  内联 Python（冻结自证判据 / 汇总表生成），但「真数据下的读数」仍未验证。
+
 ### 修复 · V2 Step 7 PR 2 评审响应（第二方独立评审：**无阻塞项** + 3×P3，**全部收口**）（Refs #23，2026-09-15）
 
 > 评审落点：`pulls/53/reviews` **1 条 `COMMENTED`（1878 字，`2026-09-14T13:33:04Z`）+ 行内 3 条**；
