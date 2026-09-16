@@ -23,6 +23,18 @@
 #   ./scripts/eval_rerank.sh --index X --cross-graph               # 另测跨图抖动（关精排 --runs 3）
 #   ./scripts/eval_rerank.sh --index X --skip-freeze               # 跳过 S7-T11（已自证过时）
 #   ./scripts/eval_rerank.sh --index X --lat-queries 30            # 延迟轴子集大小（默认 50；0 = 全量）
+#   ./scripts/eval_rerank.sh --index X --query-sample 60           # **分层抽样**评测子集（确定性，见下）
+#   ./scripts/eval_rerank.sh --index X --modes hybrid              # 只跑单路（省 2/3；单路对照用）
+#   ./scripts/eval_rerank.sh --index X --skip-quality-axis         # 只跑延迟轴（分段续跑用）
+#   ./scripts/eval_rerank.sh --index X --no-latency-axis           # 只跑质量轴（分段续跑用）
+#
+# ⚠️ **协议缩减（S7-04 实测后）**：设计 §4.6.1 的「全量 320 query × 5 档 × 2 轮 + 延迟轴
+#   50 query×reps 20」在本机复算 ≈260 小时（实测每文档 ≈0.45s、与 R 近似线性）⇒ 不可行。
+#   实际采用的缩减：`--query-sample 60`（**分层**：每个 type 均匀取，交错排列，
+#   保证子集内的 type 分布与全量同构）+ `R ∈ {10,20,50}` + `--rounds 1` +
+#   延迟轴 `--lat-queries 10`。
+#   🔑 **缩减不破坏 Δ 的可比性**：控制组 A 与所有档位都用**同一子集**、同一 `--runs 1`
+#   ⇒ 子集内的 Δ 仍是同口径；但**与 P5 的历史全量数字不可直接横比**（口径不同，见报告）。
 #
 # 产物（默认 /tmp/helix-rerank/）：
 #   freeze-<i>.json     冻结自证的第 i 次
@@ -31,6 +43,8 @@
 #   ml<M>.json          max_length 对照
 #   lat-r<R>.json       延迟轴
 #   summary.md          汇总表（R × 指标 × Δ vs A）
+#   latency.md          延迟轴汇总（端到端 took 与 rerank_elapsed **分列**；NFR-12 判据）
+#   queries-sample.jsonl 分层抽样的实得子集（`--query-sample N`；确定性 ⇒ 可复现）
 #
 # ⚠️ **全部为本地 release 实测，不进 CI**：需要 2.19GB 模型 + T2Ranking 语料，
 #    且延迟数字在共享 runner 上不具可引用性（本仓库既有纪律）。
@@ -58,8 +72,14 @@ WARMUP="${WARMUP:-3}"
 ML_WINDOW="${ML_WINDOW:-20}"
 # 延迟轴子集大小（**确定性**：取前 N 条 ⇒ 可复现）。0 = 全量（⚠️ 精排档可能小时级/档位）。
 LAT_QUERIES="${LAT_QUERIES:-50}"
+# **分层抽样**的评测子集大小（0 = 不抽样，用全量）。抽样是**确定性**的：
+# 每个 `type` 均匀取 N/n_types 条，再按 type **交错排列** ⇒ ① 可复现；② `head -N`
+# 取到的延迟轴子集也覆盖各 type（否则延迟轴会全落在同一个类型上）。
+QUERY_SAMPLE="${QUERY_SAMPLE:-0}"
 BUILD=0
 DRY=0
+SKIP_QUALITY=0
+NO_LAT_AXIS=0
 SKIP_FREEZE=0
 FREEZE_ONLY=0
 CROSS_GRAPH=0
@@ -73,6 +93,10 @@ while [[ $# -gt 0 ]]; do
         --rs) RS="$2"; shift 2 ;;
         --maxlens) MAXLENS="$2"; shift 2 ;;
         --lat-queries) LAT_QUERIES="$2"; shift 2 ;;
+        --modes) MODES="$2"; shift 2 ;;
+        --query-sample) QUERY_SAMPLE="$2"; shift 2 ;;
+        --skip-quality-axis) SKIP_QUALITY=1; shift ;;
+        --no-latency-axis) NO_LAT_AXIS=1; shift ;;
         --rounds) ROUNDS="$2"; shift 2 ;;
         --out) OUT_DIR="$2"; shift 2 ;;
         --reps) REPS="$2"; shift 2 ;;
@@ -129,6 +153,81 @@ if [[ -z "$INDEX" ]]; then
 fi
 
 run mkdir -p "$OUT_DIR"
+
+# ---------------------------------------------------------------------------
+# 0. 分层抽样（可选）：把评测集缩到**本机跑得完**的规模，同时保持 type 分布同构
+# ---------------------------------------------------------------------------
+# ⚠️ 抽样必须**确定性**（否则报告的数字不可复现，T5-08 数据诚信）：每个 `type` 均匀取
+# `N/n_types` 条（按原顺序等步长），再按 type **交错排列** ⇒ ① 同一命令必得同一子集；
+# ② `head -N` 取到的延迟轴子集也覆盖各 type。
+if [[ "$QUERY_SAMPLE" != "0" ]]; then
+    QS="${OUT_DIR}/queries-sample.jsonl"
+    echo "==> 分层抽样 ${QUERY_SAMPLE} 条 ⇒ ${QS}"
+    if [[ $DRY -eq 1 ]]; then
+        printf '  + [分层抽样 %s 条 ⇒ %q]\n' "$QUERY_SAMPLE" "$QS"
+    else
+        python3 - "$QUERIES" "$QS" "$QUERY_SAMPLE" <<'PYEOF'
+import collections
+import json
+import pathlib
+import sys
+
+src_p, out_p, n_total = sys.argv[1], sys.argv[2], int(sys.argv[3])
+qs_all = [
+    json.loads(l)
+    for l in pathlib.Path(src_p).read_text(encoding="utf-8").splitlines()
+    if l.strip()
+]
+by_type = collections.OrderedDict()
+for q in qs_all:
+    by_type.setdefault(q.get("type", "?"), []).append(q)
+n_types = len(by_type)
+per = max(1, n_total // n_types)
+
+# ⚠️ **两条前置守卫（fail-closed）**：本参数是**通用**入口（`--query-sample`），而
+#    「静默重复取同一 query」是最坏的一类失败 —— 子集**条数看着对**、指标却按重复样本算，
+#    下游**完全看不出来**（连下面那条「请求 N / 实得 M」的告警都**永不触发**，因为
+#    `out` 恒等 `per × n_types`）。2026-09-16 评审 P4-1 指出，已按合成样本复现
+#    （4 type = 80/80/80/2、请求 60 ⇒ 实得 60 条里**只有 47 条不同**，`paraphrase-0` 占 8 次）。
+if n_total > len(qs_all):
+    sys.exit(
+        f"✗ --query-sample {n_total} 超过 {src_p} 的可用条数 {len(qs_all)}"
+        "。请调小，或检查 --queries 指向的文件"
+    )
+short = {t: len(qs) for t, qs in by_type.items() if len(qs) < per}
+if short:
+    sys.exit(
+        f"✗ 分层抽样要求每个 type 至少 {per} 条"
+        f"（共 {n_types} 个 type、请求 {n_total} ⇒ per = n_total // n_types），"
+        f"但以下 type 不足：{short}。请调小 --query-sample（或去掉该 type）—— "
+        "否则等步长 `len(qs) / per < 1` 会让 `int(i * step)` 反复命中同一行，"
+        "产出**条数正确但内容重复**的子集"
+    )
+
+lanes = []
+for _t, qs in by_type.items():
+    step = len(qs) / per
+    lanes.append([qs[int(i * step)] for i in range(per)])
+# 交错：第 i 轮取各 type 的第 i 条 ⇒ head 子集覆盖各 type
+out = [lanes[i % n_types][i // n_types] for i in range(per * n_types)]
+# 🔑 **后置自证**（守卫 2 的兜底）：**条数相等 ≠ 没有重复**。万一将来有人改坏上面的守卫，
+#    这一行仍会拦下「条数对、内容重复」的子集 —— 宁可不出子集，也不要出一个骗人的子集。
+uniq = len({json.dumps(q, sort_keys=True, ensure_ascii=False) for q in out})
+if uniq != len(out):
+    sys.exit(f"✗ 抽样器自证失败：{len(out)} 条里只有 {uniq} 条不同（请勿使用该子集）")
+pathlib.Path(out_p).write_text(
+    "\n".join(json.dumps(q, ensure_ascii=False) for q in out) + "\n", encoding="utf-8"
+)
+print(
+    f"✓ 分层抽样：{len(qs_all)} → {len(out)} 条"
+    f"（{n_types} 个 type 各 {per} 条，交错排列；**去重后 {uniq} 条**）"
+)
+if len(out) != n_total:
+    print(f"  ⚠️ 请求 {n_total} 条、实得 {len(out)} 条（{n_total} 不能被 {n_types} 整除）")
+PYEOF
+    fi
+    QUERIES="$QS"
+fi
 
 # ---------------------------------------------------------------------------
 # 1. S7-T11 前置自证：冻结图连续 N 次加载必须逐位一致
@@ -197,6 +296,11 @@ fi
 # ---------------------------------------------------------------------------
 # 2. 控制组 A（精排关 = NoOp）：效果基线的唯一参照
 # ---------------------------------------------------------------------------
+if [[ $SKIP_QUALITY -eq 1 ]]; then
+    echo "==> --skip-quality-axis：跳过控制组 A / 档位扫描 / max_length 对照"
+fi
+
+if [[ $SKIP_QUALITY -eq 0 ]]; then
 echo "==> 控制组 A：精排关（NoOp）"
 run "$BIN" bench --index "$INDEX" --queries "$QUERIES" --k "$K" --runs 1 \
     --modes "$MODES" --no-latency --json "${OUT_DIR}/A-noop.json"
@@ -231,6 +335,8 @@ for M in $MAXLENS; do
         --json "${OUT_DIR}/ml${M}.json"
 done
 
+fi  # ← SKIP_QUALITY（质量轴段）
+
 # ---------------------------------------------------------------------------
 # 5. 延迟轴（**固定子集** × reps）
 # ---------------------------------------------------------------------------
@@ -250,6 +356,11 @@ else
         head -n "$LAT_QUERIES" "$QUERIES" > "$LAT_Q"
     fi
 fi
+if [[ $NO_LAT_AXIS -eq 1 ]]; then
+    echo "==> --no-latency-axis：跳过延迟轴（质量轴与它可分段续跑）"
+fi
+
+if [[ $NO_LAT_AXIS -eq 0 ]]; then
 echo "==> 延迟轴（子集 = ${LAT_QUERIES} 条 / 0 表示全量；warmup ${WARMUP} + ${REPS} reps）"
 run "$BIN" bench --index "$INDEX" --queries "$LAT_Q" --k "$K" --runs 1 \
     --modes "$MODES" --reps "$REPS" --warmup "$WARMUP" --json "${OUT_DIR}/lat-A-noop.json"
@@ -269,10 +380,12 @@ if [[ $CROSS_GRAPH -eq 1 ]]; then
         --modes "$MODES" --no-latency --json "${OUT_DIR}/cross-graph.json"
 fi
 
+fi  # ← NO_LAT_AXIS（延迟轴段）
+
 # ---------------------------------------------------------------------------
-# 7. 汇总表
+# 7. 汇总表（质量轴；⚠️ 只在跑了质量轴时输出 —— 否则会因缺 A-noop.json 而中止）
 # ---------------------------------------------------------------------------
-if [[ $DRY -eq 0 ]]; then
+if [[ $SKIP_QUALITY -eq 0 && $DRY -eq 0 ]]; then
     echo "==> 汇总 ⇒ ${OUT_DIR}/summary.md"
     python3 - "$OUT_DIR" <<'PY'
 import json
@@ -376,6 +489,76 @@ print(f"✓ 已写 {out / 'summary.md'}（{len(rows) - 1} 个档位）")
 PY
 fi
 
+# ---------------------------------------------------------------------------
+# 8. 延迟轴汇总（NFR-12 的判据 —— **必须与质量轴分开看**）
+# ---------------------------------------------------------------------------
+# ⚠️ 与第 7 段分成两个产物是刻意的：两者可以**分段续跑**（`--skip-quality-axis` /
+# `--no-latency-axis`），且「效果提升」与「延迟代价」是两个独立结论（设计 §4.6.3）。
+if [[ $NO_LAT_AXIS -eq 0 && $DRY -eq 0 ]]; then
+    echo "==> 延迟轴汇总 ⇒ ${OUT_DIR}/latency.md"
+    python3 - "$OUT_DIR" <<'PYEOF'
+import json
+import pathlib
+import sys
+
+out = pathlib.Path(sys.argv[1])
+docs = []
+p0 = out / "lat-A-noop.json"
+if p0.exists():
+    docs.append(("NoOp（关）", json.loads(p0.read_text(encoding="utf-8"))))
+# 文件名 `lat-r<R>.json`；按 R 数值排序（不是字典序，否则 r100 < r20）
+for f in sorted(
+    out.glob("lat-r*.json"), key=lambda x: int(x.stem[5:]) if x.stem[5:].isdigit() else 0
+):
+    docs.append((f"R={f.stem[5:]}", json.loads(f.read_text(encoding="utf-8"))))
+if not docs:
+    sys.exit("✗ 没有任何 lat-*.json ⇒ 延迟轴没跑成")
+
+
+def fmt(x, nd=1):
+    return "-" if x is None else f"{x:.{nd}f}"
+
+
+lines = [
+    "# V2 Step 7 延迟轴（NFR-12 的原始读数；结论由 S7-05 回填）",
+    "",
+    "⚠️ **分列是刻意的**（设计 §4.6.3）：端到端 `took` 含召回 / 融合 / 回捞 / 组装，",
+    "**只有 `rerank_elapsed` 才是 NFR-12 的口径** —— 只看前者无法把精排成本与外层成本分开。",
+    "",
+    "| 档位 | mode | 端到端 P50 | 端到端 P99 | 精排 P50 | 精排 P99 | 精排样本 n | 平均交接条数 |",
+    "| --- | --- | --- | --- | --- | --- | --- | --- |",
+]
+for label, d in docs:
+    for mode in sorted(d.get("latency", {})):
+        v = d["latency"][mode]
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    label,
+                    mode,
+                    fmt(v.get("p50_ms")),
+                    fmt(v.get("p99_ms")),
+                    fmt(v.get("rerank_p50_ms")),
+                    fmt(v.get("rerank_p99_ms")),
+                    str(v.get("rerank_n", 0)),
+                    fmt(v.get("mean_rerank_window")),
+                ]
+            )
+            + " |"
+        )
+lines += [
+    "",
+    "⚠️ **`精排样本 n` 是 `rerank_elapsed` 分位数的分母**（早退 / 未开精排的响应不计入）",
+    "⇒ 它与 `n_samples` 不等是**正常**的；为 0 说明该档位根本没跑精排（如控制组 A）。",
+    "⚠️ **样本 < 100 时 P99 只是装饰**（perf-ab-calibration 规则 3）⇒ 提升 `--reps` 才有判别力。",
+    "⚠️ **跨档位不可横比 `score`**（R47），但**延迟可以横比**（同一台机、同一张冻结图）。",
+]
+(out / "latency.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+print(f"✓ 已写 {out / 'latency.md'}（{len(docs)} 个档位）")
+PYEOF
+fi
+
 echo
-echo "==> 完成。产物在 ${OUT_DIR}（summary.md 为汇总）"
+echo "==> 完成。产物在 ${OUT_DIR}（summary.md / latency.md 为汇总）"
 echo "    ⚠️ 结论（默认 R / NFR-12）由 S7-05 回填进 docs/devel/eval-report.md §8.14"
