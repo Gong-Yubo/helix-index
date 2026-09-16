@@ -831,11 +831,14 @@ cargo build --release -p helix --features local-rerank     # ⚠️ local-rerank
     --output data/t2-frozen.snapshot        # 12,000 chunk / 52.3 MB（+ 图 sidecar 31.7 MB）
 
 # ② 主批：S7-T11 自证（FREEZE_N=3）→ 控制组 A → 档位扫描 → 延迟轴 → 汇总
+#    ⚠️ 必须显式给 `--maxlens ""`：脚本默认 `MAXLENS="512 1024"`（`eval_rerank.sh:64`）⇒
+#    不写这一项会把 ml512 / ml1024 **也在主批跑掉**（wall ×2），且 ml1024 与主批**同批**后
+#    §8.14.7 的「跨批次自证」前提**随之消失**。故主批的档位扫描走**库默认** max_length = 512
+#    （身份串自证：…;max_len=512;window=10|20|50）。
 FREEZE_N=3 REPS=3 WARMUP=1 ./scripts/eval_rerank.sh \
     --index data/t2-frozen.snapshot --query-sample 60 \
-    --rs "10 20 50" --rounds 1 --lat-queries 10 \
-    --out /tmp/s7-04                    # 档位扫描用**库默认** max_length = 512
-                                        #（身份串自证：…;max_len=512;window=10|20|50）
+    --rs "10 20 50" --rounds 1 --lat-queries 10 --maxlens "" \
+    --out /tmp/s7-04
 
 # ③ 段 4：`max_length = 1024` 对照（R48）—— 单路 hybrid、只跑质量轴、与主批**同子集**
 ./scripts/eval_rerank.sh \
@@ -856,13 +859,17 @@ FREEZE_N=3 REPS=3 WARMUP=1 ./scripts/eval_rerank.sh \
 | 项 | 值 |
 | --- | --- |
 | 机器 | Apple M5 / **10 核** / 32 GB / **AC 插电**（`pmset -g batt`） |
-| 构建 | release / `--features local-rerank` / helix 0.1.0 / 基线 `9a957dd`（PR #55 之后） |
+| 构建 | release / `--features local-rerank` / helix 0.1.0。**二进制出处**：`9a957dd` + **本 PR 代码轮**的工作树构建（⚠️ `9a957dd` 自己**没有**精排延迟出口 —— E9 正是本 PR 修的 ⇒ 能产出「精排 P50/P99」列的那份二进制**必然**含本 PR 代码、不含文档改动）。**md5 `facc520c1ee7a94c47d2bdf70c23a4e9`**（`target/release/helix`，mtime **`2026-09-15 23:01:42`**）⇒ 首个产物 `23:02:07`、末个 `03:01:44` **都在其之后、期间未重建** ⇒ §8.14 那句「**同一份二进制跑完全部档位**」由此**可复核**（不再只是声明）。⚠️ 它与最终提交的差异 = 事后为过 clippy 做的 `LatencySpec` 纯重构 + 把两条判据提成纯函数 —— **均无行为变更** |
 | 冻结图 | `data/t2-frozen.snapshot`：**12,000 文档 = 12,000 chunk**（`--single-chunk`），52.3 MB + 图 sidecar 31.7 MB |
 | 评测集 | `data/t2-queries.jsonl` 的**分层 60 子集**（4 个 `type` 各 15 条，**交错排列**） |
 | 精排 | `bge-reranker-v2-m3@rozgo`；FP32 / CPU EP / `batch_size = 256`（fastembed 默认） |
 | ⚠️ 其他负载 | 测量期间机器上另有 **~370% CPU** 的无关进程 ⇒ 见 §8.14.9 局限 |
 
 ⚠️ **冻结图不入库**（`.gitignore:45` 的 `/data/*.snapshot`）⇒ 复现靠 §8.14.1 的 `build` 命令。
+⚠️ **二进制 md5 的可复核范围**（如实登记）：`target/` **不入库** ⇒ 上面那个 md5 只指认**本机遗留的那份产物**。
+它解决的是「**同一份二进制跑完全部档位**」这条**内部自洽**的复核（mtime + 产物时间窗），
+**不能**用来在别的机器上重建同一字节 —— 要长期留证得把「构建它的源码状态」也固定下来
+（本 PR 的源码状态 = `9a957dd` + 代码轮，**不含**事后的 `LatencySpec` 重构）。
 ⚠️ **成本基线**（用于协议缩减的外推，**不是结论**；两个口径互相印证）：
 - **单文档精排 ≈ 0.43~0.48 s** —— 主延迟轴的 `R=10` 档 hybrid 精排 P50 = **4565 ms / 10 条** ⇒ **457 ms/条**；
   早期 5-query 探针（`/tmp/v-lat.json`，同 `R=10`）4785 ms / 10 条 ⇒ **479 ms/条**。

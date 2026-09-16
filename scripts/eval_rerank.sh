@@ -183,18 +183,44 @@ for q in qs_all:
     by_type.setdefault(q.get("type", "?"), []).append(q)
 n_types = len(by_type)
 per = max(1, n_total // n_types)
+
+# ⚠️ **两条前置守卫（fail-closed）**：本参数是**通用**入口（`--query-sample`），而
+#    「静默重复取同一 query」是最坏的一类失败 —— 子集**条数看着对**、指标却按重复样本算，
+#    下游**完全看不出来**（连下面那条「请求 N / 实得 M」的告警都**永不触发**，因为
+#    `out` 恒等 `per × n_types`）。2026-09-16 评审 P4-1 指出，已按合成样本复现
+#    （4 type = 80/80/80/2、请求 60 ⇒ 实得 60 条里**只有 47 条不同**，`paraphrase-0` 占 8 次）。
+if n_total > len(qs_all):
+    sys.exit(
+        f"✗ --query-sample {n_total} 超过 {src_p} 的可用条数 {len(qs_all)}"
+        "。请调小，或检查 --queries 指向的文件"
+    )
+short = {t: len(qs) for t, qs in by_type.items() if len(qs) < per}
+if short:
+    sys.exit(
+        f"✗ 分层抽样要求每个 type 至少 {per} 条"
+        f"（共 {n_types} 个 type、请求 {n_total} ⇒ per = n_total // n_types），"
+        f"但以下 type 不足：{short}。请调小 --query-sample（或去掉该 type）—— "
+        "否则等步长 `len(qs) / per < 1` 会让 `int(i * step)` 反复命中同一行，"
+        "产出**条数正确但内容重复**的子集"
+    )
+
 lanes = []
 for _t, qs in by_type.items():
     step = len(qs) / per
     lanes.append([qs[int(i * step)] for i in range(per)])
 # 交错：第 i 轮取各 type 的第 i 条 ⇒ head 子集覆盖各 type
 out = [lanes[i % n_types][i // n_types] for i in range(per * n_types)]
+# 🔑 **后置自证**（守卫 2 的兜底）：**条数相等 ≠ 没有重复**。万一将来有人改坏上面的守卫，
+#    这一行仍会拦下「条数对、内容重复」的子集 —— 宁可不出子集，也不要出一个骗人的子集。
+uniq = len({json.dumps(q, sort_keys=True, ensure_ascii=False) for q in out})
+if uniq != len(out):
+    sys.exit(f"✗ 抽样器自证失败：{len(out)} 条里只有 {uniq} 条不同（请勿使用该子集）")
 pathlib.Path(out_p).write_text(
     "\n".join(json.dumps(q, ensure_ascii=False) for q in out) + "\n", encoding="utf-8"
 )
 print(
     f"✓ 分层抽样：{len(qs_all)} → {len(out)} 条"
-    f"（{n_types} 个 type 各 {per} 条，交错排列）"
+    f"（{n_types} 个 type 各 {per} 条，交错排列；**去重后 {uniq} 条**）"
 )
 if len(out) != n_total:
     print(f"  ⚠️ 请求 {n_total} 条、实得 {len(out)} 条（{n_total} 不能被 {n_types} 整除）")
