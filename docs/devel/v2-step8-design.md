@@ -2,12 +2,12 @@
 
 | 项 | 内容 |
 | --- | --- |
-| 版本 | **v0.1（2026-09-16，首版，待评审）** |
+| 版本 | **v0.2（2026-09-17，第 1 轮评审响应）** —— v0.1（2026-09-16，首版）→ 本轮按评审 **5×P3 + 7×P4**（**无阻塞**）逐条处置：**12 条意见全部采纳**；其中 **P3-1（跨段墓碑在合并时的处置）/ P3-4（双写端 `commit()` 的原子性）** 是本轮**最实质的两条**（补写 §4.4.3 / §4.7.3 / §4.9.2 / §4.9.5 的取形与用例）；**P3-5（`Box::leak` 累积）** 结论采纳、**量级前提经独立复算后更正**（不是「按图规模增长」，实测 ≈ **200B + 路径串 / 每次合并**）；**P4-1（「100+ 处调用点」）** 经独立复算改为 **41 处**。⚠️ **本轮不改任何决策取值（D-S8-01 ~ 12）与风险编号**；逐条处置见 **§10**。 |
 | 日期 | 2026-09-16 |
-| 状态 | **待评审**。本文回答 `plan-v2.md` §4.0 的 **H4 / H5 / H6** 三条开工前置，并把 §4 Step 8 的四个任务（**T7-25 / T7-06 / T7-26 / T7-18**）落成 `D-S8-01~12` 决策、`S8-01~09` 任务与 `S8-T1~T16` 测试计划。**风险编号 R49~R54 由本文起分配**（架构 §14 导读钦定：「V2.1 从 R49 起」）。⚠️ **本文纯设计 —— 不落任何生产代码**。 |
+| 状态 | **第 1 轮评审已响应（v0.2，2026-09-17）**：评审 **5×P3 + 7×P4、无阻塞**；**4 条需拍板 + 需求面 1 条全部获同意**（其中 3 条附前置：**P4-7① → D-S8-01** / **P3-4 → D-S8-06** / **P3-5 → D-S8-09**）；**12 条意见全部采纳**（含 1 条结论采纳、量级前提更正）。逐条处置见 **§10**。**待评审**。本文回答 `plan-v2.md` §4.0 的 **H4 / H5 / H6** 三条开工前置，并把 §4 Step 8 的四个任务（**T7-25 / T7-06 / T7-26 / T7-18**）落成 `D-S8-01~12` 决策、`S8-01~09` 任务与 `S8-T1~T16` 测试计划。**风险编号 R49~R54 由本文起分配**（架构 §14 导读钦定：「V2.1 从 R49 起」）。⚠️ **本文纯设计 —— 不落任何生产代码**。 |
 | 上游 | `plan-v2.md` **v0.19** §4 Step 8 / §4.0 H4~H6 / §6「V2.1 门槛」/ §附-4；issue **#58**（Step 8 跟踪 issue）；`requirements-spec.md` **v1.19**（**FR-17** §5.3.5 / **NFR-14** 草案 / **NFR-11** / **NFR-10** ③）；`architecture-design.md` **v1.18**（**§14.3 R34** / **§14.4 R43** / **ADR-A**）；`v2-step5-design.md` **v0.5** §3.1 / §4.2.2（逐层遍历的正确写法与「每点恰一次」的证明） |
 | 范围 | ① **T7-25** R34 修法（精确扫描改逐层 `get_layer_iterator`，**硬前置**）；② **T7-06** delta 分段（FR-17 完整版：**读不阻塞写**）；③ **T7-26** 查询侧会话池（解 **R43** / NFR-10 ③）+ 挂起的 **Q3**；④ **T7-18** 旧 API `#[deprecated]`（**先评估、后按结论执行**）。交付形态 = `SearchIndex::searcher(&self)` + 不可变 `View` + 后台合并**原语**。 |
-| 非范围 | **不引入库内后台线程**（库不 `spawn`，合并原语由宿主 / CLI 调用，见 D-S8-08）；**不做「读能看到未 commit 的写」**（H5 ③ 明确不做）；**不做多进程 / 分布式并发写同一快照**（C5 既有边界不变）；**不做多段快照格式**（`save` 前先合并 ⇒ `FORMAT_VERSION` 保持 **2**，**不开 ADR-B**，见 D-S8-09）；**不做 prefilter / 排序键索引**（Step 10 / T7-27）；**不做自适应融合与评测集换代**（Step 9 / H7）；**不改 `bm25` 打分公式与 P5 定稿的 `k1=1.5 / b=0.75`**；**不改向量距离口径与 `Hit.score` 语义**；**不给建库路径设内存上限**（R41 保持开放）；**不做跨平台图搬运**（R21 不变）；**不做精排器池化**（架构 §14.5 R45 ⑤ 已明确不做，本 Step 不动） |
+| 非范围 | **不引入库内后台线程**（库不 `spawn`，合并原语由宿主 / CLI 调用，见 D-S8-08）；**不做「读能看到未 commit 的写」**（H5 ③ 明确不做）；**不做多进程 / 分布式并发写同一快照**（C5 既有边界不变）；**不做多段快照格式**（`save` 前先合并 ⇒ `FORMAT_VERSION` 保持 **2**，**不开 ADR-B**，见 **D-S8-01** —— ⚠️ **2026-09-17 按评审 P4-5 更正**：原写 D-S8-09，那是「向量侧合并取形」，H4 持久化形态才是 D-S8-01）；**不做 prefilter / 排序键索引**（Step 10 / T7-27）；**不做自适应融合与评测集换代**（Step 9 / H7）；**不改 `bm25` 打分公式与 P5 定稿的 `k1=1.5 / b=0.75`**；**不改向量距离口径与 `Hit.score` 语义**；**不给建库路径设内存上限**（R41 保持开放）；**不做跨平台图搬运**（R21 不变）；**不做精排器池化**（架构 §14.5 R45 ⑤ 已明确不做，本 Step 不动） |
 | 交付物 | ① `crates/core/src/vector/hnsw_rs_index.rs` 精确扫描改**逐层遍历**（T7-25）② **新增** `crates/core/src/search/view.rs`（`Segment` / `View` / `Shared` / 跨段谓词）③ `Index::merge_from` + 跨段 `content_hash` 查重（`index/mod.rs`）④ 跨段 BM25 / 向量 / 谓词（`retriever/bm25.rs`、`retriever/vector.rs`、`query/filter.rs`、`query/searcher.rs`）⑤ `SearchIndex::searcher(&self)` + `into_searcher()` / `into_index()` 转 `#[deprecated]` 薄封装 ⑥ 合并原语 `SearchIndex::merge_pending()` / `merge_all()` ⑦ **查询侧会话池**（`embed/local.rs` + `Config::embed_sessions`，默认 1 ⇒ 零行为变化）⑧ 脚本 `scripts/eval_rw_concurrency.sh` + `eval-report.md` **§8.15** ⑨ 四处定义面回写 + CHANGELOG |
 
 ---
@@ -122,7 +122,7 @@
 | `IterPoint::next`（层切换分支） | `hnsw.rs:656-677`，其中 `:661` | **再取一次** `self.point_indexation.points_by_layer.read()` ⇒ **递归读同一把 `RwLock`**（`:660` 取的是**另一把** `entry_point` 锁，不构成递归） |
 | `IterPointLayer::new` | `hnsw.rs:701` | 取**一次** `points_by_layer.read()` |
 | `IterPointLayer::next` | `hnsw.rs:715-723` | **只索引** `pi_guard[self.layer]`，**不再取锁** ⇒ **无递归** |
-| `generate_new_point` | `hnsw.rs:498-526`，push 在 `:511` | `p_id.0 = level`（`:500`）⇒ 每个点**只被推入它自己那一层**，**无回填低层** ⇒ **每点恰在一层** |
+| `generate_new_point` | `hnsw.rs:498-526`，push 在 `:511` | `let mut p_id = PointId(level as u8, -1)`（**`:505`**；`level` 来自 **`:500`** 的 `layer_g.generate()` —— ⚠️ **2026-09-17 按评审 P4-2 更正**：原写「`p_id.0 = level`（`:500`）」，`:500` 实为随机抽层那一行）⇒ 每个点**只被推入它自己那一层**，**无回填低层** ⇒ **每点恰在一层** |
 | `get_max_level_observed` | `PointIndexation`：`hnsw.rs:469-475`；`Hnsw`：`:814` | 返回 `entry_point.p_id.0`；`check_entry_point`（`:529-552`）保证 entry point 是**最大层**的点 ⇒ 它 = 全局最大层 |
 
 **修法**（本仓，`HnswRsIndex::search_exact_filtered`）：
@@ -389,6 +389,12 @@ struct IdAllocator { next_doc: DocId, next_chunk: ChunkId }
 ```
 
 - **写端串行**（`SearchIndex` 是 `!Sync`；且 `into_index()` 造出的新写端也遵守同一约定）⇒ 短期持锁、无争用；
+- 🔴 **`commit()` 的「seal + publish」必须与发号同处一个临界区**（**2026-09-17 按评审 P3-4 补**）：
+  D-S8-06 保留 `into_index()` ⇒ 同一 `Arc<Shared>` 上**可以同时存在两个写端句柄**（各自独占线程、各自持 `builder`）。
+  若「算 `base_*`（= 前序所有段长度之和）」与「把新段追加进 `View.deltas`」**不在同一临界区内**，两个写端会算出**相同 base**
+  ⇒ **段 ID 空间重叠 ⇒ 直接破坏 I8-7**。⇒ 取形 = **`commit()` 的「flush → 算 base → 构造段 → 追加 `deltas` → 发布 `View`」全程持 `Shared::ids` 锁**
+  （该锁同时保护「ID 发号」与「段基址计算 + 段追加」）。⚠️ 这把锁**只被写端取**（**I8-3**：读端永不触碰）⇒ 不违反 I8-1。
+  ⚠️ 今天**结构上不可能**出现双写端（`into_index()` 的 `Arc::try_unwrap` 要求 refcount == 1）——**「双写端」是保留 `into_index()` 新引入的可能性**，故 **D-S8-06 的前置条件就是本条**。
 - **读端永不触碰**（I8-3）⇒ 不进读路径；
 - 归零时机 = `save` / `load` 之后（单段、`base = 0`）。
 
@@ -444,7 +450,7 @@ for token in tokens {                     // ⚠️ 外层 = query term（顺序
 - **每段一个向量索引**（`Box<dyn VectorIndex>`），段自己的本地 `chunk_id`；
 - 向量路**对每段各查一次**（`k = candidate_k`，或按 §4.6.3 的过采样规则），然后**全局归并**：按 `(distance asc, 全局 chunk_id asc)` 取前 `candidate_k`；
 - **谓词逐段下推**：给第 `i` 段的是「第 `i` 段的本地谓词」（§4.7）；
-- `Metrics.vector_route`：⚠️ **各段可能给出不同的 route**（一段走 ANN、另一段走精确）⇒ 取形 = **`VectorRoute` 取「最保守者」**（只要有任一段走 `Exact` 就记 `Exact`？**不**——更诚实的取形 = **新增 `vector_route_mixed` 计数**，并保留 `vector_route` 为「主段的 route」）。⚠️ **这是本设计的已知不完美处**，登记为 Q5，默认取形 = **`vector_route` = 各段 route 的「并集分类」**（全 `Ann` ⇒ `Ann`；全 `Exact` ⇒ `Exact`；混合 ⇒ 新值 `Mixed`）。
+- `Metrics.vector_route`：⚠️ **各段可能给出不同的 route**（一段走 ANN、另一段走精确）⇒ **唯一取形 = 各段 route 的「并集分类」**（全 `Ann` ⇒ `Ann`；全 `Exact` ⇒ `Exact`；混合 ⇒ **新值 `VectorRoute::Mixed`**）。⚠️ **2026-09-17 按评审 P3-3 收敛**：本行原并存三个取形（「取最保守者」/「新增独立计数 `vector_route_mixed`」/「并集分类」）⇒ **已删掉前两个草稿**，只留并集分类一条。`Mixed` 的破坏性判定见 **Q5**（评审代核 + 本文独立复核，见附录 C）。
 
 #### 4.6.2 ⚠️ ANN 路径**不承诺**与单段逐位一致
 
@@ -462,7 +468,7 @@ for token in tokens {                     // ⚠️ 外层 = query term（顺序
 
 - 路径 A（热路径）的 `knbn` 过采样公式里的 `alive_ratio = allowed / len` —— 分段后 `allowed` 与 `len` 都是**该段的** ⇒ **逐段算**（这是正确的：过采样是为该段的图服务的）；
 - 路径 C（精确）的触发由 `prefers_exact(filter)` 决定 ⇒ **逐段判定**；
-- ⚠️ `BRUTE_FALLBACK_MAX_ALLOWED = 8192` 的阈值语义 = 「**该段的 `allowed_count`**」⇒ 段越小越容易走精确路径。**这是分段的一个副作用**（小段更容易命中低选择度兜底）⇒ 登记进 R49 的观测项，**默认不改阈值**。
+- ⚠️ `BRUTE_FALLBACK_MAX_ALLOWED = 8192` 的阈值语义 = 「**该段的 `allowed_count`**」⇒ 段越小越容易走精确路径。**这是分段的一个副作用**（小段更容易命中低选择度兜底）⇒ **默认不改阈值**，但**必须改上报口径**：`Metrics.vector_route` / `vector_shortfall` 从「一次检索一个值」变成**逐段判定 + 并集上报**（§4.13.3）。⚠️ **2026-09-17 按评审 P4-7② 更正**：原写「登记进 R49 的观测项」—— R49 的登记内容是跨段 BM25 的**三条前提**、R52 是 `bm25_f` 热路径，**两者都不含本条**；本条的归属是 **Q5（`VectorRoute` 混合取形）+ §4.13.3**。
 
 ### 4.7 过滤谓词跨段（`S8-04`）
 
@@ -498,10 +504,12 @@ impl CandidateFilter for ViewFilter<'_> {
 
 #### 4.7.3 ⚠️ 热路径回归（R52）
 
-| 场景 | 今天 | 新模型 |
-| --- | --- | --- |
-| 无用户过滤、**无墓碑** | `bm25_f = None`（零谓词） | ✅ **保持 `None`**（显式短路：`view.deltas.is_empty() \|\| view.tombstones.is_empty()`） |
-| 无用户过滤、**有墓碑** | 不可能（写端独占 ⇒ `remove` 直接摘 postings） | ❌ `bm25_f = Some(ViewAlive)`，每 posting 一次 `dyn contains()` |
+| 场景 | 今天 | 新模型（**未合并窗口**） | 新模型（**`merge_all()` 之后**） |
+| --- | --- | --- | --- |
+| 无用户过滤、**无墓碑** | `bm25_f = None`（零谓词） | ✅ **保持 `None`**（显式短路：`view.deltas.is_empty() \|\| view.tombstones.is_empty()`） | ✅ 同左 |
+| 无用户过滤、**有墓碑** | 不可能（写端独占 ⇒ `remove` 直接摘 postings） | ❌ `bm25_f = Some(ViewAlive)`，每 posting 一次 `dyn contains()` | ✅ **回到 `None`**（墓碑已**物理化**并从 `View.tombstones` 移除 ⇒ §4.9.2） |
+
+⚠️ **「合并后」这一列是 2026-09-17 按评审 P3-1 补的**，它依赖一个本轮才写明的取形：**跨段墓碑在合并时物理化**（§4.9.2）⇒ R52 的回归**只覆盖「未合并窗口」**、且**可逆**。若取「墓碑永久留存」的另一种取形，R52 将**不可逆**、且 §4.5 的「逐位一致」在带删除场景**不成立**（本轮明确不选该取形）。
 
 ⇒ 设计取形：**只要「无 delta 且无墓碑」就保持零谓词热路径**；有 delta 但无墓碑时，`AliveOnly` 逐段借用（零构建成本，`predicate.rs` 的既有实现）。⇒ **回归只发生在「确实有跨段墓碑」时**，且由 S8-T12 的 bench 对照量化。
 
@@ -541,7 +549,7 @@ struct SegmentBuilder {
 | 返回 | `Searcher` | `Searcher`（持 `Arc<Shared>` 的克隆） |
 | 与写端共存 | ❌ | ✅ |
 
-**兼容策略**：`into_searcher()` 保留为 `#[deprecated]` 薄封装 = `{ self.commit()?; self.searcher() }` ⇒ **既有 100+ 处调用点零改动，行为逐位不变**。⚠️ 新 `searcher()` 的「不隐含 flush」是**有意的语义收紧**：它让「可见性 = `commit()` 后」在 API 层面显式化（对齐 NFR-11），而不是靠一个隐式副作用。
+**兼容策略**：`into_searcher()` 保留为 `#[deprecated]` 薄封装 = `{ self.commit()?; self.searcher() }` ⇒ **既有 41 处调用点零改动，行为逐位不变**（⚠️ **2026-09-17 按评审 P4-1 更正**：原写「100+ 处」，高估 ≈2.4~2.6×；精确口径 = **生产调用 4 处（`cli/src/main.rs` 3 + `examples/search_basic.rs` 1；`core/src` 生产调用 = 0）+ 测试 37 处**，另有 2 处**定义**与 11 处**注释** —— 复算方法与「与评审 38 处的口径差异」见 **§10.3**）。⚠️ 新 `searcher()` 的「不隐含 flush」是**有意的语义收紧**：它让「可见性 = `commit()` 后」在 API 层面显式化（对齐 NFR-11），而不是靠一个隐式副作用。
 
 #### 4.8.3 `add` / `remove` / `commit` 的语义
 
@@ -578,6 +586,8 @@ impl SearchIndex {
 pub struct MergeReport {
     pub segments_merged: usize,
     pub chunks_merged: usize,
+    /// 本次合并中被**物理化**（真删）的跨段墓碑条数（取形见 §4.9.2）。
+    /// 合并完成后这些条目**从 `View.tombstones` 移除**（⇒ 热路径可回到 `None`，见 §4.7.3）。
     pub tombstones_applied: usize,
     pub vector_strategy: VectorMergeStrategy,   // Incremental | Rebuild
     pub vector_merge_ms: u128,
@@ -611,7 +621,11 @@ impl Index {
 | `stats` | `total_len += other.total_len`、`num_chunks += other.num_chunks` |
 | `chunk_lens` | `extend` |
 | `content_hashes` | `extend`；⚠️ **碰撞必须处理**（理论上不应发生——写入时已跨段查重；但仍要 `debug_assert` + 确定性策略） |
-| `field_index` | ⚠️ **不能简单 extend**（`FieldIndex` 的值池有基数上限、重复插入会双计）⇒ 用 **`FieldIndex::rebuild(&self.forward.docs)`**（既有函数，全量重建）。12K 文档下重建成本可接受；**并且**重建后「基数保护」的降级判定可能与增量维护的结论不同 ⇒ **必须有一条「合并后字段索引 == 全量重建」的等价用例**（S8-T6） |
+| `field_index` | ⚠️ **不能简单 extend** ⇒ 用 **`FieldIndex::rebuild(&self.forward.docs)`**（既有函数，全量重建）。12K 文档下重建成本可接受；**并且**重建后「基数保护」的降级判定可能与增量维护的结论不同 ⇒ **必须有一条「合并后字段索引 == 全量重建」的等价用例**（S8-T13） |
+| **跨段墓碑** 🔴 | **合并时物理化**（**2026-09-17 按评审 P3-1 补，本轮最实质的一条**）：段携带的墓碑**全部**指向**严格更早**的段（§4.8.3 的分支 ① 已把「同一 delta 内的删除」就地物理删除，**不会变成墓碑**）⇒ 在 append 完成后，对该 doc 走**既有的 `Index::remove` 语义**（物理摘 postings + `content_hashes.remove` + `stats.total_len / num_chunks` 回滚 + `field_index` 随之重建），然后**从 `View.tombstones` 移除**该条 ⇒ `MergeReport.tombstones_applied` 记的就是这个条数 |
+| ⚠️ 物理化的边界 | **不改 `forward.docs` / `forward.chunks` 的 `Vec` 长度**（`Vec<Option<..>>` 只置 `None`）⇒ **基址不变式（§4.4.2）不受影响**；FIFO 合并保证「墓碑的目标必已在主段」（若目标还在更晚的段里、则该段还没轮到合并） |
+
+⚠️ **为什么取「物理化」而不取「墓碑永久留存」**（P3-1 的两条路）：后者会让 ① `View.tombstones` 永久非空 ⇒ `bm25_f` **永远** `Some`（R52 **不可逆**）；② 全局 `N` / `total_len` / `df(t)` 把已删 doc **仍计入** ⇒ 与「单段建库 + `remove`」的统计量**发散** ⇒ **§4.5 的逐位一致在带删除场景不成立**（S8-T4 原来只测无删除场景，测不出这条）；③ `save` 落盘快照也**不再等价于今天 `remove` 后的形态** ⇒ 与 **D-S8-01**「落盘形态一个字节都不变」的表述冲突。⇒ **取物理化**，并在 S8-T4 加「带跨段删除」变体把这条钉死。
 
 ⚠️ **顺序性**：`inverted.add` 会把 posting `push` 到该 term 的链尾 ⇒ 合并后链内顺序 = 「主段原序 + 增量段序」= **全局 `chunk_id` 升序**（因为基址连续）⇒ **与单段建库的 postings 顺序一致** ✅。这条是 S8-T4「逐位一致」的结构性依据之一，**必须写成注释**（否则后人一次「顺便排序」就会破坏 I8-6 之外的又一个前提）。
 
@@ -632,6 +646,14 @@ impl Index {
 2. **收益**：A 在「delta ≈ 主段的 1/10」时的耗时 **≤ B 的 1/5**；
 3. **正确性**：A 与 B 产出的图在**同一 query 集**上 top-10 **重合率 ≥ 0.99**（⚠️ **不要求逐位**——图不同、ANN 结果本来就允许不同，见 §4.6.2）；
 4. 任一不满足 ⇒ **回落 B**，并把「合并 = 全量重建」的代价写进 NFR-14 与用户文档。
+5. 🔴 **累积（2026-09-17 按评审 P3-5 新增）**：同一进程**连续合并 10 次**，峰值 RSS 增量 **< 1 MiB**。
+   ⚠️ 这个阈值的意义**不是「不许有泄漏」**（`Box::leak` 是 R23 的既定事实），而是**把两种量级区分开**：
+   「只泄漏 `HnswIo`（≈ **200B + 路径串 / 次**）」 vs 「误泄漏整张图（≈ 50MB / 次）」——
+   前者 10 次 ≈ 2 KB（淹没在 RSS 噪声里、必然通过），后者 10 次 ≈ 500 MB（必然失败）。见 §9.1 R51。
+
+⚠️ **非对称（评审 P3-5 的另一半）**：**方案 A 每次合并都 `load_graph` ⇒ 每次都多一个 leaked `HnswIo`；方案 B 是内存重建、不 `load` ⇒ 不新增泄漏**。
+⚠️ 但**「B 更省内存」只在「图本身」这一项上成立**：B 的新图内存构建、旧图随 `Segment` 释放 ⇒ 可回收；
+而 A 的 leaked 对象**也不可回收**（只是量级极小）。**首篇 R51 已按此写明非对称**（架构 §14.6）。
 
 ⚠️ 方案 A 有一个**必须先解决的边界**：**主段图可能不存在**（未落盘 / 被降级重建 / `--no-graph-persist`）⇒ 取形 = **先 `dump` 主段图到临时目录再 `load`**（对内存图也能做，`VectorGraphPersist::dump_graph` 是 `&self`）✅。但这也意味着**每次合并都产生一次全量 dump I/O**（⏳ 50MB 级临时文件）。
 
@@ -651,7 +673,8 @@ impl Index {
 | --- | --- | --- |
 | `save(&mut self, path)` | **`merge_all()`**（D-S8-01） | 落盘仍是**单段 `Index`** ⇒ `FORMAT_VERSION` 保持 2、manifest 不变、ID 不变 |
 | `compact(&mut self)` / `compact_and_save` | **`merge_all()`**（D-S8-12） | 既有语义不变（**重编号**、回收墓碑）。⚠️ 文档必须写明：**`compact` 之后 `chunk_id` 会变**（既有行为，但新模型下读者可能持有旧 view ⇒ 必须写清「旧 view 的 ID 与 compact 后的 ID 不可混用」） |
-| `tombstone_stats()` | 无 | 改为**跨段求和** + 加上未合并墓碑 |
+| `tombstone_stats()` | 无 | 改为**跨段求和**；⚠️ **合并后归零**（墓碑已物理化、条目已从 `View.tombstones` 移除 —— §4.9.2） |
+| 跨段墓碑 | 随段合并 | **物理化**（§4.9.2）：走既有 `Index::remove` 语义 + 从 `View.tombstones` 移除 ⇒ `MergeReport.tombstones_applied` 计数；**这是 `save` 落盘形态与今天 `remove` 后形态等价的前提** |
 
 ### 4.10 持久化：H4 的结论（D-S8-01）——**不开 ADR-B**
 
@@ -660,6 +683,7 @@ impl Index {
 | `SnapshotSections` | **一字不改**（仍是单段） |
 | `FORMAT_VERSION` | **保持 2**（ADR-A 的不变式 ① 续存） |
 | `GraphManifest` | **一字不改**（`snapshot_crc` / `snapshot_len` / `nb_point` 仍绑单个快照） |
+| 跨段墓碑 | **合并时已物理化**（§4.9.2）⇒ 落盘的 `forward` / `inverted` / `content_hashes` 与「**今天 `remove` 之后**」的形态**等价**（postings 已摘、hash 已摘、`alive` 已清）| 
 | 图 sidecar | **单份**（合并后的主段图）；`save` 的 dump 计时口径不变 |
 | `load` | 产出**单段 view**（`deltas = []`、`base_* = 0`、`ids` 归零） |
 | ADR-B | **不开**；但**登记为 Q2 的条件项**：若将来要求「不合并就落盘」（例如 delta 大到 merge 成本不可接受），H4 的原始担忧（manifest 挂多段图）才会成立 |
@@ -779,7 +803,7 @@ pub struct LocalEmbedder {
 ### D-S8-01 H4：持久化形态 ✅ 建议：`save` 前先 `merge_all()`，**不开 ADR-B**
 
 - **理由**：`SnapshotSections` / `FORMAT_VERSION` / `GraphManifest` 三个面**一个字节都不用改**（§2.6 的源码依据）；ADR-A 的三条不变式全部续存；ID 在 save/load 往返后不变（既有行为，§2.4 的 DTO 显式携带 ID）。**用一条前置步骤消解一个架构级问题，是最省的取形。**
-- **代价**：`save` 的成本多了「合并所有未合并段」。⚠️ 但 `save` 本来就 `commit()` + 全量序列化（O(N)），合并在同一量级。
+- **代价**：`save` 的成本多了「合并所有未合并段」。⚠️ **限定（2026-09-17 按评审 P4-7①）**：`save` 本来就 `commit()` + 全量序列化（O(N)），**文本侧**的合并在同一量级；**向量侧视 S8-S1 结论** —— 若回落方案 B（全量重建），`save` 会多付 ≈ **38.7s / 12K**（§4.9.3）。原写「合并在同一量级」**只对文本侧成立**。
 - **不同意会怎样**：多段快照 ⇒ `FORMAT_VERSION` 升 3 + `GraphManifest` 改多段 + 向后兼容分支 ⇒ **ADR-B 必出**，Step 8 体量与风险再上一档。
 
 ### D-S8-02 视图模型 ✅ 建议：`RwLock<Arc<View>>` + 不可变 `Segment`
@@ -869,15 +893,15 @@ pub struct LocalEmbedder {
 | **S8-T1** | **R34 探针复跑**：std-only 探针（写线程等待 + 读线程在层切换时递归读）**必须不再死锁** | CI | `crates/core/tests/step8_rw_concurrency.rs` | ⚠️ **必须含反向自证**：把遍历改回 `IntoIterator` 后该用例**变红**（证明探针有鉴别力，否则「绿」没有意义） |
 | **S8-T2** | **覆盖等价「每点恰一次」**：逐层遍历的 ID 集 == 入库 ID 全集；`get_layer_iterator(0)` 的基数 **<** `get_nb_point()` | CI | `crates/core/src/vector/hnsw_rs_index.rs` 单测（**扩展既有用例**） | 红 = 遍历写回单层（3.7% 静默错答） |
 | **S8-T3** | **定向用例**：`level ≥ 1` 的点自查询排第一 | CI | 既有用例（确认仍绿） | 红 = 高层点被漏 |
-| **S8-T4** | **跨段 BM25 逐位一致**：同内容 `[单段]` vs `[主段 + 2 个增量段]` ⇒ `hits` 的 `(chunk_id, score)` **逐位相同**；`Explain` 亦同 | CI | `crates/core/tests/step8_segments.rs` | 红 = I8-5 / I8-6 / I8-7 之一被破坏（**本设计最重要的用例**） |
+| **S8-T4** | **跨段 BM25 逐位一致**：同内容 `[单段]` vs `[主段 + 2 个增量段]` ⇒ `hits` 的 `(chunk_id, score)` **逐位相同**；`Explain` 亦同。🔴 **＋「带跨段删除」变体（2026-09-17 按评审 P3-1 新增）**：先建主段 → `remove` 一条（落进墓碑）→ `commit` 出新 delta → **在合并前后各比一次** ⇒ 合并前「未合并窗口」与合并后「墓碑已物理化」**都必须与「单段建库 + 同序 remove」逐位一致**（两条断言，缺一不可 —— 「合并前」那条同时锁住 §4.5 的全局统计量、「合并后」那条锁住 §4.9.2 的物理化） | CI | `crates/core/tests/step8_segments.rs` | 红 = I8-5 / I8-6 / I8-7 之一被破坏（**本设计最重要的用例**） |
 | **S8-T5** | **Brute 后端的 `vector` 模式跨段逐位一致** | CI | 同上 | 红 = 精确路径的全局归并写错（`(距离, chunk_id)` 全序） |
 | **S8-T6** | **跨段 `content_hash` 幂等 + 删除后可重新 upsert**：主段有 doc ⇒ `add` 同 hash 报 `deduped`；`remove` 后 `add` 同 hash **不再 deduped** | CI | 同上 | 红 = 「命中但被墓碑挡住」被当成命中（§4.8.3 的语义） |
 | **S8-T7** | **可见性双向**：`add` 后未 `commit` ⇒ 查不到；`commit` 后 ⇒ 立即查到 | CI | 同上 | 红 = 可见性边界错（NFR-14 ①） |
 | **S8-T8** | **合并保 ID + save/load 往返保 ID**：`merge_pending()` 前后同一 chunk 的全局 `chunk_id` 不变；`save`→`load` 后仍不变 | CI | 同上 | 红 = D-S8-04 的基址不变式被破坏 |
 | **S8-T9** | **同 view 内的确定性**：同 query 连续 100 次逐位一致；`generation` 不变期间 `Arc<View>` 内容不变 | CI | 同上 | 红 = I8-2（段被就地修改） |
-| **S8-T10** | **三线程并发探针**：写线程持续 `add`/`commit`、合并线程持续 `merge_pending`、读线程持续检索 ⇒ **零 `Err`、零超时、结果只反映已提交前缀**；并断言 `Error` 枚举**无**「重建索引中」类变体 | CI（规模小） | 同上 | 红 = 读端被阻塞 / 看到未提交内容 / 出现新错误码 |
-| **S8-T11** | **合并期读延迟**（同机、同 fig、同 query 集）：②a 比值 ≤ 1.2（拟）与 ②b 绝对护栏 | 脚本 | `scripts/eval_rw_concurrency.sh` | 红 = 写锁被用在重活上（I8-1 被违反） |
-| **S8-T12** | **热路径回归对照**：无 delta / 有 delta 无墓碑 / 有跨段墓碑 三档的 `bm25` lane 耗时 | 脚本 | 同上 | 量化 R52（不是门槛，是读数） |
+| **S8-T10** | **三线程并发探针**（🔴 **2026-09-17 按评审 P3-4 加「双写端」臂**：由 `into_index()` 再造一个写端、两写端各自持续 `add`/`commit`，断言**段 ID 空间无重叠**（`base` 严格递增、全局 `chunk_id` 无重复）—— 这是 §4.4.3 那条锁的鉴别力用例）：写线程持续 `add`/`commit`、合并线程持续 `merge_pending`、读线程持续检索 ⇒ **零 `Err`、零超时、结果只反映已提交前缀**；并断言 `Error` 枚举**无**「重建索引中」类变体 | CI（规模小） | 同上 | 红 = 读端被阻塞 / 看到未提交内容 / 出现新错误码 |
+| **S8-T11** | **合并期读延迟**（同机、同**图**、同 query 集 —— ⚠️ **2026-09-17 按评审 P4-3 更正**：原写「同 fig」）：②a 比值 ≤ 1.2（拟）与 ②b 绝对护栏 | 脚本 | `scripts/eval_rw_concurrency.sh` | 红 = 写锁被用在重活上（I8-1 被违反） |
+| **S8-T12** | **热路径回归对照**：无 delta / 有 delta 无墓碑 / 有跨段墓碑 / **有跨段墓碑但已 `merge_all()`** **四档**的 `bm25` lane 耗时（第 4 档由 P3-1 的「合并后回到 `None`」推出 —— 2026-09-17 新增） | 脚本 | 同上 | 量化 R52（不是门槛，是读数）；第 4 档必须回到第 1 档量级 |
 | **S8-T13** | **合并器等价的字段索引**：合并后的 `field_index` 求值 == 全量重建的求值（过滤 battery） | CI | `crates/core/tests/step8_segments.rs` | 红 = `FieldIndex::rebuild` 与增量维护不等价（§4.9.2） |
 | **S8-T14** | **合并器向量侧等价**：合并后的图在固定 query 集上与全量重建图的 top-10 重合率 ≥ 0.99 | CI（小规模、Brute/Hnsw 各一） | 同上 | 红 = 向量合并丢点 |
 | **S8-T15** | **NFR-11 写延迟直接计时** | 脚本 | `scripts/eval_rw_concurrency.sh` | 产出 P50/P99 读数（D-S8-10 的定稿依据） |
@@ -938,10 +962,106 @@ pub struct LocalEmbedder {
 | **Q2** | **是否永远不做多段快照？** | D-S8-01 把多段快照推给了「将来」 | 登记为**条件项**：若出现「delta 大到 `save` 时合并成本不可接受」的真实场景，再开 **ADR-B** |
 | **Q3′** | （**改述自 Q3**）不同 `intra_threads`（及不同实例数）是否改变 `embed_query` 的向量**数值**？ | 若改变 ⇒ 池化破坏 NFR-10 ① 的「逐位一致」前置 ⇒ **必须判「不投」** | **spike S8-S2 必答**；⚠️ 不允许推断（R47 的教训） |
 | **Q4** | **默认 `embed_sessions` 取值** | 默认 1 = 零收益零风险；默认 > 1 = 在**没有实测支撑**的情况下付内存 | 默认 **1**；若 S8-S2 通过，再在 CLI / 用户文档给推荐值（**库侧默认不动**） |
-| **Q5** | **`VectorRoute` 混合取形**：新增 `Mixed` 变体（破坏性，取决于是否 `#[non_exhaustive]`）还是新增独立布尔字段？ | 影响公开面 | **实现期核实** `VectorRoute` 的定义后定；倾向**新增 `Mixed` 变体 + 给枚举补 `#[non_exhaustive]`** |
+| **Q5** | ✅ **已结案（2026-09-17，评审代核 + 本文独立复核）**：**`VectorRoute` 定义于 `vector/mod.rs:37`，未标 `#[non_exhaustive]`**，三变体 `None` / `Ann` / `Exact`，经 `query/mod.rs:24` 再导出、在公开的 `Metrics.vector_route` 上暴露 ⇒ **新增 `Mixed` 变体对下游 exhaustive `match` 是破坏性变更**；**给枚举补 `#[non_exhaustive]` 同样会让下游 exhaustive `match` 编译失败**（须加通配臂）⇒ **两条路都属 breaking，没有「零破坏」选项**。⇒ 取形 = **新增 `Mixed` 变体 + PR5 的 CHANGELOG 记 `Breaking`**。~~**`VectorRoute` 混合取形**~~：新增 `Mixed` 变体（破坏性，取决于是否 `#[non_exhaustive]`）还是新增独立布尔字段？ | 影响公开面 | **实现期核实** `VectorRoute` 的定义后定；倾向**新增 `Mixed` 变体 + 给枚举补 `#[non_exhaustive]`** |
 | **Q6** | **段数上限与「何时合并」的策略**（`deltas.len() > K` 才合并？） | 读路径成本随段数线性增长 | 库**不设**策略；CLI / 宿主按 `K = 4`（拟）触发；**D-S8-08 的「库只给原语」在此延续** |
 | **Q7** | **NFR-14 ② 的判据取形**：相对（比值）还是绝对（ms）？ | 决定报告怎么读 | **相对为主 + 绝对为护栏**（§4.13.1 已给理由：避免把「分段的基线变化」与「合并的干扰」混在一起） |
-| **Q8** | `Config::embed_sessions` 加在 `Config` 还是 `ConfigBuilder`？ | 公开面（§6 的破坏性核实项） | **实现期核实** `Config` 是否有字面构造用法后定；若走 `ConfigBuilder` 则风险最小 |
+| **Q8** | ✅ **已结案（2026-09-17，评审代核 + 本文独立复核）**：**`Config` 无 `impl Default` / 无 `Default` derive**（`search/config.rs:35` 的 `pub struct Config {` 上方只有文档注释），全仓**唯一**字面构造点是 `config.rs:301` 的 `build_config`（crate 内部）⇒ **仓内无下游破坏**。⇒ 取形 = **加在 `Config` 上（字段公开）+ 同步 `build_config`**；`ConfigBuilder` 不必需。~~`Config::embed_sessions` 加在 `Config` 还是 `ConfigBuilder`？~~ | 公开面（§6 的破坏性核实项） | **实现期核实** `Config` 是否有字面构造用法后定；若走 `ConfigBuilder` 则风险最小 |
+
+---
+
+## 10. 第 1 轮评审响应（v0.2，2026-09-17）
+
+> 评审：`pulls/60/reviews` **1 条**（**5×P3 + 7×P4，无阻塞**）+ 行内 **0** 条 + `issues/60/comments` **0** 条 ⇒
+> **本轮评审只在 `reviews` 一处**（本轮 head `75aa724`）。评审的**独立复核表**（18 条仓库侧 + 16 条依赖侧）
+> 与**4 条拍板 + 需求面 1 条**的回应见该评审正文；本节只记**处置**。
+
+### 10.1 逐条处置
+
+| # | 位置 | 处置 | 落地位置（本文内） |
+| --- | --- | --- | --- |
+| **P3-1** | 跨段墓碑在**合并时**的处置未写明 | ✅ **采纳，取「A. 物理化」** | §4.9.2（新增「跨段墓碑」行 + 物理化边界行 + 选 A 的三条理由）、§4.9.5（表 + `tombstone_stats()` 改为「合并后归零」）、§4.7.3（表加「合并后」列）、§4.9.1（`tombstones_applied` 语义）、§4.10（落盘等价精确化）、S8-T4（**加「带跨段删除」变体，合并前后各一条断言**）、S8-T12（第 4 档）、附录 A.3 不变式 3 |
+| **P3-2** | 附录 B `cargo run -p helix-cli` 包不存在（Step 6 评审 F2 的**复发**） | ✅ 采纳 | 附录 B 命令 ⑥ 改为 `-p helix` + 注明「包名见 `crates/cli/Cargo.toml:2`、F2 同类复发」；并**逐条实跑核对了附录 B 其余命令**（`-p helix-core` ✅ / `eval_quality.sh --runs` ✅ / `--example bench_embed_session` ✅ / `data/t2-corpus.jsonl` ✅） |
+| **P3-3** | §4.6.1 三个取形并存；顺带把 Q5 / Q8 的核实做掉 | ✅ 采纳 | §4.6.1（**删两个草稿**、只留「并集分类 ⇒ 新值 `Mixed`」）、Q5（**结案**：无 `#[non_exhaustive]` ⇒ 两条路都 breaking）、Q8（**结案**：无 `impl Default`、唯一字面构造在 `config.rs:301`）、附录 C |
+| **P3-4** | 双写端并存时 `commit()` 的「算 base + 发布」原子性未写明 | ✅ 采纳（**D-S8-06 的前置条件**） | §4.4.3（新增「seal + publish 必须与发号同处一个临界区」的取形与理由）、S8-T10（**加「双写端」臂**：断言段 ID 空间无重叠） |
+| **P3-5** | `Box::leak` 是「每次合并 +1」的累积效应 | ⚠️ **结论采纳、量级前提更正**（见 §10.2） | S8-S1 决策门**新增第 ⑤ 条**（连续 10 次合并 RSS 增量 < 1 MiB，**阈值的意义是把「只泄漏 `HnswIo`」与「误泄漏整张图」区分开**）、§4.9.3（补 A / B 的**非对称**）、架构 §14.6 R51 的残余列 |
+| **P4-1** | 「既有 **100+ 处调用点**」高估 ~2.6× | ⚠️ **采纳、但数字经独立复算后与评审不同**（见 §10.3） | §4.8.2 改为精确口径：**41 处调用点**（+2 处定义 +11 处注释） |
+| **P4-2** | `p_id.0 = level`（`:500`）→ `:505` | ✅ 采纳 | §2.2 表 + 附录 C，并**把代码片段改为逐字原文** `let mut p_id = PointId(level as u8, -1)`（原「`p_id.0 = level`」是转述、文中并不存在该行） |
+| **P4-3** | S8-T11「同 **fig**」→「同**图**」 | ✅ 采纳（笔误） | §7 S8-T11 |
+| **P4-4** | 需求 v1.20 行「**复发**触发条件」→「**复审**」；同段加粗嵌套断开 | ✅ 采纳（**两处位置都在 `requirements-spec.md`**；加粗断裂实为 **`:9` 头部状态行**，非 `:595`） | `requirements-spec.md:595`（措辞）+ `:9`（**多余 `**` 已删**，见 §10.4） |
+| **P4-5** | 非范围「不开 ADR-B，见 **D-S8-09**」→ **D-S8-01** | ✅ 采纳 | 头部「非范围」行 |
+| **P4-6** | §4.9.2 field_index 行的「重复插入会双计」与代码不符 | ✅ 采纳（**机理写错了**） | §4.9.2 `field_index` 行——真实机理是**同一数值同时登记 terms + numbers 两池、合计计入同一限额**（`field_index.rs:51-52`），而 `field_index.rs:188` 有 `!contains_key` 守卫 ⇒ 重复插入同一 value 键**不会**重复 +1；「必须 rebuild」的结论仍成立（另有依据：degraded 粘滞 + 降级字段缺键） |
+| **P4-7** | ① D-S8-01 代价「同一量级」只对文本侧成立；② 「登记进 **R49** 的观测项」挂错 | ✅ 两条都采纳 | ① D-S8-01 代价行加限定（向量侧视 S8-S1）；② §4.6.3 改为**改挂 Q5 + §4.13.3**（⚠️ **与评审建议的 R52 不同**，理由见 §10.2） |
+
+### 10.2 与评审结论**不同**的地方（两类）
+
+**① P3-5 的量级前提：结论采纳，但「内存随合并次数线性增长」的量级被高估。**
+
+评审的表述是「长驻进程的内存随合并次数**线性增长**」（隐含按图规模计），并据此要求 S8-S1 加「重复合并不增长内存」的门。
+**独立复算**（`crates/core/src/vector/persist.rs:210-216` 的 P1-2 注释 + 架构 §14.6 R23 的影响列）：
+
+| 项 | 实测/代码事实 |
+| --- | --- |
+| leaked 的对象 | **只有 `HnswIo`**（`Box::leak(Box::new(HnswIo::new(dir, &basename)))`，`persist.rs:216`） |
+| 量级 | 「**每次加载约 200B + 路径串**」（`persist.rs:214` 逐字），R23 影响列同 |
+| **不是**什么 | **不是**图 / 向量数据 —— `HnswIo` leak 后句柄被**直接丢弃**（P1-2），向量被读进内存（`PointData::V`）、由 `Hnsw<'static>` **自持**；旧 `Segment` 释放时**那部分是可回收的** |
+
+⇒ 「线性」在**数学上成立**（每次合并 +1 个 `HnswIo`），但**速率是 ≈200B/次**而不是图规模；
+10 次合并 ≈ 2 KB（被 RSS 噪声淹没）。⇒ 处置：**保留该门，但把阈值定成「< 1 MiB」并在注释里写明它的鉴别力**
+（把「只泄漏 `HnswIo`」与「误泄漏整张图」区分开）——否则一个「按 ≤20% 相对增量」写的门会**必然假通过**（2KB 相对 373MB 是 0.0005%）。
+
+**② P4-7② 的归属：改成 Q5 + §4.13.3，而不是 R52。**
+
+评审建议「改挂 **R52**（或补进 R51 的段堆积链条）」。**未采纳该归属**，理由是三条各自的范围：
+- **R49** = 跨段 BM25 的**三条前提**（I8-5/6/7）；
+- **R52** = **`bm25_f` 热路径**（谓词从 `None` 变 `Some`）；
+- 本条（逐段判 `prefers_exact` ⇒ 小段更易命中低选择度兜底 ⇒ `vector_route` / `vector_shortfall` 语义变化）**既不是打分前提、也不是 bm25 热路径**，而是**路由/阈值的可观测语义** ⇒ 归 **Q5（`VectorRoute` 混合取形）+ §4.13.3 可观测节**更贴。
+（若评审坚持挂 R52，改一行即可；**本轮不改风险编号**。）
+
+### 10.3 P4-1 的独立复算：**41 处**（≠ 评审的 38 处）
+
+**复核方法**：`git ls-files crates` ⇒ 对每个 `.rs` 逐行匹配 `into_searcher|into_index`，按「行首是否为 `//`」「是否 `fn` 定义」「是否 `.into_x(` 调用」「是否落在 `#[cfg(test)]`/`tests/`」分类（脚本一次性跑，非目测）。
+
+| 分类 | 计数 |
+| --- | --- |
+| 原始提及（含注释） | **56** |
+| 其中注释行 | **11**（`core/src` 7 + 集成测试 4） |
+| **代码提及（非注释）** | **45** |
+| 　├ **定义**（`index.rs` 的 `into_searcher` + `searcher.rs` 的 `into_index`） | 2 |
+| 　├ **生产调用点**（`cli/src/main.rs` 3 + `examples/search_basic.rs` 1；**`core/src` 生产调用 = 0**） | **4** |
+| 　└ **测试里的调用**（集成测试 33 + `searcher.rs` 的单测 4；另有 2 个**测试函数名**含该词） | **37** |
+| ⇒ **调用点合计（生产 4 + 测试 37）** | **41** |
+
+⚠️ **与评审的 38 不同**：评审给的是「**38** = 44 raw − 6 注释；tests 32 / src 2 / cli 3 / examples 1」。逐项比对：**cli 3 ✅ / examples 1 ✅ / src 2 ✅**（3 项完全一致），差额全在 **tests（32 vs 37）与 raw（44 vs 56）** ⇒ **两者的分类口径不同**（我这版把 `searcher.rs` 的 `#[cfg(test)]` 块 6 处与 4 处行内注释计入 tests 侧；是否计入「测试函数名」也影响 2 处）。**不宣称评审算错** —— 两套口径都自洽，本文采用**自己这版**并把口径写在上面（可复核）。
+⚠️ **实质结论不变**：无论 38 还是 41，「**100+**」都是高估（≈2.4~2.6×），且**生产调用点只有 4 处**——`#[deprecated]` 薄封装的「零改动」结论仍然成立，但**理由比原文更强**：不是因为「调用点太多不能改」，而是**这 4 处本来就是「交出读端」的合法用法**（本次只是给它加一层 deprecated 提示）。
+
+### 10.4 顺手修的**既有**缺陷（非本次引入，评审未点名）
+
+按「一类缺陷要全仓扫」的纪律，用**非级联判据**（逐行 `**` 奇偶 × 与 `main` 内容对照 + 合法嵌套对照样本自证）扫了 6 个文件：
+
+| 文件 | 本次引入 | 既有（`main` 上就有） | 处置 |
+| --- | --- | --- | --- |
+| `requirements-spec.md` | **1**（`:9`，本 PR 新写的 v1.20 段） | 0 | ✅ **已修**（删多余 `**`） |
+| `architecture-design.md` | 0 | **1**（`:9` 状态行的孤儿 `**`） | ✅ **顺手修**（该行本 PR 已在改） |
+| `plan-v2.md` | 0 | **1**（`:10` 状态行的孤儿 `**`） | ✅ **顺手修**（同上） |
+| `v2-step8-design.md` / `docs/README.md` / `CHANGELOG.md` | 0 | 0 | — |
+| `v2-step8-design.md` | 0 | — | ⚠️ **块级配对曾误报 1 处**：块内**跨行**加粗（表格相邻行之间）会被块级配对级联错位 ⇒ 用**逐行奇偶**复核后确认为**假报**（该文件奇数行 = 0）。**判据要选「可复核的单一事实」，不要选「级联的推导结果」。** |
+
+⚠️ **`CHANGELOG.md` 有 4 行「逐行奇偶为奇」是合法的跨行加粗**（`**A…
+…B**`）⇒ 逐行口径对它是**假报**，已按块级确认。两次假报都说明：**加粗类检查器必须先跑「合法嵌套 / 跨行加粗」两个好样本自证**（本轮探针的 `--selftest` 含 4 个好样本 + 1 个坏样本）。
+
+### 10.5 本轮**不适用**变异测试（纯文档 PR）
+
+本 PR **没有任何断言可变异**（`.rs` 零改动、无新增测试）。替代验证 = **§10.4 的探针（含 4 个好样本 + 1 个坏样本的对照自证）** + 评审自身的独立复核表。
+⚠️ 唯一「新门」是 **S8-S1 的第 ⑤ 条**，它是**将来实现期的 spike 判据**，本 PR 不落代码 ⇒ 无门可变异。
+
+### 10.6 未闭环 / 盲区（如实登记）
+
+1. **P3-1 / P3-4 的取形是「设计期决定」，尚无实现**：影响面 = S8-03 / S8-06 / S8-07 三个任务（PR4 / PR6）。评审建议「在 PR4/PR6 开工前以 v0.2 补明」—— **本轮已补明**，实现按本节取形走。
+2. **P3-2 是已修错误的复发**：本轮只修了附录 B 的那一条。⚠️ **更彻底的处置（把「包名 / 命令实存性」做成守门）本轮未做** —— 建议与 §10.4 的加粗探针**合并立为一个工程卫生项**（见 `plan-v2.md` §4 的「V2.1 横切任务」）。
+3. **评审的 38 vs 本文的 41 未收敛到单一口径**：已在 §10.3 写明两套口径与差额来源；**若评审要求统一，我按评审口径改**（改的是 4 处文档数字）。
+4. **`LayerGenerator` 的层高生成实现细节仍未核实**（附录 C ①）—— 与本 Step 无关，保持登记。
+
+**结论**：12 条意见**全部处置完毕**（11 条采纳 + 1 条结论采纳/量级更正 + 1 条归属不同）；`.rs` 零改动；设计文档 v0.1 → **v0.2**。
 
 ---
 
@@ -973,7 +1093,8 @@ pub struct LocalEmbedder {
 
 1. `searcher()` 不隐含 `flush`：**可见性 = `commit()` 后**。
 2. **合并保 ID；`compact()` 改 ID**；`compact` 前必须先 `merge_all()`。
-3. **分段布局下 `bm25` 与单段逐位一致；`vector`/`hybrid` 的 Hnsw 路径不承诺**（Brute 承诺）。
+3. **分段布局下 `bm25` 与单段逐位一致**（**含「带跨段删除」场景**：墓碑在合并时物理化，全局统计量与「单段建库 + 同序 `remove`」一致）；**`vector`/`hybrid` 的 Hnsw 路径不承诺**（Brute 承诺）。
+4. **`commit()` 的「seal + publish」与 ID 发号同处一个临界区**（`Shared::ids` 锁）⇒ 双写端下段 ID 空间**不可能重叠**（I8-7）。
 
 ---
 
@@ -994,6 +1115,8 @@ cargo test -p helix-core --test step8_segments -- --nocapture
 
 # ── 3) 读写并发：三线程探针 + 合并期读延迟 + 写延迟（本地 release）──
 #    ⚠️ 延迟数字在 CI 共享 runner 上不具可引用性
+#    ⚠️ `scripts/eval_rw_concurrency.sh` **尚未存在** —— 它是 S8 的交付物（§8 交付物 ⑧），
+#       S8-09 落地后本条命令才可执行（2026-09-17 补注）
 ./scripts/eval_rw_concurrency.sh --index /tmp/frozen.idx --runs 1
 
 # ── 4) 零回归对照（视图骨架落地后、delta 未启用时）──
@@ -1005,7 +1128,11 @@ cargo test -p helix-core --test step8_segments -- --nocapture
 # ⚠️ 查询侧口径必须另给（batch 1 × 短 query），不得沿用 E2 的 4000 段长文本口径
 
 # ── 6) 冻结图（⚠️ 只做一次；A/B 必须在同一张图上做）──
-cargo run -p helix-cli --release -- build --input data/t2-corpus.jsonl --index /tmp/frozen.idx
+cargo run -p helix --release -- build --input data/t2-corpus.jsonl --index /tmp/frozen.idx
+# ⚠️ 2026-09-17 按评审 P3-2 更正：包名是 `helix`（`crates/cli/Cargo.toml:2`），**不是** `helix-cli`
+#    —— 这是 Step 6 评审 F2 已修过的同类错误复发（`cargo pkgid -p helix-cli` → did not match any packages）。
+#    附录 B 其余命令已逐条实跑核对：`-p helix-core` ✅ / `scripts/eval_quality.sh --runs` ✅ /
+#    `--example bench_embed_session` ✅ / `data/t2-corpus.jsonl` ✅。
 ```
 
 ---
@@ -1018,7 +1145,7 @@ cargo run -p helix-cli --release -- build --input data/t2-corpus.jsonl --index /
 | `hnsw_rs v0.3.4` `hnsw.rs:656-677`（其中 `:661`） | 层切换时**再取一次**同一把 `points_by_layer` 读锁 ⇒ **递归读** | §2.2 / R34 / D-S8 的 T7-25 |
 | `hnsw_rs v0.3.4` `hnsw.rs:660` | 同行取的是**另一把** `entry_point` 锁 ⇒ **不构成递归**（避免误判成「两把锁都递归」） | §2.2 |
 | `hnsw_rs v0.3.4` `hnsw.rs:701` / `:715-723`（`IterPointLayer`） | 构造取一次锁；`next` 只索引 `pi_guard[self.layer]`，**不再取锁** | §2.2 修法可行性 |
-| `hnsw_rs v0.3.4` `hnsw.rs:498-526`（`generate_new_point`，push 在 `:511`） | `p_id.0 = level`；**只推入自己那一层、无回填** ⇒ 每点恰在一层 | §2.2 覆盖等价证明 |
+| `hnsw_rs v0.3.4` `hnsw.rs:498-526`（`generate_new_point`，push 在 `:511`） | `let mut p_id = PointId(level as u8, -1)`（**`:505`**；`level` = `:500` 的 `layer_g.generate()`）；**只推入自己那一层、无回填** ⇒ 每点恰在一层 | §2.2 覆盖等价证明 |
 | `hnsw_rs v0.3.4` `hnsw.rs:469-475`（`PointIndexation::get_max_level_observed`）/ `:814`（`Hnsw` 同名方法） | 返回 `entry_point.p_id.0`；空图为 **0** | §2.2 写法钉死 + 空图边界 |
 | `hnsw_rs v0.3.4` `hnsw.rs:529-552`（`check_entry_point`） | entry point 恒为最大层的点 ⇒ `get_max_level_observed()` = 全局最大层 | §2.2 |
 | `hnsw_rs v0.3.4` `hnsw.rs:809-812`（`get_max_level`） | 返回构造期授权的 `max_layer`（**≠** 实际观测最大层）⇒ **不可**用作循环上界 | §2.2 的「写法必须钉死」 |
@@ -1030,7 +1157,7 @@ cargo run -p helix-cli --release -- build --input data/t2-corpus.jsonl --index /
 | `fastembed v6.0.2` `src/text_embedding/impl.rs:453-456` | `embed(&mut self, …)` | §2.7 / §4.11.1（池化是唯一形态） |
 | `fastembed v6.0.2` `src/common.rs:262-290` | `init_session_builder(eps, intra_threads)`：`None` ⇒ `available_parallelism()`；`Session::builder().with_intra_threads(threads)` | §2.7 / §4.11 |
 
-⚠️ **本文未核实的项**（诚实标注）：① `LayerGenerator` 的层高生成实现细节（本文只依赖「每点恰在一层」这一条，已由 `generate_new_point` 的 push 语义直接给出）；② `VectorRoute` 是否 `#[non_exhaustive]`（Q5）；③ `Config` 是否有字面构造用法（Q8）。**三项都登记为实现期核实项，本文不凭记忆下结论。**
+⚠️ **本文未核实的项**（诚实标注，2026-09-17 更新）：① `LayerGenerator` 的层高生成实现细节 —— **仍未核实**（本文只依赖「每点恰在一层」这一条，已由 `generate_new_point` 的 push 语义直接给出）；② ~~`VectorRoute` 是否 `#[non_exhaustive]`（Q5）~~ ⇒ ✅ **已核实并结案**（`vector/mod.rs:37`，**无** `#[non_exhaustive]`；评审代核、本文独立复核，见 Q5）；③ ~~`Config` 是否有字面构造用法（Q8）~~ ⇒ ✅ **已核实并结案**（**无** `impl Default`；全仓唯一字面构造在 `config.rs:301` 的 `build_config`，属 crate 内部；评审代核、本文独立复核，见 Q8）。
 
 ---
 
