@@ -351,8 +351,8 @@ impl SegmentBuilder {
     }
 }
 
-/// 写端门面（拥有型）。持 [`Shared`]（与读端共享的视图 + 装配）与**写端私有**的
-/// [`SegmentBuilder`]（`S8-03` 起：未 `commit` 的内容都在那里，读端看不到）。
+/// 写端门面（拥有型）。持 `Shared`（与读端共享的视图 + 装配）与**写端私有**的
+/// `SegmentBuilder`（`S8-03` 起：未 `commit` 的内容都在那里，读端看不到）。
 ///
 /// 注意：`SearchIndex` 仍是 **`!Sync`**（`add(&mut self)`）——但 `S8-02` 起这**不再**
 /// 是「读写互斥」的来源：读端持独立的 `Searcher`（`Arc<Shared>`），与写端**并存**。
