@@ -260,10 +260,21 @@ fn S8_02_旧API与新API结果逐位一致() {
         .exec()
         .unwrap();
     assert!(!probe.hits.is_empty(), "hybrid 检索必须有命中");
-    let dbg = format!("{:?}", probe.hits);
+    // 🔑 判据用 `Explain` 的**结构化字段**，不用 `format!("{:?}")` 的字符串包含
+    // （`S8-02` 评审 P4-4）：原写法 `dbg.contains("0.")` 对任何 `0.x` 的分数都成立
+    // ⇒ **几乎恒真、零鉴别力** —— 它**并不能**证明向量 lane 参与了（能证明这一点的
+    // 是「必须用带向量 lane 的装配」这个**夹具选择**，不是那条断言）。
+    let vector_recalled = probe
+        .hits
+        .iter()
+        .filter(|h| h.explain.vector_score.is_some() || h.explain.vector_rank.is_some())
+        .count();
     assert!(
-        dbg.contains("vector") || dbg.contains("1.0") || dbg.contains("0."),
-        "explain 应反映混合检索：{dbg}"
+        vector_recalled > 0,
+        "hybrid 检索下必须至少有一条命中由**向量路**召回\
+         （`explain.vector_score` / `vector_rank` 为 `Some`）—— 否则「带向量 lane 的装配」\
+         这个前提不成立，「两条路径逐位一致」就成了空转。explain = {:?}",
+        probe.hits.iter().map(|h| &h.explain).collect::<Vec<_>>()
     );
 }
 

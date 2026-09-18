@@ -14,7 +14,7 @@
 //!
 //! | ID | 不变式 |
 //! | --- | --- |
-//! | **I8-1** | **写锁只用于指针替换**：[`Shared::publish`] 的写锁内**不得**做任何计算 / I/O / 分配（除 `Arc::new`）。任何「先取写锁再干活」的写法都必须在评审里被拒。 |
+//! | **I8-1** | **写锁只用于指针替换**：发布路径 [`Shared::commit_view`] 的写锁内**不得**做任何计算 / I/O / 分配（除 `Arc::new`）。任何「先取写锁再干活」的写法都必须在评审里被拒。**发布逻辑内联在该方法内、不另开 `publish`** ⇒ 「锁外三段」在可见性层面写不出来（`S8-02` 评审 P2 的结构性对策）。 |
 //! | **I8-2** | **段一旦进入过任何 `View`，永不再被修改**。⚠️ **PR3（`S8-02`）阶段尚未成立**：此时 `deltas` 恒空、内容唯一，写端经 [`Shared::with_main_mut`] **就地修改** `main` ⇒ 该约束自 **`S8-03`（delta 写入）** 起才真正成立。 |
 //! | **I8-3** | **读端只在取快照那一刻取一次读锁**（[`Shared::snapshot`]），之后全程无锁；一次检索**只用一个 `View`**。 |
 //!
@@ -96,6 +96,36 @@ impl Tombstones {
     pub(crate) fn is_empty(&self) -> bool {
         self.doc_ids.is_empty()
     }
+
+    /// 墓碑数量（`S8-02` 期恒 `0`）。
+    ///
+    /// 由 `SearchIndex::tombstone_stats()` 的**跨段求和**消费：墓碑指向的 doc 在段内
+    /// 仍然存活，但对外必须计成「已死」⇒ 要从存活文档数里扣掉（`S8-02` 期扣 0）。
+    pub(crate) fn len(&self) -> usize {
+        self.doc_ids.len()
+    }
+}
+
+/// `main` + `deltas` 的六项计数之和（`tombstone_stats` 的中间量）。
+///
+/// 🔑 抽成类型 + [`View::sums`] 的**纯函数**形态是为了**可测**（`S8-02` 评审 P3-2）：
+/// `S8-02` 期 `deltas` 恒空 ⇒ 若求和逻辑内联在 `SearchIndex::tombstone_stats()` 里
+/// （而视图只能经 `Shared::snapshot()` 拿到），「`deltas` 非空时是否正确累加」
+/// **永远测不到**。纯函数可以直接喂一个**手工构造的、带 delta 的 `View`**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct SegmentSums {
+    /// 正排分片槽位总数（含墓碑）
+    pub(crate) chunks_total: usize,
+    /// 存活分片数
+    pub(crate) chunks_alive: usize,
+    /// 正排文档槽位总数（含墓碑）
+    pub(crate) docs_total: usize,
+    /// 存活文档数（**不含**跨段墓碑扣减 —— 那一步在 `tombstone_stats` 里）
+    pub(crate) docs_alive: usize,
+    /// 向量索引中的点数（含墓碑）
+    pub(crate) graph_points: usize,
+    /// `raw_vectors` 原始向量条数
+    pub(crate) raw_vectors: usize,
 }
 
 /// 读端看到的一致快照。**不可变**：任何变化都产出新的 `Arc<View>`。
@@ -116,6 +146,24 @@ pub(crate) struct View {
 }
 
 impl View {
+    /// `main` + 全部 `deltas` 的六项计数**逐段求和**（设计 §4.9.5）。
+    ///
+    /// ⚠️ **这里真的逐段累加**（不是「只读 `main` + 一条阶段断言」）：`deltas` 恒空时
+    /// 结果与只读 `main` **逐位一致**；非空时（`S8-03` 起）也直接正确。
+    /// 『先前的版本只有断言、没有求和』是 `S8-02` 评审 P3-2 指出的问题。
+    pub(crate) fn sums(&self) -> SegmentSums {
+        let mut out = SegmentSums::default();
+        for seg in std::iter::once(&self.main).chain(self.deltas.iter()) {
+            out.chunks_total += seg.index.total_chunks();
+            out.chunks_alive += seg.index.alive_count();
+            out.docs_total += seg.index.total_docs();
+            out.docs_alive += seg.index.num_docs();
+            out.graph_points += seg.vector_index.as_ref().map(|v| v.len()).unwrap_or(0);
+            out.raw_vectors += seg.raw_vectors.as_ref().map(|v| v.len()).unwrap_or(0);
+        }
+        out
+    }
+
     /// 由单个主段构造初始视图（`deltas` 空、墓碑空、`generation = 0`）。
     pub(crate) fn single(main: Arc<Segment>) -> Self {
         Self {
@@ -181,28 +229,72 @@ impl Shared {
         Arc::clone(&self.view.read().expect("视图锁中毒"))
     }
 
-    /// **发布**新视图（唯一写点，`I8-1`：写锁内只有一次指针替换）。
-    pub(crate) fn publish(&self, next: View) {
-        *self.view.write().expect("视图锁中毒") = Arc::new(next);
-    }
-
-    /// 一次推进「已发布 doc / chunk 总数 + 视图序号」，返回新序号。
+    /// **原子提交**：持 `ids` 锁完成「取快照 → 算下一段基址 → 推进序号 → 发布」**四步**，
+    /// 返回新视图序号。
     ///
-    /// ⚠️ 发号与「算段基址」必须在**同一临界区**内（设计 §4.4.3 / 评审 P3-4）：
-    /// 保留 `into_index()` 后同一 `Arc<Shared>` 上可同时存在两个写端句柄，
-    /// 若两者分别算 `base_*` 会得到相同值 ⇒ 段 ID 空间重叠 ⇒ 破坏 I8-7。
-    /// `PR3` 里该锁只被 `commit()` 取（写端串行）。
+    /// # 为什么必须在一把锁内（`S8-02` 评审 P2；`2026-09-18` 两套实测）
     ///
-    /// `published_docs` / `published_chunks` 是「本次发布之后、全局空间的已用长度」，
-    /// 即**下一段的 `base_*`**（设计 §4.4.1：`base = 前序所有段长度之和`）。
-    pub(crate) fn advance(&self, published_docs: DocId, published_chunks: ChunkId) -> u64 {
+    /// `into_index()` 起总是成功 ⇒ 同一 `Arc<Shared>` 上可有**多个写端句柄**
+    /// （`SearchIndex: Send`）⇒ 两写端并发 `commit()` 合法。四步分离时会这样交错：
+    ///
+    /// ```text
+    /// A: snapshot(gen N) → advance(N+1)
+    /// B: snapshot(gen N) → advance(N+2) → publish(N+2)
+    /// A:                                   publish(N+1)   ⇒ generation 2 → 1（回退）
+    /// ```
+    ///
+    /// **实测（修复前）**：① 手工编排上述交错 ⇒ 终值 `generation = 1`（应为 2），
+    /// 且原「单调性告警」判据 `generation <= cur.generation` = `1 <= 0` = **false ⇒ 不触发**
+    /// （它比较的是**发布前的旧 `cur`**，形同虚设）；② **真实并发**：4 写端 × 150 次
+    /// `commit()` ⇒ 观察线程看到 **70 次回退**（样本 `(65,64)` / `(82,81)` / `(134,127)`）。
+    /// 回归判据见 `crate::search::index` 的 `S8_02_并发commit不丢失视图序号`。
+    ///
+    /// 🔑 这不只是「序号难看」：**同一形状原样带入 `S8-03`（delta 分段）会让两个 delta 段
+    /// 拿到相同 `base_*`** ⇒ 段 ID 空间重叠 ⇒ 破坏 `I8-7`。⇒ 本方法是 `S8-03` 的**形状前置**。
+    ///
+    /// # 锁序与唯一发布路径
+    ///
+    /// 锁序 `ids` → `view`；反向路径不存在（[`Shared::snapshot`] 与
+    /// [`Shared::with_main_mut`] 都只取 `view`）⇒ 无死锁。
+    ///
+    /// 本方法是**唯一**能替换 `view` 指针的地方（发布逻辑内联在此，不另开 `publish`）
+    /// ⇒ 「锁外三段」在**可见性层面**写不出来。这是对评审 P2 的**结构性**对策：
+    /// 不是加一个检查，而是**消除违反它的入口**。
+    pub(crate) fn commit_view(&self) -> u64 {
         let mut ids = self.ids.lock().expect("发号锁中毒");
-        ids.next_doc = published_docs;
-        ids.next_chunk = published_chunks;
+        let cur = Arc::clone(&self.view.read().expect("视图锁中毒"));
+
+        // 下一段的基址 = 本段基址 + 本段长度（设计 §4.4.1：`base = 前序所有段长度之和`）。
+        // ⚠️ `Index` 的计数是 `usize`、全局 ID 是 `u32`：本阶段（单段、`base = 0`）
+        // 不会溢出；`S8-03` 引入真正的多段发号时须在此显式处理上限（设计 §4.4.3）。
+        let next_base_doc = cur.main.base_doc + cur.main.index.total_docs() as DocId;
+        let next_base_chunk = cur.main.base_chunk + cur.main.index.total_chunks() as ChunkId;
+        ids.next_doc = next_base_doc;
+        ids.next_chunk = next_base_chunk;
         ids.generation += 1;
-        ids.generation
+        let generation = ids.generation;
+
+        // 不变式守卫：发布序号必须严格大于当前视图序号。
+        //
+        // ⚠️ 在本临界区内它**结构性成立**（`ids.generation` 只增、`view` 只由本方法更新）
+        // ⇒ 这是**防旁路守卫**（防未来有人从别处替换指针），**不是**可测行为 ——
+        // 别把它当成「覆盖了回退场景」；那条判据在 `index.rs` 的并发用例里。
+        debug_assert!(
+            generation > cur.generation,
+            "发布序号必须严格递增：ids = {generation}，view = {}",
+            cur.generation
+        );
+
+        // ⚠️ I8-1：写锁内只有一次指针替换（内容全部来自 `cur`，不做计算 / I/O）。
+        *self.view.write().expect("视图锁中毒") = Arc::new(View {
+            main: Arc::clone(&cur.main),
+            deltas: Arc::clone(&cur.deltas),
+            tombstones: Arc::clone(&cur.tombstones),
+            generation,
+        });
+        generation
     }
-    /// 下一段的 `base_*`（`S8-03` 起由段构造消费；本阶段用于自洽断言）。
+    /// 下一段的 `base_*`（`S8-03` 起由段构造消费；本阶段由 `commit()` 的 `tracing` 字段消费）。
     pub(crate) fn next_base(&self) -> (DocId, ChunkId) {
         let ids = self.ids.lock().expect("发号锁中毒");
         (ids.next_doc, ids.next_chunk)
@@ -225,7 +317,9 @@ impl Shared {
 
 /// 「写入需要独占」的统一错误（消息里指明阶段与出路，避免被误读成 bug）。
 fn write_needs_exclusive() -> Error {
-    Error::InvalidInput(
+    // ⚠️ **`Error::Busy` 而不是 `Error::InvalidInput`**（`S8-02` 评审 P4-5a）：
+    // 这是**瞬态并发状态**（重试即可），不是参数错误（重试无用）。
+    Error::Busy(
         "写入需要独占当前视图（此刻有并发检索持有快照）—— S8-02 过渡期约束；\
          并发读写由 S8-03 的 delta 分段交付"
             .to_string(),
@@ -263,32 +357,30 @@ mod tests {
         assert_eq!(v.main.base_chunk, 0, "单段下 base_chunk 恒为 0");
     }
 
-    /// **`S8-02`**：`publish` 之后 `generation` **单调递增**，且 `deltas` 仍空
-    /// （骨架期发布**不产生新段**：内容只在 `main` 里，指针替换是唯一的可见性跃迁）。
+    /// **`S8-02`**：`commit_view` 之后 `generation` **单调递增**，且 `deltas` 仍空
+    /// （骨架期提交**不产生新段**：内容只在 `main` 里，指针替换是唯一的可见性跃迁）。
     #[test]
-    fn S8_02_发布只递增序号且不产生新段() {
+    fn S8_02_提交只递增序号且不产生新段() {
         let sh = shared();
         let before = sh.snapshot();
-        assert_eq!(sh.next_base(), (0, 0), "未发布时应为 (0, 0)");
+        assert_eq!(sh.next_base(), (0, 0), "未提交时应为 (0, 0)");
 
-        let g1 = sh.advance(3, 7);
+        let g1 = sh.commit_view();
         assert_eq!(g1, 1, "序号应从 1 开始");
-        assert_eq!(sh.next_base(), (3, 7), "advance 必须同临界区更新基址");
-        sh.publish(View {
-            main: Arc::clone(&before.main),
-            deltas: Arc::clone(&before.deltas),
-            tombstones: Arc::clone(&before.tombstones),
-            generation: g1,
-        });
+        assert_eq!(
+            sh.next_base(),
+            (0, 0),
+            "空段（`Segment::empty`）⇒ 下一段基址仍为 (0, 0)"
+        );
         let after = sh.snapshot();
         assert_eq!(after.generation, 1);
-        assert!(after.deltas.is_empty(), "发布不得产生新段（骨架期）");
+        assert!(after.deltas.is_empty(), "提交不得产生新段（骨架期）");
         assert!(
             Arc::ptr_eq(&after.main, &before.main),
-            "骨架期发布必须复用同一个 main 段（不复制内容）"
+            "骨架期提交必须复用同一个 main 段（不复制内容）"
         );
 
-        let g2 = sh.advance(3, 7);
+        let g2 = sh.commit_view();
         assert_eq!(g2, 2, "序号必须单调递增");
     }
 
@@ -307,6 +399,12 @@ mod tests {
         // 造一个读者持有当前视图
         let held = sh.snapshot();
         let err = sh.with_main_mut(|seg| seg.index.total_docs()).unwrap_err();
+        // ⚠️ 必须是**独立的瞬态变体**（`S8-02` 评审 P4-5a）：它表示「稍后重试即可」，
+        // 不是「参数错了」。混用 `InvalidInput` 会让调用方无法区分这两者。
+        assert!(
+            matches!(err, Error::Busy(_)),
+            "并发冲突必须报 `Error::Busy`（可重试），实际：{err:?}"
+        );
         let msg = format!("{err}");
         assert!(
             msg.contains("需要独占"),
@@ -319,21 +417,50 @@ mod tests {
             .expect("读者释放后必须恢复可写");
     }
 
-    /// **`S8-02`**：`View` 的「一次检索只用一个快照」语义 —— `snapshot()` 拿到的 `Arc<View>`
-    /// 在后续 `publish` 之后**内容不变**（`I8-3` 的基石）。
+    /// **`S8-02` 评审 P3-2**：跨段求和必须**真的遍历 `deltas`**。
+    ///
+    /// 🔑 判据刻意用 `raw_vectors` 而**不是** chunk / doc 计数：后者在
+    /// `Segment::empty` 下恒 0，两段相加仍是 0 ⇒ 与「只读 `main`」**无差别**
+    /// （那就是原缺陷能藏住的原因）。`raw_vectors` 可手工构造非零值 ⇒ 有鉴别力。
     #[test]
-    fn S8_02_已取出的快照不受后续发布影响() {
+    fn S8_02_跨段求和真的遍历deltas() {
+        let seg = |n: usize| {
+            Arc::new(Segment {
+                index: Index::new(),
+                vector_index: None,
+                raw_vectors: Some(vec![(0 as ChunkId, vec![1.0f32, 0.0]); n]),
+                base_doc: 0,
+                base_chunk: 0,
+                generation: 0,
+            })
+        };
+        let view = View {
+            main: seg(1),
+            deltas: Arc::from(vec![seg(1), seg(1)]),
+            tombstones: Arc::new(Tombstones::default()),
+            generation: 0,
+        };
+        assert_eq!(view.deltas.len(), 2, "前提：两个 delta 段");
+
+        let s = view.sums();
+        assert_eq!(
+            s.raw_vectors, 3,
+            "必须 1（main）+ 1 + 1（两个 delta）—— 只读 `main` 会得 1"
+        );
+        // 空 `Index` 的计数恒 0（这也是「用 raw_vectors 当判据」的理由）
+        assert_eq!(s.chunks_total, 0);
+        assert_eq!(s.docs_alive, 0);
+    }
+
+    /// **`S8-02`**：`View` 的「一次检索只用一个快照」语义 —— `snapshot()` 拿到的 `Arc<View>`
+    /// 在后续提交之后**内容不变**（`I8-3` 的基石）。
+    #[test]
+    fn S8_02_已取出的快照不受后续提交影响() {
         let sh = shared();
         let held = sh.snapshot();
-        let g = sh.advance(0, 0);
-        let cur = sh.snapshot();
-        sh.publish(View {
-            main: Arc::clone(&cur.main),
-            deltas: Arc::clone(&cur.deltas),
-            tombstones: Arc::clone(&cur.tombstones),
-            generation: g,
-        });
-        assert_eq!(held.generation, 0, "已取出的快照内容不得被后续发布改动");
+        let g = sh.commit_view();
+        assert_eq!(g, 1);
+        assert_eq!(held.generation, 0, "已取出的快照内容不得被后续提交改动");
         assert_eq!(sh.snapshot().generation, 1, "新快照必须看到新序号");
     }
 }

@@ -21,7 +21,7 @@ use crate::vector::{
 };
 
 use super::config::{Config, GraphPersistMode, SearchIndexBuilder, VectorBackend};
-use super::view::{Segment, Shared, View};
+use super::view::{Segment, Shared};
 
 /// 图 sidecar 的状态（V2 Step 2 / NFR-07：降级不能静默）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -361,6 +361,18 @@ impl SearchIndex {
     ///   命中已存在文档时直接返回 `deduped = true`，不重复分块/插入。
     /// - 向量化**延后到 `flush`**（批量 embed，NFR-03）；此刻只进倒排与写缓冲。
     /// - 缓冲满（`batch_size`）时自动同步 flush。
+    ///
+    /// # ⚠️ `S8-02` 期失败可能是**部分生效**（评审 P4-5b）
+    ///
+    /// 本方法有**两处**写点：① 倒排（第一处 `Shared::with_main_mut`）；
+    /// ② 缓冲满时的 `flush()`（内部再取一次 `with_main_mut`）。
+    /// **① 成功后 ② 可能失败**（读者恰在两步之间插入 ⇒ 见 `Shared::with_main_mut`
+    /// 的过渡约束）⇒ 返回 `Err` **但倒排已写入、内容已可查**。
+    ///
+    /// - **重试是安全的**：`content_hash` 查重短路 ⇒ 第二次 `add` 返回 `deduped = true`，
+    ///   不会重复插入；`pending` 保留待下次 `flush()` 自愈。
+    /// - 但调用方**不能**假定「`Err` ⇒ 什么都没发生」。
+    /// - `S8-03`（delta 分段）后写入不再需要独占 ⇒ 该情形消失。
     pub fn add(&mut self, doc: impl Into<Document>) -> Result<AddOutcome> {
         let doc = doc.into();
         let text = doc.text.clone();
@@ -497,38 +509,25 @@ impl SearchIndex {
     /// → 发布」，届时它才成为**唯一的可见性边界**（设计 §4.8.3 / §1.3 第 7 条）。
     pub fn commit(&mut self) -> Result<()> {
         self.flush()?;
-        // ⚠️ I8-1：`publish` 的写锁内只有一次指针替换；构造 `next` 在锁外完成。
-        let cur = self.shared.snapshot();
-        // 本段（= 发布后的全局空间已用长度）的下一段基址：base + 本段长度。
-        // ⚠️ 与视图序号在**同一临界区**内推进（评审 P3-4 / 设计 §4.4.3）。
-        // ⚠️ `Index` 的计数是 `usize`、全局 ID 是 `u32`：本阶段（单段、`base = 0`）
-        // 不会溢出；`S8-03` 引入真正的多段发号时须在此显式处理上限（设计 §4.4.3）。
-        let next_base_doc = cur.main.base_doc + cur.main.index.total_docs() as DocId;
-        let next_base_chunk = cur.main.base_chunk + cur.main.index.total_chunks() as ChunkId;
-        let generation = self.shared.advance(next_base_doc, next_base_chunk);
-        debug_assert_eq!(
-            self.shared.next_base(),
-            (next_base_doc, next_base_chunk),
-            "发号器状态必须与本次发布的段长度同步"
-        );
-        self.shared.publish(View {
-            main: Arc::clone(&cur.main),
-            deltas: Arc::clone(&cur.deltas),
-            tombstones: Arc::clone(&cur.tombstones),
-            generation,
-        });
-        // 单调性诊断：视图序号只增不减；不递增说明 publish 路径被绕过（NFR-07）。
-        if generation <= cur.generation {
-            tracing::warn!(
-                prev = cur.generation,
-                now = generation,
-                "视图序号未递增（publish 路径异常）"
-            );
-        }
+        // ⚠️ **四步（取快照 / 算下一段基址 / 推进序号 / 发布）全部在
+        // `Shared::commit_view` 的 `ids` 锁内完成** —— 两写端并发 `commit()` 时
+        // 序号不会回退、段基址不会重叠（`S8-02` 评审 P2 / 设计 §4.4.3）。
+        //
+        // 🔑 `publish` 已**不再是公开入口**：发布逻辑内联在 `commit_view` 里
+        // ⇒ 「锁外三段」在可见性层面写不出来（结构性对策，不是加检查）。
+        // ⚠️ 原先的「单调性告警」已删除：它比较的是**发布前的旧 `cur`**
+        // （`generation <= cur.generation`），在上述交错下 `1 <= 0` = false
+        // ⇒ **永不触发、形同虚设**（评审 P2 复核 + 实测）。真正的守卫在
+        // `commit_view` 的 `debug_assert`（防旁路）与
+        // `S8_02_并发commit不丢失视图序号`（行为判据）。
+        let generation = self.shared.commit_view();
         // 可观测性（NFR-07）：发布是新模型下唯一的状态跃迁，必须留痕。
+        let (base_doc, base_chunk) = self.shared.next_base();
         tracing::debug!(
             generation,
-            segments = 1 + cur.deltas.len(),
+            base_doc,
+            base_chunk,
+            segments = 1 + self.shared.snapshot().deltas.len(),
             "视图已发布（S8-02 骨架：`deltas` 恒空 ⇒ segments 恒为 1）"
         );
         Ok(())
@@ -587,6 +586,11 @@ impl SearchIndex {
     ///
     /// ⚠️ **`S8-02` 过渡约束**：写端此后若在**有并发检索**时写入，会返回 `Err`
     /// （见 `Shared::with_main_mut`）；`S8-03` 起消失。
+    ///
+    /// ⚠️ **可见性口径要连读模块文档**（评审 P4-6b）：「不隐含 `flush`」说的是
+    /// **向量 / 写缓冲**的落地；`S8-02` 期**倒排是边 `add` 边可见的**（内容就在 `main` 里，
+    /// 这就是「行为与重构前逐位一致」的含义）。「可见性 = `commit()` 后」是 `S8-03`
+    /// （delta 分段）起的**终态**语义 —— 只读本方法文档容易误判成前者已经成立。
     pub fn searcher(&self) -> crate::search::Searcher {
         crate::search::Searcher {
             shared: Arc::clone(&self.shared),
@@ -767,31 +771,34 @@ impl SearchIndex {
     /// 由存活位图在检索期挡掉）；`raw_vectors` 已由 `remove` 的 `retain` 摘除墓碑。
     pub fn tombstone_stats(&self) -> TombstoneStats {
         let view = self.shared.snapshot();
-        let seg = &view.main;
-        let index = &seg.index;
-        // ⚠️ **跨段求和**（设计 §4.9.5）：本阶段 `main` 之外还有 `deltas`（恒空），
-        // 因此计数必须按段累加，而不是只看 `main` —— 这样 `S8-03` 起无需改动本函数。
-        debug_assert!(
-            view.deltas.is_empty(),
-            "S8-02 期 `deltas` 必须恒空（视图骨架的验收条件）"
-        );
+        // ⚠️ **跨段求和**（设计 §4.9.5）：`main` 之外还有 `deltas`（`S8-02` 期恒空）。
+        //
+        // 🔑 求和逻辑在 `View::sums()`（`view.rs`）—— 抽成纯函数才能直接喂一个
+        // **手工构造的、带 delta 的 `View`** 去测它（`S8-02` 期 `deltas` 恒空 ⇒
+        // 内联写法「非空时是否正确累加」永远测不到）。
+        //
+        // 🔴 `S8-02` 评审 P3-2：先前此处只有一条 `debug_assert!(deltas.is_empty())`
+        // 而**没有任何求和**，与本注释的声明不符 ⇒ `S8-03` 一旦 `deltas` 非空：
+        // debug 下断言红、**release 下静默少算**。现改为真求和。
+        let sums = view.sums();
+        // 跨段墓碑指向的是**既往段里仍存活**的 doc ⇒ 必须从「存活文档数」扣掉，
+        // 否则 `S8-03` 起该数会偏大。`S8-02` 期恒空 ⇒ 扣 0、结果不变。
         debug_assert!(
             view.tombstones.is_empty(),
             "S8-02 期不应出现跨段墓碑（删除走 `Index::remove` 的物理路径）"
         );
-        let chunks_total = index.total_chunks();
-        let chunks_alive = index.alive_count();
+        let docs_alive = sums.docs_alive.saturating_sub(view.tombstones.len());
         TombstoneStats {
-            chunks_total,
-            chunks_alive,
-            docs_total: index.total_docs(),
-            docs_alive: index.num_docs(),
-            graph_points: seg.vector_index.as_ref().map(|v| v.len()).unwrap_or(0),
-            raw_vectors: seg.raw_vectors.as_ref().map(|v| v.len()).unwrap_or(0),
-            tombstone_ratio: if chunks_total == 0 {
+            chunks_total: sums.chunks_total,
+            chunks_alive: sums.chunks_alive,
+            docs_total: sums.docs_total,
+            docs_alive,
+            graph_points: sums.graph_points,
+            raw_vectors: sums.raw_vectors,
+            tombstone_ratio: if sums.chunks_total == 0 {
                 0.0
             } else {
-                1.0 - chunks_alive as f64 / chunks_total as f64
+                1.0 - sums.chunks_alive as f64 / sums.chunks_total as f64
             },
         }
     }
@@ -808,6 +815,12 @@ impl SearchIndex {
     ///   `source` / `content_hash`，不要用 `doc_id` / `chunk_id`。
     /// - `bytes_before` / `bytes_after` 均为 `None`（无路径可 stat）；要持久化请用
     ///   [`Self::compact_and_save`]。
+    /// - ⚠️ **末步失败会丢弃整套重建结果**（评审 P4-6a）：重建（新 `Index` + 新向量图）
+    ///   在局部变量里完成，**最后一步**才是 `with_main_mut` 的原子替换；该步若因
+    ///   **并发读者**失败（见 `Shared::with_main_mut` 的过渡约束），已付出的重建代价
+    ///   **全部丢弃**并返回 `Err` —— 旧模型（写端独占）下类型上不可能发生。
+    ///   ⇒ `S8-02` 期请在**无活动读者**时调用 `compact()` / `compact_and_save()`；
+    ///   `S8-03` 起该约束消失。
     pub fn compact(&mut self) -> Result<CompactionReport> {
         self.compact_with_bytes(None)
     }
@@ -1125,6 +1138,82 @@ mod tests {
         );
         // 骨架期不变式：发布不产生新段
         assert!(idx.shared.snapshot().deltas.is_empty());
+    }
+
+    /// **`S8-02`**：**并发 `commit()` 不得丢失视图序号**（`generation` 只增不减，NFR-07）。
+    ///
+    /// # 这条锁的是一个真实缺陷（`S8-02` 评审 P2，`2026-09-18`）
+    ///
+    /// `commit()` 原本是「`snapshot` → `advance` → `publish`」**三段分离**（`ids` 锁只覆盖
+    /// `advance` 内部），而 `into_index()` 起总是成功 ⇒ 同一 `Arc<Shared>` 上可有多个写端
+    /// 句柄（`SearchIndex: Send`）⇒ 两写端交错时**后发布的可能是更早 `advance` 的序号**。
+    ///
+    /// **修复前实测**（本条就是当时的复现用例）：4 写端 × 150 次 `commit()` ⇒ 观察线程
+    /// 看到 **70 次回退**（样本 `(65,64)` / `(82,81)` / `(134,127)`）。
+    ///
+    /// # 判据为什么看「过程」而不是「最终值」
+    ///
+    /// 只看终点会**漏**：最后 `publish` 的恰好是最后 `advance` 的线程时终值仍然正确
+    /// （实测：同一压力下用「终值 == 总数」判据跑 3 轮**全绿**）。⇒ 用观察线程持续快照，
+    /// 一旦看到比历史最大值更小的序号即记录。
+    ///
+    /// # 修复后的性质（诚实标注）
+    ///
+    /// 四步在 `Shared::commit_view` 的 `ids` 锁内 ⇒ `publish` 顺序 == `advance` 顺序
+    /// ⇒ **结构性成立**。⇒ 本用例是**回归锁**：它的牙齿来自**修复前的复现**（70 次），
+    /// 而不是当前代码里某个可变点；删掉它不会有别的用例变红。
+    #[test]
+    #[allow(deprecated)] // `into_index()`（deprecated）是构造**多个写端**的唯一途径
+    fn S8_02_并发commit不丢失视图序号() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let a = bm25_index();
+        let b = a.searcher().into_index().unwrap();
+        let c = a.searcher().into_index().unwrap();
+        let d = a.searcher().into_index().unwrap();
+        let sh = Arc::clone(&a.shared);
+        const N: usize = 150;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let drops = Arc::new(std::sync::Mutex::new(Vec::<(u64, u64)>::new()));
+        {
+            let sh = Arc::clone(&sh);
+            let stop = Arc::clone(&stop);
+            let drops = Arc::clone(&drops);
+            std::thread::spawn(move || {
+                let mut max_seen = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let g = sh.snapshot().generation;
+                    if g < max_seen {
+                        drops.lock().unwrap().push((max_seen, g));
+                    } else {
+                        max_seen = g;
+                    }
+                }
+            });
+        }
+
+        let spawn = |mut w: SearchIndex| {
+            std::thread::spawn(move || {
+                for _ in 0..N {
+                    w.commit().unwrap();
+                }
+            })
+        };
+        for h in [spawn(a), spawn(b), spawn(c), spawn(d)] {
+            h.join().unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        // 给观察线程最后一次读的机会（它可能正卡在读锁上）
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let observed = drops.lock().unwrap();
+        assert!(
+            observed.is_empty(),
+            "generation 只增不减（NFR-07）：观察到 {} 次回退，样本 {:?}",
+            observed.len(),
+            observed.iter().take(3).collect::<Vec<_>>()
+        );
     }
 
     #[test]
