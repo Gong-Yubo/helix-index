@@ -2,10 +2,12 @@
 //!
 //! # 可见性语义（p6-design 6.3；`S8-02` 起见 `super::view`）
 //!
-//! ⚠️ **本阶段（`S8-02` 视图骨架）的可见性语义与重构前逐位一致**：倒排在 `add` 时
-//! **立即**写入当前段（`deltas` 恒空 ⇒ 只有一段）⇒「`add` 后未 `commit` 也能查到倒排」；
-//! 向量侧由 `flush` 灌入。`commit()` = `flush()` + **发布新视图**（`generation` +1）。
-//! 「未 `commit` 不可见」由 `S8-03`（delta 写入）收紧，届时收窄到的判据见设计 §1.3 第 7 条。
+//! **`S8-03` 起：可见性 = `commit()` 后**（NFR-11 / 设计 §1.3 第 7 条）。`add` / `flush`
+//! 写的是**写端私有的** `SegmentBuilder` ⇒ 读端看不到；`commit()` = `flush` → **封段** →
+//! 持 `ids` 锁**原子追加进 `View.deltas`** → 发布新 `View`（`generation` +1）。
+//! ⚠️ `S8-02`（视图骨架）期**恰好相反**（`deltas` 恒空、`add` 直写 `main` ⇒ 立即可见，
+//! 与重构前逐位一致）；那条语义**按计划在本 PR 收紧**，对应用例已改名 + 反转
+//! （`tests/step8_segments.rs` 的 `S8_03_未commit不可见_commit后立即可见`）。
 //!
 //! `searcher(&self)` **不隐含 flush**（对齐 NFR-11：可见性 = `commit()` 后）；
 //! 旧的 `into_searcher()` 保留为 `#[deprecated]` 薄封装 = `commit()` + `searcher()`，
