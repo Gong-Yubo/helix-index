@@ -342,8 +342,20 @@ impl VectorIndex for HnswRsIndex {
     /// 返回空迭代器 ⇒ **不 panic**。库自身的 `debug_dump`（`:485-490`）用的就是同一个
     /// `0..=max_level_observed` 模式，可作先例。
     ///
+    /// ⚠️ **顺带收益**（2026-09-18 第 1 轮评审指出）：**旧 `IntoIterator` 写法在空图上会 panic** ——
+    /// `IterPoint::next` 的首次调用即走层切换分支（`pi_guard[0].len() == 0`），该分支
+    /// `entry_point_ref.as_ref().unwrap()`（`hnsw.rs:662`）在空图上为 `None`。此前只靠上层
+    /// `VectorRetriever::search_exact_filtered` 的 `self.index.is_empty()` 早退兜住
+    /// （`retriever/vector.rs:70`）—— **trait impl 自身没有空图早退**（本函数只早退 `k == 0`）；
+    /// 逐层写法每层只读 `points_by_layer`（`IterPointLayer::new` `hnsw.rs:701` 不读
+    /// `entry_point`）⇒ 本写法**顺带消除**该隐患（判据见
+    /// `空图精确扫描返回空且不panic`，**变异实测**：改回 `IntoIterator` 时该用例 panic 于
+    /// `hnsw.rs:662`）。
+    ///
     /// ⑤ **成本（顺带收益）**：把 1 次「长持锁」换成 `L+1` 次「短持锁」
-    /// （`L` = 最大层；M=32 / N=12K 下期望 `L ≈ log₁/₃₂(12000) ≈ 2.4`）⇒ 总持锁量同量级，
+    /// （`L` = **观测到的最大层**；M=32 / N=12K 下 `E[L] ≈ (ln N + γ)/ln 32 ≈ 2.9`——
+    /// 原写 `log₁/₃₂(12000) ≈ 2.4` 为**误算**，该式实为 `2.71`，且 `L` 的口径是**最大次序统计量**
+    /// 而非 `log₃₂ N`）⇒ 总持锁量同量级，
     /// 但**单次持锁时长从 `O(N)` 降到 `O(该层点数)`** ⇒ 写端的**单次**阻塞窗口显著变短
     /// （R34 的原文只说了「消除死锁」，没说这条）。
     ///
@@ -774,10 +786,40 @@ mod tests {
             n,
             "各层点数之和必须等于总点数（generate_new_point 只把点推入**它自己那一层**、无回填）"
         );
+        // ⚠️ 此处原有一条 `assert!(l0 < n)`，**2026-09-18 第 1 轮评审后删除**（P4-2）：
+        //    它被上面两条蕴含（`upper > 0` ∧ `l0 + upper == n` ⇒ `l0 = n − upper < n`）
+        //    ⇒ 逻辑上**永不报红**、零鉴别力；留着会让后人**高估**本用例的覆盖度。
+        //    「layer 0 不是全量」这一语义已由 `upper > 0` + 并集等式**联合**表达，删除不丢语义。
+    }
+
+    /// **S8-T2 ③ / 评审 2026-09-18 顺带收益**：**空图**上的精确扫描必须返回空、**不 panic**。
+    ///
+    /// 这条同时是「改回 `IntoIterator`」这一回退的**行为级绊线**：
+    /// 旧写法 `for point in self.hnsw.get_point_indexation()` 在空图上会 **panic** ——
+    /// `IterPoint::next` 的首次调用即走层切换分支（`pi_guard[0].len() == 0`），该分支
+    /// `entry_point_ref.as_ref().unwrap()`（`hnsw.rs:662`）在空图上为 `None`（`entry_point` 未设）。
+    /// 此前只靠上层 `VectorRetriever::search_exact_filtered` 的 `self.index.is_empty()` 早退兜住
+    /// （`retriever/vector.rs:70`）—— **trait impl 自身没有空图早退**（本函数只早退 `k == 0`）；
+    /// 逐层写法每层只读 `points_by_layer`（`IterPointLayer::new` `hnsw.rs:701` 不读 `entry_point`）
+    /// ⇒ `get_layer_iterator(0)` 返回空迭代器 ⇒ **顺带消除该隐患**。
+    ///
+    /// ⚠️ **覆盖边界**：本断言抓的是「改回 `IntoIterator`」这一**具体回退**（空图上 panic ⇒ 红；
+    /// **M4 变异实测**：该用例红、其余 10 条全绿）；
+    /// 抓不住「改回 `IntoIterator` **且同时**补空图早退」的写法（那时本用例仍绿）——
+    /// 那种写法仍带 R34 的递归读，得靠 `tests/step8_rw_concurrency.rs` + 评审红线。
+    #[test]
+    fn 空图精确扫描返回空且不panic() {
+        let idx = HnswRsIndex::with_capacity(0);
+        let mut seed = 2026u64;
+        let q = NormalizedVector::new(random_vec(&mut seed));
+        assert_eq!(idx.hnsw.get_nb_point(), 0, "本用例前提：空图");
+        let got = idx
+            .search_exact_filtered(&q, 3, None)
+            .expect("空图精确扫描不得报错");
         assert!(
-            l0 < n,
-            "把层号上界写成 0 时覆盖数必须**严格小于**总点数；相等说明遍历已不是「取全部点」、\
-             本用例对「层号范围写错」已无鉴别力"
+            got.is_empty(),
+            "空图上精确扫描必须返回空，实际 {} 条",
+            got.len()
         );
     }
 
