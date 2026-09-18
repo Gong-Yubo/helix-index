@@ -35,6 +35,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crate::error::{Error, Result};
 use crate::index::Index;
+use crate::predicate::{CandidateFilter, FilterKind};
 use crate::types::{ChunkId, DocId};
 use crate::vector::VectorIndex;
 
@@ -73,6 +74,16 @@ impl Segment {
             generation: 0,
         }
     }
+
+    /// 段内本地 `chunk_id` → **全局** `chunk_id`（`base + local`，设计 §4.4.1）。
+    pub(crate) fn global_chunk(&self, local: ChunkId) -> ChunkId {
+        self.base_chunk + local
+    }
+
+    /// 段内本地 `doc_id` → **全局** `doc_id`。
+    pub(crate) fn global_doc(&self, local: DocId) -> DocId {
+        self.base_doc + local
+    }
 }
 
 /// 跨段墓碑（针对**既往段**的全局 doc 墓碑）。
@@ -80,7 +91,7 @@ impl Segment {
 /// ⚠️ **`PR3` 阶段恒为空**：内容只有一段、且删除仍走 `Index::remove` 的**物理**路径
 /// （与今天逐位一致）。`S8-03` 起「删除落在既往段上」的 doc 记进这里，
 /// 由 `S8-06` 的合并**物理化**（设计 §4.9.2）。
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct Tombstones {
     /// 已墓碑化的全局 doc_id（升序去重）
     doc_ids: Vec<DocId>,
@@ -103,6 +114,34 @@ impl Tombstones {
     /// 仍然存活，但对外必须计成「已死」⇒ 要从存活文档数里扣掉（`S8-02` 期扣 0）。
     pub(crate) fn len(&self) -> usize {
         self.doc_ids.len()
+    }
+
+    /// 记一条墓碑（**幂等**）；`doc_id` 是**全局** ID。
+    ///
+    /// 保持**升序去重**：这样 `tombstone_stats` 的扣减与合并时的物理化遍历顺序都确定
+    /// （NFR-06），且 `blocks_doc` 可以用二分。
+    pub(crate) fn add(&mut self, doc_id: DocId) {
+        match self.doc_ids.binary_search(&doc_id) {
+            Ok(_) => {}
+            Err(pos) => self.doc_ids.insert(pos, doc_id),
+        }
+    }
+
+    /// 该 doc 是否已被墓碑挡住（`O(log n)`）。
+    pub(crate) fn blocks_doc(&self, doc_id: DocId) -> bool {
+        self.doc_ids.binary_search(&doc_id).is_ok()
+    }
+
+    /// 按升序遍历全部墓碑（合并时**物理化**用，设计 §4.9.2）。
+    pub(crate) fn iter(&self) -> impl Iterator<Item = DocId> + '_ {
+        self.doc_ids.iter().copied()
+    }
+
+    /// 移除一条墓碑（物理化之后调用 ⇒ 热路径可回到零谓词，见 §4.7.3）。
+    pub(crate) fn remove(&mut self, doc_id: DocId) {
+        if let Ok(pos) = self.doc_ids.binary_search(&doc_id) {
+            self.doc_ids.remove(pos);
+        }
     }
 }
 
@@ -172,6 +211,69 @@ impl View {
             tombstones: Arc::new(Tombstones::default()),
             generation: 0,
         }
+    }
+
+    /// **最新优先**：`deltas` 末尾 → … → `main`（跨段 `content_hash` 查重的顺序，
+    /// 设计 §4.8.3：越新的段越可能是「同一逻辑文档」的最近一次写入）。
+    pub(crate) fn segments_newest_first(&self) -> impl Iterator<Item = &Arc<Segment>> {
+        self.deltas.iter().rev().chain(std::iter::once(&self.main))
+    }
+
+    /// **FIFO 顺序**的全部段：`main` 在最前，其后依次 `deltas[0], deltas[1], …`。
+    ///
+    /// ⚠️ 这是跨段遍历的**唯一**顺序（设计 §4.4.2 / §4.5.2）：合并只能从头消费一个前缀
+    /// （否则基址不变式破裂），BM25 的 TAAT 也必须按它累加（否则 `I8-6` 破）。
+    pub(crate) fn segments_in_order(&self) -> impl Iterator<Item = &Arc<Segment>> {
+        std::iter::once(&self.main).chain(self.deltas.iter())
+    }
+
+    /// BM25 的**全局统计量**（`S8-04` / 设计 §4.5.1）：返回 `(N, total_len)`。
+    ///
+    /// - `N` = Σ 各段**活**分片数（`Index::num_chunks` = `Stats::num_chunks`）；
+    /// - `total_len` = Σ 各段 `Stats::total_len`。
+    ///
+    /// 🔴 **必须是精确整数和**（`I8-5`）：`avgdl` 要用**全局** `total_len / N` 算**一次**。
+    /// 若各段各算 `avgdl` 再加权平均，会引入两次浮点舍入 ⇒ 分数**只在分段布局下**漂移
+    /// （结果「看起来对」，但此后所有质量对比失去可比性 —— 这正是 `S8-T4` 要钉的东西）。
+    pub(crate) fn bm25_totals(&self) -> (u32, u64) {
+        let mut n = 0u32;
+        let mut total = 0u64;
+        for seg in self.segments_in_order() {
+            n += seg.index.num_chunks();
+            total += seg.index.total_len();
+        }
+        (n, total)
+    }
+
+    /// 把**全局** `chunk_id` 折算成 `(段下标, 段内本地 id)`；不属于任何段则 `None`。
+    ///
+    /// 段数极少（主段 + 少量 delta）⇒ **线性扫描 `base` 区间**（每段一次 `u32` 比较）即可。
+    /// ⚠️ 刻意**不**为此建 `HashMap`：段数 ≤ 8 时更慢，且多一份要维护的一致性状态（§4.7.2）。
+    ///
+    /// 用的是 `total_chunks()`（**槽位**数，含墓碑）而非 `num_chunks()`（活数）——
+    /// 全局 ID 空间覆盖的是槽位，死 chunk 也必须有合法折算（它会被存活判定挡掉）。
+    pub(crate) fn locate(&self, global_chunk: ChunkId) -> Option<(usize, ChunkId)> {
+        for (i, seg) in self.segments_in_order().enumerate() {
+            if let Some(local) = global_chunk.checked_sub(seg.base_chunk) {
+                if (local as usize) < seg.index.total_chunks() {
+                    return Some((i, local));
+                }
+            }
+        }
+        None
+    }
+
+    /// **BM25 是否需要跨段谓词**（R52 热路径判据，`S8-04` / 设计 §4.7.3）。
+    ///
+    /// `false` ⇒ 调用方可以传 `filter = None`（零谓词热路径）。
+    ///
+    /// 🔑 判据是「**有跨段墓碑**」而非「有多段」：
+    /// `remove` 落在**段内**时总是**物理摘除**该段的 postings（§4.8.3 分支 ①）⇒
+    /// 活 postings 里**不可能**有本段已删的 chunk（与今天同理）。真正需要判活的只有
+    /// **跨段墓碑**：目标 doc 在它所属的段里**仍然存活**、postings 也还在，只有墓碑
+    /// 知道它已删。⇒ 无墓碑时保持 `None`，R52 的回归**只发生在确实有跨段墓碑时**。
+    pub(crate) fn needs_bm25_tombstone_filter(&self) -> bool {
+        !self.tombstones.is_empty()
     }
 }
 
@@ -260,17 +362,14 @@ impl Shared {
     /// 本方法是**唯一**能替换 `view` 指针的地方（发布逻辑内联在此，不另开 `publish`）
     /// ⇒ 「锁外三段」在**可见性层面**写不出来。这是对评审 P2 的**结构性**对策：
     /// 不是加一个检查，而是**消除违反它的入口**。
-    pub(crate) fn commit_view(&self) -> u64 {
+    pub(crate) fn commit_view(
+        &self,
+        build_next: impl FnOnce(&Arc<View>, u64, DocId, ChunkId) -> (View, DocId, ChunkId),
+    ) -> u64 {
         let mut ids = self.ids.lock().expect("发号锁中毒");
         let cur = Arc::clone(&self.view.read().expect("视图锁中毒"));
-
-        // 下一段的基址 = 本段基址 + 本段长度（设计 §4.4.1：`base = 前序所有段长度之和`）。
-        // ⚠️ `Index` 的计数是 `usize`、全局 ID 是 `u32`：本阶段（单段、`base = 0`）
-        // 不会溢出；`S8-03` 引入真正的多段发号时须在此显式处理上限（设计 §4.4.3）。
-        let next_base_doc = cur.main.base_doc + cur.main.index.total_docs() as DocId;
-        let next_base_chunk = cur.main.base_chunk + cur.main.index.total_chunks() as ChunkId;
-        ids.next_doc = next_base_doc;
-        ids.next_chunk = next_base_chunk;
+        // 新段的基址 = 「前序所有段的槽位数之和」= 上一次发布后的已用长度（§4.4.1 / §4.4.2）
+        let (base_doc, base_chunk) = (ids.next_doc, ids.next_chunk);
         ids.generation += 1;
         let generation = ids.generation;
 
@@ -285,15 +384,38 @@ impl Shared {
             cur.generation
         );
 
-        // ⚠️ I8-1：写锁内只有一次指针替换（内容全部来自 `cur`，不做计算 / I/O）。
-        *self.view.write().expect("视图锁中毒") = Arc::new(View {
-            main: Arc::clone(&cur.main),
-            deltas: Arc::clone(&cur.deltas),
-            tombstones: Arc::clone(&cur.tombstones),
-            generation,
-        });
+        // `build_next` 在锁内构造新视图（`S8-03`）：它拿到的基址与序号**就是本次发布的**
+        // ⇒ 「算基址 → 追加段 → 发布」不可能被另一个写端插队（`I8-7` 的结构性保证）。
+        let (next, used_doc, used_chunk) = build_next(&cur, generation, base_doc, base_chunk);
+        debug_assert!(
+            used_doc >= base_doc && used_chunk >= base_chunk,
+            "已用长度不得回退：base = ({base_doc}, {base_chunk})，\
+             used = ({used_doc}, {used_chunk})（回退会让下一段的基址落在本段之前）"
+        );
+        ids.next_doc = used_doc;
+        ids.next_chunk = used_chunk;
+
+        // ⚠️ I8-1：`view` 的写锁内只有一次指针替换（`next` 已在锁内构造完毕）。
+        *self.view.write().expect("视图锁中毒") = Arc::new(next);
         generation
     }
+    /// **重置式发布**（`compact` 专用）：`compact` 会**重编号**（稠密化）⇒ 新主段
+    /// **比原来短**，且**整个旧 ID 空间作废**。
+    ///
+    /// ⚠️ 与 [`Self::commit_view`] 的唯一差别：这里**允许「已用长度变小」**。
+    /// 这是 `I8-7`（段 ID 空间不重叠）的**唯一合法例外** —— 调用方必须保证发布后的视图里
+    /// **没有任何段引用旧 ID 空间**（`compact` 正是如此：它重建了主段、清空 `deltas`
+    /// 与跨段墓碑）。
+    pub(crate) fn publish_reset(&self, next: View, used_doc: DocId, used_chunk: ChunkId) -> u64 {
+        let mut ids = self.ids.lock().expect("发号锁中毒");
+        ids.generation += 1;
+        let generation = ids.generation;
+        ids.next_doc = used_doc;
+        ids.next_chunk = used_chunk;
+        *self.view.write().expect("视图锁中毒") = Arc::new(View { generation, ..next });
+        generation
+    }
+
     /// 下一段的 `base_*`（`S8-03` 起由段构造消费；本阶段由 `commit()` 的 `tracing` 字段消费）。
     pub(crate) fn next_base(&self) -> (DocId, ChunkId) {
         let ids = self.ids.lock().expect("发号锁中毒");
@@ -315,6 +437,193 @@ impl Shared {
     }
 }
 
+/// **跨段**候选谓词（`S8-04` / 设计 §4.7.1）。
+///
+/// 与单段的 `ChunkFilter` / `AliveOnly` 的两点差别：
+/// ① 判定前要先 [`View::locate`] 到段（全局 → 段内 ID），再在该段内判存活 + doc 位图；
+/// ② 要额外挡掉**跨段墓碑**指向的 doc（它们在所属段里仍然存活 —— 那正是墓碑存在的理由）。
+///
+/// # ⚠️ `allowed_count()` 必须**精确**（`predicate.rs` 的硬契约）
+///
+/// ```text
+/// allowed = Σ_seg （该段通过过滤的活分片数）
+///         − Σ_{墓碑 doc} （该 doc 在所属段里通过过滤的活分片数）
+/// ```
+///
+/// 后半项**必须精确计算**、**不得估算**：向量路用它做 `prefers_exact` 分派，一旦估算会
+/// **静默失效**（结果仍然正确，只是低选择度退化成精确扫描，且只表现为标定表里
+/// 「精确占比 0%」，极难归因）。
+pub(crate) struct SegmentFilter<'a> {
+    /// 该段的段内索引（存活位图的来源）
+    index: &'a Index,
+    /// 该段内**通过用户过滤**的 doc 位图（**段内** `doc_id`）。
+    /// `None` = 无用户过滤（全部通过）—— 这样 `AliveOnly` 形态无需构造位图（`O(1)`）。
+    doc_bits: Option<crate::bitmap::DocBits>,
+    /// 段基址（全局 ↔ 段内折算）
+    base_doc: DocId,
+    base_chunk: ChunkId,
+}
+
+impl<'a> SegmentFilter<'a> {
+    /// 无用户过滤（只判存活）。
+    fn alive_only(seg: &'a Segment) -> Self {
+        Self {
+            index: &seg.index,
+            doc_bits: None,
+            base_doc: seg.base_doc,
+            base_chunk: seg.base_chunk,
+        }
+    }
+
+    /// 有用户过滤（`doc_bits` 按**段内** `doc_id` 索引）。
+    fn filtered(seg: &'a Segment, doc_bits: crate::bitmap::DocBits) -> Self {
+        Self {
+            index: &seg.index,
+            doc_bits: Some(doc_bits),
+            base_doc: seg.base_doc,
+            base_chunk: seg.base_chunk,
+        }
+    }
+
+    /// 段内本地 `chunk_id` 是否通过（存活 + 用户过滤）。
+    fn chunk_allowed(&self, local_chunk: ChunkId) -> bool {
+        if !self.index.alive_chunks().contains(local_chunk) {
+            return false;
+        }
+        match (self.doc_bits.as_ref(), self.index.doc_of(local_chunk)) {
+            (None, _) => true,
+            (Some(bits), Some(local_doc)) => bits.contains(local_doc),
+            (Some(_), None) => false,
+        }
+    }
+
+    /// 段内本地 `doc_id` 是否通过**用户过滤**（墓碑扣减用）。
+    fn doc_passes_filter(&self, local_doc: DocId) -> bool {
+        match self.doc_bits.as_ref() {
+            None => true,
+            Some(bits) => bits.contains(local_doc),
+        }
+    }
+
+    /// 本段通过过滤的**活分片数**（精确）。
+    fn allowed_chunks(&self) -> usize {
+        match self.doc_bits.as_ref() {
+            // 无用户过滤 ⇒ 直接是存活数（位图缓存，`O(1)`）
+            None => self.index.alive_count(),
+            Some(bits) => crate::query::filter::allowed_chunk_count(bits, self.index),
+        }
+    }
+
+    /// 全局 `doc_id` 是否落在本段。
+    fn owns_doc(&self, global_doc: DocId) -> bool {
+        global_doc >= self.base_doc
+            && ((global_doc - self.base_doc) as usize) < self.index.total_docs()
+    }
+}
+
+/// 跨段谓词本体（`CandidateFilter` 的实现）。
+pub(crate) struct ViewFilter<'a> {
+    /// 与 `View::segments_in_order()` **一一对应**（顺序也一致）
+    per_seg: Vec<SegmentFilter<'a>>,
+    /// 针对**既往段**的全局 doc 墓碑（命中即挡）
+    tombstones: &'a Tombstones,
+    allowed: usize,
+    kind: FilterKind,
+}
+
+impl<'a> ViewFilter<'a> {
+    /// 组装：`per_seg` 必须与 FIFO 段列表一一对应；`allowed` 在此算清。
+    fn new(view: &'a View, per_seg: Vec<SegmentFilter<'a>>, kind: FilterKind) -> Self {
+        debug_assert_eq!(
+            per_seg.len(),
+            view.segments_in_order().count(),
+            "per_seg 必须与 FIFO 段列表一一对应（含顺序）"
+        );
+        let mut allowed: usize = per_seg.iter().map(|s| s.allowed_chunks()).sum();
+        // 🔴 精确扣减：墓碑 doc 在所属段里仍存活（postings 也在），必须从 `allowed` 里去掉
+        // 它**通过过滤**的那些活分片 —— 不得估算（硬契约，见类型文档）。
+        for doc in view.tombstones.iter() {
+            if let Some(s) = per_seg.iter().find(|s| s.owns_doc(doc)) {
+                let local_doc = doc - s.base_doc;
+                if s.doc_passes_filter(local_doc) {
+                    allowed =
+                        allowed.saturating_sub(s.index.chunk_count_of_doc(local_doc) as usize);
+                }
+            }
+        }
+        Self {
+            per_seg,
+            tombstones: view.tombstones.as_ref(),
+            allowed,
+            kind,
+        }
+    }
+
+    /// 无用户过滤形态：只判存活 + 墓碑（各段位图**借用**，零重建成本）。
+    pub(crate) fn alive_only(view: &'a View) -> Self {
+        let per_seg = view
+            .segments_in_order()
+            .map(|seg| SegmentFilter::alive_only(seg))
+            .collect();
+        Self::new(view, per_seg, FilterKind::Alive)
+    }
+
+    /// 有用户过滤形态：`per_seg_bits` 是**逐段**求好的「段内 `doc_id`」位图（FIFO 顺序）。
+    ///
+    /// 逐段求值（而不是拼一张全局位图）的原因：字段索引是**段内**结构（`FieldIndex`
+    /// 按段内 `doc_id` 登记），跨段拼装只会多一份要维护的状态。
+    pub(crate) fn filtered(view: &'a View, per_seg_bits: Vec<crate::bitmap::DocBits>) -> Self {
+        debug_assert_eq!(
+            per_seg_bits.len(),
+            view.segments_in_order().count(),
+            "`per_seg_bits` 必须与 FIFO 段列表一一对应"
+        );
+        let per_seg = view
+            .segments_in_order()
+            .zip(per_seg_bits)
+            .map(|(seg, bits)| SegmentFilter::filtered(seg, bits))
+            .collect();
+        Self::new(view, per_seg, FilterKind::Filtered)
+    }
+
+    /// 全局 → `(段下标, 段内本地 id)`（谓词的定位入口）。
+    fn locate(&self, global_chunk: ChunkId) -> Option<(usize, ChunkId)> {
+        for (i, s) in self.per_seg.iter().enumerate() {
+            if let Some(local) = global_chunk.checked_sub(s.base_chunk) {
+                if (local as usize) < s.index.total_chunks() {
+                    return Some((i, local));
+                }
+            }
+        }
+        None
+    }
+}
+
+impl CandidateFilter for ViewFilter<'_> {
+    fn contains(&self, global_chunk_id: ChunkId) -> bool {
+        let Some((i, local)) = self.locate(global_chunk_id) else {
+            return false;
+        };
+        let s = &self.per_seg[i];
+        // ① 跨段墓碑：doc 在该段内**仍然存活**，只有墓碑知道它已删（§4.8.3 分支 ②）
+        if let Some(local_doc) = s.index.doc_of(local) {
+            if self.tombstones.blocks_doc(s.base_doc + local_doc) {
+                return false;
+            }
+        }
+        // ② 存活 + 用户过滤
+        s.chunk_allowed(local)
+    }
+
+    fn allowed_count(&self) -> usize {
+        self.allowed
+    }
+
+    fn kind(&self) -> FilterKind {
+        self.kind
+    }
+}
+
 /// 「写入需要独占」的统一错误（消息里指明阶段与出路，避免被误读成 bug）。
 fn write_needs_exclusive() -> Error {
     // ⚠️ **`Error::Busy` 而不是 `Error::InvalidInput`**（`S8-02` 评审 P4-5a）：
@@ -331,6 +640,28 @@ mod tests {
     #![allow(non_snake_case)]
     use super::*;
     use crate::search::config::SearchIndexBuilder;
+
+    /// 测试用「空提交」闭包：**不追加任何段**、`generation` 照常 +1
+    /// （= `S8-02` 骨架期 `commit_view` 的行为，也是 `S8-03` 起「空 builder 不追加段」的等价物）。
+    ///
+    /// 它是**函数项**（不是闭包），因此实现 `FnOnce` 且可被反复传入。
+    fn empty_commit(
+        cur: &Arc<View>,
+        generation: u64,
+        base_doc: DocId,
+        base_chunk: ChunkId,
+    ) -> (View, DocId, ChunkId) {
+        (
+            View {
+                main: Arc::clone(&cur.main),
+                deltas: Arc::clone(&cur.deltas),
+                tombstones: Arc::clone(&cur.tombstones),
+                generation,
+            },
+            base_doc,
+            base_chunk,
+        )
+    }
 
     fn shared() -> Shared {
         let cfg = SearchIndexBuilder::default().embedder(None).build_config();
@@ -365,7 +696,7 @@ mod tests {
         let before = sh.snapshot();
         assert_eq!(sh.next_base(), (0, 0), "未提交时应为 (0, 0)");
 
-        let g1 = sh.commit_view();
+        let g1 = sh.commit_view(empty_commit);
         assert_eq!(g1, 1, "序号应从 1 开始");
         assert_eq!(
             sh.next_base(),
@@ -380,7 +711,7 @@ mod tests {
             "骨架期提交必须复用同一个 main 段（不复制内容）"
         );
 
-        let g2 = sh.commit_view();
+        let g2 = sh.commit_view(empty_commit);
         assert_eq!(g2, 2, "序号必须单调递增");
     }
 
@@ -458,7 +789,7 @@ mod tests {
     fn S8_02_已取出的快照不受后续提交影响() {
         let sh = shared();
         let held = sh.snapshot();
-        let g = sh.commit_view();
+        let g = sh.commit_view(empty_commit);
         assert_eq!(g, 1);
         assert_eq!(held.generation, 0, "已取出的快照内容不得被后续提交改动");
         assert_eq!(sh.snapshot().generation, 1, "新快照必须看到新序号");

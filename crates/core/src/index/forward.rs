@@ -19,7 +19,7 @@ use crate::document::{Chunk, DocRecord};
 use crate::types::{ChunkId, DocId};
 
 /// 正排存储：chunk_id / doc_id → 内容与元数据（`None` 表示墓碑位）。
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ForwardStore {
     chunks: Vec<Option<Chunk>>,
     docs: Vec<Option<DocRecord>>,
@@ -208,6 +208,43 @@ impl ForwardStore {
         }
         self.alive = alive;
         self.doc_chunk_count = counts;
+    }
+
+    /// 把 `other` 的槽位**按原顺序追加**到本存储尾部（**含 `None` 墓碑位**，消耗 `other`）。
+    ///
+    /// # 为什么必须**保留 `None` 槽位**（S8-06 / 设计 §4.9.2）
+    ///
+    /// 段合并依赖「**槽位对齐**」：`other` 的本地 ID `i` 在 append 之后必须恰好等于
+    /// `self.chunks_slots() + i`（这就是 §4.4.2 基址不变式的全部含义）。丢掉 `None`
+    /// 槽位会让**后续段**的 ID 整体前移 ⇒ 段 ID 空间错位 ⇒ 破坏 `I8-7`。
+    ///
+    /// # 偏移改写
+    ///
+    /// `DocRecord.doc_id` / `Chunk.chunk_id` / `Chunk.doc_id` 一律改写为**新的槽位号**
+    /// （= `base + 本地 ID`）—— 内部字段与槽位号必须一致，否则 `doc_of` / 字段索引
+    /// 之类的「数组索引」语义会在合并后静默错位。
+    ///
+    /// ⚠️ 末尾调 [`Self::rebuild`]（`O(总槽位)`）：`chunks` 是存活状态的**唯一真源**，
+    /// `alive` 与 `doc_chunk_count` 只能从它重建（本文件的既有纪律）。合并是低频操作，
+    /// 这个 `O(N)` 可以接受。
+    pub fn append_from(&mut self, other: ForwardStore) {
+        let base_doc = self.docs.len() as DocId;
+        let base_chunk = self.chunks.len() as ChunkId;
+
+        for slot in other.docs {
+            self.docs.push(slot.map(|mut d| {
+                d.doc_id += base_doc;
+                d
+            }));
+        }
+        for slot in other.chunks {
+            self.chunks.push(slot.map(|mut c| {
+                c.chunk_id += base_chunk;
+                c.doc_id += base_doc;
+                c
+            }));
+        }
+        self.rebuild();
     }
 }
 

@@ -33,7 +33,7 @@ use crate::error::Result;
 use crate::types::{ChunkId, DocId, TermId};
 
 /// 内存索引：倒排 + 正排 + 统计量。
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Index {
     inverted: InvertedIndex,
     forward: ForwardStore,
@@ -490,6 +490,101 @@ impl Index {
             field_index,
         };
         (new_index, reclaimed_terms)
+    }
+
+    /// 把 `other` 的内容**按本地顺序追加**到 `self` —— **不重编号**（`D-S8-04` / 设计 §4.9.2）。
+    ///
+    /// # 前提（由调用方保证）
+    ///
+    /// `other` 是 `self` 之后的**下一个**段（严格 FIFO，见 §4.4.2）⇒ append 之后
+    /// `other` 的本地 ID `i` 在全局恰好是 `base + i`，即**不需要任何重编号**。
+    /// 这也正是 `compact()`（会重编号）**必须**在 `merge_all()` 之后的原因（`D-S8-12`）。
+    ///
+    /// # 返回
+    ///
+    /// 本次追加的**活分片数**（= `other.stats.num_chunks`，即 `other` 的墓碑位不计入）。
+    ///
+    /// # 🔴 postings 顺序（`S8-T4`「逐位一致」的结构性依据之一）
+    ///
+    /// [`InvertedIndex::add`] 把 posting **push 到链尾** ⇒ 合并后同一 term 的链内顺序 =
+    /// 「主段原序 + 增量段序」，而基址连续 ⇒ **恰为全局 `chunk_id` 升序** = 单段建库的顺序。
+    /// ⇒ 与 `retriever::bm25` 的 TAAT 累加顺序一致（`I8-6`）。
+    /// **后人在此处「顺便排序」会破坏它** —— 所以这段注释必须留着。
+    ///
+    /// # 与 `compacted()` 的区别
+    ///
+    /// `compacted()` **重编号**（并为墓碑腾出的稠密化）；本方法**不动 ID**。
+    pub(crate) fn merge_from(&mut self, other: Index) -> Result<usize> {
+        let base_doc = self.forward.docs_slots() as u64;
+        let base_chunk = self.forward.chunks_slots() as u64;
+        let other_docs = other.forward.docs_slots() as u64;
+
+        // 不静默溢出：全局 ID 是 `u32`（`types.rs`），合并本身不重编号 ⇒ 越界就是真错误。
+        if base_doc + other_docs > u32::MAX as u64 {
+            return Err(crate::error::Error::InvalidInput(format!(
+                "合并后文档槽位数 {} 超过 u32 上限（doc_id 是 u32）",
+                base_doc + other_docs
+            )));
+        }
+        if base_chunk + other.forward.chunks_slots() as u64 > u32::MAX as u64 {
+            return Err(crate::error::Error::InvalidInput(format!(
+                "合并后分片槽位数 {} 超过 u32 上限（chunk_id 是 u32）",
+                base_chunk + other.forward.chunks_slots() as u64
+            )));
+        }
+
+        // ① 倒排：必须在 `forward` append **之前**取出（此时 `other` 的 chunk_id 还是本地 ID，
+        //    统一加 `base_chunk` 一步到位）。`export()` 返回的 `term_dict` 按 TermId 升序
+        //    ⇒ 遍历顺序确定（NFR-06）。
+        let (term_dict, postings) = other.inverted.export();
+        for (term, tid) in term_dict {
+            for p in &postings[tid as usize] {
+                #[cfg(feature = "positions")]
+                self.inverted.add(
+                    &term,
+                    p.chunk_id + base_chunk as ChunkId,
+                    p.tf,
+                    &p.positions,
+                );
+                #[cfg(not(feature = "positions"))]
+                self.inverted
+                    .add(&term, p.chunk_id + base_chunk as ChunkId, p.tf, &[]);
+            }
+        }
+
+        // ② 正排：槽位逐个 push（含 `None` 墓碑位 ⇒ 保槽位对齐）
+        let other_chunk_lens = other.chunk_lens.clone();
+        debug_assert_eq!(
+            other_chunk_lens.len(),
+            other.forward.chunks_slots(),
+            "`chunk_lens` 必须与 chunks 槽位一一对应（删除后保留 ⇒ 不是活分片数）"
+        );
+        let other_stats = other.stats;
+        let other_hashes = other.content_hashes.clone();
+        self.forward.append_from(other.forward);
+
+        // ③ 统计量 / chunk_lens：都是「活量」，且已按各自段维护 ⇒ 直接相加 / 追加
+        self.stats.total_len += other_stats.total_len;
+        self.stats.num_chunks += other_stats.num_chunks;
+        self.chunk_lens.extend(other_chunk_lens);
+
+        // ④ content_hash 表：跨段查重的前提。⚠️ 碰撞**理论上不应发生**（写入时已跨段查重），
+        //    但仍要显式处理：debug 下报错，release 下**确定性**地以后写入者为准（`insert` 覆盖）。
+        for (h, d) in other_hashes {
+            let displaced = self.content_hashes.insert(h, d + base_doc as DocId);
+            debug_assert!(
+                displaced.is_none(),
+                "content_hash 跨段碰撞：{h}（写入路径的跨段查重应已排除）"
+            );
+        }
+
+        // ⑤ 字段索引：**不能 extend**（它是 field → value → doc 位图，且带基数降级判定）
+        //    ⇒ 走既有的全量重建（`import` 用同一函数）。重建后「基数保护」的降级结论
+        //    可能与增量维护不同 ⇒ 由 `S8-T13` 的等价用例钉住（属 S8-06）。
+        let (docs, _) = self.forward.export();
+        self.field_index.rebuild(docs);
+
+        Ok(other_stats.num_chunks as usize)
     }
 
     // ---- 快照导出 / 导入（T4-02，供 storage 模块序列化）----

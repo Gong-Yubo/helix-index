@@ -23,11 +23,15 @@ use crate::fusion::{FusionStrategy, LaneResults, RrfFusion};
 use crate::index::Index;
 use crate::predicate::CandidateFilter;
 use crate::rerank::{NoOpReranker, Reranker};
-use crate::retriever::{Bm25Params, Bm25Retriever, Retriever, Scored, VectorRetriever};
+use crate::retriever::{
+    Bm25Params, Bm25Retriever, Retriever, Scored, SegmentSet, SegmentedBm25Retriever,
+    VectorRetriever,
+};
 use crate::types::{ChunkId, Score};
 use crate::vector::{VectorIndex, VectorRoute};
 
 use super::explain::{determine_empty_reason, matched_terms};
+use super::filter::PredicateBuilder;
 use super::metrics::Metrics;
 use super::response::{Explain, Hit, SearchResponse};
 
@@ -78,6 +82,14 @@ pub struct SearchParts<'a> {
     pub reranker: &'a dyn Reranker,
     /// BM25 参数（P5 定稿 k1=1.5 / b=0.75）
     pub bm25_params: Bm25Params,
+    /// **跨段**检索输入（`S8-04`）：`Some` ⇒ 走 `main + deltas` 的跨段路径；
+    /// `None` ⇒ 单段（只用 `index`，与 `S8-03` 之前**逐位一致**）。
+    ///
+    /// ⚠️ 由门面层按「是否真的多段 / 有跨段墓碑」决定是否填 —— 单段时必须留 `None`，
+    /// 否则热路径会平白多一层段遍历（R52 的零谓词/短路策略见设计 §4.7.3）。
+    pub segment_set: Option<SegmentSet<'a>>,
+    /// 跨段谓词构造器（与 `segment_set` **成对**给出）。
+    pub predicate_builder: Option<Box<dyn PredicateBuilder + 'a>>,
 }
 
 /// 编排的唯一实现：两路召回 → 融合前过滤 → 融合 → 窗口回捞 → 精排 → 补齐 explain。
@@ -110,7 +122,13 @@ pub fn search_parts(
     let started = Instant::now();
     let mut metrics = Metrics::default();
 
-    let index_is_empty = parts.index.num_chunks() == 0;
+    // 跨段载具（`Some` ⇒ 走 `main + deltas`）
+    let segmented = parts.segment_set.as_ref();
+    // 空库判定：跨段时看**全局** N（`main` 空但有 delta 时库不是空的）
+    let index_is_empty = match segmented {
+        Some(set) => set.n == 0,
+        None => parts.index.num_chunks() == 0,
+    };
     let query_tokens = parts.analyzer.analyze_query(query);
     let query_is_empty = query_tokens.is_empty();
 
@@ -150,7 +168,12 @@ pub fn search_parts(
 
     // 1. 过滤求值 → 候选谓词（**下推的数据源**，只求值一次；空集直接短路）
     let t0 = Instant::now();
-    let predicate = match super::filter::try_build_predicate(parts.index, filter) {
+    let predicate = match parts.predicate_builder.as_deref() {
+        // 跨段：谓词构造在门面层完成（它才持有 `View`）
+        Some(b) => b.build(filter),
+        None => super::filter::try_build_predicate(parts.index, filter),
+    };
+    let predicate = match predicate {
         Some(p) => Some(p),
         None => {
             // 过滤条件排空了所有文档：不必进两路召回（省掉一次完整检索）。
@@ -159,7 +182,7 @@ pub fn search_parts(
             // query 本身就无命中时，报"你的过滤太窄"是误导——Agent 会去调过滤条件，
             // 而真正的问题在 query。故此处也跑一次词典探针（O(query 词数)，
             // 相比省下的一次完整检索可忽略）。
-            let reason = if query_is_empty || !query_has_hits(parts.index, parts.analyzer, query) {
+            let reason = if query_is_empty || !query_has_hits_any(parts, segmented, query) {
                 determine_empty_reason(false, query_is_empty, 0)
             } else {
                 Some(super::response::EmptyReason::FilteredOut)
@@ -183,8 +206,13 @@ pub fn search_parts(
     // 每 posting 一次 `dyn contains()` 虚调用——这是所有无过滤查询的必经之路。
     // 向量路**必须**始终传谓词：hnsw_rs 无法从图中摘除已删向量（Q-C1）。
     let pred = predicate.as_deref();
-    // BM25：无用户过滤时传 None（postings 已物理摘除死 chunk，无需再判活）
-    let bm25_f = if filter.is_some() { pred } else { None };
+    // BM25：无用户过滤时传 None（postings 已物理摘除死 chunk，无需再判活）。
+    //
+    // ⚠️ `S8-04`：**有跨段墓碑时必须传**（`R52` / §4.7.3）—— 墓碑指向的 doc 在它所属的
+    // 段里**仍然存活**、postings 也还在，只有谓词能挡住它。判据就是「有墓碑」，
+    // 而不是「有多段」：多段但无墓碑时活 postings 依然是干净的（段内删除总是物理摘除）。
+    let bm25_needs_filter = filter.is_some() || segmented.is_some_and(|set| set.tombstones > 0);
+    let bm25_f = if bm25_needs_filter { pred } else { None };
     // 向量：恒传谓词（hnsw_rs 无法摘除已删向量，Q-C1）
     let vec_f = pred;
 
@@ -208,10 +236,8 @@ pub fn search_parts(
 
     let (bm25_lane, vector_lane) = match mode {
         SearchMode::Bm25 => {
-            let bm25 =
-                Bm25Retriever::new(parts.index, parts.analyzer).with_params(parts.bm25_params);
             let t = Instant::now();
-            let lane = to_lane(bm25.search_filtered(query, candidate_k, bm25_f)?);
+            let lane = to_lane(bm25_recall(parts, segmented, query, candidate_k, bm25_f)?);
             metrics.bm25_elapsed = t.elapsed();
             (Some(lane), None)
         }
@@ -228,8 +254,6 @@ pub fn search_parts(
         }
         SearchMode::Hybrid => {
             let (e, vi) = vec_parts.ok_or(Error::NoEmbedder)?;
-            let bm25 =
-                Bm25Retriever::new(parts.index, parts.analyzer).with_params(parts.bm25_params);
             let vec = VectorRetriever::new(e, vi);
             metrics.vector_route = vec_route;
             // 并行执行；谓词是 Send + Sync，可安全跨 rayon 线程共享。
@@ -238,7 +262,7 @@ pub fn search_parts(
             let (r1, r2) = rayon::join(
                 || {
                     let t = Instant::now();
-                    let r = bm25.search_filtered(query, candidate_k, bm25_f);
+                    let r = bm25_recall(parts, segmented, query, candidate_k, bm25_f);
                     (r, t.elapsed())
                 },
                 || {
@@ -286,7 +310,7 @@ pub fn search_parts(
         //
         // 下推后 lane 结果已是过滤后的，"本来有候选但被过滤光"这个信号丢失了，
         // 因此用 `query_has_hits` 词典探针还原它（O(query 词数)，成本可忽略）。
-        let reason = if query_is_empty || !query_has_hits(parts.index, parts.analyzer, query) {
+        let reason = if query_is_empty || !query_has_hits_any(parts, segmented, query) {
             determine_empty_reason(false, query_is_empty, 0)
         } else if filter.is_some() {
             Some(super::response::EmptyReason::FilteredOut)
@@ -335,19 +359,36 @@ pub fn search_parts(
     };
     let mut proto: Vec<Hit> = Vec::with_capacity(take_n);
     for (chunk_id, fused_score) in fused.into_iter().take(take_n) {
-        let Some(chunk) = parts.index.chunk(chunk_id) else {
-            // 陈旧 `chunk_id`（图/索引不同步）⇒ 该条不进 `proto`，故 `proto.len()`
-            // 可能**小于** `take_n`（见下方 `handed` 的记账口径）。
-            continue;
+        // ⚠️ 回捞必须**跨段**（`S8-04`）：`S8-03` 起内容分布在 `main + deltas` 里，
+        //    只看 `parts.index`（= 主段）会把 delta 的命中**静默丢掉**。
+        //    路径 A：按全局 ID 定位段；路径 B（单段）：与 `S8-03` 之前逐字相同。
+        let (chunk, seg_index, base_doc) = match segmented {
+            Some(set) => {
+                // 陈旧 `chunk_id`（图/索引不同步）⇒ 该条不进 `proto`，故 `proto.len()`
+                // 可能**小于** `take_n`（见下方 `handed` 的记账口径）。
+                let Some((seg, local)) = set.locate(chunk_id) else {
+                    continue;
+                };
+                let Some(chunk) = seg.index.chunk(local) else {
+                    continue;
+                };
+                (chunk, seg.index, seg.base_doc)
+            }
+            None => {
+                let Some(chunk) = parts.index.chunk(chunk_id) else {
+                    continue;
+                };
+                (chunk, parts.index, 0)
+            }
         };
-        let doc = parts
-            .index
+        let doc = seg_index
             .doc(chunk.doc_id)
             .ok_or(Error::ChunkNotFound(chunk_id))?;
 
         proto.push(Hit {
             chunk_id,
-            doc_id: chunk.doc_id,
+            // 段内 → 全局（`Hit.doc_id` 的对外契约是**全局** ID）
+            doc_id: base_doc + chunk.doc_id,
             score: fused_score,
             text: chunk.text.clone(),
             source: doc.source.clone(),
@@ -476,6 +517,41 @@ fn query_has_hits(index: &Index, analyzer: &dyn Analyzer, query: &str) -> bool {
         .any(|id| !index.postings_by_id(id).is_empty())
 }
 
+/// **BM25 召回**（单段 / 跨段统一入口，`S8-04`）。
+///
+/// `Some(set)` ⇒ [`SegmentedBm25Retriever`]（term 外层、**段**内层，全局整数统计量）；
+/// `None` ⇒ 单段 [`Bm25Retriever`]（与 `S8-03` 之前**同一份实现**，零回归）。
+fn bm25_recall(
+    parts: &SearchParts<'_>,
+    segmented: Option<&SegmentSet<'_>>,
+    query: &str,
+    k: usize,
+    filter: Option<&dyn CandidateFilter>,
+) -> Result<Vec<Scored>> {
+    match segmented {
+        Some(set) => SegmentedBm25Retriever::new(set, parts.analyzer)
+            .with_params(parts.bm25_params)
+            .search_filtered(query, k, filter),
+        None => Bm25Retriever::new(parts.index, parts.analyzer)
+            .with_params(parts.bm25_params)
+            .search_filtered(query, k, filter),
+    }
+}
+
+/// 词典探针（单段 / 跨段统一入口）：query 的词在**任何段**里有 posting 吗？
+///
+/// 用于空结果时区分「query 侧无命中」与「过滤太窄」（§5.8.1：query 侧信号优先）。
+fn query_has_hits_any(
+    parts: &SearchParts<'_>,
+    segmented: Option<&SegmentSet<'_>>,
+    query: &str,
+) -> bool {
+    match segmented {
+        Some(set) => set.any_term_hits(parts.analyzer, query),
+        None => query_has_hits(parts.index, parts.analyzer, query),
+    }
+}
+
 /// 向量路依赖检查：embedder 与 vector_index 必须成对出现。
 fn require_vector<'a>(
     embedder: Option<&'a dyn Embedder>,
@@ -581,6 +657,10 @@ impl<'a> QueryExecutor<'a> {
             fusion: self.fusion.as_ref(),
             reranker: self.reranker.as_ref(),
             bm25_params: self.bm25_params,
+            // ⚠️ `QueryExecutor` 是**单段逃生舱**（它持 `&Index`，不认识 `View` / 分段）
+            // ⇒ 两个跨段字段恒为空 ⇒ 走的还是 `S8-03` 之前那条单段路径（逐位不变）。
+            segment_set: None,
+            predicate_builder: None,
         }
     }
 

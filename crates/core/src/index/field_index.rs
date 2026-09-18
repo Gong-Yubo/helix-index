@@ -102,7 +102,7 @@ impl Ord for NumKey {
 }
 
 /// 单个字段的取值索引。
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct FieldValues {
     /// 等值匹配：值的 `json_to_string` 形式 → doc 位图
     terms: HashMap<String, DocBits>,
@@ -130,7 +130,7 @@ struct FieldValues {
 ///   （此时 metadata 仍可读）——该时序由 T15 单独钉死
 /// - `Index::import` → [`FieldIndex::rebuild`]（从 docs 全量重建）
 /// - **不入快照**：可由 docs 的 metadata 重建，因此 `FORMAT_VERSION` 无需升版（D-S1-07）
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FieldIndex {
     fields: HashMap<String, FieldValues>,
     max_values_per_field: usize,
