@@ -13,24 +13,26 @@ use crate::query::searcher::{search_parts, SearchParts};
 use crate::query::{SearchMode, SearchResponse};
 use crate::schema::Filter;
 
-use super::config::Config;
-use super::index::{Inner, SearchIndex};
+use super::index::SearchIndex;
+use super::view::{Shared, View};
 
-/// 只读检索器（owned）。持有已提交索引的不可变快照。
+/// 只读检索器（owned）。持有与写端**共享**的 `Shared`（`S8-02` 起）。
 ///
 /// - `'static + Clone + Send + Sync`（G3）：可直接放进 axum `AppState`、
 ///   可 `Arc<Searcher>` 分发、可 `move` 进 rayon 任务。
 /// - `search(query)` 只有 query 必选；`search_with(query)` 承载可选参数。
+///
+/// # 可见性（`S8-02` / NFR-11）
+///
+/// 本类型**不隐含 `flush()`**：它读的是 `shared.view` 的**当前快照**，
+/// 因此「能查到什么」完全由写端是否 `commit()` 决定（`commit()` 是唯一的可见性边界）。
+/// 旧的所有权型 API `SearchIndex::into_searcher()`（隐含 flush）已 `#[deprecated]`。
 #[derive(Clone)]
 pub struct Searcher {
-    pub(crate) cfg: Arc<Config>,
-    pub(crate) inner: Arc<Inner>,
-    /// 图持久化开关（V2 Step 2：`into_index` 往返时保留，避免 strict 设置丢失）
-    pub(crate) graph: crate::search::config::GraphOpts,
-    /// 最近一次图 sidecar 状态（NFR-07 可观测性，读端也能查）
+    /// 与写端共享的视图 + 装配
+    pub(crate) shared: Arc<Shared>,
+    /// 最近一次图 sidecar 状态（NFR-07 可观测性，读端也能查；快照语义）
     pub(crate) graph_status: crate::search::index::GraphStatus,
-    /// 向量后端（V2 Step 4：`into_index` 往返时保留，供 compaction 重建同类型）
-    pub(crate) backend: crate::search::config::VectorBackend,
 }
 
 impl Searcher {
@@ -53,27 +55,29 @@ impl Searcher {
         }
     }
 
-    /// 把自身投影成借用型 `SearchParts`（编排内核的输入）。
-    fn parts(&self) -> SearchParts<'_> {
+    /// 把 `view` 投影成借用型 `SearchParts`（编排内核的输入）。
+    ///
+    /// ⚠️ `S8-02` 期 `deltas` 恒空 ⇒ 只用 `view.main`；跨段在 `S8-04` / `S8-05`。
+    fn parts<'a>(&'a self, view: &'a View) -> SearchParts<'a> {
         SearchParts {
-            index: &self.inner.index,
-            analyzer: self.cfg.analyzer.as_ref(),
-            embedder: self.cfg.embedder.as_ref().map(|e| e.as_ref()),
-            vector_index: self.inner.vector_index.as_ref().map(|vi| vi.as_ref()),
-            fusion: self.cfg.fusion.as_ref(),
-            reranker: self.cfg.reranker.as_ref(),
-            bm25_params: self.cfg.bm25_params,
+            index: &view.main.index,
+            analyzer: self.shared.cfg.analyzer.as_ref(),
+            embedder: self.shared.cfg.embedder.as_ref().map(|e| e.as_ref()),
+            vector_index: view.main.vector_index.as_ref().map(|vi| vi.as_ref()),
+            fusion: self.shared.cfg.fusion.as_ref(),
+            reranker: self.shared.cfg.reranker.as_ref(),
+            bm25_params: self.shared.cfg.bm25_params,
         }
     }
 
     /// 是否有向量侧（决定默认 mode）。
-    fn has_vector(&self) -> bool {
-        self.cfg.embedder.is_some() && self.inner.vector_index.is_some()
+    fn has_vector(&self, view: &View) -> bool {
+        self.shared.cfg.embedder.is_some() && view.main.vector_index.is_some()
     }
 
     /// 按装配推断默认 mode：有向量 → `Hybrid`，否则 → `Bm25`。
-    fn infer_mode(&self) -> SearchMode {
-        if self.has_vector() {
+    fn infer_mode(&self, view: &View) -> SearchMode {
+        if self.has_vector(view) {
             SearchMode::Hybrid
         } else {
             SearchMode::Bm25
@@ -81,40 +85,48 @@ impl Searcher {
     }
 
     /// 执行检索（内部实现，供 `SearchRequest::exec` 调用）。
+    ///
+    /// ⚠️ `view` 由调用方**取一次**并传入（`I8-3`：一次检索只用一个 `View`）。
     pub(crate) fn run(
         &self,
+        view: &View,
         query: &str,
         mode: SearchMode,
         top_n: usize,
         filter: Option<&Filter>,
     ) -> Result<SearchResponse> {
-        let parts = self.parts();
+        let parts = self.parts(view);
         search_parts(&parts, query, mode, top_n, filter)
     }
 
-    /// 换回写端（零拷贝，p6-design 6.4 方案 A）。
+    /// 换回写端（用同一 `Arc<Shared>` 造一个新写端）。
     ///
-    /// 用 `Arc::try_unwrap` 解包 `Inner`：refcount == 1 时零拷贝取出；
-    /// 存在 `Searcher` clone 残留（refcount > 1）时返回 `Err`（而非静默深拷贝）。
+    /// ⚠️ **已废弃**：`S8-02` 起写端不必「换回」——`SearchIndex::searcher(&self)` 让读写
+    /// **并存**（`D-S8-06` 的动机消失）。本方法保留只是为了让既有调用点零改动。
+    ///
+    /// # ⚠️ 与重构前的**行为差异**（`S8-02`，需评审确认）
+    ///
+    /// 重构前用 `Arc::try_unwrap`：refcount > 1（有 `Searcher` clone 残留）时**报错**。
+    /// 新模型下 `shared` 是**共享**的 ——「`Searcher` clone 残留」与「写端仍然存活」
+    /// 在 `Arc<Shared>` 的视角下**不可区分**，而后者在 `S8-02` 是**合法状态**
+    /// （`searcher(&self)` 的整个意义）。
+    /// ⇒ 取形 = **总是成功**：返回一个共享同一视图的新写端（返回类型保持 `Result` 不变）。
+    /// ⚠️ **这正是「双写端」成为可能的入口** —— 也是 `commit()` 全程持 `Shared::ids`
+    /// 锁的**前置理由**（设计 §4.4.3 / 评审 P3-4）。
+    #[deprecated(note = "写端不必再「换回」：用 SearchIndex::searcher(&self) 让读写并存")]
     pub fn into_index(self) -> Result<SearchIndex> {
-        match Arc::try_unwrap(self.inner) {
-            Ok(inner) => Ok(SearchIndex {
-                cfg: self.cfg,
-                inner,
-                pending: Vec::new(),
-                embed_elapsed: std::time::Duration::ZERO,
-                // 读端从未 embed 过（swap 回写端后重新计数）
-                embed_count: 0,
-                graph: self.graph,
-                graph_status: self.graph_status,
-                backend: self.backend,
-                // 读端从未执行过 save，图 dump 耗时无意义（不是 0，是「未发生」）
-                graph_dump_elapsed: None,
-            }),
-            Err(_) => Err(Error::InvalidInput(
-                "Searcher 仍有 clone 残留，无法换回写端（先 drop 其他 reader）".to_string(),
-            )),
-        }
+        Ok(SearchIndex {
+            // ⚠️ 克隆 `Arc`（不是 `try_unwrap`）：写端与读端**共享**同一视图，
+            //    因此换回写端**不**要求「无其他持有者」。
+            shared: self.shared,
+            pending: Vec::new(),
+            embed_elapsed: std::time::Duration::ZERO,
+            // 读端从未 embed 过（换回写端后重新计数）
+            embed_count: 0,
+            graph_status: self.graph_status,
+            // 读端从未执行过 save，图 dump 耗时无意义（不是 0，是「未发生」）
+            graph_dump_elapsed: None,
+        })
     }
 }
 
@@ -163,12 +175,16 @@ impl<'a> SearchRequest<'a> {
 
     /// 收口执行检索。
     pub fn exec(self) -> Result<SearchResponse> {
+        // ⚠️ I8-3：**一次检索只取一次视图快照**，之后全程无锁。
+        // 若中途重新取，可能出现「BM25 用 v1 的段、向量用 v2 的段」⇒ 跨 lane 语义不一致。
+        let view = self.searcher.shared.snapshot();
         let mode = match self.mode {
-            None => self.searcher.infer_mode(),
+            None => self.searcher.infer_mode(&view),
             Some(ModeArg::Resolved(m)) => m,
             Some(ModeArg::Raw(s)) => SearchMode::parse(&s).map_err(Error::InvalidInput)?,
         };
-        self.searcher.run(self.query, mode, self.top_n, self.filter)
+        self.searcher
+            .run(&view, self.query, mode, self.top_n, self.filter)
     }
 }
 
@@ -193,6 +209,9 @@ impl From<String> for ModeArg {
 #[cfg(test)]
 mod tests {
     #![allow(non_snake_case)]
+    // ⚠️ 本模块刻意覆盖旧所有权 API（`into_searcher` / `into_index`）的**行为不变**，
+    // 故显式允许 `deprecated` 警告（不影响生产调用点的迁移）。
+    #![allow(deprecated)]
     use super::*;
     use crate::embed::Embedder;
     use crate::error::Result;
@@ -297,17 +316,27 @@ mod tests {
         assert!(idx.num_chunks() >= 4);
     }
 
+    /// **`S8-02` 口径变更**（原用例名：`clone残留时into_index报错`）：
+    /// 新模型下 `into_index()` **不再**因「clone 残留」失败 —— `shared` 是共享的，
+    /// 「clone 残留」与「写端存活」不可区分，而后者是合法状态。
+    /// ⇒ 新语义 = **总是成功**，且新旧句柄**共享同一视图**。
+    ///
+    /// 🔑 这条同时覆盖「双写端」的核心语义（设计 §4.4.3 的前提）：
+    /// 老 clone 必须能看到新写端提交的内容。
     #[test]
-    fn clone残留时into_index报错() {
+    fn S8_02_into_index总是成功且与旧clone共享视图() {
         let s = build_hybrid();
         let s2 = s.clone();
-        let err = match s.into_index() {
-            Ok(_) => panic!("clone 残留时应报错"),
-            Err(e) => e,
-        };
-        assert!(matches!(err, Error::InvalidInput(_)));
-        // s2 仍可检索
+        let mut idx = s.into_index().expect("S8-02 起 into_index 不再报错");
+        // 旧 clone 仍可检索（共享视图，未被消耗）
         assert!(!s2.search("检索").unwrap().hits.is_empty());
+        // 新写端提交的内容，旧 clone 也必须能看到
+        idx.add("换成新写端之后写入的一篇文档").unwrap();
+        idx.commit().unwrap();
+        assert!(
+            !s2.search("换成新写端之后写入").unwrap().hits.is_empty(),
+            "旧 clone 必须看到新写端提交的内容（共享同一 Arc<Shared>）"
+        );
     }
     #[test]
     fn 纯bm25装配默认mode为bm25() {

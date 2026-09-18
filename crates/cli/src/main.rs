@@ -847,20 +847,25 @@ fn search(args: SearchArgs) -> Result<()> {
         (Some(idx_path), None) => {
             let t = std::time::Instant::now();
             // 门面层 load（默认装配 + 配置指纹校验，修 B1：不再写死 MixedAnalyzer）
-            let index = with_rerank(SearchIndex::builder())
+            let mut index = with_rerank(SearchIndex::builder())
                 .load(idx_path)
                 .with_context(|| format!("加载快照失败: {}", idx_path.display()))?;
             eprintln!("[快照加载 {} 耗时 {:?}]", idx_path.display(), t.elapsed());
             // V2 Step 2：图 sidecar 状态（NFR-07 —— 降级不能静默，必须显式可见）
             report_graph_status(&index);
-            index.into_searcher()?
+            // V2 Step 8 / S8-02：新 API —— 显式 `commit()` 决定可见性（NFR-11），
+            // `searcher(&self)` 不消耗写端（旧 `into_searcher()` 已 deprecated）。
+            index.commit()?;
+            index.searcher()
         }
         (None, Some(input)) => {
             // 现场建库（默认装配：MixedAnalyzer + bge + HNSW，向量模式可用）
             let mut index = with_rerank(SearchIndex::builder()).build();
             let docs = read_corpus_documents(input)?;
             index.add_documents(docs)?;
-            index.into_searcher()?
+            // S8-02：显式 `commit()`（旧 `into_searcher()` 的隐含 flush 已改为显式）
+            index.commit()?;
+            index.searcher()
         }
         _ => bail!("--index 与 --input 必须二选一"),
     };
@@ -917,7 +922,9 @@ fn compare(args: CompareArgs) -> Result<()> {
     let mut index = SearchIndex::builder().build();
     let docs = read_corpus_documents(&args.input)?;
     index.add_documents(docs)?;
-    let searcher = index.into_searcher()?;
+    // S8-02：显式 `commit()` + `searcher(&self)`（写端不再被消耗）
+    index.commit()?;
+    let searcher = index.searcher();
 
     println!("查询: {}\n", args.query);
     println!("=== BM25 ===");

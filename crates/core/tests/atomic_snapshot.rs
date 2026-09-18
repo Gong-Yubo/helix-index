@@ -13,6 +13,9 @@
 //!   Strict 失败的生命周期（D-S3-07 的用户可见后果）。
 
 #![allow(non_snake_case)]
+// ⚠️ 本文件沿用旧所有权 API（`into_searcher` / `into_index`）以**锁住其行为不变**
+// （`S8-02` 起二者为 `#[deprecated]` 薄封装）。生产调用点已在 `cli` / `examples` 迁移。
+#![allow(deprecated)]
 
 use std::sync::Arc;
 
