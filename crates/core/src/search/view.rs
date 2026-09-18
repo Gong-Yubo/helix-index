@@ -89,9 +89,10 @@ pub(crate) struct Tombstones {
 impl Tombstones {
     /// 是否为空（`PR3` 阶段恒 `true`）。
     ///
-    /// ⚠️ 只在 `debug_assertions` 下存在：它服务于一条**阶段不变式断言**
-    /// （`S8-02` 期不应出现跨段墓碑），release 构建不保留。
-    #[cfg(debug_assertions)]
+    /// ⚠️ **不能加 `#[cfg(debug_assertions)]`**（`2026-09-18` CI `build (release)` 实测失败）：
+    /// `debug_assert!` 展开成 `if cfg!(debug_assertions) { … }` —— `cfg!` 是**运行时**宏，
+    /// 不是 `#[cfg]` ⇒ **它的实参在 release 下照样要编译** ⇒ 用 `#[cfg]` 把本方法去掉会让
+    /// release 构建**编译失败**。
     pub(crate) fn is_empty(&self) -> bool {
         self.doc_ids.is_empty()
     }
