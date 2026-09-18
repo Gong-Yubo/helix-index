@@ -347,7 +347,6 @@ impl VectorIndex for HnswRsIndex {
     /// 但**单次持锁时长从 `O(N)` 降到 `O(该层点数)`** ⇒ 写端的**单次**阻塞窗口显著变短
     /// （R34 的原文只说了「消除死锁」，没说这条）。
     ///
-    ///
     /// # 与 `BruteForceIndex` 的逐位一致性（I4）
     ///
     /// 距离走 [`NormalizedVector::distance_to_slice`]（与 `distance_sq` 同一份求和
@@ -709,37 +708,77 @@ mod tests {
     // V2 Step 5 / S5-02：精确扫描（路径 C）的正确性护栏
     // ========================================================================
 
-    /// **S5-T2 ①**：全量遍历的**基数断言**——每点恰好 yield 一次、零重复。
+    /// **S5-T2 ① / S8-T2**：全量遍历的**覆盖等价**——每点恰好 yield 一次、零重复。
     ///
     /// 这条是 v0.1 教训的直接固化：当时把 `get_layer_iterator(0)` 当全量遍历写进
     /// 设计，而它只迭代 layer 0（`hnsw.rs:715-723` 只索引 `pi_guard[self.layer]`），
-    /// 因 `generate_new_point` **无回填低层**（`:500-511`）而漏掉约 `1/M` 的点。
-    /// 断言"全量 API 的基数 == `get_nb_point()`"能在**有人把遍历写回 layer 0 时立刻红**。
+    /// 因 `generate_new_point` **无回填低层**（`:505` 构造 `p_id`、push 在 `:511`）而漏掉约 `1/M` 的点。
+    ///
+    /// **V2 Step 8 / T7-25 起**：本用例改为**按生产路径的逐层写法**收集
+    /// （`0..=get_max_level_observed()`，见 `search_exact_filtered` 的 rustdoc），
+    /// 不再走 `IntoIterator` —— 后者是 R34 的**递归读**来源，生产已不用它。
+    /// 并新增两条**层号范围**断言（设计 §4.2 ③）：层号只写到 0 时必须**能观测到少点**，
+    /// 且各层点数之和必须**恰等于**总点数（`每点恰在一层` 的直接推论）。
+    ///
+    /// ⚠️ **① 必须经由 `search_exact_filtered`（生产路径），不能在用例内复刻循环**：
+    /// 复刻版不打生产代码 ⇒ 生产循环被改坏（如层号上界写成 `0..=0`）时它**仍然绿**
+    /// （2026-09-18 **变异实测**）。②③ 才是 `get_layer_iterator` 自身的 API 契约。
     #[test]
     fn 全量遍历基数等于点数且零重复() {
+        // ⚠️ N 由 300 提到 512：新增的范围断言以「存在 level ≥ 1 的点」为前提，
+        //    P(一个都没有) = (1 − 1/32)^N ⇒ N=512 约 1e-7、N=300 约 8.5e-5
+        //    （后者跨 CI 轮次有可观测的假红风险）。代价是多建 212 个点。
         let mut seed = 99u64;
-        let (idx, entries) = build_index(300, &mut seed);
+        let (idx, entries) = build_index(512, &mut seed);
+        let n = idx.hnsw.get_nb_point();
         let pi = idx.hnsw.get_point_indexation();
+        let max_layer = pi.get_max_level_observed() as usize;
 
-        let ids: Vec<ChunkId> = pi
-            .into_iter()
-            .map(|p| p.get_origin_id() as ChunkId)
-            .collect();
-        assert_eq!(
-            ids.len(),
-            idx.hnsw.get_nb_point(),
-            "全量遍历必须覆盖每一个点（每点恰一次）"
-        );
-
-        let mut uniq = ids.clone();
-        uniq.sort_unstable();
-        uniq.dedup();
-        assert_eq!(uniq.len(), ids.len(), "全量遍历出现重复 yield");
-
-        // 与真实 ID 全集相等：既不少（漏点）也不多（幽灵）
         let mut expect: Vec<ChunkId> = entries.iter().map(|(id, _)| *id).collect();
         expect.sort_unstable();
-        assert_eq!(uniq, expect, "遍历得到的 ID 集与入库集不相等");
+
+        // ── ① 走**生产路径**：覆盖等价必须在 `search_exact_filtered` 上成立 ───────────
+        // 🔴 **不要**在这里复刻那个逐层循环：复刻版**不打生产代码** ⇒ 把生产循环的层号上界
+        //    改成 `0..=0` 时它**仍然绿**（2026-09-18 变异实测，见 PR 正文的变异表）。
+        //    ⇒ 覆盖类断言必须经由被测函数，否则它锁的是「用例自己抄的那份循环」。
+        let all = idx.search_exact_filtered(&entries[0].1, n, None).unwrap();
+        assert_eq!(all.len(), n, "生产精确路径必须覆盖每一个点（每点恰一次）");
+        let mut uniq: Vec<ChunkId> = all.iter().map(|(id, _)| *id).collect();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), n, "生产精确路径出现重复 yield");
+        assert_eq!(
+            uniq, expect,
+            "生产精确路径的 ID 集与入库集不相等（漏点或幽灵）"
+        );
+
+        // ── ② 底层 API 契约：`get_layer_iterator` 的**并集** == 全部点（每点恰在一层） ──
+        let ids: Vec<ChunkId> = (0..=max_layer)
+            .flat_map(|l| pi.get_layer_iterator(l))
+            .map(|p| p.get_origin_id() as ChunkId)
+            .collect();
+        assert_eq!(ids.len(), n, "逐层遍历的并集必须覆盖每一个点");
+
+        // ── ③ 层号范围钉死 ───────────────────────────────────────────────
+        // 前提单独断言：没有 level ≥ 1 的点时，下面两条断言**无鉴别力**（不是错，是空转）。
+        let l0 = pi.get_layer_iterator(0).count();
+        let upper: usize = (1..=max_layer)
+            .map(|l| pi.get_layer_iterator(l).count())
+            .sum();
+        assert!(
+            upper > 0,
+            "本用例失去鉴别力：N=512 / M=32 下应存在 level ≥ 1 的点（P(不存在) ≈ 1e-7）"
+        );
+        assert_eq!(
+            l0 + upper,
+            n,
+            "各层点数之和必须等于总点数（generate_new_point 只把点推入**它自己那一层**、无回填）"
+        );
+        assert!(
+            l0 < n,
+            "把层号上界写成 0 时覆盖数必须**严格小于**总点数；相等说明遍历已不是「取全部点」、\
+             本用例对「层号范围写错」已无鉴别力"
+        );
     }
 
     /// **S5-T2 ②**：**定向用例**——取一个 `level ≥ 1` 的点，用**它自己的向量**查询，
