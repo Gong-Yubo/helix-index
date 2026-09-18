@@ -9,7 +9,64 @@
 
 ## [Unreleased]
 
-### 修复 · V2 Step 8 PR 2 · **第 1 轮评审响应**（#61，2026-09-18）—— 数值勘误 + 空图行为断言 + 覆盖边界**就地收窄**
+### 新增 · V2 Step 8 PR 3 —— **不可变视图骨架** + `searcher(&self)` + 旧所有权 API 废弃（`S8-02` / `T7-18`）（Refs #58，2026-09-18）
+
+> 设计依据 `v2-step8-design.md` §4.3 / §4.8 / §4.12（**v0.5**，新增 §4.3.4 实施结果）。
+> ⚠️ **本 PR 是「大重构不夹带行为变化」的护栏段**（§1.3 第 2 条）：`deltas` 恒空 ⇒
+> **既有测试全绿 = 行为与重构前逐位一致**。真正改变可见性语义的是下一个 PR（`S8-03`）。
+
+#### ✅ Added
+- **`crates/core/src/search/view.rs`（新）** —— 视图模型：`Segment`（内容容器）/ `View`（读端快照）/
+  `Shared`（`RwLock<Arc<View>>` + 发号 + 装配）/ `Tombstones`（跨段墓碑，本 PR 恒空）/ `IdAllocator`。
+  发布协议 `publish` = **写锁内只做一次指针替换**（不变式 `I8-1`）；读端 `snapshot()` 一次取定（`I8-3`）。
+- **`SearchIndex::searcher(&self) -> Searcher`** —— **不消耗写端、不隐含 `flush`**（对齐 NFR-11：
+  可见性 = `commit()` 后）。这是 `S8-02` 的**核心对外价值**：读写可以并存。
+
+
+#### 🔁 Changed
+- **`SearchIndex` 改持 `Arc<Shared>`**：内容从「写端私有的 `Inner`」上移为 `Segment`，
+  经 `Shared::view` 共享；`SearchIndex` 只留 `pending` 与诊断计数。**`add(&mut self)` 签名一字未改**
+  （`D-S8-05`：保持 `!Sync`，「零所有权破坏」的另一半）。
+- **`Searcher` 改持 `Arc<Shared>`**：`parts()` / `has_vector()` / `infer_mode()` / `run()` 接 `&View`；
+  `SearchRequest::exec` **一次检索只取一次快照**（`I8-3` 的落地）。
+- **`commit()` = `flush()` + 发布新视图**（`generation` +1，附 `tracing::debug!` 与单调性告警）。
+  ⚠️ 骨架期**不移动内容**（只有一段）⇒ 可见性语义与重构前**完全一致**。
+- **`tombstone_stats()` 改为「跨段求和」形状**（`main` + `deltas` + 阶段不变式断言），`S8-03` 起无需再改。
+
+#### ⚠️ 废弃（`T7-18`）
+- `SearchIndex::into_searcher(mut self)` → `#[deprecated]` 薄封装 = `commit()` + `searcher()`（**行为逐位不变**）。
+- `Searcher::into_index()` → `#[deprecated]`：
+  🔴 **行为变更** —— 重构前 `Arc::try_unwrap` 在「`Searcher` clone 残留」时**报错**；新模型下
+  「clone 残留」与「写端存活」**不可区分**（后者是合法状态）⇒ **总是成功**。
+  既有单测 `clone残留时into_index报错` 已改口径为 `S8_02_into_index总是成功且与旧clone共享视图`。
+  ⚠️ **这正是「双写端」成为可能的入口** ⇒ `commit()` 全程持 `Shared::ids` 锁从本条起即必需。
+- **生产调用点已迁移**：`cli/src/main.rs`（3）+ `examples/search_basic.rs`（1）改用 `commit()` + `searcher()`；
+  测试文件（7 个）显式 `#![allow(deprecated)]` —— **刻意**沿用旧 API 以锁住其行为不变。
+
+#### 🧪 测试（**+13 条**：`view.rs` 4 / `index.rs` 1 / `tests/step8_segments.rs` 8）
+`S8-T9`（同视图内 50 次检索逐位一致）+ 骨架不变式 4 条（含 **`有读者时写入必须失败`**，`S8-03` 时应删除）
++ 外部行为 8 条（读写并存 / 不隐含 flush / 旧新 API 逐位一致 / 可见性语义钉住 / commit 幂等）。
+
+#### 🧪 变异验证（**M5 / M6′：两条首轮「零命中」**）
+| # | 注入 | 结果 |
+| --- | --- | --- |
+| **M5** | `commit()` 不 `publish` | ⚠️ 首轮 **8 条集成用例全绿**（**抓不住**）⇒ 补 `index.rs` 单测后 **1 条红** |
+| **M6′** | `into_searcher()` 去掉隐含 `commit()` | ⚠️ 首轮 **全仓全绿**（**抓不住**）⇒ 改用**带向量 lane** 的装配后 **1 条红** |
+
+#### ⚠️ 覆盖边界（**如实登记，不声称已覆盖**）
+- **「`commit()` 不 `publish`」在外部 API 层面不可观测**（骨架期内容与视图同源）⇒ **任何集成测试都抓不住**
+  （M5 实证）；只有 `pub(crate)` 单测（`generation` 递增）能抓。`S8-03` 起才从外部可测。
+- **「`into_searcher` 隐含 flush」只在带向量 lane 的装配下可测**（纯 BM25 下 `pending` 恒空、`flush` 是 no-op）
+  ⇒ M6′ 首轮全仓全绿；已把该用例改用带假 embedder 的装配并注明理由。
+- **过渡约束（非缺陷，但须知）**：骨架期写操作要求「无并发读者」（`deltas` 恒空 ⇒ `Arc::get_mut`），
+  有读者时返回 `Err`；**`I8-2`（段不可变）在 PR3 尚未成立**。二者均由 `S8-03` 解除。
+- 由**类型系统**保证、无断言覆盖：`searcher(&self)` 不可能隐式 `flush`（`flush` 需 `&mut self`）。
+
+#### 📄 Docs
+- `docs/devel/v2-step8-design.md`：v0.4 → **v0.5**（新增 **§4.3.4 实施结果**，含 5 条偏差 / 13 条测试 /
+  M5·M6′ / 2 条覆盖边界）。
+
+—— 数值勘误 + 空图行为断言 + 覆盖边界**就地收窄**
 
 > 评审落点 = `pulls/61/reviews`（**1 条，4×P4、无阻塞**）+ **行内 4 条**；`issues/61/comments` = **0**；
 > 落点 SHA = `19635d7`。⚠️ **无生产逻辑改动**（`hnsw_rs_index.rs` 只动 rustdoc / 注释 + 新增 1 条单测）
