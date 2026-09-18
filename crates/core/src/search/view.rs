@@ -15,17 +15,18 @@
 //! | ID | 不变式 |
 //! | --- | --- |
 //! | **I8-1** | **写锁只用于指针替换**：发布路径 [`Shared::commit_view`] 的写锁内**不得**做任何计算 / I/O / 分配（除 `Arc::new`）。任何「先取写锁再干活」的写法都必须在评审里被拒。**发布逻辑内联在该方法内、不另开 `publish`** ⇒ 「锁外三段」在可见性层面写不出来（`S8-02` 评审 P2 的结构性对策）。 |
-//! | **I8-2** | **段一旦进入过任何 `View`，永不再被修改**。⚠️ **PR3（`S8-02`）阶段尚未成立**：此时 `deltas` 恒空、内容唯一，写端经 [`Shared::with_main_mut`] **就地修改** `main` ⇒ 该约束自 **`S8-03`（delta 写入）** 起才真正成立。 |
+//! | **I8-2** | **段一旦进入过任何 `View`，永不再被修改**。✅ **`S8-03` 起成立**：写端只写私有的 `SegmentBuilder`；`commit()` 把段追加进 `View.deltas`；`fold_deltas` **克隆**主段内容后发布**新** `main`；`compact` 亦发布新段 —— 三条路径都不就地改已发布的段。 |
 //! | **I8-3** | **读端只在取快照那一刻取一次读锁**（[`Shared::snapshot`]），之后全程无锁；一次检索**只用一个 `View`**。 |
 //!
 //! 🔑 **I8-3 的最后半句是正确性的关键**：若一次检索中途重新取 view，可能出现
 //! 「BM25 用了 v1 的段、向量用了 v2 的段」⇒ 跨 lane 的 chunk 语义不一致。
 //!
-//! # ⚠️ PR3 的过渡约束（必须在评审里说清）
+//! # ⚠️ PR3 的过渡约束（**已在 `S8-03` 解除**，此处留作历史）
 //!
-//! `deltas` 恒空 ⇒ 内容只有一份（`main`）⇒ 写入必须**独占**该段：
-//! [`Shared::with_main_mut`] 用 `Arc::get_mut`，要求**没有读者持有当前 `Arc<View>`**。
-//! 因此 PR3 的写入在**恰好有并发检索进行中**时会返回 `Err`（消息里指明原因）。
+//! `deltas` 恒空 ⇒ 内容只有一份（`main`）⇒ 那时写入必须**独占**该段（用 `Arc::get_mut`，
+//! 要求**没有读者持有当前 `Arc<View>`**）⇒ 有并发检索进行中时会返回 `Err`。
+//! 🔴 **该入口（`with_main_mut`）与配套的 `write_needs_exclusive()` 已随 `S8-03` 一起删除**
+//! （`S8-03` 评审 P3-4.4 / P4-3：生产路径已无调用点，留着只会腐烂）。
 //!
 //! **这不是终态**：`S8-03` 引入 `SegmentBuilder` + delta 追加后，写入落在写端私有的
 //! builder 上、不再需要 `get_mut`，该约束随之消失（`FR-17` 的「读不阻塞写」
@@ -33,7 +34,6 @@
 
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::error::{Error, Result};
 use crate::index::Index;
 use crate::predicate::{CandidateFilter, FilterKind};
 use crate::types::{ChunkId, DocId};
@@ -75,10 +75,9 @@ impl Segment {
         }
     }
 
-    /// 段内本地 `chunk_id` → **全局** `chunk_id`（`base + local`，设计 §4.4.1）。
-    pub(crate) fn global_chunk(&self, local: ChunkId) -> ChunkId {
-        self.base_chunk + local
-    }
+    // ⚠️ 原 `Segment::global_chunk()` 已删除（**零调用点**）：跨段向量折算（`S8-05`）
+    //    需要时再加 —— 不留 dead code（`clippy -D warnings` 会红）。
+    //    `global_doc()` 有调用点（跨段查重），保留。
 
     /// 段内本地 `doc_id` → **全局** `doc_id`。
     pub(crate) fn global_doc(&self, local: DocId) -> DocId {
@@ -245,36 +244,22 @@ impl View {
         (n, total)
     }
 
-    /// 把**全局** `chunk_id` 折算成 `(段下标, 段内本地 id)`；不属于任何段则 `None`。
-    ///
-    /// 段数极少（主段 + 少量 delta）⇒ **线性扫描 `base` 区间**（每段一次 `u32` 比较）即可。
-    /// ⚠️ 刻意**不**为此建 `HashMap`：段数 ≤ 8 时更慢，且多一份要维护的一致性状态（§4.7.2）。
-    ///
-    /// 用的是 `total_chunks()`（**槽位**数，含墓碑）而非 `num_chunks()`（活数）——
-    /// 全局 ID 空间覆盖的是槽位，死 chunk 也必须有合法折算（它会被存活判定挡掉）。
-    pub(crate) fn locate(&self, global_chunk: ChunkId) -> Option<(usize, ChunkId)> {
-        for (i, seg) in self.segments_in_order().enumerate() {
-            if let Some(local) = global_chunk.checked_sub(seg.base_chunk) {
-                if (local as usize) < seg.index.total_chunks() {
-                    return Some((i, local));
-                }
-            }
-        }
-        None
-    }
+    // ⚠️ 原 `View::locate()` 已删除（`S8-03` 评审 P4-2：`locate` 有三份等价实现）：
+    //    真正被调用的两份是 `ViewFilter::locate`（跨段谓词用，见本文件下方）与
+    //    `SegmentSet::locate`（`retriever::bm25`，检索回捞用）；这一份**零调用点**
+    //    （`dead_code` 会让 `clippy -D warnings` 红），删掉以免三处口径分叉。
+    //    ⚠️ 折算语义（`checked_sub` + 槽位数上界、死 chunk 也有合法折算）在两份实现里保持。
 
-    /// **BM25 是否需要跨段谓词**（R52 热路径判据，`S8-04` / 设计 §4.7.3）。
-    ///
-    /// `false` ⇒ 调用方可以传 `filter = None`（零谓词热路径）。
-    ///
-    /// 🔑 判据是「**有跨段墓碑**」而非「有多段」：
-    /// `remove` 落在**段内**时总是**物理摘除**该段的 postings（§4.8.3 分支 ①）⇒
-    /// 活 postings 里**不可能**有本段已删的 chunk（与今天同理）。真正需要判活的只有
-    /// **跨段墓碑**：目标 doc 在它所属的段里**仍然存活**、postings 也还在，只有墓碑
-    /// 知道它已删。⇒ 无墓碑时保持 `None`，R52 的回归**只发生在确实有跨段墓碑时**。
-    pub(crate) fn needs_bm25_tombstone_filter(&self) -> bool {
-        !self.tombstones.is_empty()
-    }
+    // ⚠️ 删除了原 `needs_bm25_tombstone_filter()`（`S8-03` 评审 P4-3，**零调用点**）：
+    //    「有跨段墓碑 ⇒ 才需要对 BM25 传谓词」这条 R52 热路径判据的**唯一权威落点**现在是
+    //    `query/searcher.rs` 的 `bm25_needs_filter`（内联在热路径上，省掉每 posting 一次
+    //    dyn 调用）。留同义助手 ⇒ 两处口径可能分叉。
+    //
+    // 📌 判据为什么是「有墓碑」而不是「有多段」：`remove` 落在**段内**时总是**物理摘除**
+    //    该段的 postings（§4.8.3 分支 ①）⇒ 活 postings 里不可能有本段已删的 chunk。
+    //    真正需要判活的只有**跨段墓碑**（目标 doc 在它所属的段里仍存活、postings 还在）。
+    // ⚠️ 设计 §4.7.3 的「有 delta 但无墓碑 ⇒ 逐段 `AliveOnly`」**实现没有采纳**：
+    //    无墓碑时直接零谓词（**实现优于设计文本**），设计文本待同步（评审 P3-4.5）。
 }
 
 /// 全局 ID 发号器（`D-S8-04`）。
@@ -367,12 +352,60 @@ impl Shared {
     ///
     /// # 锁序与唯一发布路径
     ///
-    /// 锁序 `ids` → `view`；反向路径不存在（[`Shared::snapshot`] 与
-    /// [`Shared::with_main_mut`] 都只取 `view`）⇒ 无死锁。
+    /// 锁序 `ids` → `view`；反向路径不存在（[`Shared::snapshot`] 与发布路径都只取
+    /// `view`、不回头取 `ids`）⇒ 无死锁。
     ///
     /// 本方法是**唯一**能替换 `view` 指针的地方（发布逻辑内联在此，不另开 `publish`）
     /// ⇒ 「锁外三段」在**可见性层面**写不出来。这是对评审 P2 的**结构性**对策：
     /// 不是加一个检查，而是**消除违反它的入口**。
+    /// **合并发布时的「窗口吸收」**（`S8-03` 评审 **P1-1** 的修复核心，纯函数以便单测）。
+    ///
+    /// # 背景（原缺陷）
+    ///
+    /// `fold_deltas` / `compact` 属于「读-改-发布」路径：它们在**锁外**读快照、克隆合并，
+    /// 再进 `commit_view` 替换指针。若另一个写端在「读快照」与「拿锁」之间提交了新 delta，
+    /// 而发布闭包**无视锁内的 `cur`**（原写法是 `move |_cur, …|`），那个 delta 会：
+    /// ① 从视图里**消失**（读不到已提交内容）；② `ids.next_*` **回缩** ⇒ 下一个 builder 的
+    /// 基址落回已发号区间 ⇒ **ID 复用**（`AddOutcome` 给出的 ID 被后续内容别名）。
+    /// debug 下只靠 `used >= base` 断言偶然拦一下，release 下**全静默**。
+    ///
+    /// # 修法：吸收，而不是报错
+    ///
+    /// 合并**不改 ID**（`D-S8-04`：`merge_from` 按本地顺序 append、不重编号）⇒ 主段吸收快照里
+    /// 那些 delta 之后，**全局 ID 空间的长度不变**；窗口内新提交的 delta 的 `base_*` 是它
+    /// 提交时算的「前序所有段长度之和」，恰好等于吸收后的长度 ⇒ **基址仍然有效**，
+    /// 直接挂在 `main` 之后即可（FIFO 不变式 `main, deltas[0], …` 保持）。
+    ///
+    /// 墓碑同理：本次只物理化了**快照里**的墓碑 ⇒ 从 `cur.tombstones` 里**逐个摘掉它们**，
+    /// 窗口内新增的墓碑**原样保留**（它们的 `fold` 留给下一次）。
+    ///
+    /// # 前提
+    ///
+    /// `cur_deltas.len() >= snapshot_deltas`（delta 只增）。**等号**在单写端恒成立；
+    /// 严格大于即「窗口内有提交」。⚠️ 若**小于**（并发 `compact` 重编号过视图），
+    /// 本函数的假设不成立 —— 那条路径由 `S8-06` 的 epoch 对账（评审 P2-4）负责，
+    /// 这里用 `debug_assert` 显式标识。
+    pub(crate) fn absorb_window(
+        cur_deltas: &[Arc<Segment>],
+        snapshot_deltas: usize,
+        cur_tombstones: &Tombstones,
+        physicalized: &Tombstones,
+    ) -> (Arc<[Arc<Segment>]>, Arc<Tombstones>) {
+        debug_assert!(
+            cur_deltas.len() >= snapshot_deltas,
+            "发布窗口内 delta 数不得减少：cur = {}，snapshot = {}（并发 compact 重编号过视图？\
+             —— 该组合由 S8-06 的 epoch 对账负责）",
+            cur_deltas.len(),
+            snapshot_deltas
+        );
+        let carried: Vec<Arc<Segment>> = cur_deltas.iter().skip(snapshot_deltas).cloned().collect();
+        let mut tombstones = cur_tombstones.clone();
+        for doc in physicalized.iter() {
+            tombstones.remove(doc);
+        }
+        (Arc::from(carried), Arc::new(tombstones))
+    }
+
     pub(crate) fn commit_view(
         &self,
         build_next: impl FnOnce(&Arc<View>, u64, DocId, ChunkId) -> (View, DocId, ChunkId),
@@ -433,19 +466,10 @@ impl Shared {
         (ids.next_doc, ids.next_chunk)
     }
 
-    /// 取 `main` 段的**可变**引用（`PR3` 过渡入口，见模块文档）。
-    ///
-    /// 要求没有读者持有当前 `Arc<View>`；否则返回 `Err`
-    /// （`S8-03` 的 delta 写入解除该约束）。
-    pub(crate) fn with_main_mut<R>(&self, f: impl FnOnce(&mut Segment) -> R) -> Result<R> {
-        let mut guard = self.view.write().expect("视图锁中毒");
-        let view = Arc::get_mut(&mut *guard).ok_or_else(write_needs_exclusive)?;
-        let seg = Arc::get_mut(&mut view.main).ok_or_else(write_needs_exclusive)?;
-        // ⚠️ 这里只做「就地修改」、**不**替换指针 ⇒ 包在写锁内是必要的
-        // （否则读者可能看到半修改状态）。`PR3` 的写路径短（一次 add / flush 的量级），
-        // 且 `S8-03` 起本入口整体被 builder 取代。
-        Ok(f(seg))
-    }
+    // ⚠️ 原 `with_main_mut()`（`S8-02` 的过渡入口）已删除（`S8-03` 评审 P3-4.4）：
+    //    `S8-03` 起写端只写**自己私有的** builder，不再就地改已发布的段 ⇒ 该入口
+    //    在生产路径上零调用点（`dead_code` 会让 `clippy -D warnings` 直接红）。
+    //    「有读者时写入失败」这条过渡期约束随之消失，对应用例也已删除。
 }
 
 /// **跨段**候选谓词（`S8-04` / 设计 §4.7.1）。
@@ -635,16 +659,10 @@ impl CandidateFilter for ViewFilter<'_> {
     }
 }
 
-/// 「写入需要独占」的统一错误（消息里指明阶段与出路，避免被误读成 bug）。
-fn write_needs_exclusive() -> Error {
-    // ⚠️ **`Error::Busy` 而不是 `Error::InvalidInput`**（`S8-02` 评审 P4-5a）：
-    // 这是**瞬态并发状态**（重试即可），不是参数错误（重试无用）。
-    Error::Busy(
-        "写入需要独占当前视图（此刻有并发检索持有快照）—— S8-02 过渡期约束；\
-         并发读写由 S8-03 的 delta 分段交付"
-            .to_string(),
-    )
-}
+// ⚠️ 原 `write_needs_exclusive()` 已随 `with_main_mut()` 一起删除（`S8-03` 评审 P3-4.4）：
+//    它是 `S8-02` 过渡期的唯一 `Error::Busy` 产生点；`S8-03` 起该变体的产生点是
+//    `SearchIndex::commit()` 的**基址对账**（另一个写端插队），语义不同（**不可重试**），
+//    已同步更正 `error.rs` 的文档。
 
 #[cfg(test)]
 mod tests {
@@ -726,37 +744,49 @@ mod tests {
         assert_eq!(g2, 2, "序号必须单调递增");
     }
 
-    /// **`S8-02` 过渡约束**：有读者持有当前 `Arc<View>` 时，`with_main_mut` **必须失败**
-    /// 而不是静默改到读者正在看的段上。
+    // ⚠️ 原用例 `S8_02_有读者时写入必须失败` 已按承诺删除（`S8-03` 评审 P3-4.4）：
+    //    它锁的过渡期约束（`with_main_mut` 在有读者时必须失败）随 `S8-03` 落地而消失
+    //    —— 现在**写入根本不再碰已发布的段**（写端私有 builder），该断言无处可依。
+    //    ⚠️ **不是**改成「永远绿」的模糊断言，而是连同入口一起移除。
+    //
+    //    替代覆盖见 `crates/core/tests/step8_rw_concurrency.rs`（读写并存的活性判据）
+    //    与 `S8_03_未commit不可见_commit后立即可见`（可见性边界）。
+
+    /// **`S8-03` 评审 P1-1 的回归锁**：`absorb_window` 必须**无损吸收**窗口内新提交的 delta，
+    /// 且只摘掉**本次已物理化**的墓碑。
     ///
-    /// 🔑 这条锁住的是**正确性**：若 `get_mut` 失败被忽略（例如退化成「直接改」），
-    /// 读者会在检索中途看到半修改的状态。`S8-03` 起该约束被 delta 写入解除，
-    /// 届时本用例**应当被删除**（连同 `with_main_mut` 一起）——不要改成「永远绿」。
+    /// 🔑 为什么值得单测：真实的交错（另一写端恰在「取快照」与「拿锁」之间提交）在集成测试里
+    /// **无法确定性构造**（需要线程时序）；而缺陷本身是**纯函数级**的 —— 「锁内的 `cur`
+    /// 被无视」⇒ 把它抽成纯函数之后，判据就有了确定性、有牙齿：
+    /// 删掉吸收（回到 `deltas = []`）本用例立刻红。
     #[test]
-    fn S8_02_有读者时写入必须失败() {
-        let sh = shared();
-        // 无读者：可写
-        sh.with_main_mut(|seg| seg.index.total_docs()).unwrap();
+    fn S8_03_窗口吸收保留新提交的delta且只摘已物理化的墓碑() {
+        let d1 = Arc::new(Segment::empty(None));
+        let d2 = Arc::new(Segment::empty(None));
+        let d3 = Arc::new(Segment::empty(None));
+        let cur_deltas: Vec<Arc<Segment>> = vec![d1, d2, d3];
 
-        // 造一个读者持有当前视图
-        let held = sh.snapshot();
-        let err = sh.with_main_mut(|seg| seg.index.total_docs()).unwrap_err();
-        // ⚠️ 必须是**独立的瞬态变体**（`S8-02` 评审 P4-5a）：它表示「稍后重试即可」，
-        // 不是「参数错了」。混用 `InvalidInput` 会让调用方无法区分这两者。
-        assert!(
-            matches!(err, Error::Busy(_)),
-            "并发冲突必须报 `Error::Busy`（可重试），实际：{err:?}"
-        );
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("需要独占"),
-            "错误消息必须指明「写入需要独占」，实际：{msg}"
-        );
+        let cur_tomb = Tombstones {
+            doc_ids: vec![7, 9],
+        };
+        // 本次 fold 物理化的是快照里那批（只含 7）
+        let physicalized = Tombstones { doc_ids: vec![7] };
 
-        // 读者释放后恢复可写（约束是瞬时的，不是永久的）
-        drop(held);
-        sh.with_main_mut(|seg| seg.index.total_docs())
-            .expect("读者释放后必须恢复可写");
+        // 快照只有 1 个 delta ⇒ 窗口内新增了 d2 / d3 ⇒ 必须原样带上
+        let (carried, tomb) = Shared::absorb_window(&cur_deltas, 1, &cur_tomb, &physicalized);
+        assert_eq!(carried.len(), 2, "窗口内新提交的 delta 不得被丢弃");
+        assert!(
+            Arc::ptr_eq(&carried[0], &cur_deltas[1]),
+            "必须按 FIFO 原样带上"
+        );
+        assert!(!tomb.blocks_doc(7), "本次已物理化的墓碑必须从视图里摘掉");
+        assert!(tomb.blocks_doc(9), "窗口内新增的墓碑必须保留");
+
+        // 无窗口新增时行为与旧写法等价（deltas 清空）
+        let (carried, tomb) = Shared::absorb_window(&cur_deltas, 3, &cur_tomb, &physicalized);
+        assert!(carried.is_empty());
+        assert!(!tomb.blocks_doc(7));
+        assert!(tomb.blocks_doc(9));
     }
 
     /// **`S8-02` 评审 P3-2**：跨段求和必须**真的遍历 `deltas`**。

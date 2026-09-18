@@ -220,8 +220,17 @@ impl Index {
         let chunk_ids = self.forward.chunk_ids_of_doc(doc_id);
 
         // 回滚 content_hash 映射（幂等 upsert 的状态）
+        //
+        // 🔴 **条件式摘除**（`S8-03` 评审 P1-2）：只有当表中的条目**确实指向本 doc** 时才移除。
+        // 跨段之后「同一 hash 存在两个 doc」是**合法状态** —— 墓碑挡住的 hash 视为未命中
+        // ⇒ 允许用同内容重新 upsert（`SearchIndex::doc_id_by_hash_global` / §4.8.3），
+        // 于是合并后的主段里可能同时有「被墓碑的旧 doc X」与「替换文档 Y」（hash 相同）。
+        // 若在此**无条件** `remove(&H)`，物理化 X 的墓碑时会把 **Y 的去重条目**一并抹掉
+        // ⇒ Y 存活但不再可去重 ⇒ 下次同内容 `add` 生成重复文档（**FR-15 幂等 upsert 静默失效**）。
         if let Some(doc) = self.forward.doc(doc_id) {
-            if doc.content_hash != 0 {
+            if doc.content_hash != 0
+                && self.content_hashes.get(&doc.content_hash).copied() == Some(doc_id)
+            {
                 self.content_hashes.remove(&doc.content_hash);
             }
         }
@@ -568,14 +577,24 @@ impl Index {
         self.stats.num_chunks += other_stats.num_chunks;
         self.chunk_lens.extend(other_chunk_lens);
 
-        // ④ content_hash 表：跨段查重的前提。⚠️ 碰撞**理论上不应发生**（写入时已跨段查重），
-        //    但仍要显式处理：debug 下报错，release 下**确定性**地以后写入者为准（`insert` 覆盖）。
+        // ④ content_hash 表：跨段查重的前提。
+        //
+        // ⚠️ **碰撞是合法状态，不是 bug**（`S8-03` 评审 P1-2 更正）：墓碑挡住的 hash 视为
+        //    未命中 ⇒ 同一内容可以被**重新 upsert** ⇒ 合并时 `self`（主段）里的旧 doc 与
+        //    `other`（delta）里的替换文档会**共用同一个 hash**。语义由「**后写入者为准**」
+        //    （`insert` 覆盖）给出：被覆盖的是**已被墓碑的**旧 doc，而它在物理化时走
+        //    `Index::remove` 的**条件式摘除** ⇒ 替换文档的去重条目不会被误删。
+        //    ⇒ 原「debug 必 panic / release 静默」的断言已删除（它把合法路径变成了 panic）。
+        //    更强的判据（要求 displaced 必为墓碑 doc）需要把段级墓碑信息传进来，
+        //    留给 `S8-06` 的合并器。
         for (h, d) in other_hashes {
             let displaced = self.content_hashes.insert(h, d + base_doc as DocId);
-            debug_assert!(
-                displaced.is_none(),
-                "content_hash 跨段碰撞：{h}（写入路径的跨段查重应已排除）"
-            );
+            if displaced.is_some() {
+                tracing::debug!(
+                    hash = h,
+                    "content_hash 跨段碰撞：同一 hash 在两段里各有一个 doc（墓碑挡住查重 ⇒ 合法）"
+                );
+            }
         }
 
         // ⑤ 字段索引：**不能 extend**（它是 field → value → doc 位图，且带基数降级判定）

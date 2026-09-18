@@ -201,8 +201,8 @@ fn S8_02_searcher不隐含flush() {
 
 /// **`S8-T9`**：同一视图内，连续 N 次检索**逐位一致**（NFR-06 不破）。
 ///
-/// 判据同时覆盖「段未被就地修改」：若 `with_main_mut` 之后忘了重新发布、
-/// 或有读者时静默改到共享段上，稳定输入下的重复检索会先出现不一致。
+/// 判据同时覆盖「段未被就地修改」：若某条写路径忘了重新发布（而是就地改已发布的段）、
+/// 或把半修改状态暴露给读者，稳定输入下的重复检索会先出现不一致。
 #[test]
 fn S8_T9_同视图内检索逐位一致() {
     let idx = bm25_index();
@@ -370,4 +370,50 @@ fn S8_02_commit后立即可查且幂等() {
         .exec()
         .unwrap();
     assert!(!bm.hits.is_empty());
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// 6) `content_hash` 与「跨段墓碑 + 重新 upsert」的交互（评审 P1-2 的回归锁）
+// ══════════════════════════════════════════════════════════════════════════
+
+/// **`S8-03` 新增（评审 P1-2 的回归锁）**：跨段墓碑 + 同内容重加 + `save()` **不得 panic**，
+/// 且替换文档的去重条目**必须保留**（FR-15 幂等 upsert）。
+///
+/// 🔴 修前形态（**已在评审批次内实测复现**）：`remove` 分支② 只记墓碑 ⇒ 同 hash 的旧 doc X
+/// 仍在已发布的段里 ⇒ `doc_id_by_hash_global` 被墓碑挡住 ⇒ 允许插入同 hash 的新 doc Y ⇒
+/// `fold_deltas` 的 `merge_from` 撞上 `content_hashes` 的 `debug_assert!`（**debug 必 panic**）；
+/// release 下继续走，但物理化 X 时 `Index::remove` **无条件**摘 hash 条目 ⇒ 把 **Y 的去重条目**
+/// 一并抹掉 ⇒ 同一内容可被重复 upsert（**静默失效**）。
+///
+/// 修法（同批次落地）：① `Index::remove` 的 hash 摘除改**条件式**（只摘指向本 doc 的条目）；
+/// ② `merge_from` 的碰撞断言**删除**（碰撞是合法状态，语义 = 后写入者为准）。
+#[test]
+fn S8_T6_跨段墓碑下同内容重加经save后仍可去重() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t6.idx");
+    let text = "跨段墓碑下的去重条目 苹果";
+
+    let mut idx = bm25_builder().build();
+    let out = idx.add(Document::new(text)).unwrap();
+    idx.commit().unwrap(); // 内容进 delta（已发布）
+    idx.remove(out.doc_id).unwrap(); // 分支② 记跨段墓碑（**在 builder 上**）
+                                     // ⚠️ 墓碑与内容走**同一条可见性边界**：要 `commit()` 才进 `View.tombstones`
+                                     //    ⇒ 不 commit 就重加，查重根本看不到墓碑，会直接去重（本用例第一版就是这么错的）。
+    idx.commit().unwrap();
+
+    // 同内容重加：查重被墓碑挡住 ⇒ 视为未命中 ⇒ 允许插入（§4.8.3 钦定语义）
+    let again = idx.add(Document::new(text)).unwrap();
+    assert!(!again.deduped, "被墓碑挡住 ⇒ 应重新 upsert（不算命中）");
+    idx.commit().unwrap();
+
+    // ① 合并 + 落盘：修前 debug 构建必在 `merge_from` 的碰撞断言上 panic
+    idx.save(&path).unwrap();
+
+    // ② 落盘往返之后，同内容**仍然**可去重（替换文档的条目没被旧 doc 的物理化抹掉）
+    let mut loaded = bm25_builder().load(&path).unwrap();
+    let third = loaded.add(Document::new(text)).unwrap();
+    assert!(
+        third.deduped,
+        "物理化旧 doc 不得摘掉替换文档的去重条目（FR-15 幂等 upsert）"
+    );
 }

@@ -93,7 +93,7 @@ impl Searcher {
         // 跨段载具（`S8-04`）：**只有真的多段 / 有跨段墓碑时才填**。
         // ⚠️ 单段时必须留 `None`：那条路径与 `S8-03` 之前**同一份实现**（零回归），
         //    也避免热路径平白多一层段遍历（R52）。
-        let multi = view.deltas.len() > 0 || !view.tombstones.is_empty();
+        let multi = !view.deltas.is_empty() || !view.tombstones.is_empty();
         let (segment_set, predicate_builder) = if multi {
             let segments: Vec<crate::retriever::SegmentRef<'a>> = view
                 .segments_in_order()

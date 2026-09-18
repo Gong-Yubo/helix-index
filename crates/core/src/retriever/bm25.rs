@@ -95,7 +95,10 @@ impl Retriever for Bm25Retriever<'_> {
         // TAAT 累加：chunk_id → 累计分
         let mut acc: HashMap<ChunkId, f32> = HashMap::new();
 
-        // 去重 query term，但保留顺序无关紧要（累加）
+        // ⚠️ **刻意不去重** query term（`S8-03` 评审 P4-1 更正了旧注释的「去重」说法）：
+        //    本循环与跨段版（`SegmentedBm25Retriever`）里的同类循环都是 `for token in tokens`
+        //    直遍 ⇒ 重复 term 会累加两次 —— **两条路径同形**，这正是逐位一致的前提之一
+        //    （若只有一边去重，跨段与单段的结果就会分叉）。
         for token in tokens {
             let term = token.term.as_str();
             let Some(term_id) = self.index.term_id(term) else {
