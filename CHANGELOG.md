@@ -9,6 +9,70 @@
 
 ## [Unreleased]
 
+### 新增 · V2 Step 8 PR 4（**WIP，未完成**）—— `S8-03` delta 写入闭环 + `S8-04` 跨段 BM25 / 谓词 + **最小文本侧合并**（Refs #58，2026-09-19）
+
+> ⚠️ **本条对应的实现尚未全绿**（见「已知红」）。条目先落，是因为**每个 PR 必带 CHANGELOG**，
+> 而本 PR 的用途 = **第三方 harness 评审**（见 PR 正文）。
+>
+> **本 PR 的范围偏差（须评审确认）**：设计 §8 的切分里合并器属 **PR6（`S8-06`）**，但
+> `D-S8-01` / `D-S8-12` 要求 `save()` / `compact()` **第一步就 `merge_all()`** —— 不做最小合并，
+> `save` 落盘的快照**只含 `main`** ⇒ **静默丢内容**。⇒ PR4 内实现**最小文本侧合并**（`fold_deltas()`，
+> 不含向量侧策略 / `MergeReport` / 字段索引等价 —— 那些仍留给 `S8-06`）。
+
+#### Added
+
+- **`search/index.rs`：`SegmentBuilder`**（`pub(crate)`，写端私有：`index` / `pending` / `raw_vectors` /
+  `vector` / `tombstones` / `base_doc` / `base_chunk`）—— `S8-03` 起**写端不再就地改 `main`**。
+- **`search/view.rs`：读侧跨段基础设施** —— `SegmentRef` / `SegmentSet`（FIFO 段列表 = `main, deltas[0], …`）/
+  `SegmentsInOrder` / `SegmentFilter` / `ViewFilter`（`CandidateFilter` 的跨段实现，`allowed_count`
+  为**精确计数**：`Σ allowed_seg − 墓碑挡掉的 chunk 数`）/ `View::sums()`（全局统计量）/
+  `Shared::publish_reset()`（`compact` 专用：**允许已用长度变小**，`I8-7` 的唯一合法例外）/
+  `View::segments_in_order()`。
+- **`retriever/bm25.rs`：`SegmentedBm25Retriever`** —— 跨段 BM25：**外层 term、内层段**的 TAAT 累加 +
+  **全局精确整数统计量**（`N` / `total_len` / `df(t)`）⇒ 与单段布局的 `bm25` 结果**逐位一致**（结构性结论）。
+- **`index/mod.rs`：`Index::merge_from()`** + **`index/forward.rs`：`ForwardStore::append_from()`** ——
+  把 delta 的内容按**本地顺序 append** 进主段，**不重编号**（合并保 ID：`S8-T8` 的门）。
+- **`tests/atomic_snapshot.rs`**：该用例的检索手段改为 **`bm25` 模式**（理由见下「Changed」）。
+
+#### Changed
+
+- **`SearchIndex`**：`add` / `flush` / `remove` 全部改走**自己的 builder**（不再 `with_main_mut`）
+  ⇒ **并发检索进行中也能写入**（`FR-17` 的核心诉求）；`commit()` = `flush` → **封段** → 持
+  `Shared::ids` 锁**原子追加进 `View.deltas`** → 发布新 `View`（含**基址对账**：双写端插队 ⇒ `Error::Busy`，
+  不静默发错 ID）。
+- **`remove` 三分支**：① 目标在**当前 builder**（未发布）⇒ 就地物理删；② 在**既往段** ⇒ 记**跨段墓碑**
+  （`View.tombstones`）；③ 不存在 ⇒ no-op。跨段 `content_hash` 查重同步覆盖「命中但被墓碑挡住 ⇒ 视为未命中」。
+- **`compact_with_bytes`**：改走 `Shared::publish_reset()`（重编号 ⇒ 新主段**比原来短**，必须重置发号器）
+  **+ 重编号后重建 builder**（否则后续 `commit()` 的基址对账必失败）。
+- **`SearchParts` 新增 `segment_set` / `predicate_builder` 两个字段** —— ⚠️ **破坏性**：下游若有字面量
+  构造 `SearchParts { … }` 会编译失败（本仓内为 0 处）。
+- **`atomic_snapshot::TI5_strict失败后快照仍可加载并恢复`** 的检索手段由 `hybrid` 改为 **`bm25`**：
+  该断言验的是「快照内容完整」，而 `save` 前先合并会让图按**全量原始向量重建** ⇒ ANN 拓扑变化 ⇒
+  `hybrid` 的 top-10 漂移（§4.6.2 明确「ANN 路径不承诺跨布局逐位一致」）。**BM25 与图无关、确定性**，
+  语义不变。
+
+#### Fixed
+
+- **`Shared::new` 的发号器初始化**：原用 `IdAllocator::default()`（全 0）⇒ `load` 后主段已有 N 个槽位，
+  新段 ID 会与主段**重叠**（破坏 `I8-7`）。改为从 `main.index.total_docs()` / `total_chunks()` 起步。
+- **`fold_deltas` 的 `raw_vectors` 未按 liveness 过滤** ⇒ 快照会带**已删 chunk** 的向量。
+- **跨段 BM25 的零谓词判据漏了「跨段墓碑」** ⇒ 墓碑挡不住检索（数据错误）。
+
+#### ⚠️ 已知红（本 PR 尚未完成的部分）
+
+- `step4_compaction`：2 条（compact / 死词回收与 delta + 墓碑的交互 —— 设计上属 `S8-06` 领域）
+- `compaction_cli_semantics`：1 条（图 sidecar 体积）
+- `integration`：1 条（`已删向量不霸占 TopK 名额` —— **向量路只覆盖 `main`**；跨段向量属 `S8-05`/PR5，
+  按已拍板的**范围决策**留待 PR5，不在本 PR 内掩盖）
+- `tests/step8_segments.rs` 的新用例（含 **`S8-T4` 跨段 BM25 逐位一致**）**尚未补**；变异验证 / 守门链 /
+  设计文档实施结果回填**均未做**。
+
+#### 设计文档更正
+
+- `docs/devel/v2-step8-design.md` **§4.10**：原写「`load` … **`ids` 归零**」为**错误**（会让新段全局 ID
+  与主段重叠、破坏 `I8-7`）；更正为「**`ids` 不归零**：从主段已用槽位数起步」，并附实测依据
+  （`S6_T8` / `S6_T10` 两条用例）。
+
 ### 修复 · V2 Step 8 PR 3 · **第 1 轮评审响应**（#62，2026-09-18）—— `commit()` 原子化（P2）+ 跨段求和（P3-2）+ 3 处顺手修
 
 > 评审落点 = `pulls/62/reviews`（**1 条：1×P2 + 2×P3 + 3×P4**）+ **行内 5 条**；`issues/62/comments` = **0**；
