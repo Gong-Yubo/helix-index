@@ -299,17 +299,54 @@ impl VectorIndex for HnswRsIndex {
     /// 差别在每个点做什么：路径 B 每点一次 512 维距离（≈100ns），
     /// 本路径每点一次位图判定（≈5~20ns）。
     ///
-    /// # ⚠️ 全量遍历必须用 `&PointIndexation` 的 `IntoIterator`
+    /// # ⚠️ 全量遍历必须**逐层**——**不可**用 `&PointIndexation` 的 `IntoIterator`（R34 递归读）
     ///
-    /// 它从 layer 0 **逐层上升到 `entry_point_level`**，每个点恰好 yield 一次
-    /// （`hnsw.rs:681-688` / `IterPoint::next` `:647-677`）。
+    /// 生产写法（**层号上界钉死**，与下面循环体一致）：
     ///
-    /// **不可**改用 `get_layer_iterator(0)`：`generate_new_point` 只把新点推入
-    /// **它自己那一层**（`hnsw.rs:500-511`，全文件唯一一处 push，**无回填低层**），
-    /// 而 `level = floor(-ln u · scale)`、`scale = 1/ln(M)` ⇒ `P(level ≥ 1) = 1/M`，
-    /// 本项目 M=32 ⇒ 约 3.1% 的点**不在 layer 0**。用它做精确扫描会**静默漏掉**
-    /// 这 3%——不是变慢、不是少召回，是**答错**（拿被漏点自己的向量去查，它会消失）。
-    /// 定向护栏见测试 `精确扫描覆盖高层点_定向用例`。
+    /// ```text
+    /// let pi = self.hnsw.get_point_indexation();
+    /// for layer in 0..=pi.get_max_level_observed() as usize {
+    ///     for point in pi.get_layer_iterator(layer) { /* … */ }
+    /// }
+    /// ```
+    ///
+    /// ① **为什么不能用 `IntoIterator`**：`IterPoint::new` 构造即取
+    /// `points_by_layer.read()`（`hnsw.rs:633`）并**全程持有**，而 `IterPoint::next` 在
+    /// **层切换**时**再取一次同一把锁**（`hnsw.rs:661`；相邻的 `:660` 取的是另一把
+    /// `entry_point` 锁，**不构成**递归）⇒ 同一把 `std::sync::RwLock` 被**递归读**。
+    /// `std` 不保证递归读可重入（其 futex 实现要求 `!has_writers_waiting`，**写者优先**）
+    /// ⇒ 并发检索之间互不阻塞，但**若恰在层切换那一刻有写者在等待，第二次读可能永久阻塞
+    /// ⇒ 挂死**（架构 §14.3 **R34**）。逐层写法每层一个独立 `IterPointLayer`
+    /// （`:701` 只取一次锁，`:715-723` 的 `next` **只索引** `pi_guard[self.layer]`、
+    /// **不再取锁**）⇒ **层间 guard 不重叠 ⇒ 无递归读**。
+    /// 并发判据见 `tests/step8_rw_concurrency.rs`（std-only 复刻体；真实 `Hnsw` 上的
+    /// 读写并发在安全 Rust 下不可达 —— `insert` 与 `add` 都要求 `&mut self`）。
+    ///
+    /// ② **为什么层号必须从 0 起、到 `get_max_level_observed()` 止**：
+    /// `generate_new_point` 只把新点推入**它自己那一层**（`hnsw.rs:505` 构造 `p_id`，
+    /// `:511` 是全文件唯一一处 push，**无回填低层**）⇒ **每点恰在一层** ⇒ 逐层**并集**
+    /// = 全部点、每点恰一次。而单层 `get_layer_iterator(0)` **不是**全量：
+    /// `level = floor(-ln u · scale)`、`scale = 1/ln(M)` ⇒ `P(level ≥ 1) = 1/M`，
+    /// 本项目 M=32 ⇒ 约 3.1% 的点**不在 layer 0**（实测 N=5000 漏 3.74%）。
+    /// 用它做精确扫描会**静默漏掉**这 3%——不是变慢、不是少召回，是**答错**
+    /// （拿被漏点自己的向量去查，它会消失）。护栏见测试
+    /// `全量遍历基数等于点数且零重复`（含**层号范围**断言）与
+    /// `精确扫描覆盖高层点_定向用例`（定向：`level ≥ 1` 的点自查询必排第一）。
+    ///
+    /// ③ **不可用 `get_max_level()`**（`hnsw.rs:809-812`）：它返回**构造期授权的**
+    /// `max_layer`，**大于等于**实际观测层 ⇒ 会白跑空层；两者仅在「已建满」时相等。
+    ///
+    /// ④ **空图边界**：`get_max_level_observed()` 在 `entry_point == None` 时返回 **0**
+    /// （`hnsw.rs:469-475`），而 `points_by_layer` 由 `PointIndexation::new` 按
+    /// `max_layer` 预分配（`:448-456`）⇒ `get_layer_iterator(0)` 落在合法下标上、
+    /// 返回空迭代器 ⇒ **不 panic**。库自身的 `debug_dump`（`:485-490`）用的就是同一个
+    /// `0..=max_level_observed` 模式，可作先例。
+    ///
+    /// ⑤ **成本（顺带收益）**：把 1 次「长持锁」换成 `L+1` 次「短持锁」
+    /// （`L` = 最大层；M=32 / N=12K 下期望 `L ≈ log₁/₃₂(12000) ≈ 2.4`）⇒ 总持锁量同量级，
+    /// 但**单次持锁时长从 `O(N)` 降到 `O(该层点数)`** ⇒ 写端的**单次**阻塞窗口显著变短
+    /// （R34 的原文只说了「消除死锁」，没说这条）。
+    ///
     ///
     /// # 与 `BruteForceIndex` 的逐位一致性（I4）
     ///
@@ -327,19 +364,27 @@ impl VectorIndex for HnswRsIndex {
             return Ok(Vec::new());
         }
         let mut out: Vec<(ChunkId, f32)> = Vec::new();
-        for point in self.hnsw.get_point_indexation() {
-            let id = point.get_origin_id() as ChunkId;
-            if filter.is_none_or(|f| f.contains(id)) {
-                let d = query.distance_to_slice(point.get_v());
-                // 精确路径把"依赖 embedder 输出有限"从**声明**变成**断言**：
-                // `NormalizedVector::new`（`point.rs`）的 `norm > 0.0` 在 NaN 下为
-                // false（IEEE-754：NaN 的一切比较皆 false）⇒ NaN 会被**静默存下**，
-                // 不 panic / 不报错；全 crate 无 `is_finite` / `is_nan`。
-                debug_assert!(
-                    d.is_finite(),
-                    "embedder 输出含 NaN/Inf（精确路径契约外输入）：chunk {id}"
-                );
-                out.push((id, d));
+        // ⚠️ 逐层遍历——**不可**改回 `for point in self.hnsw.get_point_indexation()`：
+        //    那条路径的 `IterPoint::next` 会在层切换时**递归读**同一把 `points_by_layer`
+        //    （`hnsw.rs:633` 取、`:661` 再取）⇒ 有写者等待时**永久阻塞**（架构 §14.3 R34）。
+        //    ⚠️ 上界必须是 `get_max_level_observed()`（**不是** `get_max_level()`），
+        //    且必须从 **0** 起（只写 0 会漏掉约 `1/M` 的点）。详见本函数的 rustdoc。
+        let pi = self.hnsw.get_point_indexation();
+        for layer in 0..=pi.get_max_level_observed() as usize {
+            for point in pi.get_layer_iterator(layer) {
+                let id = point.get_origin_id() as ChunkId;
+                if filter.is_none_or(|f| f.contains(id)) {
+                    let d = query.distance_to_slice(point.get_v());
+                    // 精确路径把"依赖 embedder 输出有限"从**声明**变成**断言**：
+                    // `NormalizedVector::new`（`point.rs`）的 `norm > 0.0` 在 NaN 下为
+                    // false（IEEE-754：NaN 的一切比较皆 false）⇒ NaN 会被**静默存下**，
+                    // 不 panic / 不报错；全 crate 无 `is_finite` / `is_nan`。
+                    debug_assert!(
+                        d.is_finite(),
+                        "embedder 输出含 NaN/Inf（精确路径契约外输入）：chunk {id}"
+                    );
+                    out.push((id, d));
+                }
             }
         }
         out.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
