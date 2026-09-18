@@ -1,21 +1,27 @@
-//! 写端门面：`SearchIndex`（拥有型，持有全部装配与状态）。
+//! 写端门面：`SearchIndex`（拥有型；持 `Arc<Shared>` 与**私有**写缓冲）。
 //!
-//! # 可见性语义（p6-design 6.3）
+//! # 可见性语义（p6-design 6.3；`S8-02` 起见 `super::view`）
 //!
-//! `add` 之后必须 `commit()` 才对检索可见（对齐 Lucene / tantivy）。
-//! `into_searcher()` 隐含 flush（把 `pending` 刷进 `Inner`，p6-design 6.4 评审 P2）。
+//! ⚠️ **本阶段（`S8-02` 视图骨架）的可见性语义与重构前逐位一致**：倒排在 `add` 时
+//! **立即**写入当前段（`deltas` 恒空 ⇒ 只有一段）⇒「`add` 后未 `commit` 也能查到倒排」；
+//! 向量侧由 `flush` 灌入。`commit()` = `flush()` + **发布新视图**（`generation` +1）。
+//! 「未 `commit` 不可见」由 `S8-03`（delta 写入）收紧，届时收窄到的判据见设计 §1.3 第 7 条。
+//!
+//! `searcher(&self)` **不隐含 flush**（对齐 NFR-11：可见性 = `commit()` 后）；
+//! 旧的 `into_searcher()` 保留为 `#[deprecated]` 薄封装 = `commit()` + `searcher()`，
+//! **行为与重构前逐位一致**（41 处既有调用点零改动）。
 
 use std::sync::Arc;
 
 use crate::document::{content_hash, DocRecord, Document};
 use crate::error::{Error, Result};
-use crate::index::Index;
 use crate::types::{ChunkId, DocId};
 use crate::vector::{
     BruteForceIndex, HnswRsIndex, NormalizedVector, VectorGraphPersist, VectorIndex,
 };
 
 use super::config::{Config, GraphPersistMode, SearchIndexBuilder, VectorBackend};
+use super::view::{Segment, Shared, View};
 
 /// 图 sidecar 的状态（V2 Step 2 / NFR-07：降级不能静默）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,15 +180,9 @@ fn snapshot_bytes(path: &std::path::Path) -> std::io::Result<SizeBytes> {
     })
 }
 
-/// 已提交状态（`Arc` 共享：`into_searcher` 零拷贝移交给读端）。
-pub(crate) struct Inner {
-    /// 倒排 + 正排 + 统计量
-    pub index: Index,
-    /// 向量索引（`None` = 纯 BM25）
-    pub vector_index: Option<Box<dyn VectorIndex>>,
-    /// 原始向量（快照策略 D1：存原始向量不存 HNSW 图；`None` = 未启用 keep_raw）
-    pub raw_vectors: Option<Vec<(ChunkId, Vec<f32>)>>,
-}
+// ⚠️ 原 `pub(crate) struct Inner`（`index` / `vector_index` / `raw_vectors`）已上移为
+// [`super::view::Segment`]：`S8-02` 起「内容容器」= 段，写端经
+// [`super::view::Shared::with_main_mut`] 独占访问（见 `view` 模块的 I8-2 说明）。
 
 /// 待 embed 的缓冲项（写缓冲，p6-design 6.2）。
 pub(crate) struct PendingChunk {
@@ -269,22 +269,29 @@ pub struct CompactionReport {
     pub graph_status: GraphStatus,
 }
 
-/// 写端门面（拥有型）。持有 analyzer / chunker / embedder / fusion / reranker /
-/// 倒排 / 向量索引 / 写缓冲，暴露 `add(doc)` / `commit()` / `into_searcher()`。
+/// 写端门面（拥有型）。持 `Shared`（与读端共享的视图 + 装配）与**私有**写缓冲。
 ///
-/// 注意：`SearchIndex` 是 **`!Sync`**（含可变 `pending`，`add(&mut self)`）。
-/// 它可 `Send`（能整体 move 到别的线程），但不可跨线程共享（p6-design 5.3）。
+/// 注意：`SearchIndex` 仍是 **`!Sync`**（含可变 `pending`，`add(&mut self)`）——但
+/// `S8-02` 起这**不再**是「读写互斥」的来源：读端持独立的 `Searcher`（`Arc<Shared>`），
+/// 与写端**并存**。并发来自：「写端线程独占 `SearchIndex`」+「读端持 owned `Searcher`」。
 ///
-/// # 所有权切换（p6-design 6.4 方案 A 的实现细化）
+/// # 内容的位置（`S8-02`）
 ///
-/// `inner` 直接持有 `Inner`（**非** `Arc`）。`into_searcher()` 时包成 `Arc` 移交；
-/// `Searcher::into_index()` 用 `Arc::try_unwrap` 解包——refcount==1 零拷贝取出，
-/// refcount>1（有 `Searcher` clone 残留）时**明确报错**而非静默深拷贝。
-/// （设计 6.4 的 P3 修正假设 `Arc::make_mut` 静默深拷贝，但 `Box<dyn VectorIndex>`
-/// 不可 `Clone` 使该路径无法编译；`try_unwrap` 是更诚实的等价实现。）
+/// 内容**不在**本结构里，而在 `shared.view.main`（`Segment`）。本结构只持
+/// 「写缓冲 `pending`」与「诊断计数」。
+///
+/// ⚠️ **过渡约束**：`deltas` 恒空 ⇒ 写入需独占 `main`（`Shared::with_main_mut`）⇒
+/// 有并发检索进行中时写操作返回 `Err`。`S8-03` 起写入落在写端私有 builder 上、该约束消失。
+///
+/// # 所有权切换（p6-design 6.4 方案 A → `S8-02` 起改用共享视图）
+///
+/// `shared` 是 `Arc<Shared>`：`searcher(&self)` 只克隆该 `Arc`（不消耗写端）；
+/// `Searcher::into_index()` 同样只克隆该 `Arc`（**总是成功**，不再要求 refcount==1
+/// ——「Searcher clone 残留」与「写端存活」在新模型下不可区分，后者是合法状态）。
 pub struct SearchIndex {
-    pub(crate) cfg: Arc<Config>,
-    pub(crate) inner: Inner,
+    /// 与读端共享的视图 + 装配（唯一内容来源）
+    pub(crate) shared: Arc<Shared>,
+    /// 写缓冲（`S8-02` 期仍是写端私有的唯一可变状态）
     pub(crate) pending: Vec<PendingChunk>,
     /// 累计 embed 推理耗时（`flush` 中累加，供 NFR-03 构建耗时口径观测）。
     /// 只计 `embed_documents` 推理本身，不含归一化 / 灌向量索引。
@@ -295,15 +302,11 @@ pub struct SearchIndex {
     /// 吃 ONNX 推理的只有新增的那一批 —— 用 `num_chunks()` 报「embed N 条」
     /// 会把 NFR-03 的口径讲错（增量场景下高估）。
     pub(crate) embed_count: usize,
-    /// 图持久化开关（ef_search 回填 / strict 模式 / 逃生舱）
-    pub(crate) graph: super::config::GraphOpts,
     /// 最近一次图 sidecar 的状态（NFR-07：降级必须可观测）
     pub(crate) graph_status: GraphStatus,
     /// 最近一次 `save` 中图 sidecar 落盘（dump + CRC + manifest 发布）的耗时。
-    /// `None` = 本次 `save` 未走图持久化（验收 7：dump 耗时要有实测记录）。
+    /// `None` = 本次 `save` 未走图持久化（验收 7：dump 要有实测记录）。
     pub(crate) graph_dump_elapsed: Option<std::time::Duration>,
-    /// 向量后端（V2 Step 4：compaction 重建向量索引需按后端重建同类型，故留档）
-    pub(crate) backend: VectorBackend,
 }
 
 impl SearchIndex {
@@ -333,22 +336,23 @@ impl SearchIndex {
             }),
             None => None,
         };
-        let inner = Inner {
-            index: Index::new(),
-            vector_index,
-            raw_vectors: Some(Vec::new()),
-        };
+        let main = Arc::new(Segment::empty(vector_index));
         Self {
-            cfg: Arc::new(cfg),
-            inner,
+            shared: Arc::new(Shared::new(Arc::new(cfg), graph, backend, main)),
             pending: Vec::new(),
             embed_elapsed: std::time::Duration::ZERO,
             embed_count: 0,
-            graph,
             graph_status: GraphStatus::NotApplicable,
             graph_dump_elapsed: None,
-            backend,
         }
+    }
+
+    /// 当前主段的快照（`I8-3`：一次操作只取一次读锁）。
+    ///
+    /// ⚠️ `S8-02` 期 `deltas` 恒空 ⇒ 读路径只看 `main`；`S8-03` 起读端遍历
+    /// `main + deltas`（跨段检索在 `S8-04` / `S8-05`）。
+    fn seg(&self) -> Arc<Segment> {
+        Arc::clone(&self.shared.snapshot().main)
     }
 
     /// 摄入一篇文档：查重 → 分块 → 倒排 → 写缓冲（p6-design 6.1）。
@@ -363,7 +367,7 @@ impl SearchIndex {
         let hash = content_hash(doc.dedup_key.as_deref().unwrap_or(&text));
 
         // 短路查重（与 Index::add 内部去重语义一致）
-        if let Some(existing) = self.inner.index.doc_id_by_hash(hash) {
+        if let Some(existing) = self.seg().index.doc_id_by_hash(hash) {
             return Ok(AddOutcome {
                 doc_id: existing,
                 chunk_ids: Vec::new(),
@@ -379,22 +383,22 @@ impl SearchIndex {
         };
 
         // 分块 → 倒排（立即完成）
-        let chunks = self.cfg.chunker.chunk(0, &text);
+        let chunks = self.shared.cfg.chunker.chunk(0, &text);
         let chunk_texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
-        let (doc_id, chunk_ids) =
-            self.inner
-                .index
-                .add(record, chunks, self.cfg.analyzer.as_ref())?;
+        let (doc_id, chunk_ids) = self.shared.with_main_mut(|seg| {
+            seg.index
+                .add(record, chunks, self.shared.cfg.analyzer.as_ref())
+        })??;
 
         // 进写缓冲（有向量侧时才需要 embed）
-        if self.cfg.embedder.is_some() {
+        if self.shared.cfg.embedder.is_some() {
             for (chunk_id, text) in chunk_ids.iter().zip(chunk_texts) {
                 self.pending.push(PendingChunk {
                     chunk_id: *chunk_id,
                     text,
                 });
             }
-            if self.pending.len() >= self.cfg.batch_size {
+            if self.pending.len() >= self.shared.cfg.batch_size {
                 self.flush()?;
             }
         }
@@ -425,7 +429,8 @@ impl SearchIndex {
         if self.pending.is_empty() {
             return Ok(());
         }
-        let Some(embedder) = self.cfg.embedder.as_ref() else {
+        let cfg = Arc::clone(&self.shared.cfg);
+        let Some(embedder) = cfg.embedder.as_ref() else {
             // 无向量侧：缓冲不应存在（add 里已短路）；防御性清空
             self.pending.clear();
             return Ok(());
@@ -461,49 +466,92 @@ impl SearchIndex {
         // 刻意**先整批 embed、再过滤**（不改变 `embed_documents` 入参组成）：fastembed
         // 推理是否受 batch 组成影响未经实测（Step 2 教训是「别赌」），「白算一条 embed」
         // 的代价只是时间；若后续实测证明组成无关，可再改「先过滤再 embed」（见设计 §9 Q5）。
-        let vi = self.inner.vector_index.as_mut().ok_or(Error::NoEmbedder)?;
         let mut items: Vec<(ChunkId, NormalizedVector)> = Vec::new();
-        for (pending, v) in self.pending.iter().zip(vecs) {
-            if !self.inner.index.is_live_chunk(pending.chunk_id) {
-                continue; // 墓碑 chunk：向量丢弃，不落 raw_vectors、不进图
+        self.shared.with_main_mut(|seg| -> Result<()> {
+            let vi = seg.vector_index.as_mut().ok_or(Error::NoEmbedder)?;
+            for (pending, v) in self.pending.iter().zip(vecs) {
+                if !seg.index.is_live_chunk(pending.chunk_id) {
+                    continue; // 墓碑 chunk：向量丢弃，不落 raw_vectors、不进图
+                }
+                let nv = NormalizedVector::new(v);
+                if let Some(raw) = seg.raw_vectors.as_mut() {
+                    raw.push((pending.chunk_id, nv.as_slice().to_vec()));
+                }
+                items.push((pending.chunk_id, nv));
             }
-            let nv = NormalizedVector::new(v);
-            if let Some(raw) = self.inner.raw_vectors.as_mut() {
-                raw.push((pending.chunk_id, nv.as_slice().to_vec()));
-            }
-            items.push((pending.chunk_id, nv));
-        }
-        vi.add_batch(&items)?;
+            vi.add_batch(&items)
+        })??;
         self.pending.clear();
         Ok(())
     }
 
-    /// 使已摄入的文档对检索可见（对齐 Lucene `commit`，p6-design 6.3）。
+    /// 使已摄入的文档对检索可见：`flush()` + **发布新视图**（`generation` +1）。
     ///
-    /// 本轮实现中 `commit()` 与 `flush()` 等价（都是刷写缓冲）；真正的
-    /// delta 分段（`commit` = 刷成新 segment）留 P7，届时 API 形态不变。
+    /// # `S8-02` 期的语义（与重构前逐位一致）
+    ///
+    /// 内容只有一段（`deltas` 恒空）⇒ `commit()` **不移动**任何内容，只把
+    /// 「当前视图」重新发布一次（`generation` +1）。因此「`add` 后未 `commit`
+    /// 也能查到倒排」这一既有语义**保持不变**（既有测试 `add后未commit也能查到倒排`）。
+    ///
+    /// `S8-03` 起 `commit()` 改为「封段（把 builder 冻结成 `Segment`）→ 追加进 `deltas`
+    /// → 发布」，届时它才成为**唯一的可见性边界**（设计 §4.8.3 / §1.3 第 7 条）。
     pub fn commit(&mut self) -> Result<()> {
-        self.flush()
+        self.flush()?;
+        // ⚠️ I8-1：`publish` 的写锁内只有一次指针替换；构造 `next` 在锁外完成。
+        let cur = self.shared.snapshot();
+        // 本段（= 发布后的全局空间已用长度）的下一段基址：base + 本段长度。
+        // ⚠️ 与视图序号在**同一临界区**内推进（评审 P3-4 / 设计 §4.4.3）。
+        // ⚠️ `Index` 的计数是 `usize`、全局 ID 是 `u32`：本阶段（单段、`base = 0`）
+        // 不会溢出；`S8-03` 引入真正的多段发号时须在此显式处理上限（设计 §4.4.3）。
+        let next_base_doc = cur.main.base_doc + cur.main.index.total_docs() as DocId;
+        let next_base_chunk = cur.main.base_chunk + cur.main.index.total_chunks() as ChunkId;
+        let generation = self.shared.advance(next_base_doc, next_base_chunk);
+        debug_assert_eq!(
+            self.shared.next_base(),
+            (next_base_doc, next_base_chunk),
+            "发号器状态必须与本次发布的段长度同步"
+        );
+        self.shared.publish(View {
+            main: Arc::clone(&cur.main),
+            deltas: Arc::clone(&cur.deltas),
+            tombstones: Arc::clone(&cur.tombstones),
+            generation,
+        });
+        // 单调性诊断：视图序号只增不减；不递增说明 publish 路径被绕过（NFR-07）。
+        if generation <= cur.generation {
+            tracing::warn!(
+                prev = cur.generation,
+                now = generation,
+                "视图序号未递增（publish 路径异常）"
+            );
+        }
+        // 可观测性（NFR-07）：发布是新模型下唯一的状态跃迁，必须留痕。
+        tracing::debug!(
+            generation,
+            segments = 1 + cur.deltas.len(),
+            "视图已发布（S8-02 骨架：`deltas` 恒空 ⇒ segments 恒为 1）"
+        );
+        Ok(())
     }
 
     /// 当前已提交的分片数（不含 pending）。
     pub fn num_chunks(&self) -> u32 {
-        self.inner.index.num_chunks()
+        self.seg().index.num_chunks()
     }
 
     /// 当前已提交的文档数（不含墓碑）。
     pub fn num_docs(&self) -> usize {
-        self.inner.index.num_docs()
+        self.seg().index.num_docs()
     }
 
     /// 全语料词项总数（所有分片的分词数之和）。
     pub fn total_len(&self) -> u64 {
-        self.inner.index.total_len()
+        self.seg().index.total_len()
     }
 
     /// 平均分片长度（BM25 长度归一化用）。
     pub fn avgdl(&self) -> f32 {
-        self.inner.index.avgdl()
+        self.seg().index.avgdl()
     }
 
     /// 累计 embed 推理耗时（NFR-03 构建耗时口径观测）。
@@ -525,19 +573,37 @@ impl SearchIndex {
         self.embed_count
     }
 
-    /// 交出所有权，产出只读 `Searcher`（`'static + Clone + Send + Sync`）。
+    /// 产出一个只读 `Searcher`（`'static + Clone + Send + Sync`），**不消耗写端**。
     ///
-    /// **隐含 flush**（p6-design 6.4 评审 P2）：把 `pending` 刷进 `Inner` 后再移交，
-    /// 否则未 embed 的分片在检索侧不可见。`Inner` 包成 `Arc` 移交给读端，零拷贝。
+    /// # 与 `into_searcher()` 的两点差别（`D-S8-06`）
+    ///
+    /// | 项 | `into_searcher(mut self)`（旧） | 本方法（新） |
+    /// | --- | --- | --- |
+    /// | 接收者 | `self`（消耗） | `&self`（**不消耗**，写端可继续 `add` / `commit`） |
+    /// | 隐含 `flush()` | **是** | **否**（⚠️ 调用方须自己 `commit()`） |
+    ///
+    /// ⚠️ **「不隐含 flush」是有意的语义收紧**：它让「可见性 = `commit()` 后」在 API
+    /// 层面显式化（对齐 NFR-11），而不是靠一个隐式副作用。
+    ///
+    /// ⚠️ **`S8-02` 过渡约束**：写端此后若在**有并发检索**时写入，会返回 `Err`
+    /// （见 `Shared::with_main_mut`）；`S8-03` 起消失。
+    pub fn searcher(&self) -> crate::search::Searcher {
+        crate::search::Searcher {
+            shared: Arc::clone(&self.shared),
+            graph_status: self.graph_status.clone(),
+        }
+    }
+
+    /// 交出所有权，产出只读 `Searcher`（**隐含 flush**）。
+    ///
+    /// ⚠️ **已废弃**：改用 [`Self::searcher`]（不消耗写端）并**显式** `commit()`。
+    ///
+    /// 本方法保留为薄封装 = `{ self.commit()?; self.searcher() }` ⇒ 既有调用点零改动、
+    /// **行为与重构前逐位一致**（`commit()` == `flush()` + 发布，见 [`Self::commit`]）。
+    #[deprecated(note = "改用 searcher()；并显式 commit()")]
     pub fn into_searcher(mut self) -> Result<crate::search::Searcher> {
-        self.flush()?;
-        Ok(crate::search::Searcher {
-            cfg: self.cfg,
-            inner: Arc::new(self.inner),
-            graph: self.graph,
-            graph_status: self.graph_status,
-            backend: self.backend,
-        })
+        self.commit()?;
+        Ok(self.searcher())
     }
 
     /// 删除一个文档（及其全部分片），含统计量回滚（复用 `Index::remove`）。
@@ -555,19 +621,21 @@ impl SearchIndex {
     /// > **这是错的**：`raw_vectors` 没有任何移除路径，`save` 原样导出、`load` 全量重灌，
     /// > 幽灵候选因此会跨快照永续。现在 `remove` 主动摘除，另由存活位图在检索期兜底。
     pub fn remove(&mut self, doc_id: DocId) -> Result<()> {
-        self.inner
-            .index
-            .remove(doc_id, self.cfg.analyzer.as_ref())?;
-
         // 顺带摘除原始向量（O(len)，与 `Index::remove` 的 O(N) 同量级）：
         // 这既缩小快照体积，也断掉「删除 → save → load → 幽灵候选复活」的路径。
         // 内存中的 HNSW 图仍需靠存活位图过滤（物理回收归 Step 4 的 compaction，S4-03~S4-07）。
-        let Inner {
-            index, raw_vectors, ..
-        } = &mut self.inner;
-        if let Some(raw) = raw_vectors.as_mut() {
-            raw.retain(|(id, _)| index.is_live_chunk(*id));
-        }
+        //
+        // ⚠️ **两步必须在同一个 `with_main_mut` 内**：拆成两次会释放写锁，读者可能
+        // 在中间态（postings 已摘、`raw_vectors` 未摘）取到快照 —— 重构前不会
+        // （那时读写在类型上互斥）。
+        let cfg = Arc::clone(&self.shared.cfg);
+        self.shared.with_main_mut(|seg| -> Result<()> {
+            seg.index.remove(doc_id, cfg.analyzer.as_ref())?;
+            if let Some(raw) = seg.raw_vectors.as_mut() {
+                raw.retain(|(id, _)| seg.index.is_live_chunk(*id));
+            }
+            Ok(())
+        })??;
         Ok(())
     }
 
@@ -583,13 +651,13 @@ impl SearchIndex {
     /// 图是缓存，下次冷启动降级重建即可，快照本身完好。
     pub fn save(&mut self, path: &std::path::Path) -> Result<()> {
         self.commit()?;
-        let vectors: Vec<(ChunkId, Vec<f32>)> =
-            self.inner.raw_vectors.as_deref().unwrap_or(&[]).to_vec();
+        let seg = self.seg();
+        let vectors: Vec<(ChunkId, Vec<f32>)> = seg.raw_vectors.as_deref().unwrap_or(&[]).to_vec();
         let body_crc = crate::storage::save_with_crc(
             path,
-            &self.inner.index,
+            &seg.index,
             &vectors,
-            &self.cfg.fingerprint(),
+            &self.shared.cfg.fingerprint(),
         )?;
 
         // 图 sidecar 单独计时（验收 7）：`save` 的总耗时里，快照写入与图 dump
@@ -642,11 +710,12 @@ impl SearchIndex {
     ) -> Result<GraphStatus> {
         // 逃生舱 / 无向量 / Brute 后端：不写图，并清掉可能存在的僵尸 sidecar
         //（否则「关掉向量重建库」会留下永远匹配不上的旧图文件，§5.4）
-        let Some(vi) = self.inner.vector_index.as_ref() else {
+        let seg = self.seg();
+        let Some(vi) = seg.vector_index.as_ref() else {
             crate::storage::remove_sidecars(path)?;
             return Ok(GraphStatus::NotApplicable);
         };
-        if !self.graph.persist || vectors.is_empty() {
+        if !self.shared.graph.persist || vectors.is_empty() {
             crate::storage::remove_sidecars(path)?;
             return Ok(GraphStatus::NotApplicable);
         }
@@ -660,9 +729,9 @@ impl SearchIndex {
         // 只把 `dump_graph` 包进 Lenient 是不够的——紧随其后的 CRC 扫描、
         // manifest 原子发布同样会返回 Err，而此刻快照已完整落盘，
         // 让 `save()` 失败等于「缓存写坏了把主数据一起否决」。
-        match write_graph_sidecar(path, g, body_crc, self.cfg.fingerprint().dim) {
+        match write_graph_sidecar(path, g, body_crc, self.shared.cfg.fingerprint().dim) {
             Ok(()) => Ok(GraphStatus::Loaded),
-            Err(e) if self.graph.mode == GraphPersistMode::Strict => {
+            Err(e) if self.shared.graph.mode == GraphPersistMode::Strict => {
                 // D-S3-07（拍板）：Strict 返回 Err 前也补 best-effort 清理——
                 // 「失败上抛」不等于「失败且留垃圾」：此刻 dump 可能已删旧图，
                 // 残留半截 `*.hnsw.graph`/`*.hnsw.data` + 已失效的旧 manifest
@@ -697,7 +766,19 @@ impl SearchIndex {
     /// `graph_points` 是向量索引中的点数（含墓碑——hnsw_rs 无 remove，墓碑留图，
     /// 由存活位图在检索期挡掉）；`raw_vectors` 已由 `remove` 的 `retain` 摘除墓碑。
     pub fn tombstone_stats(&self) -> TombstoneStats {
-        let index = &self.inner.index;
+        let view = self.shared.snapshot();
+        let seg = &view.main;
+        let index = &seg.index;
+        // ⚠️ **跨段求和**（设计 §4.9.5）：本阶段 `main` 之外还有 `deltas`（恒空），
+        // 因此计数必须按段累加，而不是只看 `main` —— 这样 `S8-03` 起无需改动本函数。
+        debug_assert!(
+            view.deltas.is_empty(),
+            "S8-02 期 `deltas` 必须恒空（视图骨架的验收条件）"
+        );
+        debug_assert!(
+            view.tombstones.is_empty(),
+            "S8-02 期不应出现跨段墓碑（删除走 `Index::remove` 的物理路径）"
+        );
         let chunks_total = index.total_chunks();
         let chunks_alive = index.alive_count();
         TombstoneStats {
@@ -705,18 +786,8 @@ impl SearchIndex {
             chunks_alive,
             docs_total: index.total_docs(),
             docs_alive: index.num_docs(),
-            graph_points: self
-                .inner
-                .vector_index
-                .as_ref()
-                .map(|v| v.len())
-                .unwrap_or(0),
-            raw_vectors: self
-                .inner
-                .raw_vectors
-                .as_ref()
-                .map(|v| v.len())
-                .unwrap_or(0),
+            graph_points: seg.vector_index.as_ref().map(|v| v.len()).unwrap_or(0),
+            raw_vectors: seg.raw_vectors.as_ref().map(|v| v.len()).unwrap_or(0),
             tombstone_ratio: if chunks_total == 0 {
                 0.0
             } else {
@@ -751,7 +822,7 @@ impl SearchIndex {
     /// `bytes_before` / `bytes_after` 为落盘前后的三体积。
     ///
     /// **失败语义（评审建议 3）**：`save` 失败（如 Strict 下图 dump 升级为 Err）时本方法
-    /// 返回 `Err`，但**内存已在 `compact()` 阶段压实（I5 已原子替换 `self.inner`）**——
+    /// 返回 `Err`，但**内存已在 `compact()` 阶段压实（I5 已原子替换主段）**——
     /// 返回的 `Err` 与内存状态不一致，磁盘仍是旧档。这是设计内行为：compaction 的核心
     /// 价值就是内存压实，落盘失败不回滚内存（I5 无 undo 路径）；调用方拿到 `Err` 后
     /// 可对同一 `path` 重试 `save()` 续写，不必重跑 `compact()`。
@@ -809,13 +880,14 @@ impl SearchIndex {
         }
 
         // 步骤 1~2：取存活集 + 建 ID 映射（重编号，D-S4-01）
-        let remap = self.inner.index.build_remap();
+        let seg = self.seg();
+        let remap = seg.index.build_remap();
 
         // 步骤 3：Index 重新物化（返回新实例，self.inner.index 未动 → I5）
-        let (new_index, reclaimed_terms) = self.inner.index.compacted(&remap);
+        let (new_index, reclaimed_terms) = seg.index.compacted(&remap);
 
         // 步骤 4：raw_vectors 过滤死 chunk + remap（I7）
-        let new_raw = self.inner.raw_vectors.as_ref().map(|raw| {
+        let new_raw = seg.raw_vectors.as_ref().map(|raw| {
             let mut out: Vec<(ChunkId, Vec<f32>)> = Vec::with_capacity(raw.len());
             for (old, v) in raw.iter() {
                 if let Some(new_id) = remap.chunk.get(*old as usize).copied().flatten() {
@@ -833,25 +905,34 @@ impl SearchIndex {
         // `vector_index = None`，flush 会误报 `NoEmbedder` 而砖死（索引不可恢复）。
         // `rebuild_vector_index` 对空 raw 天然安全（Hnsw `add_batch(&[])` no-op /
         // Brute `from_entries(&[])` 空索引），与设计 §4.5 的「无条件重建」一致。
-        let had_vectors = self.inner.vector_index.is_some();
+        let had_vectors = seg.vector_index.is_some();
         let t_vec = std::time::Instant::now();
         let new_vi = match (&new_raw, had_vectors) {
             (Some(raw), true) => Some(rebuild_vector_index(
-                self.backend,
+                self.shared.backend,
                 raw,
-                self.cfg.ef_search,
-                self.cfg.parallel_build,
+                self.shared.cfg.ef_search,
+                self.shared.cfg.parallel_build,
             )?),
             _ => None,
         };
         let vector_rebuild_ms = t_vec.elapsed().as_millis();
 
         // 全部构建成功 → 一次性原子替换（I5：任一 Err 都已 return，旧状态未动）
-        self.inner = Inner {
-            index: new_index,
-            raw_vectors: new_raw,
-            vector_index: new_vi,
-        };
+        // ⚠️ 必须先释放上面为「读旧状态」持有的 `Arc<Segment>`：`with_main_mut` 用
+        // `Arc::get_mut`，refcount > 1 会直接失败。
+        let generation = seg.generation;
+        drop(seg);
+        self.shared.with_main_mut(move |slot| {
+            *slot = Segment {
+                index: new_index,
+                vector_index: new_vi,
+                raw_vectors: new_raw,
+                base_doc: slot.base_doc,
+                base_chunk: slot.base_chunk,
+                generation,
+            };
+        })?;
 
         let after = self.tombstone_stats();
 
@@ -860,7 +941,7 @@ impl SearchIndex {
             reclaimed_docs: before.docs_total.saturating_sub(after.docs_total),
             reclaimed_terms,
             reclaimed_graph_points: before.graph_points.saturating_sub(
-                self.inner
+                self.seg()
                     .vector_index
                     .as_ref()
                     .map(|v| v.len())
@@ -988,20 +1069,22 @@ impl SearchIndex {
             None => None,
         };
 
+        let main = Arc::new(Segment {
+            index,
+            vector_index,
+            raw_vectors: Some(raw_vectors),
+            // 单段快照：基址归零、`deltas` 空、发号器归零（设计 §4.10）
+            base_doc: 0,
+            base_chunk: 0,
+            generation: 0,
+        });
         Ok(Self {
-            cfg: Arc::new(cfg),
-            inner: Inner {
-                index,
-                vector_index,
-                raw_vectors: Some(raw_vectors),
-            },
+            shared: Arc::new(Shared::new(Arc::new(cfg), graph, backend, main)),
             pending: Vec::new(),
             embed_elapsed: std::time::Duration::ZERO,
             embed_count: 0,
-            graph,
             graph_status,
             graph_dump_elapsed: None,
-            backend,
         })
     }
 }
@@ -1014,6 +1097,34 @@ mod tests {
     fn bm25_index() -> SearchIndex {
         let cfg = SearchIndexBuilder::default().embedder(None).build_config();
         SearchIndex::from_config(cfg, VectorBackend::Brute, Default::default())
+    }
+
+    /// **`S8-02`**：`commit()` 必须**发布新视图**（`generation` 递增）。
+    ///
+    /// 🔴 **为什么这条必须是单测**（变异实测，2026-09-18）：`S8-02` 期内容与视图**同源**
+    /// （写端就地改 `main`）⇒「`commit()` 不做 publish」在**外部 API 层面不可观测**
+    /// （读端读的还是那一个段，照样看得到新内容）⇒ **任何集成测试都抓不住它**
+    /// （**M5 变异实测**：注入后 `tests/step8_segments.rs` 的 8 条**全绿**）。
+    /// 能抓住的只有这里（`shared` 是 `pub(crate)`）。
+    /// `S8-03` 起内容落进 `deltas` 后，可见性用例（§1.3 第 7 条）才会从外部覆盖它。
+    #[test]
+    fn S8_02_commit递增视图序号() {
+        let mut idx = bm25_index();
+        let g0 = idx.shared.snapshot().generation;
+        idx.commit().unwrap();
+        assert_eq!(
+            idx.shared.snapshot().generation,
+            g0 + 1,
+            "commit() 必须恰好发布一次新视图"
+        );
+        idx.commit().unwrap();
+        assert_eq!(
+            idx.shared.snapshot().generation,
+            g0 + 2,
+            "每次 commit() 都必须发布（空 commit 也发布 ⇒ 幂等性只体现在内容上）"
+        );
+        // 骨架期不变式：发布不产生新段
+        assert!(idx.shared.snapshot().deltas.is_empty());
     }
 
     #[test]
@@ -1095,8 +1206,8 @@ mod tests {
 
         // 检索能力保留：doc_freq 一致
         assert_eq!(
-            loaded.inner.index.doc_freq("检索"),
-            idx.inner.index.doc_freq("检索")
+            loaded.seg().index.doc_freq("检索"),
+            idx.seg().index.doc_freq("检索")
         );
     }
 

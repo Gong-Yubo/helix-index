@@ -32,7 +32,9 @@ fn main() -> anyhow::Result<()> {
     }
 
     // ---- 3. 检索（只有 query 必选；默认 Hybrid + top_n=10）----
-    let searcher = index.into_searcher()?;
+    // S8-02：显式 `commit()` 决定可见性；`searcher(&self)` 不消耗写端。
+    index.commit()?;
+    let searcher = index.searcher();
     let resp = searcher.search_with("如何加快检索速度").top_n(3).exec()?;
 
     // ---- 4. 拼进 prompt 的上下文块（带出处与命中词，FR-12）----

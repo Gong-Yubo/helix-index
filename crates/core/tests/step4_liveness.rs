@@ -6,6 +6,9 @@
 //! 共享 helper（确定性 Embedder）收敛在 `tests/common/`（评审建议）。
 
 #![allow(non_snake_case)]
+// ⚠️ 本文件沿用旧所有权 API（`into_searcher` / `into_index`）以**锁住其行为不变**
+// （`S8-02` 起二者为 `#[deprecated]` 薄封装）。生产调用点已在 `cli` / `examples` 迁移。
+#![allow(deprecated)]
 
 mod common;
 

@@ -14,6 +14,7 @@
 mod config;
 mod index;
 mod searcher;
+mod view;
 
 pub use config::{required_local_embedder, GraphPersistMode, SearchIndexBuilder, VectorBackend};
 pub use index::{
