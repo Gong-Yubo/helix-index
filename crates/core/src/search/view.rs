@@ -317,9 +317,20 @@ impl Shared {
         backend: VectorBackend,
         main: Arc<Segment>,
     ) -> Self {
+        // 🔴 发号器**必须**从「主段已用的长度」起步，而不是 `default()`（全 0）：
+        //    `load` 出来的主段已经有 N 个槽位，而**新段**的基址 = 前序所有段长度之和
+        //    （§4.4.1）⇒ 若从 0 起步，新段的本地 ID `i` 会被折算成全局 `i`，与主段的
+        //    全局 ID **直接重叠** ⇒ 破坏 `I8-7`（不同 chunk 的分数被合并 = 结果错）。
+        //    实测：`S6_T8_追加分配的id严格大于历史最大id` 正是钉这个不变量。
+        let next_doc = main.index.total_docs() as DocId;
+        let next_chunk = main.index.total_chunks() as ChunkId;
         Self {
             view: RwLock::new(Arc::new(View::single(main))),
-            ids: Mutex::new(IdAllocator::default()),
+            ids: Mutex::new(IdAllocator {
+                next_doc,
+                next_chunk,
+                generation: 0,
+            }),
             cfg,
             graph,
             backend,
