@@ -461,6 +461,54 @@ fn S8_T6_跨段墓碑下同内容重加经save后仍可去重() {
     );
 }
 
+/// **`S8-03` 第 2 轮评审 P1-1 的回归锁**：`remove(已发布 doc)` 后**不 `commit()`** 就重加同
+/// `content_hash` 的内容 ⇒ 必须**不被去重吞掉**（`!deduped` 且 `doc_id != X`）。
+///
+/// 🔴 修前形态（第 2 轮评审指出，本轮已复现）：`doc_id_by_hash_global` 的 ② 循环只查
+/// `view.tombstones`，而 `remove` **分支②** 的墓碑**先落在 `self.builder.tombstones`**
+/// （要 `commit()` 才发布）⇒ 查重看不到那条墓碑 ⇒ 命中**刚被删除的** X
+/// ⇒ 返回 `deduped = true` + `doc_id = X` ⇒ **替换 / 重加静默丢失**
+/// （`commit()` 后 X 被墓碑挡住，而新内容**根本没被创建**，调用方却拿到一个已死 doc 的 ID）。
+///
+/// 🔑 **这是缺口不是设计**（判据 = 同序列在**分支①**下的行为）：目标**未发布**时
+/// `remove` 就地物理删 + 条件式摘 hash 条目 ⇒ 重加正常工作；同一个逻辑操作只因「目标 doc
+/// 是否已发布」而结果相反 —— 而「`remove` 后用同 `dedup_key` 换正文重新 upsert」（FR-15 的
+/// 替换文档流程）恰恰**总是**落在分支②（目标必然已发布才谈得上"替换"）。
+#[test]
+fn S8_T6_remove未commit即重加不得被去重吞掉() {
+    let text = "未发布墓碑下的重加 香蕉";
+    let mut idx = bm25_builder().build();
+    let out = idx.add(Document::new(text)).unwrap();
+    idx.commit().unwrap(); // X 已发布（进 delta）
+
+    // 目标在既往段 ⇒ `remove` 分支②：墓碑记在 **builder** 上（尚未发布）
+    idx.remove(out.doc_id).unwrap();
+
+    // 同 hash 重加：墓碑还在 builder 上 ⇒ 修前这里看不到墓碑 ⇒ 被误判为「已存在」
+    let again = idx.add(Document::new(text)).unwrap();
+    assert!(
+        !again.deduped,
+        "刚被删除的 doc 不算命中 ⇒ 必须重新 upsert\
+         （修前：查重只认 `view.tombstones`，看不到 builder 上未发布的墓碑）"
+    );
+    assert_ne!(
+        again.doc_id, out.doc_id,
+        "不得把新内容记到刚被删除的 doc_id 上（那等于静默丢弃）"
+    );
+
+    idx.commit().unwrap();
+
+    // 终态：新内容**可被检索**（修前它压根没被创建），且旧 doc 不复活
+    let seg = idx.searcher();
+    let hits = resp(&seg, "香蕉").hits;
+    assert_eq!(
+        hits.len(),
+        1,
+        "重加的内容必须在检索里出现（修前 `hits` 为空）"
+    );
+    assert_eq!(hits[0].doc_id, again.doc_id, "命中的必须是**新** doc");
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 // 4) `S8-T4`：跨段 BM25 逐位一致（**本 PR 的门测试**）
 // ══════════════════════════════════════════════════════════════════════════
