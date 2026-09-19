@@ -178,11 +178,27 @@ fn CLI3_原地compact回收墓碑并收缩体积() {
         ids.push(out.doc_id);
     }
     idx.save(&path).unwrap();
+    // 🔑 **参照基线（8 点、无墓碑）**：`D-S8-01`（`S8-03`/PR4 起 `save` 第一步就 `fold_deltas`）
+    //    之前，它与下面的 `graph_tomb` 是同一个量；**之后不再是** —— 见下。
+    let graph_baseline = on_disk_sizes(&path).1;
+    let total_baseline = total_bytes(&path);
 
     // 删 4 篇（全「删除目标」）→ 墓碑落盘。hnsw 图无 remove API ⇒ 墓碑点留在图 sidecar，
     // 故此刻 graph 体积 = 8 点（含 4 墓碑）；raw_vectors/data 已被 remove 的 retain 摘除
     // 4 条，故只看 total 不一定变大。以 **graph sidecar 体积**作为 compaction 回收的
     // 判别信号：compact 把图重建为 4 存活点 ⇒ graph 必须显著回落。
+    //
+    // 🔴 **2026-09-19（`S8-03` / PR4）前提更正** —— 本节原本断言
+    // `graph_after < graph_tomb`，其中 `graph_tomb` 被当作「8 点含墓碑」的图。PR4 起不再是：
+    // 第二次 `save()`（`D-S8-01`：第一步 `commit()`、第二步 `fold_deltas()`）在**落盘前**就
+    // 把 4 条跨段墓碑**物理化**、并用 `retain` 后的 4 条原始向量**重建了图**
+    // ⇒ 磁盘上的「墓碑态」已经是一张 **4 点图** ⇒ 两侧同量级。
+    // 实测：`graph_tomb = 1097`、`graph_after = 1097`（**相等**）—— 这不是「图没收缩」，
+    // 而是**已经收缩过了**；旧断言据此必红（且 `hnsw_rs` 的层级分配用无种子 `OsRng`
+    // ⇒ 两棵同点数的图的字节数会上下浮动 ⇒ 旧断言**偶发通过** = flaky）。
+    // ⇒ 参照系改为**同一装配的 8 点基线**（`graph_baseline`）：这个判据与「回收发生在
+    // `fold` 还是 `compact`」**无关**（`S8-06` 若改成增量合并，结论不变），仍然钉住
+    // 「墓碑态 + 重编号 + 重建之后，图与总体积都必须回落到存活规模」。
     for d in ids[1..8].iter().step_by(2) {
         idx.remove(*d).unwrap();
     }
@@ -197,8 +213,13 @@ fn CLI3_原地compact回收墓碑并收缩体积() {
     let total_after = total_bytes(&path);
     let graph_after = on_disk_sizes(&path).1;
     assert!(
-        graph_after < graph_tomb,
-        "图 sidecar 应从墓碑态 {graph_tomb} 字节收缩到 {graph_after}（4 存活点）"
+        graph_after < graph_baseline,
+        "图 sidecar 必须相对 **8 点基线** {graph_baseline} 字节收缩（compact 后 {graph_after} 字节 / \
+         4 存活点；墓碑态 {graph_tomb} 已经是 4 点图，见上方前提更正）"
+    );
+    assert!(
+        total_after < total_baseline,
+        "compact 后总字节 {total_after} 应小于 **8 点基线** {total_baseline}（墓碑态 {total_tomb}）"
     );
     assert!(
         total_after < total_tomb,
