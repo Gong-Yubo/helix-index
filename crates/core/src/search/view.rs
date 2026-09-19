@@ -314,6 +314,11 @@ pub(crate) struct Shared {
     pub(crate) backend: VectorBackend,
 }
 
+/// [`Shared::absorb_window`] 的产出：`(窗口内新增的增量段, 摘掉本次已物理化墓碑后的墓碑集)`。
+///
+/// 抽别名只为过 `clippy::type_complexity`（嵌套 `Arc` + 元组）；语义就是「一段新的 `View` 内容」。
+pub(crate) type AbsorbedWindow = (Arc<[Arc<Segment>]>, Arc<Tombstones>);
+
 impl Shared {
     /// 构造：以给定段作为唯一主段。
     pub(crate) fn new(
@@ -401,32 +406,54 @@ impl Shared {
     /// 墓碑同理：本次只物理化了**快照里**的墓碑 ⇒ 从 `cur.tombstones` 里**逐个摘掉它们**，
     /// 窗口内新增的墓碑**原样保留**（它们的 `fold` 留给下一次）。
     ///
-    /// # 前提
+    /// # 前提：前缀必须是**同一批段**（第 2 轮评审 **P1-2** 的修复）
     ///
-    /// `cur_deltas.len() >= snapshot_deltas`（delta 只增）。**等号**在单写端恒成立；
-    /// 严格大于即「窗口内有提交」。⚠️ 若**小于**（并发 `compact` 重编号过视图），
-    /// 本函数的假设不成立 —— 那条路径**已由 [`Shared::commit_view`] 的 `expected_epoch`
-    /// 对账在进入本函数之前拦下**（`S8-03` 评审 P2-4，本 PR 落地）；此处的 `debug_assert`
-    /// 是**第二道**防旁路守卫（防将来有人绕过 `commit_view` 直接发布）。
+    /// 旧写的「`cur_deltas.len() >= snapshot_deltas`（delta 只增）」**不够** —— 它只约束
+    /// **长度**，没约束**身份**。🔴 反例（并发 `fold`，而 `fold` **不改 `epoch`**
+    /// ⇒ 世代对账**拦不住**）：
+    ///
+    /// ```text
+    /// ① 视图：main M（已用 U）+ deltas [D1]，epoch 0
+    /// ② A：fold —— 取快照（[D1]），开始 O(N) 克隆 + O(N·logN) 向量重建（**秒级窗口**）
+    /// ③ B：fold —— 把 D1 吸收进 main 并发布（main M′，deltas = []，epoch **仍是 0**）
+    /// ④ B：add(D2) → commit() —— deltas = [D2]，ids.next = U + d2
+    /// ⑤ A：发布 —— 长度 1 == 1 ⇒ 旧写法通过；`skip(1)` 跳掉的却是 **D2** ⇒ carried = []
+    ///    ⇒ 🔴 D2 从视图**静默消失**，而 ID 空间已把它的槽位记账（永久孤儿区间）
+    /// ```
+    ///
+    /// 段一旦发布就**不可变**（`I8-2`）⇒ `Arc::ptr_eq` 是合法的**身份**判据 ⇒ 前置条件
+    /// 应写成「`cur_deltas` 的**前 `snapshot_deltas.len()` 项与快照逐个 `Arc::ptr_eq`**」。
+    /// 不符 ⇒ 返回 `None`，调用方**必须拒绝发布**（与 `epoch` 同型处置：`Err(Busy)`）。
+    ///
+    /// ⚠️ 同一条判据也覆盖「并发 `compact` 重编号」造成的**长度回退**（`len < snapshot`）：
+    /// 那条本来由 [`Shared::commit_view`] 的 `expected_epoch` 先拦，这里按同一判据兜底 ——
+    /// 但**不再是 `debug_assert`**：合法路径（并发 fold）就能踩到它，dev/release **都必须显式拒绝**。
+    ///
+    /// # 返回
+    ///
+    /// `Some((窗口内新增的 delta, 已摘掉本次物理化墓碑的墓碑集))`；**前缀身份不符 ⇒ `None`**。
     pub(crate) fn absorb_window(
         cur_deltas: &[Arc<Segment>],
-        snapshot_deltas: usize,
+        snapshot_deltas: &[Arc<Segment>],
         cur_tombstones: &Tombstones,
         physicalized: &Tombstones,
-    ) -> (Arc<[Arc<Segment>]>, Arc<Tombstones>) {
-        debug_assert!(
-            cur_deltas.len() >= snapshot_deltas,
-            "发布窗口内 delta 数不得减少：cur = {}，snapshot = {}（并发 compact 重编号过视图？\
-             —— 该组合应由 commit_view 的 epoch 对账拦下，若走到这里说明有旁路发布点）",
-            cur_deltas.len(),
-            snapshot_deltas
-        );
-        let carried: Vec<Arc<Segment>> = cur_deltas.iter().skip(snapshot_deltas).cloned().collect();
+    ) -> Option<AbsorbedWindow> {
+        // 前缀身份校验：长度不得回退 **且** 前 N 项必须是**同一批 `Arc`**（段不可变 ⇒ 身份即内容）。
+        // ⚠️ `||` 短路保证 `len < snapshot` 时不会去切越界的 slice。
+        if cur_deltas.len() < snapshot_deltas.len()
+            || !cur_deltas[..snapshot_deltas.len()]
+                .iter()
+                .zip(snapshot_deltas)
+                .all(|(cur, snap)| Arc::ptr_eq(cur, snap))
+        {
+            return None;
+        }
+        let carried: Vec<Arc<Segment>> = cur_deltas[snapshot_deltas.len()..].to_vec();
         let mut tombstones = cur_tombstones.clone();
         for doc in physicalized.iter() {
             tombstones.remove(doc);
         }
-        (Arc::from(carried), Arc::new(tombstones))
+        Some((Arc::from(carried), Arc::new(tombstones)))
     }
 
     /// # `expected_epoch`（`S8-03` 评审 **P2-4** 的修复）
@@ -439,10 +466,18 @@ impl Shared {
     ///
     /// ⚠️ 这是**纯加法**：单写端下 `epoch` 只在同一个 `&mut self` 的 `compact()` 内部变，
     /// 而 `compact()` 之后**总是立刻换新 builder** ⇒ 单写端永不触发。
+    ///
+    /// # `build_next` 可以返回 `Err`（第 2 轮评审 **P1-2** 的配套）
+    ///
+    /// 闭包在**锁内**做「快照前缀身份校验」之类的检查；不符时它必须能**中止发布**，
+    /// 而检查又**只能**在锁内做（锁外做等于没做）⇒ 用 `Result` 把失败带出来。
+    /// 🔑 **失败时不做任何记账**：`generation` 不消耗、`next_*` 不回退、`view` 不动 ——
+    /// 与 `expected_epoch` 不符那条路径的语义**完全一致**（调用方拿到 `Err` 后按「丢弃 +
+    /// 重新执行未成功的操作」处置，见两条 `Busy` 消息的指引）。
     pub(crate) fn commit_view(
         &self,
         expected_epoch: u64,
-        build_next: impl FnOnce(&Arc<View>, u64, DocId, ChunkId) -> (View, DocId, ChunkId),
+        build_next: impl FnOnce(&Arc<View>, u64, DocId, ChunkId) -> Result<(View, DocId, ChunkId)>,
     ) -> Result<u64> {
         let mut ids = self.ids.lock().expect("发号锁中毒");
         if ids.epoch != expected_epoch {
@@ -450,15 +485,15 @@ impl Shared {
                 "ID 空间已换代（epoch {expected_epoch} → {}，`compact()` 的重编号会作废整个旧 ID \
                  空间）⇒ 本次发布依据的基址 / 跨段墓碑 / 去重条目都可能指向旧 ID 空间，已拒绝发布。\
                  ⚠️ 本写端**未提交内容已被丢弃**（builder 已换成与当前世代对齐的新 builder），\
-                 重试**不会**恢复它；请重新 `add` 后再 `commit()`",
+                 重试**不会**恢复它；请重新执行未成功的 `add` **与 `remove`** 后再 `commit()`",
                 ids.epoch
             )));
         }
         let cur = Arc::clone(&self.view.read().expect("视图锁中毒"));
         // 新段的基址 = 「前序所有段的槽位数之和」= 上一次发布后的已用长度（§4.4.1 / §4.4.2）
         let (base_doc, base_chunk) = (ids.next_doc, ids.next_chunk);
-        ids.generation += 1;
-        let generation = ids.generation;
+        // ⚠️ `generation` **先只算不写回**：`build_next` 失败时本次不消耗序号（见方法文档）。
+        let generation = ids.generation + 1;
 
         // 不变式守卫：发布序号必须严格大于当前视图序号。
         //
@@ -473,12 +508,15 @@ impl Shared {
 
         // `build_next` 在锁内构造新视图（`S8-03`）：它拿到的基址与序号**就是本次发布的**
         // ⇒ 「算基址 → 追加段 → 发布」不可能被另一个写端插队（`I8-7` 的结构性保证）。
-        let (next, used_doc, used_chunk) = build_next(&cur, generation, base_doc, base_chunk);
+        // 🔴 它同时承担**锁内的拒绝判据**（第 2 轮评审 P1-2 的快照前缀身份校验，在
+        //    `index.rs::fold_deltas` 的闭包里）：`Err` ⇒ 本次**不记账、不发布**。
+        let (next, used_doc, used_chunk) = build_next(&cur, generation, base_doc, base_chunk)?;
         debug_assert!(
             used_doc >= base_doc && used_chunk >= base_chunk,
             "已用长度不得回退：base = ({base_doc}, {base_chunk})，\
              used = ({used_doc}, {used_chunk})（回退会让下一段的基址落在本段之前）"
         );
+        ids.generation = generation;
         ids.next_doc = used_doc;
         ids.next_chunk = used_chunk;
 
@@ -739,8 +777,8 @@ mod tests {
         generation: u64,
         base_doc: DocId,
         base_chunk: ChunkId,
-    ) -> (View, DocId, ChunkId) {
-        (
+    ) -> Result<(View, DocId, ChunkId)> {
+        Ok((
             View {
                 main: Arc::clone(&cur.main),
                 deltas: Arc::clone(&cur.deltas),
@@ -749,7 +787,7 @@ mod tests {
             },
             base_doc,
             base_chunk,
-        )
+        ))
     }
 
     fn shared() -> Shared {
@@ -855,6 +893,104 @@ mod tests {
     //    替代覆盖见 `crates/core/tests/step8_rw_concurrency.rs`（读写并存的活性判据）
     //    与 `S8_03_未commit不可见_commit后立即可见`（可见性边界）。
 
+    /// **`S8-03` 第 2 轮评审 P1-2 的配套判据**：`commit_view` 的 `build_next` 返回 `Err` 时
+    /// **不得做任何记账**（序号不消耗、`next_*` 不回退、视图指针不动）。
+    ///
+    /// 🔑 为什么必须测：这个 `Err` 出口是 P1-2 新引入的（此前闭包不可能失败），而
+    /// 「失败即无副作用 / 本次未提交内容被丢弃但账目不脏」是我在 `commit_view` 文档与两条
+    /// `Busy` 消息里**写下的承诺** —— 承诺必须有判据，否则调用方按「重试」处置时会与实现不一致。
+    #[test]
+    fn S8_03_发布失败时不消耗任何记账() {
+        let sh = shared();
+        let before_origin = sh.next_origin();
+        let before_view = sh.snapshot();
+
+        let err = sh
+            .commit_view(0, |_cur, _generation, _base_doc, _base_chunk| {
+                Err(Error::Busy("模拟：前缀身份校验失败".to_string()))
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Busy(_)),
+            "必须是 Busy（暂态、可重试语义）"
+        );
+
+        assert_eq!(
+            sh.next_origin(),
+            before_origin,
+            "发布失败不得推进基址、也不得换代（⚠️ `next_origin` **看不到** `generation`，\
+             「不消耗序号」的真判据在下方反向自证）"
+        );
+        let after = sh.snapshot();
+        assert_eq!(after.generation, before_view.generation, "失败不得换视图");
+        assert!(Arc::ptr_eq(&after, &before_view), "视图指针必须原封不动");
+
+        // 🔑 **反向自证（这条才是「不消耗序号」的真判据）**：失败的那次若消耗了序号，
+        //    接着成功的这一次会拿到 **2**。`next_origin()` 只回报 `(next_doc, next_chunk,
+        //    epoch)`、**看不到** `ids.generation` ⇒ 「不消耗序号」只能在这里观察
+        //    （变异实测：把 `ids.generation = generation` 提前到 `?` 之前 ⇒ 本行红，
+        //    而上面那条 `next_origin` 断言**照样绿** —— 所以两条都必须在）。
+        let g = sh.commit_view(0, empty_commit).expect("第 0 代发布应通过");
+        assert_eq!(g, 1, "失败的那次不得消耗序号（否则这里会拿到 2）");
+        assert_eq!(sh.snapshot().generation, 1, "成功的发布必须换视图");
+    }
+
+    /// **`S8-03` 第 2 轮评审 P1-2 的回归锁**：窗口吸收必须先做**前缀身份校验**，
+    /// 而不是只看长度。
+    ///
+    /// 🔑 为什么这条必须存在：`fold` **不改 `epoch`** ⇒ 世代对账**拦不住**并发 fold。
+    /// 只判长度的旧写法在「另一个写端 fold 过并把 deltas 清空、随后又提交了新 delta」时，
+    /// 会拿**新 delta** 去顶**快照里那个已消失的旧 delta** ⇒ 新内容从视图**静默消失**。
+    /// 本用例**确定性构造**该状态（不需要线程时序）——判据是纯函数级的。
+    ///
+    /// ⚠️ 变异自证：把前缀身份校验删掉（退回 `skip(len)`）⇒ 本用例立刻红
+    /// （`carried.len()` 实得 0，而期望 1）。
+    #[test]
+    fn S8_03_窗口吸收必须校验前缀身份而非只看长度() {
+        let d1 = Arc::new(Segment::empty(None));
+        let d2 = Arc::new(Segment::empty(None));
+
+        // ① 快照 [D1]，锁内 [D1, D2]：前缀身份相符 ⇒ 正常带上 D2
+        let snapshot: Vec<Arc<Segment>> = vec![Arc::clone(&d1)];
+        let cur: Vec<Arc<Segment>> = vec![Arc::clone(&d1), Arc::clone(&d2)];
+        let (carried, _) = Shared::absorb_window(
+            &cur,
+            &snapshot,
+            &Tombstones::default(),
+            &Tombstones::default(),
+        )
+        .expect("前缀身份相符 ⇒ 必须放行");
+        assert_eq!(carried.len(), 1);
+        assert!(Arc::ptr_eq(&carried[0], &d2), "带上的必须就是 D2");
+
+        // ② 🔴 评审 P1-2 的交错：快照 [D1]，锁内 **[D2]** —— 长度**相等**，但 D1 已被
+        //    另一个写端的 fold 吸收进 main、这一格换成了 D2 ⇒ **长度判据看不出来**
+        let cur: Vec<Arc<Segment>> = vec![Arc::clone(&d2)];
+        assert!(
+            Shared::absorb_window(
+                &cur,
+                &snapshot,
+                &Tombstones::default(),
+                &Tombstones::default()
+            )
+            .is_none(),
+            "锁内的 D2 与快照里的 D1 不是同一个段 ⇒ 必须拒绝发布（修前：skip(1) 把它当 D1 跳掉）"
+        );
+
+        // ③ 长度回退（并发 compact 重编号过视图）⇒ 同样必须拒绝（不再是 `debug_assert`）
+        let cur: Vec<Arc<Segment>> = vec![];
+        assert!(
+            Shared::absorb_window(
+                &cur,
+                &snapshot,
+                &Tombstones::default(),
+                &Tombstones::default()
+            )
+            .is_none(),
+            "窗口内 delta 数少于快照 ⇒ 必须拒绝（合法路径就能踩到，dev/release 都要显式拒绝）"
+        );
+    }
+
     /// **`S8-03` 评审 P1-1 的回归锁**：`absorb_window` 必须**无损吸收**窗口内新提交的 delta，
     /// 且只摘掉**本次已物理化**的墓碑。
     ///
@@ -867,6 +1003,7 @@ mod tests {
         let d1 = Arc::new(Segment::empty(None));
         let d2 = Arc::new(Segment::empty(None));
         let d3 = Arc::new(Segment::empty(None));
+        let snapshot: Vec<Arc<Segment>> = vec![Arc::clone(&d1)];
         let cur_deltas: Vec<Arc<Segment>> = vec![d1, d2, d3];
 
         let cur_tomb = Tombstones {
@@ -876,7 +1013,9 @@ mod tests {
         let physicalized = Tombstones { doc_ids: vec![7] };
 
         // 快照只有 1 个 delta ⇒ 窗口内新增了 d2 / d3 ⇒ 必须原样带上
-        let (carried, tomb) = Shared::absorb_window(&cur_deltas, 1, &cur_tomb, &physicalized);
+        let (carried, tomb) =
+            Shared::absorb_window(&cur_deltas, &snapshot, &cur_tomb, &physicalized)
+                .expect("前缀身份相符 ⇒ 必须放行");
         assert_eq!(carried.len(), 2, "窗口内新提交的 delta 不得被丢弃");
         assert!(
             Arc::ptr_eq(&carried[0], &cur_deltas[1]),
@@ -886,7 +1025,10 @@ mod tests {
         assert!(tomb.blocks_doc(9), "窗口内新增的墓碑必须保留");
 
         // 无窗口新增时行为与旧写法等价（deltas 清空）
-        let (carried, tomb) = Shared::absorb_window(&cur_deltas, 3, &cur_tomb, &physicalized);
+        let snapshot_all: Vec<Arc<Segment>> = cur_deltas.to_vec();
+        let (carried, tomb) =
+            Shared::absorb_window(&cur_deltas, &snapshot_all, &cur_tomb, &physicalized)
+                .expect("前缀身份相符 ⇒ 必须放行");
         assert!(carried.is_empty());
         assert!(!tomb.blocks_doc(7));
         assert!(tomb.blocks_doc(9));

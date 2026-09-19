@@ -356,6 +356,15 @@ impl SegmentBuilder {
     }
 
     /// 该 builder 是否**空**（无内容、无墓碑）⇒ `commit()` 不追加空段（设计 §4.8.3 ③）。
+    ///
+    /// ⚠️ **「墓碑-only」builder 被判为非空是有意的**：跨段墓碑**只能**搭一次发布的便车进
+    /// `View.tombstones`（`commit()` 的追加路径），所以哪怕零内容也必须入列。两个次生效应
+    /// （`S8-03` 第 2 轮评审 **P4-1**，**本 PR 不修**、登记给 `S8-06` 合并器）：
+    /// ① `Metrics.segments` 被零内容段**膨胀**（删除密集型负载下持续偏大）；
+    /// ② `fold` 期 `merge_from(空 Index)` 仍走一遍 `append_from` 的 `ForwardStore::rebuild`
+    ///    + `field_index.rebuild`（各 O(N)）⇒ 每个墓碑-only 段白付一次**全量 pass**。
+    ///
+    /// 预期取形：零内容段不占 `deltas` 名额、墓碑直接并入 `View` 层。
     fn is_empty(&self) -> bool {
         self.index.total_chunks() == 0 && self.tombstones.is_empty()
     }
@@ -480,6 +489,18 @@ impl SearchIndex {
     /// 今天 `remove` 会 `content_hashes.remove(&hash)`（`Index::remove`）⇒「删除后可重新
     /// upsert」自然成立；跨段后**主段的 hash 表删不掉**（`remove` 只作用于它自己那段），
     /// 同一语义只能靠墓碑在这里挡一下 —— 由 `S8-T6` 钉住。
+    ///
+    /// 🔴 **两处墓碑都要查**（`S8-03` 第 2 轮评审 **P1-1**）：`remove` 的**分支②**（目标在
+    /// 既往段）把墓碑记在 **`self.builder.tombstones`** 上，要 `commit()` 才进
+    /// `View.tombstones`。只查后者的话——「`remove(X)` 后**不 `commit()`** 直接重加同 hash
+    /// 内容」——查重会命中**刚被删除的** X ⇒ 返回 `deduped = true` + `doc_id = X`
+    /// ⇒ **替换 / 重加静默丢失**（`commit()` 后 X 被墓碑挡住，而新内容**根本没被创建**，
+    /// 调用方还拿到一个已死 doc 的 ID）。
+    ///
+    /// 🔑 为什么这**是缺口而不是设计**：同一序列在**分支①**（目标未发布）下是
+    /// 「就地物理删 + 条件式摘 hash 条目」⇒ 重加正常工作。而 FR-15 的「替换文档」流程
+    /// （`remove(id)` 后用同 `dedup_key`、不同正文重新 upsert）**总是**落在分支②
+    /// （目标必然已发布才谈得上"替换"）⇒ 它是用户会真的走到的那条路。
     fn doc_id_by_hash_global(&self, hash: u64) -> Option<DocId> {
         // ① 未发布的 builder：它是最新的，且它的 doc 不可能被墓碑挡（墓碑只针对既往段）
         if let Some(local) = self.builder.index.doc_id_by_hash(hash) {
@@ -490,7 +511,12 @@ impl SearchIndex {
         for seg in view.segments_newest_first() {
             if let Some(local) = seg.index.doc_id_by_hash(hash) {
                 let global = seg.global_doc(local);
-                if view.tombstones.blocks_doc(global) {
+                // ⚠️ **两处都查**：已发布的墓碑 + 本 builder 上**尚未发布**的墓碑（P1-1）。
+                //    「命中即 return」仍成立：单写端不变式下，若最新命中被墓碑挡住，更旧的
+                //    同 hash 命中必然也已被挡住（同一条替换链上的前身）；
+                //    而「已替换 + 已删除」的旧 doc 本就不该被新的 upsert 复用。
+                if view.tombstones.blocks_doc(global) || self.builder.tombstones.blocks_doc(global)
+                {
                     return None; // 已被墓碑挡住 ⇒ 视为未命中（可重新 upsert）
                 }
                 return Some(global);
@@ -682,6 +708,10 @@ impl SearchIndex {
         //    （含已返回给调用方的 ID 与已记的墓碑）**被丢弃**，重试**不会**恢复它。
         //    ⇒ 本次已在错误消息里如实声明；「无损重基」（保留 builder、把 `base_*` 对齐到
         //    锁内真实值后重新发布）留给下一提交，与 `error.rs` 的文档同步。
+        // 🔴 **恢复指引必须同时点名 `remove`**（`S8-03` 第 2 轮评审 **P3-1**）：被丢弃的
+        //    builder 内容**含分支②记下的跨段墓碑** ⇒ 对「`remove(X)` → `commit()` 被拒」的
+        //    流程，只让用户「重新 `add`」的话他**什么都不会恢复** —— X 的删除静默失效
+        //    （X 继续可检索）。NFR-07：**恢复路径也要如实**。
         let mismatched = std::cell::Cell::new(false);
         // 取出 builder（下面在锁内被消耗）；先用占位顶上，末尾统一换成新的
         let builder = std::mem::replace(&mut self.builder, SegmentBuilder::new(None, 0, 0, 0));
@@ -694,11 +724,13 @@ impl SearchIndex {
                     // 基址不符 **或** builder 为空 ⇒ 不追加任何段（视图内容不变），但仍推进序号
                     // （「每次 commit 都发布」是既有契约，见单测 `S8_02_commit递增视图序号`；
                     //  空段**不入列**则避免 `deltas` 被空段撑大，设计 §4.8.3 ③）。
+                    // ⚠️ 「**墓碑-only**」不算空（见 `SegmentBuilder::is_empty`）⇒ 会追加一个
+                    //    **零内容段**（发布墓碑所必需）；其两个次生成本见该方法文档（P4-1 / `S8-06`）。
                     if (base_doc, base_chunk) != expected || builder.is_empty() {
                         if (base_doc, base_chunk) != expected {
                             mismatched.set(true);
                         }
-                        return (
+                        return Ok((
                             View {
                                 main: Arc::clone(&cur.main),
                                 deltas: Arc::clone(&cur.deltas),
@@ -707,7 +739,7 @@ impl SearchIndex {
                             },
                             base_doc,
                             base_chunk,
-                        );
+                        ));
                     }
                     let SegmentBuilder {
                         index,
@@ -734,7 +766,7 @@ impl SearchIndex {
                     for d in tombstones.iter() {
                         acc.add(d);
                     }
-                    (
+                    Ok((
                         View {
                             main: Arc::clone(&cur.main),
                             deltas: Arc::from(deltas),
@@ -743,7 +775,7 @@ impl SearchIndex {
                         },
                         used_doc,
                         used_chunk,
-                    )
+                    ))
                 });
 
         // 换一个与**新**「已发布长度」对齐的空 builder
@@ -759,7 +791,8 @@ impl SearchIndex {
             return Err(Error::Busy(
                 "另一个写端在本写端 add 之后提交过 ⇒ 本次段基址已过期（段内 ID 与全局 ID \
                  不再对应）；单写端下不会发生 —— 同一 Arc<Shared> 上请勿并发写。\
-                 ⚠️ 本次**未提交内容已被丢弃**（builder 已换成新的），重试**不会**恢复它"
+                 ⚠️ 本次**未提交内容已被丢弃**（builder 已换成新的），重试**不会**恢复它；\
+                 请重新执行未成功的 `add` **与 `remove`** 后再 `commit()`"
                     .to_string(),
             ));
         }
@@ -1200,25 +1233,51 @@ impl SearchIndex {
         });
         let used_doc = new_main.index.total_docs() as DocId;
         let used_chunk = new_main.index.total_chunks() as ChunkId;
-        // 🔴 **P1-1 的修复**（`S8-03` 评审）：发布闭包**必须消费锁内的 `cur`**。
+        // 🔴 **P1-1 的修复**（`S8-03` 第 1 轮评审）：发布闭包**必须消费锁内的 `cur`**。
         //
         // 原写法 `move |_cur, …|` 恒发布 `deltas = []` + 锁外算出的 `used_*` ⇒ 若另一个写端
         // 在「取快照」与「拿这把锁」之间提交了新 delta，那个 delta 会**从视图里消失**、
         // 且 `ids.next_*` **回缩**（⇒ 后续内容复用已发号的 ID）。
         // 现在改为把窗口内新提交的 delta **无损吸收**（合并不改 ID ⇒ 基址仍有效），
         // 并只摘掉**本次已物理化**的墓碑（`Shared::absorb_window`，纯函数 + 单测）。
-        let snapshot_deltas = view.deltas.len();
+        //
+        // 🔴 **P1-2 的修复**（`S8-03` 第 2 轮评审）：吸收**必须校验前缀身份**，不能只看长度。
+        //    `fold` **不改 `epoch`** ⇒ 世代对账拦不住并发 fold；而「B fold 过（D1 → main、
+        //    `deltas` 清空）⇒ B 又提交 D2」之后，`cur.deltas = [D2]` 与快照 `[D1]` **长度相等**
+        //    ⇒ 长度判据放行 ⇒ `skip(1)` 跳过 D2 ⇒ **D2 静默消失**（`ids.next_*` 却已记账 = 永久孤儿）。
+        //    现在不符即 `Err(Busy)`（与 epoch 同型：不记账、不发布、如实声明丢弃）。
+        // 🔴 **快照必须连 `Arc` 一起带进闭包**（`S8-03` 第 2 轮评审 **P1-2**）：只带**长度**的话，
+        //    「另一个写端 `fold` 过（D1 进 `main`、`deltas` 清空）⇒ 它又 `add` + `commit` 了 D2」
+        //    这一格会被 D2 **顶替**，而长度恰好相等 ⇒ 长度判据**看不出来** ⇒ **D2 静默消失**
+        //    （而 `ids.next_*` 已把它的槽位记账）。段不可变（`I8-2`）⇒ 用 `Arc::ptr_eq` 判**身份**。
+        //    `Vec<Arc<_>>` 的 clone 是 O(1)（只加引用计数）。
+        let snapshot_deltas: Vec<Arc<Segment>> = view.deltas.iter().cloned().collect();
         let physicalized = (*view.tombstones).clone();
         self.shared.commit_view(
             snapshot_epoch,
             move |cur, generation, base_doc, base_chunk| {
-                let (carried, tombstones) = Shared::absorb_window(
+                let Some((carried, tombstones)) = Shared::absorb_window(
                     &cur.deltas,
-                    snapshot_deltas,
+                    &snapshot_deltas,
                     &cur.tombstones,
                     &physicalized,
-                );
-                (
+                ) else {
+                    // 与 `expected_epoch` 同型处置：**拒绝发布**（本次不记账、不发布）。
+                    // ⚠️ 但**声明的内容与另外两条不同**：合并是**维护性**操作，被拒时
+                    //    「增量段仍在视图里、内容**没有**丢失」，丢掉的只是本次合并的**计算**
+                    //    ⇒ 恢复指引必须是「重试本次 `save`/`compact`」，**不是**「重新 add/remove」。
+                    //    （`add` 那条路径才是真的丢内容：builder 已被换掉。）
+                    return Err(Error::Busy(
+                        "本次合并依据的增量段快照已失效（窗口内有另一个写端 `fold` 过同一个 \
+                         `Arc<Shared>` ⇒ 视图的增量段列表已不是当初那一批；长度可能相同，\
+                         但段的身份不同）⇒ 本次发布已拒绝。\
+                         ✅ **内容没有丢失**：那些增量段仍然在视图里、照旧可检索；\
+                         丢掉的只是本次合并的计算结果 —— **重试本次 `save()` / `compact()` 即可**，\
+                         不需要重新执行 `add` / `remove`"
+                            .to_string(),
+                    ));
+                };
+                Ok((
                     View {
                         main: Arc::clone(&new_main),
                         deltas: carried,
@@ -1228,7 +1287,7 @@ impl SearchIndex {
                     // 吸收后「已用长度」= 锁内真实值（新 delta 的末端）⇒ 不得回退
                     used_doc.max(base_doc),
                     used_chunk.max(base_chunk),
-                )
+                ))
             },
         )?;
         Ok(merged_segments)
