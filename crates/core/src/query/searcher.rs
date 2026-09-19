@@ -124,6 +124,13 @@ pub fn search_parts(
 
     // 跨段载具（`Some` ⇒ 走 `main + deltas`）
     let segmented = parts.segment_set.as_ref();
+    // 🔴 段数 / 墓碑数必须在**空库早退之前**填（`S8-03` 评审 P2-2 的最低限观测，NFR-07）：
+    //    否则三条早退路径留下的都是草稿缓冲区的 `0`，而「`segments` 到底几个」恰恰是
+    //    调用方判断「本次结果是不是只来自一部分内容」的唯一信号（与 `vector_segments` 连看）。
+    //    ⚠️ 单段装配（`segment_set == None`）下 `segments = 1`：视图里确实有一个 `main` 段
+    //    （可能是空的）—— 「没有 delta」与「没有段」是两件事。
+    metrics.segments = segmented.map_or(1, |set| set.segments.len());
+    metrics.tombstoned = segmented.map_or(0, |set| set.tombstones);
     // 空库判定：跨段时看**全局** N（`main` 空但有 delta 时库不是空的）
     let index_is_empty = match segmented {
         Some(set) => set.n == 0,
@@ -223,6 +230,13 @@ pub fn search_parts(
             Some(require_vector(parts.embedder, parts.vector_index)?)
         }
     };
+    // 向量路本次**实际覆盖的段数**（`S8-03` 评审 P2-2）：`0` = 本次没走向量路。
+    // 🔴 `S8-05`（PR5）之前**恒为 1** —— `Searcher::parts` 只把 `view.main` 的向量索引交下来
+    //    ⇒ `deltas` 里已提交的内容不可向量召回。默认 `mode` 是 `Hybrid` ⇒ 这不是边角情形：
+    //    只要有向量能力，**每次 `commit()` 之后、`save`/`compact` 之前**都是这个状态。
+    //    这一行就是把那个「静默半盲」变成可断言 / 可告警的信号；`S8-05` 落地后应恒等于
+    //    `metrics.segments`（PR5 的验收项之一）。
+    metrics.vector_segments = if vec_parts.is_some() { 1 } else { 0 };
 
     // V2 Step 5：向量路**分派**（ANN / 精确）与**记账**（`Metrics.vector_route`）。
     // 策略由后端 `VectorIndex::prefers_exact` 给出（见 `VectorRetriever::plan`），

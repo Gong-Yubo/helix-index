@@ -34,6 +34,7 @@
 
 use std::sync::{Arc, Mutex, RwLock};
 
+use crate::error::{Error, Result};
 use crate::index::Index;
 use crate::predicate::{CandidateFilter, FilterKind};
 use crate::types::{ChunkId, DocId};
@@ -278,6 +279,25 @@ pub(crate) struct IdAllocator {
     pub(crate) next_chunk: ChunkId,
     /// 已发布的视图序号
     pub(crate) generation: u64,
+    /// **ID 空间世代**（`S8-03` 评审 **P2-4** 的修复）：只在
+    /// [`Shared::publish_reset`]（`compact` 重编号）时 `+1`。
+    ///
+    /// # 为什么「基址等值」不够
+    ///
+    /// 段的基址对账（[`Shared::commit_view`] 的 `used >= base` 与 `commit()` 的
+    /// `(base_doc, base_chunk) == expected`）只对**段的槽位基址**是严的，
+    /// 对**引用旧 ID 空间的墓碑 / 去重条目**不严：
+    ///
+    /// ```text
+    /// 写端 B 的 builder：base_doc = 1，墓碑 {doc 0}（指向旧 ID 空间）
+    /// 写端 A：compact() ⇒ 重编号 ⇒ ids 归零；随后 A 再写 1 篇 ⇒ ids.next_doc 回到 1
+    /// B.commit()：base 1 == 1 ⇒ **等值对账通过**（ABA 窗口）⇒ 过期墓碑被并进视图
+    ///              ⇒ 下一次物理化 `Index::remove(0)` 删掉的是**重编号后的另一个文档**
+    /// ```
+    ///
+    /// ⇒ 世代号让这条窗口**结构上不存在**：`publish_reset` 一发生，
+    /// 所有既有 builder / 合并快照的发布就全部被拒（不是「碰巧不相等」）。
+    pub(crate) epoch: u64,
 }
 
 /// 写端与读端共享的唯一对象。
@@ -315,6 +335,8 @@ impl Shared {
                 next_doc,
                 next_chunk,
                 generation: 0,
+                // `load` / 新建时是「第 0 代 ID 空间」；只有 `compact` 重编号才会换代
+                epoch: 0,
             }),
             cfg,
             graph,
@@ -383,8 +405,9 @@ impl Shared {
     ///
     /// `cur_deltas.len() >= snapshot_deltas`（delta 只增）。**等号**在单写端恒成立；
     /// 严格大于即「窗口内有提交」。⚠️ 若**小于**（并发 `compact` 重编号过视图），
-    /// 本函数的假设不成立 —— 那条路径由 `S8-06` 的 epoch 对账（评审 P2-4）负责，
-    /// 这里用 `debug_assert` 显式标识。
+    /// 本函数的假设不成立 —— 那条路径**已由 [`Shared::commit_view`] 的 `expected_epoch`
+    /// 对账在进入本函数之前拦下**（`S8-03` 评审 P2-4，本 PR 落地）；此处的 `debug_assert`
+    /// 是**第二道**防旁路守卫（防将来有人绕过 `commit_view` 直接发布）。
     pub(crate) fn absorb_window(
         cur_deltas: &[Arc<Segment>],
         snapshot_deltas: usize,
@@ -394,7 +417,7 @@ impl Shared {
         debug_assert!(
             cur_deltas.len() >= snapshot_deltas,
             "发布窗口内 delta 数不得减少：cur = {}，snapshot = {}（并发 compact 重编号过视图？\
-             —— 该组合由 S8-06 的 epoch 对账负责）",
+             —— 该组合应由 commit_view 的 epoch 对账拦下，若走到这里说明有旁路发布点）",
             cur_deltas.len(),
             snapshot_deltas
         );
@@ -406,11 +429,31 @@ impl Shared {
         (Arc::from(carried), Arc::new(tombstones))
     }
 
+    /// # `expected_epoch`（`S8-03` 评审 **P2-4** 的修复）
+    ///
+    /// 调用方把「它据以构造新视图的那一代 ID 空间」传进来（builder 创建时记录的
+    /// `epoch`；`fold_deltas` 则是取快照时读到的 `epoch`）。若与锁内世代不符 ⇒
+    /// **拒绝发布**并返回 [`Error::Busy`] —— 因为 `compact` 的重编号已经把
+    /// 「基址 / 墓碑 / 去重条目」全部作废，此时**基址等值检查是失效的**
+    /// （见 [`IdAllocator::epoch`] 的 ABA 推演）。
+    ///
+    /// ⚠️ 这是**纯加法**：单写端下 `epoch` 只在同一个 `&mut self` 的 `compact()` 内部变，
+    /// 而 `compact()` 之后**总是立刻换新 builder** ⇒ 单写端永不触发。
     pub(crate) fn commit_view(
         &self,
+        expected_epoch: u64,
         build_next: impl FnOnce(&Arc<View>, u64, DocId, ChunkId) -> (View, DocId, ChunkId),
-    ) -> u64 {
+    ) -> Result<u64> {
         let mut ids = self.ids.lock().expect("发号锁中毒");
+        if ids.epoch != expected_epoch {
+            return Err(Error::Busy(format!(
+                "ID 空间已换代（epoch {expected_epoch} → {}，`compact()` 的重编号会作废整个旧 ID \
+                 空间）⇒ 本次发布依据的基址 / 跨段墓碑 / 去重条目都可能指向旧 ID 空间，已拒绝发布。\
+                 ⚠️ 本写端**未提交内容已被丢弃**（builder 已换成与当前世代对齐的新 builder），\
+                 重试**不会**恢复它；请重新 `add` 后再 `commit()`",
+                ids.epoch
+            )));
+        }
         let cur = Arc::clone(&self.view.read().expect("视图锁中毒"));
         // 新段的基址 = 「前序所有段的槽位数之和」= 上一次发布后的已用长度（§4.4.1 / §4.4.2）
         let (base_doc, base_chunk) = (ids.next_doc, ids.next_chunk);
@@ -441,7 +484,7 @@ impl Shared {
 
         // ⚠️ I8-1：`view` 的写锁内只有一次指针替换（`next` 已在锁内构造完毕）。
         *self.view.write().expect("视图锁中毒") = Arc::new(next);
-        generation
+        Ok(generation)
     }
     /// **重置式发布**（`compact` 专用）：`compact` 会**重编号**（稠密化）⇒ 新主段
     /// **比原来短**，且**整个旧 ID 空间作废**。
@@ -450,20 +493,37 @@ impl Shared {
     /// 这是 `I8-7`（段 ID 空间不重叠）的**唯一合法例外** —— 调用方必须保证发布后的视图里
     /// **没有任何段引用旧 ID 空间**（`compact` 正是如此：它重建了主段、清空 `deltas`
     /// 与跨段墓碑）。
+    ///
+    /// 🔴 **本方法同时把 ID 空间世代 `+1`**（`S8-03` 评审 P2-4）：这是「作废旧 ID 空间」
+    /// 这件事**唯一**的记账点。之后任何持旧 `epoch` 的写端（另一个写端的 builder）或
+    /// 旧快照（`fold_deltas`）走到 [`Self::commit_view`] 都会被拒 —— 包括那种
+    /// 「重编号后基址恰好又相等」的 ABA 窗口。
     pub(crate) fn publish_reset(&self, next: View, used_doc: DocId, used_chunk: ChunkId) -> u64 {
         let mut ids = self.ids.lock().expect("发号锁中毒");
         ids.generation += 1;
         let generation = ids.generation;
         ids.next_doc = used_doc;
         ids.next_chunk = used_chunk;
+        ids.epoch += 1;
         *self.view.write().expect("视图锁中毒") = Arc::new(View { generation, ..next });
         generation
     }
 
-    /// 下一段的 `base_*`（`S8-03` 起由段构造消费；本阶段由 `commit()` 的 `tracing` 字段消费）。
-    pub(crate) fn next_base(&self) -> (DocId, ChunkId) {
+    /// 下一段的「出生点」：`(base_doc, base_chunk, epoch)`（`S8-03` 起由段构造消费）。
+    ///
+    /// ⚠️ **三项必须在同一把锁内一次取回**：分两次调用（先 `next_base` 再 `epoch`）时，
+    /// 另一个写端可以在两次调用之间 `compact()` ⇒ 得到「旧世代的基址 + 新世代的 epoch」
+    /// 这种**自相矛盾**的 builder（它的对账会通过，正是 P2-4 要堵的窗口）。
+    pub(crate) fn next_origin(&self) -> (DocId, ChunkId, u64) {
         let ids = self.ids.lock().expect("发号锁中毒");
-        (ids.next_doc, ids.next_chunk)
+        (ids.next_doc, ids.next_chunk, ids.epoch)
+    }
+
+    /// 当前 ID 空间世代（`S8-03` 评审 P2-4）。取快照的写路径（`fold_deltas`）必须在
+    /// **取视图快照的同时**记下它，并在 [`Self::commit_view`] 里回报 ⇒ 期间发生过
+    /// `compact()` 重编号就必须拒绝发布，而不是拿旧快照的段/墓碑去覆盖新视图。
+    pub(crate) fn epoch(&self) -> u64 {
+        self.ids.lock().expect("发号锁中毒").epoch
     }
 
     // ⚠️ 原 `with_main_mut()`（`S8-02` 的过渡入口）已删除（`S8-03` 评审 P3-4.4）：
@@ -723,15 +783,18 @@ mod tests {
     fn S8_02_提交只递增序号且不产生新段() {
         let sh = shared();
         let before = sh.snapshot();
-        assert_eq!(sh.next_base(), (0, 0), "未提交时应为 (0, 0)");
+        assert_eq!(sh.next_origin(), (0, 0, 0), "未提交时应为 (0, 0) 且第 0 代");
+        assert_eq!(sh.epoch(), 0, "未 compact ⇒ 恒第 0 代 ID 空间");
 
-        let g1 = sh.commit_view(empty_commit);
+        let g1 = sh.commit_view(0, empty_commit).expect("第 0 代发布应通过");
         assert_eq!(g1, 1, "序号应从 1 开始");
+        let (bd, bc, ep) = sh.next_origin();
         assert_eq!(
-            sh.next_base(),
+            (bd, bc),
             (0, 0),
             "空段（`Segment::empty`）⇒ 下一段基址仍为 (0, 0)"
         );
+        assert_eq!(ep, 0, "普通发布不得换代");
         let after = sh.snapshot();
         assert_eq!(after.generation, 1);
         assert!(after.deltas.is_empty(), "提交不得产生新段（骨架期）");
@@ -740,8 +803,48 @@ mod tests {
             "骨架期提交必须复用同一个 main 段（不复制内容）"
         );
 
-        let g2 = sh.commit_view(empty_commit);
+        let g2 = sh.commit_view(0, empty_commit).expect("第 0 代发布应通过");
         assert_eq!(g2, 2, "序号必须单调递增");
+    }
+
+    /// **`S8-03` 评审 P2-4 的回归锁（P2-4 的核心判据）**：`publish_reset`（`compact` 重编号）
+    /// 之后，持**旧世代**的写端再发布必须被**拒绝**，不能只靠「基址等值」。
+    ///
+    /// 🔑 判据刻意构造成 **ABA 形态**：让 `publish_reset` 之后的 `next_*` 与发布前**完全相等**
+    /// ⇒ 基址等值检查在这种情况下**恒通过**，唯一能拦住它的是 `epoch`。
+    /// 这条用例在「只有基址对账」的实现下必然红（`commit_view` 不会返回 `Err`）。
+    #[test]
+    fn S8_03_换代后旧世代发布被拒_基址等值也拦不住ABA() {
+        let sh = shared();
+        // 前提：publish_reset 前后「**基址**」完全相等（= ABA 窗口的最小构造）；
+        // ⚠️ 比的是**基址两项**，不是整个 `next_origin()`（后者含 `epoch`，换代后必然不等）。
+        let (bd0, bc0, ep0) = sh.next_origin();
+        sh.publish_reset(View::single(Arc::new(Segment::empty(None))), 0, 0);
+        let (bd1, bc1, ep1) = sh.next_origin();
+        assert_eq!(
+            (bd1, bc1),
+            (bd0, bc0),
+            "前提：本用例要构造的是「基址**等值**」的 ABA 窗口 ⇒ 前后基址必须相同"
+        );
+        assert_eq!((ep0, ep1), (0, 1), "publish_reset 必须换代");
+
+        // 旧世代的发布被拒（★ 这条是新增的鉴别力：只有基址检查的实现会放行）
+        let err = sh.commit_view(0, empty_commit).unwrap_err();
+        assert!(
+            matches!(err, Error::Busy(_)),
+            "换代后旧世代的发布必须报 Busy，实际 = {err:?}"
+        );
+        assert!(
+            err.to_string().contains("epoch 0 → 1"),
+            "错误消息必须点名换代（可诊断，NFR-07），实际 = {err}"
+        );
+
+        // 新世代的发布照常
+        assert_eq!(
+            sh.commit_view(1, empty_commit).expect("新世代发布应通过"),
+            2,
+            "被拒的那次不得消耗序号"
+        );
     }
 
     // ⚠️ 原用例 `S8_02_有读者时写入必须失败` 已按承诺删除（`S8-03` 评审 P3-4.4）：
@@ -830,7 +933,7 @@ mod tests {
     fn S8_02_已取出的快照不受后续提交影响() {
         let sh = shared();
         let held = sh.snapshot();
-        let g = sh.commit_view(empty_commit);
+        let g = sh.commit_view(0, empty_commit).expect("第 0 代发布应通过");
         assert_eq!(g, 1);
         assert_eq!(held.generation, 0, "已取出的快照内容不得被后续提交改动");
         assert_eq!(sh.snapshot().generation, 1, "新快照必须看到新序号");

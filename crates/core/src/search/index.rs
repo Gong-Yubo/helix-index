@@ -321,6 +321,14 @@ pub(crate) struct SegmentBuilder {
     /// 本段的全局基址（创建时刻的「已发布长度」，见类型文档）
     base_doc: DocId,
     base_chunk: ChunkId,
+    /// 创建时刻的 **ID 空间世代**（`S8-03` 评审 **P2-4**）。
+    ///
+    /// 与 `base_*` 一起**在同一把锁内**取回（[`Shared::next_origin`]），并在 `commit()` 时
+    /// 回报给 [`Shared::commit_view`] ⇒ `compact()` 的重编号（[`Shared::publish_reset`]）
+    /// 会把本 builder 的发布**整条拒掉**。
+    /// ⚠️ 光有基址对账**不够**：重编号后基址可能恰好又相等（ABA），而本 builder 记的
+    /// 墓碑 / 去重条目仍指向旧 ID 空间 ⇒ 会静默错挂到无辜文档上。
+    epoch: u64,
 }
 
 impl SegmentBuilder {
@@ -328,6 +336,7 @@ impl SegmentBuilder {
         vector: Option<Box<dyn VectorIndex>>,
         base_doc: DocId,
         base_chunk: ChunkId,
+        epoch: u64,
     ) -> Self {
         Self {
             index: Index::new(),
@@ -337,6 +346,7 @@ impl SegmentBuilder {
             tombstones: Tombstones::default(),
             base_doc,
             base_chunk,
+            epoch,
         }
     }
 
@@ -408,7 +418,7 @@ impl SearchIndex {
         let main = Arc::new(Segment::empty(Self::make_vector_index(&cfg, backend)));
         Self {
             shared: Arc::new(Shared::new(Arc::clone(&cfg), graph, backend, main)),
-            builder: SegmentBuilder::new(Self::make_vector_index(&cfg, backend), 0, 0),
+            builder: SegmentBuilder::new(Self::make_vector_index(&cfg, backend), 0, 0, 0),
             embed_elapsed: std::time::Duration::ZERO,
             embed_count: 0,
             graph_status: GraphStatus::NotApplicable,
@@ -439,13 +449,18 @@ impl SearchIndex {
         }
     }
 
-    /// 造一个与 `shared` 装配一致的空 builder（基址取当前「已发布长度」）。
+    /// 造一个与 `shared` 装配一致的空 builder（基址 **+ 世代**取当前「出生点」）。
+    ///
+    /// ⚠️ 基址与 `epoch` **必须一次取回**（[`Shared::next_origin`]）：分两次取时另一个写端
+    /// 可以在两次调用之间 `compact()` ⇒ 得到「旧世代基址 + 新世代 epoch」的 builder，
+    /// 它的对账会通过（`S8-03` 评审 P2-4 的窗口）。
     pub(crate) fn new_builder(shared: &Shared) -> SegmentBuilder {
-        let (base_doc, base_chunk) = shared.next_base();
+        let (base_doc, base_chunk, epoch) = shared.next_origin();
         SegmentBuilder::new(
             Self::make_vector_index(&shared.cfg, shared.backend),
             base_doc,
             base_chunk,
+            epoch,
         )
     }
 
@@ -652,10 +667,16 @@ impl SearchIndex {
     pub fn commit(&mut self) -> Result<()> {
         self.flush()?;
 
-        // ⚠️ **对账**：本 builder 的基址是它**创建时**取的「已发布长度」；若锁内的真实基址
-        //    与它不符，说明**另一个写端**在本写端 `add` 之后提交过（`into_index()` 让同一
-        //    `Arc<Shared>` 上可以有两个写端）⇒ 段内 ID 与全局 ID 已不对应 ⇒ **必须报错**，
-        //    不能把错位的 ID 发布出去（单写端下恒不触发）。
+        // ⚠️ **对账（两项）**：① **世代**（`epoch`）—— 本 builder 创建后是否有另一个写端
+        //    `compact()` 过（重编号 ⇒ 整个旧 ID 空间作废）；② **基址** —— 是否有另一个写端
+        //    在本写端 `add` 之后提交过（`into_index()` 让同一 `Arc<Shared>` 上可以有两个写端）。
+        //    任一项不符 ⇒ 段内 ID / 墓碑 / 去重条目已与全局不对应 ⇒ **必须报错**，
+        //    不能把错位的 ID 发布出去（单写端下两项恒不触发）。
+        // 🔴 **① 是 P2-4 的修复**：只有 ② 时存在 **ABA 窗口** —— `compact()` 允许「已用长度
+        //    变小」，若此后恰好又提交了等量内容，`ids.next_*` 会回到与本 builder 记录的基址
+        //    **完全相等**的值 ⇒ 基址对账**通过** ⇒ 本 builder 里那条指向旧 ID 空间的跨段墓碑
+        //    被并进视图，下一次物理化就会删掉**重编号后的另一个无辜文档**（静默错删）。
+        //    世代号把这条窗口变成「结构上不存在」。
         // 🔴 **但本路径的语义不满足 `Error::Busy` 的「重试即可」承诺**（`S8-03` 评审 P2-1）：
         //    不匹配分支**不追加段**，而末尾**无条件**换新 builder ⇒ builder 里未提交的内容
         //    （含已返回给调用方的 ID 与已记的墓碑）**被丢弃**，重试**不会**恢复它。
@@ -663,69 +684,76 @@ impl SearchIndex {
         //    锁内真实值后重新发布）留给下一提交，与 `error.rs` 的文档同步。
         let mismatched = std::cell::Cell::new(false);
         // 取出 builder（下面在锁内被消耗）；先用占位顶上，末尾统一换成新的
-        let builder = std::mem::replace(&mut self.builder, SegmentBuilder::new(None, 0, 0));
+        let builder = std::mem::replace(&mut self.builder, SegmentBuilder::new(None, 0, 0, 0));
         let expected = (builder.base_doc, builder.base_chunk);
+        let expected_epoch = builder.epoch;
 
-        let generation = self
-            .shared
-            .commit_view(|cur, generation, base_doc, base_chunk| {
-                // 基址不符 **或** builder 为空 ⇒ 不追加任何段（视图内容不变），但仍推进序号
-                // （「每次 commit 都发布」是既有契约，见单测 `S8_02_commit递增视图序号`；
-                //  空段**不入列**则避免 `deltas` 被空段撑大，设计 §4.8.3 ③）。
-                if (base_doc, base_chunk) != expected || builder.is_empty() {
-                    if (base_doc, base_chunk) != expected {
-                        mismatched.set(true);
+        let published =
+            self.shared
+                .commit_view(expected_epoch, |cur, generation, base_doc, base_chunk| {
+                    // 基址不符 **或** builder 为空 ⇒ 不追加任何段（视图内容不变），但仍推进序号
+                    // （「每次 commit 都发布」是既有契约，见单测 `S8_02_commit递增视图序号`；
+                    //  空段**不入列**则避免 `deltas` 被空段撑大，设计 §4.8.3 ③）。
+                    if (base_doc, base_chunk) != expected || builder.is_empty() {
+                        if (base_doc, base_chunk) != expected {
+                            mismatched.set(true);
+                        }
+                        return (
+                            View {
+                                main: Arc::clone(&cur.main),
+                                deltas: Arc::clone(&cur.deltas),
+                                tombstones: Arc::clone(&cur.tombstones),
+                                generation,
+                            },
+                            base_doc,
+                            base_chunk,
+                        );
                     }
-                    return (
-                        View {
-                            main: Arc::clone(&cur.main),
-                            deltas: Arc::clone(&cur.deltas),
-                            tombstones: Arc::clone(&cur.tombstones),
-                            generation,
-                        },
+                    let SegmentBuilder {
+                        index,
+                        raw_vectors,
+                        vector,
+                        tombstones,
+                        ..
+                    } = builder;
+                    let used_doc = base_doc + index.total_docs() as DocId;
+                    let used_chunk = base_chunk + index.total_chunks() as ChunkId;
+                    let seg = Arc::new(Segment {
+                        index,
+                        vector_index: vector,
+                        raw_vectors: Some(raw_vectors),
                         base_doc,
                         base_chunk,
-                    );
-                }
-                let SegmentBuilder {
-                    index,
-                    raw_vectors,
-                    vector,
-                    tombstones,
-                    ..
-                } = builder;
-                let used_doc = base_doc + index.total_docs() as DocId;
-                let used_chunk = base_chunk + index.total_chunks() as ChunkId;
-                let seg = Arc::new(Segment {
-                    index,
-                    vector_index: vector,
-                    raw_vectors: Some(raw_vectors),
-                    base_doc,
-                    base_chunk,
-                    generation,
-                });
-                // 追加进 `deltas` **尾部**（FIFO 不变式：`main, deltas[0], …`，§4.4.2）
-                let mut deltas: Vec<Arc<Segment>> = cur.deltas.iter().cloned().collect();
-                deltas.push(seg);
-                // builder 的墓碑并入视图（全局 doc_id；`add` 幂等去重）
-                let mut acc = (*cur.tombstones).clone();
-                for d in tombstones.iter() {
-                    acc.add(d);
-                }
-                (
-                    View {
-                        main: Arc::clone(&cur.main),
-                        deltas: Arc::from(deltas),
-                        tombstones: Arc::new(acc),
                         generation,
-                    },
-                    used_doc,
-                    used_chunk,
-                )
-            });
+                    });
+                    // 追加进 `deltas` **尾部**（FIFO 不变式：`main, deltas[0], …`，§4.4.2）
+                    let mut deltas: Vec<Arc<Segment>> = cur.deltas.iter().cloned().collect();
+                    deltas.push(seg);
+                    // builder 的墓碑并入视图（全局 doc_id；`add` 幂等去重）
+                    let mut acc = (*cur.tombstones).clone();
+                    for d in tombstones.iter() {
+                        acc.add(d);
+                    }
+                    (
+                        View {
+                            main: Arc::clone(&cur.main),
+                            deltas: Arc::from(deltas),
+                            tombstones: Arc::new(acc),
+                            generation,
+                        },
+                        used_doc,
+                        used_chunk,
+                    )
+                });
 
         // 换一个与**新**「已发布长度」对齐的空 builder
         self.builder = Self::new_builder(&self.shared);
+
+        // ① 世代对账失败（`P2-4`）：`commit_view` 在**进入闭包前**就返回了 `Err` ⇒
+        //    本次既没追加段、也没推进任何计数器（`generation` 都不消耗）。
+        //    ⚠️ 注意这里是**发布之后**才 `?`：builder 已换成与**当前**世代对齐的新的一枚，
+        //    契约与下面的基址分支一致（未提交内容被丢弃、重试不恢复）。
+        let generation = published?;
 
         if mismatched.get() {
             return Err(Error::Busy(
@@ -1076,6 +1104,12 @@ impl SearchIndex {
     ///
     /// 本次合并掉的 delta 段数。
     fn fold_deltas(&mut self) -> Result<usize> {
+        // 🔴 **顺序是硬要求**（`S8-03` 评审 P2-4）：**先记世代、后取视图快照**。
+        //    反过来的话，若 `compact()` 恰好落在两次读之间，我们会拿到「旧进程内的视图 +
+        //    新世代的 epoch」⇒ `commit_view` 的世代对账**通过** ⇒ 把基于旧 `main` 克隆出来的
+        //    `merged` 发布进新视图（旧 ID 空间覆盖新 ID 空间）。
+        //    先记世代则相反：期间任何 `compact()` 都会让 epoch 变化 ⇒ 发布被拒（保守但正确）。
+        let snapshot_epoch = self.shared.epoch();
         let view = self.view();
         if view.deltas.is_empty() {
             return Ok(0);
@@ -1175,8 +1209,9 @@ impl SearchIndex {
         // 并只摘掉**本次已物理化**的墓碑（`Shared::absorb_window`，纯函数 + 单测）。
         let snapshot_deltas = view.deltas.len();
         let physicalized = (*view.tombstones).clone();
-        self.shared
-            .commit_view(move |cur, generation, base_doc, base_chunk| {
+        self.shared.commit_view(
+            snapshot_epoch,
+            move |cur, generation, base_doc, base_chunk| {
                 let (carried, tombstones) = Shared::absorb_window(
                     &cur.deltas,
                     snapshot_deltas,
@@ -1194,7 +1229,8 @@ impl SearchIndex {
                     used_doc.max(base_doc),
                     used_chunk.max(base_chunk),
                 )
-            });
+            },
+        )?;
         Ok(merged_segments)
     }
 
