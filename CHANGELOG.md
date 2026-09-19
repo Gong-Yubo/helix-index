@@ -105,8 +105,8 @@
   （评审接受「错误信息如实声明」这一取形；本轮把**世代**那条也纳入同一声明）。
 - **P3-3**（`num_docs` × `tombstone_stats` 口径分叉，已按评审给的两个选项之一「doc 写明」落地）/
   **P3-5**（`fold_deltas` 的 O(k·N)）/ **P3-6** / **P4-2 的其余两份 `locate` 收敛**：随 `S8-06` 处置。
-- **剩余 1 条已知红**：`integration::T1_已删向量不霸占TopK名额`（向量跨段留 PR5；**刻意不改写**该用例
-  —— 它对 Q-C1 有独立回归价值，改成「断言边界」等于销毁它）。
+- ✅ **红灯已清零（同日追加，见下方「CI 红灯收尾」）** —— 原话「剩余 1 条已知红：`integration::T1`（留 PR5）」
+  已被**夹具更正**取代；⚠️ 判据一条未改，向量跨段本身**仍**留 PR5。
 - **变异验证的覆盖边界**：`MUT-I8-6`（各段各算 `df`）最初**只被主用例命中**，「带跨段删除」变体不敏感
   —— 因为该变体的语料里没有跨段共享词 ⇒ 已把 `T4_D1` 第 2 篇改成含「检索」（主段也出现的词）
   并复跑确认两条都命中；`MUT-I8-7a`（`commit_view` 基址置 0）的红因是**上游基址对账 `Err(Busy)`**
@@ -129,6 +129,70 @@
 > `--features local-rerank --no-fail-fast` = **325 passed / 1 failed / 11 ignored**。
 > 🔴 三个测试范围内的**唯一一条红是同一条**：`integration::T1_已删向量不霸占TopK名额`
 > （向量跨段留 PR5；见下方「仍未闭环」）。⇒ 红灯 **4 → 2 → 1**。
+>
+> 📌 **以上是本轮第一次推送时的读数**；同日追加的「CI 红灯收尾」把它变成了**全绿**
+> （见下一节的最新读数）。
+
+#### 🔴 CI 红灯收尾（**同日追加**；红灯 1 → **0**）
+
+##### Fixed（`integration::T1` 的**夹具**更正 —— **判据一个字未改**）
+
+`build_ghost_facade` 只 `add` + `commit`、**不 `save`** ⇒ `S8-03` 起内容全在 **delta 段**，
+而向量路的取形（设计 §4.6；跨段向量 = `S8-05`）**只覆盖 `main`**
+（`Searcher::parts` 交下去的是 `view.main.vector_index`）⇒ `main` 是一张**空图** ⇒
+基线断言 `hits.len() == k` 实测 **`left: 0 / right: 5`**（`integration.rs:291`；
+CI 的 `test` 与 `feature isolation` 两个 job 都栽在这一行）。
+
+🔑 **真因不是「少了一条断言」，而是「夹具没跟上 `S8-03` 的语义」**：原夹具下本用例
+**即便绿也是空转**（0 条候选时「不含幽灵」trivially 成立）。
+⇒ 夹具加 `save` + `load`（`D-S8-01`：`save` 第一步就 `fold_deltas` ⇒ 内容折进 `main`、
+`deltas` 清空）⇒ 向量路恢复覆盖，本用例**重新成为真测试**（图里确实有幽灵点，
+存活谓词必须把它们挡在 Top-K 之外）。
+
+⚠️ **不违反「刻意不改写该用例」**：那条纪律针对的是「把断言改成边界断言」（会销毁它对
+Q-C1 的回归价值）；本次改的是「**怎么造库**」，断言 / 基线 / 删除流程全部原样。
+⚠️ **本夹具不覆盖**「内容还在 `deltas` 时的向量路」（那是 `S8-05` 的领域）：该半盲态由
+`step8_segments.rs` 的 `S8_02_旧API与新API结果逐位一致`（`vector_recalled == 0`，
+`S8-05` 落地后必须反转）+ `Metrics.vector_segments` 观测钉住。
+
+##### Fixed（`CLI3` 的第三条断言 —— 顺带抓到的**纯噪声判据**）
+
+同一次收尾里，`--features local-rerank` 这一档把上一轮**漏删**的旧断言
+`total_after < total_tomb` 暴露出来（默认 feature 下侥幸通过）：墓碑态 **2619** vs
+compact 后 **2624** —— 两者相差**几字节**，差别只来自 `hnsw_rs` 的无种子 `OsRng`
+（**同源**于上一轮那条 `graph_after < graph_tomb`）。⇒ **删除**该断言：
+「体积必须回落」的语义已被以「8 点无墓碑基线」为参照的两条完整覆盖，且与
+「回收发生在 `fold` 还是 `compact`」无关。⚠️ 这正是「**一次红 run 会掩盖后面所有二进制**」
+的反面教材：它在默认 feature 下不红，是**换了 feature 组合**才现形的。
+
+##### Changed（CI 工程卫生：**别让早期失败掩盖覆盖面**）
+
+- `test` job：`cargo test --workspace` → **`cargo test --workspace --no-fail-fast`**。
+  🔴 **实测依据**（head `26b81d7`）：`cargo test` 默认在**第一个失败的测试二进制**就停 ⇒
+  那次 run 的 `test` job **只跑完 8 个测试目标**就结束（本地同命令 **17 行**）⇒ 按 cargo 的
+  字母序，`integration` 之后的 `step4_compaction` / `step4_liveness` /
+  `step5_query_observability` / `step6_incremental_build` / `step7_rerank_local` /
+  `step8_rw_concurrency` / **`step8_segments`（本 PR 新增的 `S8-T4` 门测试就在里面）** /
+  `vector_ab` **在 CI 上从未跑过** —— 那次「CI 只有一条红」的读数**低估了未验证面**。
+- `features` job：三个 `cargo test` 加 `--no-fail-fast`；第 2~4 步
+  （`local-rerank` ×2 / `no-default-features`）加 **`if: always()`** —— 同一原因：
+  Actions 默认在**第一个失败的 step** 就停，那次 run 在第 1 步（charabia）就中断，
+  后 3 个 feature 组合**没跑**。
+- ⚠️ **这不是放宽门禁**：job 仍然红，只是**把失败报全**（一次 run 看到全部失败点与全部覆盖）。
+  本 PR 的红灯由**修代码**清掉，不是由这两个改动清掉的。
+
+##### 最新读数（12 段链，含 CI 的 `-p helix --features local-rerank` 一步）
+
+| 段 | 结果 |
+| --- | --- |
+| `fmt` / `clippy -D warnings` / `rustdoc -D warnings` / `make shell` / `msrv 1.90` / `no-default-features` / `build --release --workspace` / `cargo deny` | ✅ 全绿 |
+| `cargo test --workspace --no-fail-fast` | ✅ **347 passed / 0 failed / 6 ignored**（17 行） |
+| `cargo test -p helix-core --features charabia --no-fail-fast` | ✅ **329 passed / 0 failed / 6 ignored** |
+| `cargo test -p helix-core --features local-rerank --no-fail-fast` | ✅ **326 passed / 0 failed / 11 ignored** |
+| `cargo test -p helix --features local-rerank` | ✅ **21 passed / 0 failed** |
+
+⇒ **红灯 4 → 2 → 1 → 0**。
+
 
 ### 修复 · V2 Step 8 PR 4 · **第 1 轮评审响应**（#63，2026-09-19）—— P1-1 窗口吸收 + P1-2 去重条目 + 4 条红定性更正 + 死代码清理
 
