@@ -991,11 +991,27 @@ pub struct LocalEmbedder {
 | 字段 | 位置 | 含义 |
 | --- | --- | --- |
 | `Metrics.segments` | `crates/core/src/query/metrics.rs` | 本次检索实际扫了几个段（`1` = 只有主段 ⇒ 零回归） |
-| `Metrics.tombstoned` | 同上 | 本次检索被跨段墓碑挡掉的候选数（0 = 无墓碑） |
+| `Metrics.vector_segments` | 同上 | 向量路本次**实际覆盖**了几个段（`0` = 本次没走向量路） |
+| `Metrics.tombstoned` | 同上 | 本次检索所依据的视图里的**跨段墓碑条数**（0 = 无墓碑） |
 | `Metrics.vector_route` | 既有 | ⚠️ 混合时新增 `VectorRoute::Mixed`（Q5） |
 | `MergeReport` | `crates/core/src/search/index.rs` | 合并的可观测（§4.9.1） |
 
 ⚠️ **`Metrics.segments` 必须进 `SearchResponse.metrics`**（既有链路已在，见 `query/metrics.rs` 的四处断链修复史）。
+
+> **2026-09-19 三处更正与补充**（`S8-03` 评审批次 P2-2 落地，与实现同步）：
+>
+> 1. **新增 `Metrics.vector_segments`**（评审 P2-2 的建议取形）：`Metrics.segments` 单独**不是**缺陷信号，
+>    「**向量路只覆盖了一部分段**」才是。默认 `mode` 是 `Hybrid` ⇒ `S8-05` 之前，
+>    只要有向量能力，**每次 `commit()` 之后、`save`/`compact` 之前**都处于半盲态
+>    （`helix serve` 这种「写端持续 commit、无人调 fold」的形态下**长期**如此）。
+>    ⇒ 原表只列 `segments` 会漏掉这条真正要看的信号；PR5 的验收项 = `vector_segments == segments` 恒成立。
+> 2. **`tombstoned` 的口径更正**（原文：「本次检索**被跨段墓碑挡掉的候选数**」）：该口径在**召回层不可良定义** ——
+>    同一个 chunk 会被「BM25 路 / 向量路」各取一次、甚至在同一路的多个 posting 上重复出现
+>    ⇒ 计数随 lane 数与 term 命中数**虚增**，读出来无法解释（也无法与「候选数」口径对齐）。
+>    改为「**视图里的跨段墓碑条数**」：精确、O(1)，且正是调用方真正要的那个量
+>    （`0` ⇒ 热路径已回到零谓词，`R52` 的回归可逆）。
+> 3. **三者都必须在 `search_parts` 的入口填值**（三条早退路径也带真实值）：`Metrics::default()` 是
+>    草稿缓冲区，只在返回路径上被覆盖 —— 早退路径若漏填，调用方读到的 `0` 是**假值**（`S5-T8` 的同族教训）。
 
 ### 4.14 不变式清单（写进 rustdoc 的三条以内 + 其余进设计文档）
 
@@ -1079,7 +1095,7 @@ pub struct LocalEmbedder {
 | `SearchIndex::add/commit/flush/save/remove/compact*` | 语义不变（`save` / `compact` 多一步 `merge_all()` 前置） | 无（签名不变） |
 | `SearchIndex::merge_pending()` / `merge_all()` | **新增** | 无 |
 | **新增** `MergeReport` | 公开类型 | 无（新增） |
-| `Metrics.segments` / `tombstoned` | **纯加法** | 无 |
+| `Metrics.segments` / `Metrics.vector_segments` / `Metrics.tombstoned` | **纯加法**（但见下方 ⚠️） | 无 |
 | `VectorRoute::Mixed` | **新增枚举变体** | ⚠️ **破坏性**：`VectorRoute` 若非 `#[non_exhaustive]`，外部 `match` 会**编译失败** ⇒ **必须核实**（若是，则要么加 `#[non_exhaustive]`，要么改为「新增一个独立字段 `vector_route_mixed: bool`」）。**取形待实现期核实后定**（登记 Q5） |
 | `Config::embed_sessions` | **新增字段**，默认 **1** | ⚠️ `Config` 是 `pub struct`（字段公开）⇒ 直接构造 `Config { .. }` 的代码会编译失败。**核实是否已有此用法**；若有 ⇒ 走 `ConfigBuilder` 或补 `Default`。登记为实现期检查项 |
 | `ConfigFingerprint` | **不扩**（会话数不影响索引内容） | 无 |
@@ -1094,6 +1110,13 @@ pub struct LocalEmbedder {
 | `.rs` 变更规模（预估） | **新增 ≈ 600~900 行**（`view.rs` 为主体），**改动 ≈ 300~500 行**（跨段 BM25/向量/谓词 + 合并器） | ⚠️ **L 级**，与 `plan-v2` 的标注一致 |
 
 ⚠️ **两处「破坏性」必须实现期核实**（`VectorRoute` 的 `#[non_exhaustive]`、`Config` 的字面构造用法）——**本文不凭记忆下结论**（Step 7 曾凭空造出 `rerank_status` 字段的教训）。
+
+⚠️ **表外新增面（2026-09-19，请评审复核）**：`Metrics.vector_segments` **不在**本节原表中，是
+`S8-03` 评审批次 P2-2 落地时按评审建议新增的（理由见 §4.13.3 的更正块）。
+另需登记一条**既有事实**：`Metrics` 是 `pub struct` 且**无 `#[non_exhaustive]`** ⇒ 三个新字段对
+「字面构造 `Metrics { .. }` 的下游」是**破坏性**（与 Step 7 新增 `rerank_window` / `rerank_elapsed` 同一形态）。
+本仓内唯一字面构造点是 `query/metrics.rs` 自己的单测（已同步）；**是否给 `Metrics` 补
+`#[non_exhaustive]`** 属公开面决策，本 PR 不做（补它同样会让下游字面构造编译失败 ⇒ 没有「零破坏」选项，同 Q5）。
 
 ---
 
