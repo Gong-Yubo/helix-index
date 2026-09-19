@@ -33,7 +33,7 @@ use crate::error::Result;
 use crate::types::{ChunkId, DocId, TermId};
 
 /// 内存索引：倒排 + 正排 + 统计量。
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Index {
     inverted: InvertedIndex,
     forward: ForwardStore,
@@ -220,8 +220,17 @@ impl Index {
         let chunk_ids = self.forward.chunk_ids_of_doc(doc_id);
 
         // 回滚 content_hash 映射（幂等 upsert 的状态）
+        //
+        // 🔴 **条件式摘除**（`S8-03` 评审 P1-2）：只有当表中的条目**确实指向本 doc** 时才移除。
+        // 跨段之后「同一 hash 存在两个 doc」是**合法状态** —— 墓碑挡住的 hash 视为未命中
+        // ⇒ 允许用同内容重新 upsert（`SearchIndex::doc_id_by_hash_global` / §4.8.3），
+        // 于是合并后的主段里可能同时有「被墓碑的旧 doc X」与「替换文档 Y」（hash 相同）。
+        // 若在此**无条件** `remove(&H)`，物理化 X 的墓碑时会把 **Y 的去重条目**一并抹掉
+        // ⇒ Y 存活但不再可去重 ⇒ 下次同内容 `add` 生成重复文档（**FR-15 幂等 upsert 静默失效**）。
         if let Some(doc) = self.forward.doc(doc_id) {
-            if doc.content_hash != 0 {
+            if doc.content_hash != 0
+                && self.content_hashes.get(&doc.content_hash).copied() == Some(doc_id)
+            {
                 self.content_hashes.remove(&doc.content_hash);
             }
         }
@@ -490,6 +499,111 @@ impl Index {
             field_index,
         };
         (new_index, reclaimed_terms)
+    }
+
+    /// 把 `other` 的内容**按本地顺序追加**到 `self` —— **不重编号**（`D-S8-04` / 设计 §4.9.2）。
+    ///
+    /// # 前提（由调用方保证）
+    ///
+    /// `other` 是 `self` 之后的**下一个**段（严格 FIFO，见 §4.4.2）⇒ append 之后
+    /// `other` 的本地 ID `i` 在全局恰好是 `base + i`，即**不需要任何重编号**。
+    /// 这也正是 `compact()`（会重编号）**必须**在 `merge_all()` 之后的原因（`D-S8-12`）。
+    ///
+    /// # 返回
+    ///
+    /// 本次追加的**活分片数**（= `other.stats.num_chunks`，即 `other` 的墓碑位不计入）。
+    ///
+    /// # 🔴 postings 顺序（`S8-T4`「逐位一致」的结构性依据之一）
+    ///
+    /// [`InvertedIndex::add`] 把 posting **push 到链尾** ⇒ 合并后同一 term 的链内顺序 =
+    /// 「主段原序 + 增量段序」，而基址连续 ⇒ **恰为全局 `chunk_id` 升序** = 单段建库的顺序。
+    /// ⇒ 与 `retriever::bm25` 的 TAAT 累加顺序一致（`I8-6`）。
+    /// **后人在此处「顺便排序」会破坏它** —— 所以这段注释必须留着。
+    ///
+    /// # 与 `compacted()` 的区别
+    ///
+    /// `compacted()` **重编号**（并为墓碑腾出的稠密化）；本方法**不动 ID**。
+    pub(crate) fn merge_from(&mut self, other: Index) -> Result<usize> {
+        let base_doc = self.forward.docs_slots() as u64;
+        let base_chunk = self.forward.chunks_slots() as u64;
+        let other_docs = other.forward.docs_slots() as u64;
+
+        // 不静默溢出：全局 ID 是 `u32`（`types.rs`），合并本身不重编号 ⇒ 越界就是真错误。
+        if base_doc + other_docs > u32::MAX as u64 {
+            return Err(crate::error::Error::InvalidInput(format!(
+                "合并后文档槽位数 {} 超过 u32 上限（doc_id 是 u32）",
+                base_doc + other_docs
+            )));
+        }
+        if base_chunk + other.forward.chunks_slots() as u64 > u32::MAX as u64 {
+            return Err(crate::error::Error::InvalidInput(format!(
+                "合并后分片槽位数 {} 超过 u32 上限（chunk_id 是 u32）",
+                base_chunk + other.forward.chunks_slots() as u64
+            )));
+        }
+
+        // ① 倒排：必须在 `forward` append **之前**取出（此时 `other` 的 chunk_id 还是本地 ID，
+        //    统一加 `base_chunk` 一步到位）。`export()` 返回的 `term_dict` 按 TermId 升序
+        //    ⇒ 遍历顺序确定（NFR-06）。
+        let (term_dict, postings) = other.inverted.export();
+        for (term, tid) in term_dict {
+            for p in &postings[tid as usize] {
+                #[cfg(feature = "positions")]
+                self.inverted.add(
+                    &term,
+                    p.chunk_id + base_chunk as ChunkId,
+                    p.tf,
+                    &p.positions,
+                );
+                #[cfg(not(feature = "positions"))]
+                self.inverted
+                    .add(&term, p.chunk_id + base_chunk as ChunkId, p.tf, &[]);
+            }
+        }
+
+        // ② 正排：槽位逐个 push（含 `None` 墓碑位 ⇒ 保槽位对齐）
+        let other_chunk_lens = other.chunk_lens.clone();
+        debug_assert_eq!(
+            other_chunk_lens.len(),
+            other.forward.chunks_slots(),
+            "`chunk_lens` 必须与 chunks 槽位一一对应（删除后保留 ⇒ 不是活分片数）"
+        );
+        let other_stats = other.stats;
+        let other_hashes = other.content_hashes.clone();
+        self.forward.append_from(other.forward);
+
+        // ③ 统计量 / chunk_lens：都是「活量」，且已按各自段维护 ⇒ 直接相加 / 追加
+        self.stats.total_len += other_stats.total_len;
+        self.stats.num_chunks += other_stats.num_chunks;
+        self.chunk_lens.extend(other_chunk_lens);
+
+        // ④ content_hash 表：跨段查重的前提。
+        //
+        // ⚠️ **碰撞是合法状态，不是 bug**（`S8-03` 评审 P1-2 更正）：墓碑挡住的 hash 视为
+        //    未命中 ⇒ 同一内容可以被**重新 upsert** ⇒ 合并时 `self`（主段）里的旧 doc 与
+        //    `other`（delta）里的替换文档会**共用同一个 hash**。语义由「**后写入者为准**」
+        //    （`insert` 覆盖）给出：被覆盖的是**已被墓碑的**旧 doc，而它在物理化时走
+        //    `Index::remove` 的**条件式摘除** ⇒ 替换文档的去重条目不会被误删。
+        //    ⇒ 原「debug 必 panic / release 静默」的断言已删除（它把合法路径变成了 panic）。
+        //    更强的判据（要求 displaced 必为墓碑 doc）需要把段级墓碑信息传进来，
+        //    留给 `S8-06` 的合并器。
+        for (h, d) in other_hashes {
+            let displaced = self.content_hashes.insert(h, d + base_doc as DocId);
+            if displaced.is_some() {
+                tracing::debug!(
+                    hash = h,
+                    "content_hash 跨段碰撞：同一 hash 在两段里各有一个 doc（墓碑挡住查重 ⇒ 合法）"
+                );
+            }
+        }
+
+        // ⑤ 字段索引：**不能 extend**（它是 field → value → doc 位图，且带基数降级判定）
+        //    ⇒ 走既有的全量重建（`import` 用同一函数）。重建后「基数保护」的降级结论
+        //    可能与增量维护不同 ⇒ 由 `S8-T13` 的等价用例钉住（属 S8-06）。
+        let (docs, _) = self.forward.export();
+        self.field_index.rebuild(docs);
+
+        Ok(other_stats.num_chunks as usize)
     }
 
     // ---- 快照导出 / 导入（T4-02，供 storage 模块序列化）----

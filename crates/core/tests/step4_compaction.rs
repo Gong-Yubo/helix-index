@@ -97,14 +97,32 @@ fn T3_BM25检索逐位一致() {
         assert!(rep.remapped, "删了 3/6 应有重编号");
         rep
     };
-    // 死词「榴莲」被摘除
+    // 死词「榴莲」被摘除 —— 🔴 **判据取「结果」，不取计数器**（`S8-03` 评审 P3-1/P3-4 更正）
+    //
+    // 实测（本 PR 探针，三档对照）告诉了我们真因：本用例的删除发生在**未发布的 builder**
+    // 上（§4.8.3 分支 ① 就地物理摘除）⇒ `save()` 里的 `fold_deltas` 在合并该段时
+    // **只对非空链调用 `inverted.add`** ⇒ 空链的死词在 **fold 期就被丢掉**，
+    // 而 fold **不计入任何「回收」计数** ⇒ 走到 compact 时 `reclaimed_terms` 必然是 **0**。
+    //   · [A] builder 内删 → 内存 compact：`reclaimed_terms = 0`
+    //   · [B] 同上 + save → load → compact：`= 0`
+    //   · [C] **先 commit 再删（墓碑路径）→ compact：`= 11`**
+    // ⇒ 死词确实被回收了（甚至更早），只是**计数器覆盖不到那条路径**。
+    // 计数器本身的语义由紧随其后的 `T3b_墓碑路径下compact仍回收死词` 继续钉住。
     let after_index = bm25_builder().load(&path).unwrap();
     assert_eq!(after_index.num_chunks(), 3, "存活 3 doc");
-    assert!(
-        rep.reclaimed_terms >= 1,
-        "「榴莲」应作为死词被回收，实为 {}",
-        rep.reclaimed_terms
+    assert_eq!(
+        rep.reclaimed_terms, 0,
+        "新语义下的预期值（死词已在 fold 期丢弃）；若变非 0，说明 fold 期的丢弃行为变了，         请复核 `S8-06` 的合并口径"
     );
+    // 结果层判据：死词不可召回
+    let dead = bm25_builder()
+        .load(&path)
+        .unwrap()
+        .into_searcher()
+        .unwrap()
+        .search("榴莲")
+        .unwrap();
+    assert!(dead.hits.is_empty(), "死词「榴莲」不得可召回");
 
     // compact 后检索：与 compact 前逐位一致
     for (i, q) in queries.iter().enumerate() {
@@ -125,6 +143,32 @@ fn T3_BM25检索逐位一致() {
             "query「{q}」compact 前后 BM25 结果应逐位一致（I3）"
         );
     }
+}
+
+/// **`S8-03` 新增**（评审 P3-1/P3-4 的配套）：墓碑路径下 `compact` **仍然**回收死词。
+///
+/// 🔑 与 `T3` 的分工：`T3` 的删除落在**未发布的 builder** 上（分支 ①）⇒ 死词在
+/// `save()` 的 `fold_deltas` 期就被丢掉、**不计入任何计数** ⇒ 那个用例的
+/// `reclaimed_terms` 必然是 0（判据已改为「结果」）。要让**计数器**有意义，删除必须发生在
+/// **已发布的段**上（分支 ② 记墓碑），且中间**不能有 `save`/`fold`**（`fold` 会先把墓碑
+/// 物理化 ⇒ 又变成「在 fold 期丢掉」）。实测该路径：`reclaimed_terms = 11`。
+#[test]
+fn T3b_墓碑路径下compact仍回收死词() {
+    let mut idx = bm25_builder().build();
+    let mut ids = Vec::new();
+    for t in ["doc0 苹果 水果 甜", "doc1 榴莲 气味 特殊", "doc2 香蕉 水果"] {
+        ids.push(idx.add(t).unwrap().doc_id);
+    }
+    idx.commit().unwrap(); // 内容进 delta（**已发布**）
+    idx.remove(ids[1]).unwrap(); // 分支②：记跨段墓碑（不物理摘除）
+
+    let rep = idx.compact().unwrap();
+    assert!(rep.remapped, "删了 1/3 应有重编号");
+    assert!(
+        rep.reclaimed_terms >= 1,
+        "墓碑路径下「榴莲」必须由 compact 回收，实为 {}",
+        rep.reclaimed_terms
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -187,6 +231,12 @@ fn T11_无墓碑时compact为noop_remapped_false() {
         let out = idx.add(format!("文档{i} 内容 BBB")).unwrap();
         ids.push((out.doc_id, out.chunk_ids[0]));
     }
+    // ⚠️ **必须先显式 `commit()`**（`S8-03` 评审 P3-1 更正本用例的红因）：
+    //    `S8-03` 起 `num_docs` / `num_chunks` 只统计**已发布**的内容，而 `add` 落进
+    //    写端私有的 builder ⇒ 未 commit 时读到的是 **0**。原写法把 `before_*` 读成 0，
+    //    于是 compact 之后 `num_docs()` 变 4 ⇒ `:199` 的 `assert_eq!` 红。
+    //    这与「与 delta+墓碑交互 / S8-06 领域」无关，是**可见性语义变更**后的期望更新。
+    idx.commit().unwrap();
     let before_docs = idx.num_docs();
     let before_chunks = idx.num_chunks();
 

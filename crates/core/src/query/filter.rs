@@ -179,6 +179,21 @@ impl CandidateFilter for ChunkFilter<'_> {
     }
 }
 
+/// **跨段**候选谓词的**构造器**（`S8-04`）。
+///
+/// # 为什么要有这个 trait
+///
+/// 跨段谓词（`ViewFilter`）的构造需要 `&View`（各段存活位图 + 跨段墓碑），而 `View` 是
+/// `pub(crate)`、**不能**出现在公开的 `SearchParts` 里。⇒ 由门面层（能访问 `View` 的那一层）
+/// 实现本 trait，`search_parts` 只通过它构造谓词 —— 公开面因此只多一个 trait 对象。
+pub trait PredicateBuilder: Send + Sync {
+    /// 构造本 query 的谓词。
+    ///
+    /// 返回 `None` = **用户过滤排空**（没有任何文档通过），编排层据此短路
+    /// （与 [`try_build_predicate`] 的同名语义一致）。
+    fn build<'a>(&'a self, filter: Option<&Filter>) -> Option<Box<dyn CandidateFilter + 'a>>;
+}
+
 /// 构建本 query 的候选谓词。
 ///
 /// - `None`（无用户过滤）→ [`AliveOnly`](crate::predicate::AliveOnly)，只做存活过滤；

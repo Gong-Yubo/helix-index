@@ -9,6 +9,397 @@
 
 ## [Unreleased]
 
+### 修复 · V2 Step 8 PR 4 · **第 2 轮评审响应**（#63，2026-09-19）—— 2×P1（多写端 / 未发布状态的缝隙）+ P3 恢复指引 + P4 登记
+
+> 落点 = `pulls/63/reviews` **1 条**（id `5255969412`，SHA `f69fb8e`）+ **行内 4 条**；`issues/63/comments` 无新增。
+> 评审另逐条确认了 §6 十二项（**12 项全 ✅**，含对 `epoch`/ABA 推演链与 CI 覆盖面修复的肯定）。
+> **两条 P1 都先确定性复现、再修、再做变异自证**（见下方「复现证据」）。
+
+#### Fixed
+
+- 🔴 **P1-1 `doc_id_by_hash_global` 不认 builder 上的未发布墓碑**（`crates/core/src/search/index.rs`）：
+  `remove` 的**分支②**（目标在既往段）把墓碑记在 `self.builder.tombstones`，要 `commit()` 才进
+  `View.tombstones`；而 ② 的查重循环**只查后者** ⇒ 「`remove(X)` 后**不 `commit()`** 直接重加同
+  `content_hash` 的内容」会命中**刚被删除的** X ⇒ 返回 `deduped = true` + `doc_id = X`
+  ⇒ **替换 / 重加静默丢失**（`commit()` 后 X 被墓碑挡住，而新内容**根本没被创建**，
+  调用方还拿到一个已死 doc 的 ID）。
+  🔑 **是缺口不是设计**：同序列在**分支①**（目标未发布）下会就地物理删 + 条件式摘 hash 条目 ⇒ 重加正常；
+  而 FR-15 的「替换文档」流程（同 `dedup_key`、不同正文）**总是**落在分支②。
+  **修法** = 查重判据补上 `|| self.builder.tombstones.blocks_doc(global)`（一行）。
+  **复现证据**（先红后绿）：新增 `S8_T6_remove未commit即重加不得被去重吞掉`，修前在
+  `assert!(!again.deduped)` 处失败（`step8_segments.rs:489`）。
+- 🔴 **P1-2 `absorb_window` 的长度前缀假设被并发 `fold` 破坏**（`crates/core/src/search/view.rs`）：
+  判据只有「`cur_deltas.len() >= snapshot_deltas`（delta 只增）」，而 `fold` **不改 `epoch`**
+  ⇒ 世代对账**拦不住**并发 fold。交错：A 取快照 `[D1]`（O(N) 克隆 + O(N·logN) 向量重建 = **秒级窗口**）
+  → B fold 把 D1 吸进 `main` 并发布（`deltas = []`）→ B `add(D2)` + `commit()`（`deltas = [D2]`）
+  → A 发布：**长度 1 == 1** ⇒ 旧判据放行，而 `skip(1)` 跳掉的是 **D2** ⇒ **D2 从视图静默消失**，
+  而 `ids.next_*` 已把它的槽位记账（**永久孤儿区间**）；A 随后的 `save` 把该状态落盘。
+  **修法** = 判据从「长度」升级为**前缀身份**（段不可变 ⇒ `Arc::ptr_eq` 是合法身份判据）：
+  快照把 `Vec<Arc<Segment>>`（clone = O(1)）带进发布闭包，锁内校验前 N 项逐个 `Arc::ptr_eq`，
+  不符 ⇒ `Err(Busy)`。为此 **`Shared::commit_view` 的 `build_next` 改为可返回 `Result`**
+  并保证「`Err` ⇒ **不做任何记账**」（序号不消耗 / `base` 不推进 / 视图不动）。
+  ⚠️ **`absorb_window` 的 `debug_assert` 已删除**：它被定位为「防旁路守卫」，但**合法路径**
+  （并发 fold）就能踩到 ⇒ 必须 dev/release **双端显式拒绝**。
+  **复现证据**（先红后绿）：纯函数级确定性构造（无需线程时序）—— 修前
+  `absorb_window(&[D2], 1, …)` 返回 `carried` 长度 **0**（D2 被当成 D1 跳掉）。
+
+#### Changed
+
+- **P3-1 三条 `Error::Busy` 的恢复指引按语义分家**（`error.rs` 的产生点表 + 两条消息）：
+  被丢弃的 builder 内容**含分支②记下的跨段墓碑** ⇒ 「`remove(X)` → `commit()` 被拒」的流程
+  若只照「重新 `add`」指引重试，**什么都不会恢复**（X 的删除静默失效、继续可检索）。
+  ⇒ `commit()` 的两条消息改为「重新执行未成功的 `add` **与 `remove`**」；
+  🔑 而 `fold` 那条**反过来**必须写「重试本次 `save()` / `compact()` **即可**」——
+  合并是**维护性**操作，被判拒时增量段**仍在视图里、内容没丢**，丢的只是本次合并的**计算**
+  （我第一版误抄了 `commit()` 的措辞，已按 NFR-07「恢复路径也要如实」更正）。
+- **P4-1 墓碑-only 空段的次生成本登记给 `S8-06`**（`SegmentBuilder::is_empty()` + `commit()` 注释）：
+  「无内容、有墓碑」被判非空是有意的（墓碑只能搭一次发布的便车进 `View.tombstones`），
+  但带来 ① `Metrics.segments` 被零内容段膨胀；② fold 期 `merge_from(空 Index)` 仍走
+  `ForwardStore::rebuild` + `field_index.rebuild`（各 O(N)）⇒ 每个墓碑-only 段白付一次全量 pass。
+
+#### Added
+
+- `crates/core/tests/step8_segments.rs`：**`S8_T6_remove未commit即重加不得被去重吞掉`**（P1-1 的回归锁）。
+- `crates/core/src/search/view.rs`：**`S8_03_窗口吸收必须校验前缀身份而非只看长度`**（P1-2 的回归锁；
+  三条判据 = 前缀相符放行 / 长度相等但身份不同 ⇒ 拒绝 / 长度回退 ⇒ 拒绝）。
+- `crates/core/src/search/view.rs`：**`S8_03_发布失败时不消耗任何记账`**（P1-2 的配套判据 ——
+  「`Err` 即无副作用」是**承诺**，必须可测）。
+
+#### 变异验证（3 条注入，**逐个命中且红因与意图相符**）
+
+| 注入 | 期望命中 | 实测 |
+| --- | --- | --- |
+| `M-P1-1`：查重退回「只查 `view.tombstones`」 | `S8_T6_remove未commit即重加…` | ✅ 该条红、**同文件的旧 `S8_T6` 绿** ⇒ 新变体是唯一绊线 |
+| `M-P1-2a`：`absorb_window` 退回「只判长度」 | `S8_03_窗口吸收必须校验前缀身份…` | ✅ 唯一红 |
+| `M-P1-2b`：`commit_view` 把 `ids.generation = generation` 提前到 `?` 之前 | `S8_03_发布失败时不消耗任何记账` | ✅ 唯一红（⚠️ 见下方「覆盖边界②」） |
+
+#### 守门链附带抓到的一条**既有 flaky**（`CLI4`，`D-S8-01` 系统性影响的**第 4 条**）
+
+- 🔴 **`CLI4_output另存源不变回收看源vs结果` 的 `dst_total < src_tomb` 是噪声判据**（≈**1/8 假红**）：
+  该断言本身由 **PR #31** 引入、`origin/main` 上就存在（`git log -S` 实测），
+  **但把它从稳健变成 flaky 的是本 PR 的 `D-S8-01`** —— `save` 第一步 `fold_deltas` ⇒
+  **第二次 `save` 就已把 4 条墓碑物理化、并用 4 条存活原始向量重建了图** ⇒ `src_tomb` 与 `dst_total`
+  **都是 4 点图**，两者只剩 `hnsw_rs` 无种子 `OsRng` 的层级分配差异。
+  **实测 8 次**：`src_tomb` 恒 **2556**；`dst_total` ∈ {**2528** ×7、**2579** ×1} ⇒ 符号随机翻转。
+  ⇒ 与 `CLI3` 的第三条断言**同一形状**（那条上一轮已删）：参照系改为**同一装配的 8 点基线**
+  （`graph_baseline` / `total_baseline`，在删除**之前**量取，≈2.2× 裕度）；**其余断言一条未放宽**。
+  **变异自证**：把 compact 重建图的原始向量**重复灌 3 遍**（4 → 16 点，模拟「图没有回收」）
+  ⇒ `CLI3` 与 `CLI4` 的基线判据**双双报红**（6713 vs 基线 2425 字节）。
+  ⚠️ 发现方式值得记：**同一次守门链里 `CLI3` 绿、`CLI4` 红** —— 上一轮的「`D-S8-01` 系统性影响」
+  清单（当时写「3 条均已收口」）**漏了这第 4 条**；`--features local-rerank` 那一档把它暴露出来。
+
+#### 覆盖边界（如实登记，**不声称已守住**）
+
+- ① **`fold_deltas` 的「接线」没有确定性判据**：三条新用例分别锁住**纯函数语义**（前缀校验）与
+  `commit_view` 的**错误语义**（失败不记账）；而「`fold_deltas` 真的把快照 `Arc` 列表传下去、
+  且真的把 `None` 转成 `Err`」这 6 行**没有测试能盖到** —— 真实的并发交错（另一写端恰在
+  「取快照」与「拿锁」之间 fold）**需要线程时序、无法确定性构造**（与 PR #63 上一轮 M9 同族）。
+  把它改回「忽略失败」的变异**不会让任何用例变红**。
+- ② `M-P1-2b` 意外暴露**我自己的断言名不副实**：`next_origin()` 只回报 `(next_doc, next_chunk,
+  epoch)`、**看不到** `ids.generation` ⇒ 我最初写的「发布失败不得消耗序号」那条断言在变异下
+  **照样绿**，真正抓住它的是**后面那条反向自证**（失败后再成功发布一次，序号必须是 1 而不是 2）。
+  已就地更正标注（两条都保留，因为它们观察的量不同）。
+
+### 修复 · V2 Step 8 PR 4 · **未闭环项收口**（#63，2026-09-19）—— `S8-T4` 门测试落地 + P2-2 观测 + P2-4 epoch 对账
+
+> 处置对象 = 上一条（第 1 轮评审响应）末节登记的**未闭环清单**；本轮**没有新的评审意见**
+> （`pulls/63/reviews` 无第 2 轮，`issues/63/comments` 无新增）。
+
+#### Added
+
+- 🔴 **`S8-T4` 门测试落地**（设计 §8 明写的「**PR4 的门**」，含第 1 轮评审 **P2-5** 更正后的双参照系）：
+  - **`S8_T4_跨段BM25与单段逐位一致`**：同一份内容，`[单段]` vs `[主段 + 2 个增量段]`，
+    6 个 query 的 `hits`（含 `score` / `chunk_id` / `explain`）**逐位相同**。
+    前提自证 = 两侧 `metrics.segments` 分别为 `1` / `3`（否则「单段 vs 单段」会静默通过）、
+    两侧内容量一致、每个 query 必须有命中（防「空 == 空」空转）。
+  - **`S8_T4_带跨段删除_合并前后双参照系`**：① **合并前**（墓碑未物理化）对照
+    「单段建库**不删** + 命中集剔除」——并显式断言两侧的 `allowed`（= `N`）**都含**被删 doc；
+    ② **合并后**对照「单段建库 + 同序 `remove`」（两侧都**不含**）。
+    另显式断言墓碑**真的挡住**召回（不是「只在统计量里扣」），且至少有一个 query 命中被删文档
+    （否则「命中集剔除」这一步没被验到）。
+  - **`S8_T8_合并与落盘往返保ID`**：`fold_deltas` 与 `save`/`load` 往返都不得改 ID（`D-S8-04`）；
+    判据用「搜出来那条命中的 `(doc_id, chunk_id)`」= 调用方真正持有的东西（`R50` 的静默风险面），
+    并显式断言「合并必须真的发生」（`segments` 2 → 1），否则「ID 不变」是空转通过。
+- **`Metrics.segments` / `Metrics.vector_segments` / `Metrics.tombstoned`**（设计 §4.13.3；评审 P2-2 的
+  「最低限观测」）—— 在 `search_parts` **入口**填值（三条早退路径也带真实值，不是草稿缓冲区的 `0`）；
+  `Metrics::log` 同步输出三个字段。`vector_segments` 是**表外新增面**（原表只列 `segments` / `tombstoned`），
+  理由与 `tombstoned` 的口径更正见设计 §4.13.3 的更正块。
+- **`IdAllocator.epoch`（ID 空间世代）** + `Shared::next_origin()` / `Shared::epoch()`：
+  `publish_reset()`（`compact` 重编号）**换代**；`SegmentBuilder` 在**同一把锁内**记下
+  「基址 + 世代」；`commit_view()` 新增 `expected_epoch` 对账。
+- 回归锁三条：`S8_03_compact换代后另一写端的提交被拒`（端到端**构造 ABA 窗口**，
+  `crates/core/tests/step8_segments.rs`）、`S8_03_换代后旧世代发布被拒_基址等值也拦不住ABA`
+  （`search/view.rs` 单测）、`S8_03_窗口吸收…` 的既有单测继续保留。
+
+#### Fixed
+
+- 🔴 **P2-4 采纳并落地（`compact()` × 多写端的 ID 空间换代）**：原实现只有**基址**对账，而
+  `compact()` 允许「已用长度变小」⇒ 若此后恰好又提交等量内容，`ids.next_*` 会回到旧 builder 记录的
+  **同一个**基址（**ABA 窗口**）⇒ 基址对账**通过** ⇒ 那条指向**旧 ID 空间**的跨段墓碑被并进视图
+  ⇒ 下一次物理化删掉的是**重编号后的另一个无辜文档**（静默错删）。
+  现在 `publish_reset()` 把世代 `+1`，`commit_view()` 世代不符即 `Err(Busy)` 并**点名** `epoch a → b`；
+  被拒的提交**不消耗** `generation`、也不发布任何内容。
+- **`fold_deltas` 的顺序纪律**：**先记世代、后取视图快照**。反序（先取视图、后读世代）会在
+  「`compact` 恰好落在两次读之间」时拿到「**旧**视图 + **新**世代」⇒ 对账**通过** ⇒ 用旧 `main`
+  的克隆覆盖新视图。
+- **`error.rs` 的 `Busy` 文档同步**（评审 P3-4.1 + P2-1 的剩余项）：删掉已作废的
+  「`S8-03` 后内核不再产生该错误」，改为登记**两条**新产生点（基址对账 / 世代对账），并写明两条
+  **都不满足「重试即可」**——本写端未提交内容已被丢弃，必须重新 `add`。
+- **设计 §4.13.3 的 `Metrics.tombstoned` 口径更正**：「被跨段墓碑挡掉的候选数」在召回层
+  **不可良定义**（同一 chunk 会被两条 lane、乃至同一路的多个 posting 重复取出 ⇒ 计数虚增）⇒
+  改为「视图里的**跨段墓碑条数**」（精确、O(1)，且正是调用方要的量：`0` = 热路径零谓词）。
+- 🔴 **`compaction_cli_semantics::CLI3` 的参照系更正（第 2 条已知红的定性收尾，红灯 2 → 1）**：
+  原断言 `graph_after < graph_tomb` 把 `graph_tomb` 当「8 点含墓碑的图」。`D-S8-01`（PR4 起
+  `save` 第一步 `fold_deltas`）之后**不再是**：第二次 `save()` 在**落盘前**就把 4 条跨段墓碑
+  物理化、并用 `retain` 后的 4 条原始向量**重建了图** ⇒ 磁盘上的「墓碑态」已经是一张 **4 点图**
+  ⇒ 两侧同量级。**实测**：8 点基线 **2425** 字节 ／ 墓碑态 **1097** ／ compact 后 **1097**（相等）
+  —— 这不是「图没收缩」，是**已经收缩过了**；旧断言据此必红，而 `hnsw_rs` 的层级分配用无种子
+  `OsRng` ⇒ 两棵同点数图的字节数上下浮动 ⇒ 旧断言**偶发通过**（= 本用例被登记为 flaky 的真因）。
+  ⇒ 参照系改为**同一装配的 8 点基线**（`graph_baseline` / `total_baseline`）：该判据与「回收发生在
+  `fold` 还是 `compact`」**无关**（`S8-06` 若改增量合并，结论不变），仍有 2.2× 的裕度。
+
+#### 自查抓到的问题（守门不会报这类）
+
+- 🔴 **clippy `-D warnings` 在第一次守门链里红了**（`match published { Ok(g) => g, Err(e) => return Err(e) }`
+  ⇒ clippy `question_mark`）：我先前只跑 `cargo test` / `cargo check`（它们不报这条 lint）⇒ 修成 `published?`
+  并**重跑整条链**（本 CHANGELOG 的读数取自修复后的链）。
+- ⚠️ **`charabia` / `local-rerank` 两个 feature 段第一次跑时没有 `--no-fail-fast`** ⇒ `cargo test`
+  在 `compaction_cli_semantics` 这个（按字母序第 4 个）二进制就停了，**后 13 个二进制根本没跑**
+  ⇒ 只看「段标记有、无 FAILED」会**误判覆盖完整**。已加 `--no-fail-fast` 重跑并据实报数。
+
+#### 变异验证（本轮 5 条注入，**表里填实测命中者**）
+
+| # | 注入（可逆，`git diff` 可见） | 期望命中 | **实测命中** | 红因（实读） |
+| --- | --- | --- | --- | --- |
+| **M-I8-5** | `SegmentedBm25Retriever` 的 `avgdl` 改读**首段**统计量（`self.set.segments[0].index.avgdl()`），即「各段各算 `avgdl`」那一类 | `S8_T4` ×2 | ✅ `S8_T4_跨段BM25与单段逐位一致` + `S8_T4_带跨段删除_合并前后双参照系` | 逐位断言（`query 检索`） |
+| **M-I8-6** | 段循环内**各段各算 `df`** ⇒ `idf` 随段变化（`term 外层累加` 的反例） | `S8_T4` ×2 | ✅ 两条（补强语料后） | 逐位断言（`query 段` / `query 检索`） |
+| **M-I8-7a** | `Shared::commit_view` 的基址改恒 `(0, 0)` | `S8_T4` ×2 | ⚠️ 红 8 条，但**红因 = 上游 `commit()` 基址对账 `Err(Busy)`** | **不计数**（红因与意图不符） |
+| **M-I8-7b** | **发布段的** `base_chunk` 置 0（绕开对账，只让 ID 空间真重叠） | `S8_T4` ×2 | ✅ 两条 | 逐位断言（`query 检索`） |
+| **M-P2-4** | `commit_view` 的世代检查改恒假（`if false && …`） | 两条 P2-4 回归锁 | ✅ `S8_03_换代后旧世代发布被拒_基址等值也拦不住ABA`（单测）+ `S8_03_compact换代后另一写端的提交被拒`（集成，**ABA 放行** ⇒ `unwrap_err()` 直接炸） | 断言 |
+| **M-P2-2** | `metrics.segments` 恒 0 | 依赖该字段的「前提自证」 | ✅ `S8_T4` ×2 + `S8_T8` | 前提断言（`参照系必须是单段` / `被测侧 = main + 1 个 delta`） |
+
+⚠️ **覆盖边界（如实登记）**：`M-I8-6` 首轮**只被主用例命中**，「带跨段删除」变体不敏感
+（该变体语料里没有**跨段共享词**）⇒ 已把 `T4_D1` 第 2 篇改成含「检索」（主段也出现的词）并复跑确认。
+`M-I8-7a` 说明 I8-7 的破坏**首先**被 `commit()` 的对账守卫拦住（纵深防御），
+但「逐位断言能不能抓」必须用 `M-I8-7b`（绕开守卫）证明 —— 两者不可互相替代。
+
+#### 仍未闭环（如实登记）
+
+- **`S8-T6` 已正式化**：`S8_T6_跨段墓碑下同内容重加经save后仍可去重` 补齐设计 §7 的**上半句**
+  （既往段同 hash ⇒ 必须去重、返回既有 `doc_id`、不分配新分片）。
+- **定义面回写仍不在本 PR**（更正我在第 1 轮响应里的措辞）：PR4 引入的定义面事实变更
+  —— `Metrics` 三个新公开字段、`requirements-spec.md:362`（FR-17 §5.3.5 的**行为行**仍写
+  「新增文档进入 delta 区，立即对检索可见」，`S8-03` 后应为「**`commit()` 后**进入 delta 区」）
+  —— 按设计 §8 归 **`S8-09`**（`PR7`）四处定义面同批回写 + 升版本行；本 PR 只回写**实现依据文档**
+  （设计 §4.13.3 / §6 / §7 与本文）。⚠️ 该行是**已知的需求面漂移**，已在此指名登记，不得在收尾时漏掉。
+- **P2-1 的另一半**：真正的「无损重基」（保留 builder、对齐基址后重新发布）仍未实现
+  （评审接受「错误信息如实声明」这一取形；本轮把**世代**那条也纳入同一声明）。
+- **P3-3**（`num_docs` × `tombstone_stats` 口径分叉，已按评审给的两个选项之一「doc 写明」落地）/
+  **P3-5**（`fold_deltas` 的 O(k·N)）/ **P3-6** / **P4-2 的其余两份 `locate` 收敛**：随 `S8-06` 处置。
+- ✅ **红灯已清零（同日追加，见下方「CI 红灯收尾」）** —— 原话「剩余 1 条已知红：`integration::T1`（留 PR5）」
+  已被**夹具更正**取代；⚠️ 判据一条未改，向量跨段本身**仍**留 PR5。
+- **变异验证的覆盖边界**：`MUT-I8-6`（各段各算 `df`）最初**只被主用例命中**，「带跨段删除」变体不敏感
+  —— 因为该变体的语料里没有跨段共享词 ⇒ 已把 `T4_D1` 第 2 篇改成含「检索」（主段也出现的词）
+  并复跑确认两条都命中；`MUT-I8-7a`（`commit_view` 基址置 0）的红因是**上游基址对账 `Err(Busy)`**
+  而非逐位断言 ⇒ **不作为「断言有牙齿」的证据**，改用 `MUT-I8-7b`（发布段的 `base_chunk` 置 0，
+  绕开对账）复现逐位断言命中。
+
+#### Changed
+
+- `Shared::next_base()` → **`Shared::next_origin()`**（返回 `(base_doc, base_chunk, epoch)` 三元组）。
+  ⚠️ 必须**一次取回**：分两次调用时另一个写端可在两次之间 `compact()`，得到
+  「**旧**世代基址 + **新**世代 epoch」这种**自相矛盾**的 builder（它的对账会通过 —— 正是 P2-4 要堵的窗口）。
+- `Shared::commit_view()` 返回 `Result<u64>`（新增 `expected_epoch` 参数）。
+
+> 守门读数（本地 11 段链，逐段核对 `BEGIN/END/EXIT` 标记齐全，**报数取自修复后的链**）：
+> `fmt` / `clippy --workspace --all-targets -- -D warnings` / `rustdoc -D warnings` / `make shell` /
+> `msrv 1.90`（`cargo +1.90.0 check --workspace --all-targets`）/ `no-default-features` /
+> `cargo build --release --workspace` / `cargo deny check advisories licenses bans sources` **全绿**；
+> `cargo test --workspace --no-fail-fast` = **346 passed / 1 failed / 6 ignored**（17 个测试二进制）；
+> `--features charabia --no-fail-fast` = **328 passed / 1 failed / 6 ignored**；
+> `--features local-rerank --no-fail-fast` = **325 passed / 1 failed / 11 ignored**。
+> 🔴 三个测试范围内的**唯一一条红是同一条**：`integration::T1_已删向量不霸占TopK名额`
+> （向量跨段留 PR5；见下方「仍未闭环」）。⇒ 红灯 **4 → 2 → 1**。
+>
+> 📌 **以上是本轮第一次推送时的读数**；同日追加的「CI 红灯收尾」把它变成了**全绿**
+> （见下一节的最新读数）。
+
+#### 🔴 CI 红灯收尾（**同日追加**；红灯 1 → **0**）
+
+##### Fixed（`integration::T1` 的**夹具**更正 —— **判据一个字未改**）
+
+`build_ghost_facade` 只 `add` + `commit`、**不 `save`** ⇒ `S8-03` 起内容全在 **delta 段**，
+而向量路的取形（设计 §4.6；跨段向量 = `S8-05`）**只覆盖 `main`**
+（`Searcher::parts` 交下去的是 `view.main.vector_index`）⇒ `main` 是一张**空图** ⇒
+基线断言 `hits.len() == k` 实测 **`left: 0 / right: 5`**（`integration.rs:291`；
+CI 的 `test` 与 `feature isolation` 两个 job 都栽在这一行）。
+
+🔑 **真因不是「少了一条断言」，而是「夹具没跟上 `S8-03` 的语义」**：原夹具下本用例
+**即便绿也是空转**（0 条候选时「不含幽灵」trivially 成立）。
+⇒ 夹具加 `save` + `load`（`D-S8-01`：`save` 第一步就 `fold_deltas` ⇒ 内容折进 `main`、
+`deltas` 清空）⇒ 向量路恢复覆盖，本用例**重新成为真测试**（图里确实有幽灵点，
+存活谓词必须把它们挡在 Top-K 之外）。
+
+⚠️ **不违反「刻意不改写该用例」**：那条纪律针对的是「把断言改成边界断言」（会销毁它对
+Q-C1 的回归价值）；本次改的是「**怎么造库**」，断言 / 基线 / 删除流程全部原样。
+⚠️ **本夹具不覆盖**「内容还在 `deltas` 时的向量路」（那是 `S8-05` 的领域）：该半盲态由
+`step8_segments.rs` 的 `S8_02_旧API与新API结果逐位一致`（`vector_recalled == 0`，
+`S8-05` 落地后必须反转）+ `Metrics.vector_segments` 观测钉住。
+
+##### Fixed（`CLI3` 的第三条断言 —— 顺带抓到的**纯噪声判据**）
+
+同一次收尾里，`--features local-rerank` 这一档把上一轮**漏删**的旧断言
+`total_after < total_tomb` 暴露出来（默认 feature 下侥幸通过）：墓碑态 **2619** vs
+compact 后 **2624** —— 两者相差**几字节**，差别只来自 `hnsw_rs` 的无种子 `OsRng`
+（**同源**于上一轮那条 `graph_after < graph_tomb`）。⇒ **删除**该断言：
+「体积必须回落」的语义已被以「8 点无墓碑基线」为参照的两条完整覆盖，且与
+「回收发生在 `fold` 还是 `compact`」无关。⚠️ 这正是「**一次红 run 会掩盖后面所有二进制**」
+的反面教材：它在默认 feature 下不红，是**换了 feature 组合**才现形的。
+
+##### Changed（CI 工程卫生：**别让早期失败掩盖覆盖面**）
+
+- `test` job：`cargo test --workspace` → **`cargo test --workspace --no-fail-fast`**。
+  🔴 **实测依据**（head `26b81d7`）：`cargo test` 默认在**第一个失败的测试二进制**就停 ⇒
+  那次 run 的 `test` job **只跑完 8 个测试目标**就结束（本地同命令 **17 行**）⇒ 按 cargo 的
+  字母序，`integration` 之后的 `step4_compaction` / `step4_liveness` /
+  `step5_query_observability` / `step6_incremental_build` / `step7_rerank_local` /
+  `step8_rw_concurrency` / **`step8_segments`（本 PR 新增的 `S8-T4` 门测试就在里面）** /
+  `vector_ab` **在 CI 上从未跑过** —— 那次「CI 只有一条红」的读数**低估了未验证面**。
+- `features` job：三个 `cargo test` 加 `--no-fail-fast`；第 2~4 步
+  （`local-rerank` ×2 / `no-default-features`）加 **`if: always()`** —— 同一原因：
+  Actions 默认在**第一个失败的 step** 就停，那次 run 在第 1 步（charabia）就中断，
+  后 3 个 feature 组合**没跑**。
+- ⚠️ **这不是放宽门禁**：job 仍然红，只是**把失败报全**（一次 run 看到全部失败点与全部覆盖）。
+  本 PR 的红灯由**修代码**清掉，不是由这两个改动清掉的。
+
+##### 最新读数（12 段链，含 CI 的 `-p helix --features local-rerank` 一步）
+
+| 段 | 结果 |
+| --- | --- |
+| `fmt` / `clippy -D warnings` / `rustdoc -D warnings` / `make shell` / `msrv 1.90` / `no-default-features` / `build --release --workspace` / `cargo deny` | ✅ 全绿 |
+| `cargo test --workspace --no-fail-fast` | ✅ **347 passed / 0 failed / 6 ignored**（17 行） |
+| `cargo test -p helix-core --features charabia --no-fail-fast` | ✅ **329 passed / 0 failed / 6 ignored** |
+| `cargo test -p helix-core --features local-rerank --no-fail-fast` | ✅ **326 passed / 0 failed / 11 ignored** |
+| `cargo test -p helix --features local-rerank` | ✅ **21 passed / 0 failed** |
+
+⇒ **红灯 4 → 2 → 1 → 0**。
+
+
+### 修复 · V2 Step 8 PR 4 · **第 1 轮评审响应**（#63，2026-09-19）—— P1-1 窗口吸收 + P1-2 去重条目 + 4 条红定性更正 + 死代码清理
+
+> 评审落点 = `pulls/63/reviews`（**1 条：2×P1 + 5×P2 + 6×P3 + 5×P4**）+ **行内 10 条**；`issues/63/comments` = **0**；
+> 被评审 SHA = `fe940e5`。评审由**本地 DeepSeek Harness（dsh）**出具、作者代其上载（其执行通道在本机不可用）。
+
+#### Fixed
+
+- 🔴 **P1-1 采纳（窗口吸收）**：`fold_deltas` 的发布闭包原为 `move |_cur, …|` ⇒ **无视锁内 `cur`**：
+  另一个写端在「取快照」与「拿锁」之间提交的 delta 会被**静默丢弃**、且 `ids.next_*` **回缩**（后续内容复用已发号的 ID）。
+  ⇒ 新增纯函数 `Shared::absorb_window()`：**无损吸收**窗口内新提交的 delta（合并**不改 ID** ⇒ 其 `base_*` 仍有效）、
+  只摘掉**本次已物理化**的墓碑；`used_*` 取 `max(计算值, 锁内真值)` ⇒ 不再回退。
+- 🔴 **P1-2 采纳**：① `Index::remove` 的 hash 摘除改**条件式**（只摘指向本 doc 的条目，否则会抹掉「替换文档」的去重条目 ⇒ FR-15 静默失效）；
+  ② `merge_from` 的 `content_hash` 碰撞 `debug_assert!` **删除**（碰撞在「墓碑挡住查重 ⇒ 允许重新 upsert」下是**合法状态**）。
+  ⇒ 新增回归用例 `S8_T6_跨段墓碑下同内容重加经save后仍可去重`（修前 debug 必 panic）。
+- **T11 的期望更正**（评审 P3-1 判断正确）：`before_docs/before_chunks` 必须在**显式 `commit()` 之后**读
+  （`S8-03` 起计数只算已发布内容 ⇒ 原写法读到 0）。
+- **T3 的判据改为「结果」**：实测三档（[A] builder 内删+内存 compact = 0 / [B] 加 save→load = 0 /
+  [C] **先 commit 再删（墓碑路径）= 11**）⇒ 死词在 `save` 的 **fold 期**就被丢弃（`merge_from` 的倒排合并
+  只对非空链 `add`）且**不计入任何计数**；新增同伴用例 `T3b_墓碑路径下compact仍回收死词` 继续钉住计数器语义。
+- **P2-3 注释自相矛盾**：向量侧改回如实陈述（本 PR 取保守的「全量重建」；**「只能重建」的绝对命题撤回** ——
+  `D-S8-09` 的方案 A 不需要旧图所有权；spike S8-S1 未做 ⇒ 该取形是**暂定**的）。
+- **P2-5 设计文本更正**：`S8-T4` 的「合并前」参照系**结构上不可满足**（未合并窗口的 `N`/`total_len`/`df` 含墓碑 doc，
+  而「单段建库 + `remove`」不含）⇒ 改为「单段建库**不删** + 命中集剔除」，**合并后**才对照「单段建库 + 同序 `remove`」。
+- **P2-1 诚实化（部分）**：`commit()` 对账失败路径的**内容丢弃**已写进错误消息（「重试不会恢复」）；
+  无损重基取形 + `error.rs` 文档同步留给下一提交。
+- **P3-4.5 设计文本同步**：§4.7.3 的取形改为「判据只看有无跨段墓碑」—— 实现（零谓词，不论有无 delta）**优于原文本**。
+
+#### Removed
+
+- **死代码清理（评审 P3-4.4 / P4-2 / P4-3）**：`Shared::with_main_mut()` + `write_needs_exclusive()`（连同
+  `S8_02_有读者时写入必须失败` 用例）、`View::locate()`（三份等价实现里零调用点的那份）、`Segment::global_chunk()`、
+  `View::needs_bm25_tombstone_filter()`。⚠️ 这 5 处 `dead_code` 在 `fe940e5` 上**就已存在** ⇒ 上一轮的
+  「0 warning」读数是**缓存假象**（cargo 未重编译时不重放警告），实际跑 `clippy -D warnings` 会**直接红**。
+  顺带修掉 clippy 的 `length comparison to zero`（`search/searcher.rs`）。
+
+#### Added
+
+- `Shared::absorb_window()` + 单测 `S8_03_窗口吸收保留新提交的delta且只摘已物理化的墓碑`。
+- `S8_T6_跨段墓碑下同内容重加经save后仍可去重`（P1-2 回归锁）、`T3b_墓碑路径下compact仍回收死词`。
+
+#### ⚠️ 仍未完成（与评审的合并判定一致）
+
+- **P2-2**（`Metrics.segments` 最低限观测）/ **P2-4**（`publish_reset` 的 epoch 对账）/ **P3-3**（`num_docs` 与
+  `tombstone_stats` 口径分叉，本轮只加注记）/ **P3-5**（`fold_deltas` 的 O(k·N)）/ **P3-6** / **P4-2 的其余两份 `locate` 收敛**。
+- **`S8-T4` 门测试未落**（按更正后的双参照系写）、变异验证 / 13 段守门链 / 定义面回写仍未做。
+- ⚠️ **覆盖边界（本轮实测）**：P1-1 的**端到端竞态未能复现** —— 400×400 双写端探针在**修前（M9 变异）与修后
+  都是 0 丢失**（且 A 侧 `save()` 只报错 1/400）：A 的 `save()` 第一步 `commit()` 通常就先因基址对账失败而中止，
+  根本走不到 fold 窗口 ⇒ 机制属实（代码事实）但**触发难度高于评审的表述**；判据只到「纯函数 + 代码事实」层。
+  ⇒ 其中 **P2-2 / P2-4**、**`S8-T4` 门测试**、**`error.rs` 的 `Busy` 文档**已在本 PR 的**下一提交**闭环
+  （见上方「未闭环项收口」条目）；**P1-1 的端到端竞态**结论不变（仍未复现，是覆盖边界而非「已守住」）。
+
+### 新增 · V2 Step 8 PR 4（**WIP，未完成**）—— `S8-03` delta 写入闭环 + `S8-04` 跨段 BM25 / 谓词 + **最小文本侧合并**（Refs #58，2026-09-19）
+
+> ⚠️ **本条对应的实现尚未全绿**（见「已知红」）。条目先落，是因为**每个 PR 必带 CHANGELOG**，
+> 而本 PR 的用途 = **第三方 harness 评审**（见 PR 正文）。
+>
+> **本 PR 的范围偏差（须评审确认）**：设计 §8 的切分里合并器属 **PR6（`S8-06`）**，但
+> `D-S8-01` / `D-S8-12` 要求 `save()` / `compact()` **第一步就 `merge_all()`** —— 不做最小合并，
+> `save` 落盘的快照**只含 `main`** ⇒ **静默丢内容**。⇒ PR4 内实现**最小文本侧合并**（`fold_deltas()`，
+> 不含向量侧策略 / `MergeReport` / 字段索引等价 —— 那些仍留给 `S8-06`）。
+
+#### Added
+
+- **`search/index.rs`：`SegmentBuilder`**（`pub(crate)`，写端私有：`index` / `pending` / `raw_vectors` /
+  `vector` / `tombstones` / `base_doc` / `base_chunk`）—— `S8-03` 起**写端不再就地改 `main`**。
+- **`search/view.rs`：读侧跨段基础设施** —— `SegmentRef` / `SegmentSet`（FIFO 段列表 = `main, deltas[0], …`）/
+  `SegmentsInOrder` / `SegmentFilter` / `ViewFilter`（`CandidateFilter` 的跨段实现，`allowed_count`
+  为**精确计数**：`Σ allowed_seg − 墓碑挡掉的 chunk 数`）/ `View::sums()`（全局统计量）/
+  `Shared::publish_reset()`（`compact` 专用：**允许已用长度变小**，`I8-7` 的唯一合法例外）/
+  `View::segments_in_order()`。
+- **`retriever/bm25.rs`：`SegmentedBm25Retriever`** —— 跨段 BM25：**外层 term、内层段**的 TAAT 累加 +
+  **全局精确整数统计量**（`N` / `total_len` / `df(t)`）⇒ 与单段布局的 `bm25` 结果**逐位一致**（结构性结论）。
+- **`index/mod.rs`：`Index::merge_from()`** + **`index/forward.rs`：`ForwardStore::append_from()`** ——
+  把 delta 的内容按**本地顺序 append** 进主段，**不重编号**（合并保 ID：`S8-T8` 的门）。
+- **`tests/atomic_snapshot.rs`**：该用例的检索手段改为 **`bm25` 模式**（理由见下「Changed」）。
+
+#### Changed
+
+- **`SearchIndex`**：`add` / `flush` / `remove` 全部改走**自己的 builder**（不再 `with_main_mut`）
+  ⇒ **并发检索进行中也能写入**（`FR-17` 的核心诉求）；`commit()` = `flush` → **封段** → 持
+  `Shared::ids` 锁**原子追加进 `View.deltas`** → 发布新 `View`（含**基址对账**：双写端插队 ⇒ `Error::Busy`，
+  不静默发错 ID）。
+- **`remove` 三分支**：① 目标在**当前 builder**（未发布）⇒ 就地物理删；② 在**既往段** ⇒ 记**跨段墓碑**
+  （`View.tombstones`）；③ 不存在 ⇒ no-op。跨段 `content_hash` 查重同步覆盖「命中但被墓碑挡住 ⇒ 视为未命中」。
+- **`compact_with_bytes`**：改走 `Shared::publish_reset()`（重编号 ⇒ 新主段**比原来短**，必须重置发号器）
+  **+ 重编号后重建 builder**（否则后续 `commit()` 的基址对账必失败）。
+- **`SearchParts` 新增 `segment_set` / `predicate_builder` 两个字段** —— ⚠️ **破坏性**：下游若有字面量
+  构造 `SearchParts { … }` 会编译失败（本仓内为 0 处）。
+- **`atomic_snapshot::TI5_strict失败后快照仍可加载并恢复`** 的检索手段由 `hybrid` 改为 **`bm25`**：
+  该断言验的是「快照内容完整」，而 `save` 前先合并会让图按**全量原始向量重建** ⇒ ANN 拓扑变化 ⇒
+  `hybrid` 的 top-10 漂移（§4.6.2 明确「ANN 路径不承诺跨布局逐位一致」）。**BM25 与图无关、确定性**，
+  语义不变。
+
+#### Fixed
+
+- **`Shared::new` 的发号器初始化**：原用 `IdAllocator::default()`（全 0）⇒ `load` 后主段已有 N 个槽位，
+  新段 ID 会与主段**重叠**（破坏 `I8-7`）。改为从 `main.index.total_docs()` / `total_chunks()` 起步。
+- **`fold_deltas` 的 `raw_vectors` 未按 liveness 过滤** ⇒ 快照会带**已删 chunk** 的向量。
+- **跨段 BM25 的零谓词判据漏了「跨段墓碑」** ⇒ 墓碑挡不住检索（数据错误）。
+
+#### ⚠️ 已知红（本 PR 尚未完成的部分）
+
+- `step4_compaction`：2 条（compact / 死词回收与 delta + 墓碑的交互 —— 设计上属 `S8-06` 领域）
+- `compaction_cli_semantics`：1 条（图 sidecar 体积）
+- `integration`：1 条（`已删向量不霸占 TopK 名额` —— **向量路只覆盖 `main`**；跨段向量属 `S8-05`/PR5，
+  按已拍板的**范围决策**留待 PR5，不在本 PR 内掩盖）
+- `tests/step8_segments.rs` 的新用例（含 **`S8-T4` 跨段 BM25 逐位一致**）**尚未补**；变异验证 / 守门链 /
+  设计文档实施结果回填**均未做**。
+
+#### 设计文档更正
+
+- `docs/devel/v2-step8-design.md` **§4.10**：原写「`load` … **`ids` 归零**」为**错误**（会让新段全局 ID
+  与主段重叠、破坏 `I8-7`）；更正为「**`ids` 不归零**：从主段已用槽位数起步」，并附实测依据
+  （`S6_T8` / `S6_T10` 两条用例）。
+
 ### 修复 · V2 Step 8 PR 3 · **第 1 轮评审响应**（#62，2026-09-18）—— `commit()` 原子化（P2）+ 跨段求和（P3-2）+ 3 处顺手修
 
 > 评审落点 = `pulls/62/reviews`（**1 条：1×P2 + 2×P3 + 3×P4**）+ **行内 5 条**；`issues/62/comments` = **0**；

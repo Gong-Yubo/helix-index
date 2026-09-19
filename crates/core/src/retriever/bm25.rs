@@ -8,10 +8,11 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use crate::analyze::Analyzer;
+use crate::document::Chunk;
 use crate::error::Result;
 use crate::index::Index;
 use crate::predicate::CandidateFilter;
-use crate::types::ChunkId;
+use crate::types::{ChunkId, DocId};
 
 use super::{Retriever, Scored};
 
@@ -94,7 +95,10 @@ impl Retriever for Bm25Retriever<'_> {
         // TAAT 累加：chunk_id → 累计分
         let mut acc: HashMap<ChunkId, f32> = HashMap::new();
 
-        // 去重 query term，但保留顺序无关紧要（累加）
+        // ⚠️ **刻意不去重** query term（`S8-03` 评审 P4-1 更正了旧注释的「去重」说法）：
+        //    本循环与跨段版（`SegmentedBm25Retriever`）里的同类循环都是 `for token in tokens`
+        //    直遍 ⇒ 重复 term 会累加两次 —— **两条路径同形**，这正是逐位一致的前提之一
+        //    （若只有一边去重，跨段与单段的结果就会分叉）。
         for token in tokens {
             let term = token.term.as_str();
             let Some(term_id) = self.index.term_id(term) else {
@@ -122,6 +126,201 @@ impl Retriever for Bm25Retriever<'_> {
         }
 
         // 收集 → 排序（score 降序，chunk_id 升序 tie-break）
+        let mut out: Vec<Scored> = acc
+            .into_iter()
+            .map(|(chunk_id, score)| Scored { chunk_id, score })
+            .collect();
+        out.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| a.chunk_id.cmp(&b.chunk_id))
+        });
+        out.truncate(k);
+        Ok(out)
+    }
+}
+
+/// 一个段的**检索视图**（`S8-04`）：段内索引 + 它在全局 ID 空间里的基址。
+///
+/// ⚠️ 公开的理由：它是 [`SegmentSet`] 的元素，而 `SegmentSet` 是 `SearchParts`
+/// （公开结构）的字段类型。它**不**暴露 `Segment`（那是 `pub(crate)`）——
+/// 只借 `Index` 与两个基址，都是公开类型。
+#[derive(Debug, Clone, Copy)]
+pub struct SegmentRef<'a> {
+    /// 段内索引（**本地** ID 从 0 起）
+    pub index: &'a Index,
+    /// 该段的全局 `doc_id` 基址（`全局 = base_doc + 本地`）
+    pub base_doc: DocId,
+    /// 该段的全局 `chunk_id` 基址
+    pub base_chunk: ChunkId,
+}
+
+/// **跨段** BM25 的输入（`S8-04` / 设计 §4.5.1）：FIFO 顺序的段 + **全局整数统计量**。
+///
+/// 🔑 `n` / `total_len` 必须是**跨段精确和**（`I8-5`）—— 由调用方（`Searcher::parts`）
+/// 用 `Σ` 算好，而不是让检索器自己猜。
+#[derive(Debug, Clone)]
+pub struct SegmentSet<'a> {
+    /// **FIFO 顺序**：`main, deltas[0], …`。
+    ///
+    /// ⚠️ **顺序是正确性的一部分**（`I8-6`）：TAAT 的累加顺序必须与单段建库一致
+    /// （段内 postings 是 push 序 ⇒ 全局 `chunk_id` 升序）。
+    pub segments: Vec<SegmentRef<'a>>,
+    /// 全局 `N`（= Σ 各段**活**分片数）
+    pub n: u32,
+    /// 全局 `total_len`（= Σ 各段词项总数）
+    pub total_len: u64,
+    /// 跨段墓碑条数（**针对既往段**的全局 doc 墓碑）。
+    ///
+    /// 🔑 它决定 BM25 能否走**零谓词**热路径（`R52` / 设计 §4.7.3）：
+    /// 段内的删除总是**物理摘除**该段 postings ⇒ 活 postings 里不可能有本段已删的
+    /// chunk；真正需要判活的只有**跨段墓碑**（目标 doc 在所属段里仍存活、postings 还在）。
+    /// ⇒ `tombstones == 0` 时 BM25 可以传 `filter = None`（与单段同速）。
+    pub tombstones: usize,
+}
+
+impl<'a> SegmentSet<'a> {
+    /// 全局 `chunk_id` → `(段, 段内本地 id)`；不属于任何段 ⇒ `None`。
+    pub fn locate(&self, global_chunk: ChunkId) -> Option<(SegmentRef<'a>, ChunkId)> {
+        for seg in &self.segments {
+            if let Some(local) = global_chunk.checked_sub(seg.base_chunk) {
+                if (local as usize) < seg.index.total_chunks() {
+                    return Some((*seg, local));
+                }
+            }
+        }
+        None
+    }
+
+    /// 按全局 `chunk_id` 取分片正文（回捞用）。
+    pub fn chunk(&self, global_chunk: ChunkId) -> Option<&'a Chunk> {
+        let (seg, local) = self.locate(global_chunk)?;
+        seg.index.chunk(local)
+    }
+
+    /// 按全局 `chunk_id` 取**全局** `doc_id`（回捞用）。
+    pub fn global_doc_id(&self, global_chunk: ChunkId) -> Option<DocId> {
+        let (seg, local) = self.locate(global_chunk)?;
+        seg.index.doc_of(local).map(|d| seg.base_doc + d)
+    }
+
+    /// 该**全局** `doc_id` 是否落在某个段里（合并/墓碑判定用）。
+    pub fn owns_doc(&self, global_doc: DocId) -> bool {
+        self.segments.iter().any(|seg| {
+            global_doc >= seg.base_doc
+                && ((global_doc - seg.base_doc) as usize) < seg.index.total_docs()
+        })
+    }
+
+    /// 词典探针：query 的任一 term 在**任何段**里有 posting 吗？
+    ///
+    /// 与单段的 `query_has_hits` **同口径**（去重 query term、判 `df > 0`），
+    /// 只是把「单个索引」换成「所有段」。用于空结果时区分
+    /// 「query 侧无命中」与「过滤太窄」（§5.8.1 的 query 侧优先）。
+    pub fn any_term_hits(&self, analyzer: &dyn Analyzer, query: &str) -> bool {
+        let mut seen = std::collections::HashSet::new();
+        analyzer
+            .analyze_query(query)
+            .iter()
+            .filter(|t| seen.insert(t.term.as_str()))
+            .any(|t| {
+                self.segments
+                    .iter()
+                    .any(|s| s.index.doc_freq(t.term.as_str()) > 0)
+            })
+    }
+}
+
+/// **跨段** BM25 检索器（`S8-04` / 设计 §4.5.2）。
+///
+/// 与单段的 [`Bm25Retriever`] 的差别只有「统计量取全局和」与「遍历是 term 外层、
+/// **段**内层」两点 —— 而这两点恰好是 `S8-T4`「分段布局与单段布局逐位一致」的**全部**条件
+/// （设计 §2.5 的可加性分析）。
+pub struct SegmentedBm25Retriever<'a> {
+    set: &'a SegmentSet<'a>,
+    analyzer: &'a dyn Analyzer,
+    params: Bm25Params,
+}
+
+impl<'a> SegmentedBm25Retriever<'a> {
+    /// 构造（默认 `Bm25Params`，即 P5 定稿值）。
+    pub fn new(set: &'a SegmentSet<'a>, analyzer: &'a dyn Analyzer) -> Self {
+        Self {
+            set,
+            analyzer,
+            params: Bm25Params::default(),
+        }
+    }
+
+    /// 覆盖 BM25 参数（与单段版同签名，网格搜索/调参用）。
+    pub fn with_params(mut self, params: Bm25Params) -> Self {
+        self.params = params;
+        self
+    }
+}
+
+impl Retriever for SegmentedBm25Retriever<'_> {
+    fn search_filtered(
+        &self,
+        query: &str,
+        k: usize,
+        filter: Option<&dyn CandidateFilter>,
+    ) -> Result<Vec<Scored>> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let tokens = self.analyzer.analyze_query(query);
+        if tokens.is_empty() || self.set.n == 0 {
+            return Ok(Vec::new());
+        }
+
+        let n = self.set.n as f32;
+        // ⚠️ `avgdl` 用**全局** `total_len / N` 算**一次**（`I8-5`）：各段各算再平均会引入
+        //    两次浮点舍入 ⇒ 分数只在分段布局下漂移。
+        let avgdl = self.set.total_len as f32 / self.set.n as f32;
+        let k1 = self.params.k1;
+        let b = self.params.b;
+
+        let mut acc: HashMap<ChunkId, f32> = HashMap::new();
+
+        for token in tokens {
+            let term = token.term.as_str();
+            // `df` = **全局精确整数和**（`I8-5`）—— 不是最大值、不是平均
+            let df: u32 = self
+                .set
+                .segments
+                .iter()
+                .map(|s| s.index.doc_freq(term))
+                .sum();
+            if df == 0 {
+                continue; // OR 语义：该 term 不贡献
+            }
+            let x = (n - df as f32 + 0.5) / (df as f32 + 0.5);
+            let idf = (1.0 + x).ln();
+
+            // ⚠️ `I8-6`：**外层 term、内层段**（FIFO）。段内 postings 是 push 序 ⇒
+            //    全局 `chunk_id` 升序 ⇒ 与单段建库的累加顺序**逐位一致**。
+            for seg in &self.set.segments {
+                let Some(term_id) = seg.index.term_id(term) else {
+                    continue; // 该段没有这个词
+                };
+                for posting in seg.index.postings_by_id(term_id) {
+                    let global = seg.base_chunk + posting.chunk_id;
+                    if let Some(f) = filter {
+                        if !f.contains(global) {
+                            continue;
+                        }
+                    }
+                    let dl = seg.index.chunk_len(posting.chunk_id) as f32;
+                    let tf = posting.tf as f32;
+                    let norm = k1 * (1.0 - b + b * dl / avgdl);
+                    let partial = idf * (tf * (k1 + 1.0) / (tf + norm));
+                    *acc.entry(global).or_insert(0.0) += partial;
+                }
+            }
+        }
+
         let mut out: Vec<Scored> = acc
             .into_iter()
             .map(|(chunk_id, score)| Scored { chunk_id, score })

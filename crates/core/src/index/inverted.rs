@@ -14,7 +14,7 @@ use crate::types::{ChunkId, TermId};
 use super::posting::Posting;
 
 /// 倒排索引：词项 → 倒排链（chunk_id 升序，服务于确定性 NFR-06）。
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct InvertedIndex {
     /// term → TermId
     terms: HashMap<SmolStr, TermId>,
