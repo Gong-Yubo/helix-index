@@ -9,6 +9,97 @@
 
 ## [Unreleased]
 
+### 修复 · V2 Step 8 PR 4 · **第 2 轮评审响应**（#63，2026-09-19）—— 2×P1（多写端 / 未发布状态的缝隙）+ P3 恢复指引 + P4 登记
+
+> 落点 = `pulls/63/reviews` **1 条**（id `5255969412`，SHA `f69fb8e`）+ **行内 4 条**；`issues/63/comments` 无新增。
+> 评审另逐条确认了 §6 十二项（**12 项全 ✅**，含对 `epoch`/ABA 推演链与 CI 覆盖面修复的肯定）。
+> **两条 P1 都先确定性复现、再修、再做变异自证**（见下方「复现证据」）。
+
+#### Fixed
+
+- 🔴 **P1-1 `doc_id_by_hash_global` 不认 builder 上的未发布墓碑**（`crates/core/src/search/index.rs`）：
+  `remove` 的**分支②**（目标在既往段）把墓碑记在 `self.builder.tombstones`，要 `commit()` 才进
+  `View.tombstones`；而 ② 的查重循环**只查后者** ⇒ 「`remove(X)` 后**不 `commit()`** 直接重加同
+  `content_hash` 的内容」会命中**刚被删除的** X ⇒ 返回 `deduped = true` + `doc_id = X`
+  ⇒ **替换 / 重加静默丢失**（`commit()` 后 X 被墓碑挡住，而新内容**根本没被创建**，
+  调用方还拿到一个已死 doc 的 ID）。
+  🔑 **是缺口不是设计**：同序列在**分支①**（目标未发布）下会就地物理删 + 条件式摘 hash 条目 ⇒ 重加正常；
+  而 FR-15 的「替换文档」流程（同 `dedup_key`、不同正文）**总是**落在分支②。
+  **修法** = 查重判据补上 `|| self.builder.tombstones.blocks_doc(global)`（一行）。
+  **复现证据**（先红后绿）：新增 `S8_T6_remove未commit即重加不得被去重吞掉`，修前在
+  `assert!(!again.deduped)` 处失败（`step8_segments.rs:489`）。
+- 🔴 **P1-2 `absorb_window` 的长度前缀假设被并发 `fold` 破坏**（`crates/core/src/search/view.rs`）：
+  判据只有「`cur_deltas.len() >= snapshot_deltas`（delta 只增）」，而 `fold` **不改 `epoch`**
+  ⇒ 世代对账**拦不住**并发 fold。交错：A 取快照 `[D1]`（O(N) 克隆 + O(N·logN) 向量重建 = **秒级窗口**）
+  → B fold 把 D1 吸进 `main` 并发布（`deltas = []`）→ B `add(D2)` + `commit()`（`deltas = [D2]`）
+  → A 发布：**长度 1 == 1** ⇒ 旧判据放行，而 `skip(1)` 跳掉的是 **D2** ⇒ **D2 从视图静默消失**，
+  而 `ids.next_*` 已把它的槽位记账（**永久孤儿区间**）；A 随后的 `save` 把该状态落盘。
+  **修法** = 判据从「长度」升级为**前缀身份**（段不可变 ⇒ `Arc::ptr_eq` 是合法身份判据）：
+  快照把 `Vec<Arc<Segment>>`（clone = O(1)）带进发布闭包，锁内校验前 N 项逐个 `Arc::ptr_eq`，
+  不符 ⇒ `Err(Busy)`。为此 **`Shared::commit_view` 的 `build_next` 改为可返回 `Result`**
+  并保证「`Err` ⇒ **不做任何记账**」（序号不消耗 / `base` 不推进 / 视图不动）。
+  ⚠️ **`absorb_window` 的 `debug_assert` 已删除**：它被定位为「防旁路守卫」，但**合法路径**
+  （并发 fold）就能踩到 ⇒ 必须 dev/release **双端显式拒绝**。
+  **复现证据**（先红后绿）：纯函数级确定性构造（无需线程时序）—— 修前
+  `absorb_window(&[D2], 1, …)` 返回 `carried` 长度 **0**（D2 被当成 D1 跳掉）。
+
+#### Changed
+
+- **P3-1 三条 `Error::Busy` 的恢复指引按语义分家**（`error.rs` 的产生点表 + 两条消息）：
+  被丢弃的 builder 内容**含分支②记下的跨段墓碑** ⇒ 「`remove(X)` → `commit()` 被拒」的流程
+  若只照「重新 `add`」指引重试，**什么都不会恢复**（X 的删除静默失效、继续可检索）。
+  ⇒ `commit()` 的两条消息改为「重新执行未成功的 `add` **与 `remove`**」；
+  🔑 而 `fold` 那条**反过来**必须写「重试本次 `save()` / `compact()` **即可**」——
+  合并是**维护性**操作，被判拒时增量段**仍在视图里、内容没丢**，丢的只是本次合并的**计算**
+  （我第一版误抄了 `commit()` 的措辞，已按 NFR-07「恢复路径也要如实」更正）。
+- **P4-1 墓碑-only 空段的次生成本登记给 `S8-06`**（`SegmentBuilder::is_empty()` + `commit()` 注释）：
+  「无内容、有墓碑」被判非空是有意的（墓碑只能搭一次发布的便车进 `View.tombstones`），
+  但带来 ① `Metrics.segments` 被零内容段膨胀；② fold 期 `merge_from(空 Index)` 仍走
+  `ForwardStore::rebuild` + `field_index.rebuild`（各 O(N)）⇒ 每个墓碑-only 段白付一次全量 pass。
+
+#### Added
+
+- `crates/core/tests/step8_segments.rs`：**`S8_T6_remove未commit即重加不得被去重吞掉`**（P1-1 的回归锁）。
+- `crates/core/src/search/view.rs`：**`S8_03_窗口吸收必须校验前缀身份而非只看长度`**（P1-2 的回归锁；
+  三条判据 = 前缀相符放行 / 长度相等但身份不同 ⇒ 拒绝 / 长度回退 ⇒ 拒绝）。
+- `crates/core/src/search/view.rs`：**`S8_03_发布失败时不消耗任何记账`**（P1-2 的配套判据 ——
+  「`Err` 即无副作用」是**承诺**，必须可测）。
+
+#### 变异验证（3 条注入，**逐个命中且红因与意图相符**）
+
+| 注入 | 期望命中 | 实测 |
+| --- | --- | --- |
+| `M-P1-1`：查重退回「只查 `view.tombstones`」 | `S8_T6_remove未commit即重加…` | ✅ 该条红、**同文件的旧 `S8_T6` 绿** ⇒ 新变体是唯一绊线 |
+| `M-P1-2a`：`absorb_window` 退回「只判长度」 | `S8_03_窗口吸收必须校验前缀身份…` | ✅ 唯一红 |
+| `M-P1-2b`：`commit_view` 把 `ids.generation = generation` 提前到 `?` 之前 | `S8_03_发布失败时不消耗任何记账` | ✅ 唯一红（⚠️ 见下方「覆盖边界②」） |
+
+#### 守门链附带抓到的一条**既有 flaky**（`CLI4`，`D-S8-01` 系统性影响的**第 4 条**）
+
+- 🔴 **`CLI4_output另存源不变回收看源vs结果` 的 `dst_total < src_tomb` 是噪声判据**（≈**1/8 假红**）：
+  该断言本身由 **PR #31** 引入、`origin/main` 上就存在（`git log -S` 实测），
+  **但把它从稳健变成 flaky 的是本 PR 的 `D-S8-01`** —— `save` 第一步 `fold_deltas` ⇒
+  **第二次 `save` 就已把 4 条墓碑物理化、并用 4 条存活原始向量重建了图** ⇒ `src_tomb` 与 `dst_total`
+  **都是 4 点图**，两者只剩 `hnsw_rs` 无种子 `OsRng` 的层级分配差异。
+  **实测 8 次**：`src_tomb` 恒 **2556**；`dst_total` ∈ {**2528** ×7、**2579** ×1} ⇒ 符号随机翻转。
+  ⇒ 与 `CLI3` 的第三条断言**同一形状**（那条上一轮已删）：参照系改为**同一装配的 8 点基线**
+  （`graph_baseline` / `total_baseline`，在删除**之前**量取，≈2.2× 裕度）；**其余断言一条未放宽**。
+  **变异自证**：把 compact 重建图的原始向量**重复灌 3 遍**（4 → 16 点，模拟「图没有回收」）
+  ⇒ `CLI3` 与 `CLI4` 的基线判据**双双报红**（6713 vs 基线 2425 字节）。
+  ⚠️ 发现方式值得记：**同一次守门链里 `CLI3` 绿、`CLI4` 红** —— 上一轮的「`D-S8-01` 系统性影响」
+  清单（当时写「3 条均已收口」）**漏了这第 4 条**；`--features local-rerank` 那一档把它暴露出来。
+
+#### 覆盖边界（如实登记，**不声称已守住**）
+
+- ① **`fold_deltas` 的「接线」没有确定性判据**：三条新用例分别锁住**纯函数语义**（前缀校验）与
+  `commit_view` 的**错误语义**（失败不记账）；而「`fold_deltas` 真的把快照 `Arc` 列表传下去、
+  且真的把 `None` 转成 `Err`」这 6 行**没有测试能盖到** —— 真实的并发交错（另一写端恰在
+  「取快照」与「拿锁」之间 fold）**需要线程时序、无法确定性构造**（与 PR #63 上一轮 M9 同族）。
+  把它改回「忽略失败」的变异**不会让任何用例变红**。
+- ② `M-P1-2b` 意外暴露**我自己的断言名不副实**：`next_origin()` 只回报 `(next_doc, next_chunk,
+  epoch)`、**看不到** `ids.generation` ⇒ 我最初写的「发布失败不得消耗序号」那条断言在变异下
+  **照样绿**，真正抓住它的是**后面那条反向自证**（失败后再成功发布一次，序号必须是 1 而不是 2）。
+  已就地更正标注（两条都保留，因为它们观察的量不同）。
+
 ### 修复 · V2 Step 8 PR 4 · **未闭环项收口**（#63，2026-09-19）—— `S8-T4` 门测试落地 + P2-2 观测 + P2-4 epoch 对账
 
 > 处置对象 = 上一条（第 1 轮评审响应）末节登记的**未闭环清单**；本轮**没有新的评审意见**
