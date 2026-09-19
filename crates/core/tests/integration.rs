@@ -20,7 +20,7 @@ use helix_core::embed::Embedder;
 use helix_core::error::Result;
 use helix_core::index::Index;
 use helix_core::query::{QueryExecutor, SearchMode};
-use helix_core::search::{SearchIndex, VectorBackend};
+use helix_core::search::{SearchIndex, SearchIndexBuilder, VectorBackend};
 use helix_core::storage;
 use helix_core::types::{ChunkId, DocId};
 use helix_core::vector::{BruteForceIndex, NormalizedVector};
@@ -230,18 +230,50 @@ fn ghost_corpus() -> Vec<(String, String)> {
         .collect()
 }
 
-/// 返回（索引, [(doc_id, 该文档的分片)]），顺序与 [`ghost_corpus`] 一致。
-fn build_ghost_facade(backend: VectorBackend) -> (SearchIndex, Vec<(DocId, Vec<ChunkId>)>) {
-    let mut idx = SearchIndex::builder()
+/// 幽灵夹具的装配（同一份配置用两次：`build` 与 `load` —— 指纹必须一致，否则 `load` 报
+/// `ConfigMismatch`）。
+fn ghost_builder(backend: VectorBackend) -> SearchIndexBuilder {
+    SearchIndex::builder()
         .embedder(Some(Arc::new(FakeEmbedder)))
         .vector_backend(backend)
-        .build();
+}
+
+/// 返回（索引, [(doc_id, 该文档的分片)]），顺序与 [`ghost_corpus`] 一致。
+///
+/// # 🔴 为什么必须 `save` → `load`（`S8-03` / PR4 起；2026-09-19 更正）
+///
+/// `S8-03` 把**可见性边界**移到 `commit()`，同时把**内容**搬进了**追加段**：`add`/`commit`
+/// 只写「写端私有的 `SegmentBuilder` → `View.deltas`」，**`main` 要等 `save`/`compact` 的
+/// `fold_deltas` 才吸收内容**（`D-S8-01`）。
+///
+/// 而向量路的取形（设计 §4.6；跨段向量 = `S8-05`）**只覆盖 `main`**
+/// （`Searcher::parts` 交下去的是 `view.main.vector_index`）⇒ 原夹具「只 `commit` 不 `save`」下
+/// `main` 是一张**空图**：`mode("vector")` 候选恒空 ⇒ 本用例的**基线断言**
+/// （`hits.len() == k`）**必红**（实测 `left: 0 / right: 5`，CI 的 `test` 与 `feature isolation`
+/// 两个 job 都栽在这一行），而且**即便它绿也是空转** —— 0 条候选时「不含幽灵」trivially 成立。
+///
+/// ⇒ 夹具加 `save` + `load`：内容被折进 `main`（`deltas` 清空）⇒ 向量路恢复覆盖
+/// ⇒ 本用例重新成为**真测试**（图里确实有幽灵点，存活谓词必须把它们挡在 Top-K 之外）。
+///
+/// ⚠️ **判据一个字都没改**（仍是 `hits.len() == k`）：改的是「**怎么造库**」，不是「断言什么」。
+/// 因此它**不**违反「刻意不改写该用例」那条纪律 —— 那条针对的是「把断言改成边界断言」。
+///
+/// ⚠️ **本夹具不覆盖**「内容还在 `deltas` 时的向量路」（那是 `S8-05` 的领域）：该半盲态由
+/// `tests/step8_segments.rs` 的 `S8_02_旧API与新API结果逐位一致`（`vector_recalled == 0`，
+/// `S8-05` 落地后必须反转）+ `Metrics.vector_segments` 观测钉住。
+fn build_ghost_facade(backend: VectorBackend) -> (SearchIndex, Vec<(DocId, Vec<ChunkId>)>) {
+    let mut idx = ghost_builder(backend).build();
     let mut per_doc = Vec::new();
     for (source, text) in ghost_corpus() {
         let out = idx.add(Document::new(text).with_source(source)).unwrap();
         per_doc.push((out.doc_id, out.chunk_ids));
     }
     idx.commit().unwrap();
+    // 折叠进 `main` 再 load 回来（理由见上方文档）：`save` 的第一步就是 `commit` + `fold_deltas`
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ghost.idx");
+    idx.save(&path).unwrap();
+    let idx = ghost_builder(backend).load(&path).unwrap();
     (idx, per_doc)
 }
 
@@ -260,6 +292,13 @@ fn build_ghost_facade(backend: VectorBackend) -> (SearchIndex, Vec<(DocId, Vec<C
 ///
 /// hnsw_rs 没有 remove API（设计 §2.1 / H2），已删向量物理上仍在图里，
 /// 只能靠存活位图谓词在检索期挡掉，故两种后端都要覆盖。
+///
+/// # 🔴 夹具前提：内容必须落在 `main` 里（`S8-03` 起）
+///
+/// 本用例**要求向量路真的能召回**（基线 `hits.len() == k`、删除后仍要填满 K）⇒ 夹具必须在
+/// `main` 里有非空向量图。理由与取形（`save` → `load`）见 [`build_ghost_facade`] 的文档 ——
+/// 那是「内容全在 `deltas` 时向量路扫空图」这条**已知边界**（跨段向量 = `S8-05`）的落点。
+/// **动夹具前请先读那段**：把 `save`/`load` 去掉会让本用例变回「空图上的空转测试」。
 ///
 /// # 关于 Hnsw 后端的 flakiness（实测，勿回退本配置）
 ///
