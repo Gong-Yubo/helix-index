@@ -14,6 +14,13 @@ name: CI
 #     否则与 test job 完全冗余；真实目的是防止有人抬高 toolchain 后
 #     NFR-08 的 MSRV 声明悄悄失效
 #   - features job 验证 charabia feature 隔离与 no-default-features 可编译
+#   - 测试类 job（`test` / `features`）**一律带 `--no-fail-fast`**，且 `features` job 的
+#     第 2~4 步带 `if: always()`（2026-09-19 / PR #63 补）：
+#     `cargo test` 默认在**第一个失败的测试二进制**就停、Actions 默认在**第一个失败的 step**
+#     就停 ⇒ 一处早期失败会把后面一大片变成「未验证」，而界面上只显示一条红。
+#     实测（head `26b81d7`）：`test` job 只跑完 **8 个测试目标**就结束（本地同命令 17 行），
+#     `step4_*` ~ `vector_ab`（含刚落地的 `step8_segments` 门测试）**在 CI 上从未跑过**。
+#     ⚠️ 这不是「放宽门禁」：job 仍然红，只是**把失败报全**。
 #
 # 评测（eval-quality / eval-perf）**故意不进 CI**：
 #   效果评测需 12K 段落 embed（~230s）；性能是毫秒级 P99 口径，
@@ -93,7 +100,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # 注意：不跑 --ignored（那 4 个需要下载 ONNX 模型 + 万级 HNSW 构建）
-      - run: cargo test --workspace
+      #
+      # 🔴 `--no-fail-fast`（2026-09-19 / PR #63 补）：cargo 默认在**第一个失败的测试二进制**
+      #    就停止 ⇒ 一个早期失败会把**后面所有二进制**变成「未验证」，而 job 只显示一条红、
+      #    看起来像「只有一处坏」。实测（PR #63，head `26b81d7`）：本步只跑完 **8 个测试目标**
+      #    就结束（本地同命令是 **17 行**），按 cargo 的字母序 `integration` 之后的
+      #    `step4_compaction` / `step4_liveness` / `step5_query_observability` /
+      #    `step6_incremental_build` / `step7_rerank_local` / `step8_rw_concurrency` /
+      #    `step8_segments`（当时刚落地 S8-T4 门测试的那个二进制）/ `vector_ab`
+      #    **在 CI 上从未跑过** —— 「CI 绿」与「这些测试真的过了」在那次 run 里是两件事。
+      #    ⇒ 加上它：一次 run 报出**全部**失败点，代价只在红 run 上多花几分钟（工作区 15s 级）。
+      - run: cargo test --workspace --no-fail-fast
 
   # ------------------------------------------------------------ 许可合规（NFR-09）
   deny:
@@ -151,8 +168,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # charabia 是 T5-09 的验证性依赖（feature 隔离，非默认），
       # 防止分支在无人使用时悄悄腐化
+      #
+      # ⚠️ 本 job 是**多步**的，而 Actions 默认「前一步失败 ⇒ 后续 step 不再执行」
+      #    ⇒ 只给 `cargo test` 加 `--no-fail-fast` 还不够：第 1 步红会让**剩余 3 步**
+      #    （两个 `local-rerank` + `no-default-features`）也变成「未验证」。
+      #    实测（PR #63，head `26b81d7`）：本 job 在第 1 步（charabia）就中断，后 3 步没跑。
+      #    ⇒ 第 2~4 步一律加 `if: always()`（**不是为了掩盖失败**：job 仍会红，
+      #    只是把「哪几个 feature 组合坏了」一次报全）。`--no-fail-fast` 同理覆盖
+      #    「同一个 `cargo test` 里的多个二进制」。
       - name: charabia feature
-        run: cargo test -p helix-core --features charabia
+        run: cargo test -p helix-core --features charabia --no-fail-fast
       # V2 Step 7 / S7-01：`local-rerank`（本地精排）同样是**非默认** feature ——
       # 模型合计 ≈2.19GB ⇒ 不能进默认构建 / 下载路径（设计 §3.6 / R44）。
       # 但本 crate 又必须**编译并测**它，否则重蹈 `coreml` 的腐化：
@@ -162,16 +187,19 @@ jobs:
       #    不依赖 fastembed 的 `rerank::scoring`，默认 `cargo test` 就跑到（`cfg(test)`）。
       #    本步覆盖的是「`LocalReranker` 这个适配层仍然编得过、非模型的单测仍然过」。
       - name: local-rerank feature
-        run: cargo test -p helix-core --features local-rerank
+        if: always()
+        run: cargo test -p helix-core --features local-rerank --no-fail-fast
       # V2 Step 7 / S7-03：CLI 侧的接线（`--rerank-window` / `--rerank-max-length`
       # 的参数面 + 守卫 + 装配注入）同样只在 `local-rerank` 下才编得出来那两条
       # 分支 ⇒ 必须**同批**覆盖，否则 `cli/Cargo.toml` 的 feature 透传会悄悄腐化
       # （step 失败点会落在「只在你本地才编的分支」上）。
       # 真模型仍不下载：这一步跑的是 `helix` 的单测（守卫/参数解析，纯函数）。
       - name: local-rerank feature (cli)
+        if: always()
         run: cargo test -p helix --features local-rerank
       # local-embed 必须真的可选（远程 embedding 场景会关掉它）
       - name: no-default-features
+        if: always()
         run: cargo check -p helix-core --no-default-features
 
   # ------------------------------------------------------------ release 构建
