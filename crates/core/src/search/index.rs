@@ -13,6 +13,7 @@
 //! 旧的 `into_searcher()` 保留为 `#[deprecated]` 薄封装 = `commit()` + `searcher()`，
 //! **行为与重构前逐位一致**（41 处既有调用点零改动）。
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::document::{content_hash, DocRecord, Document};
@@ -270,6 +271,67 @@ pub struct CompactionReport {
     pub remapped: bool,
     /// 落盘后的最终图状态；内存-only 时为磁盘旧值（§4.6）
     pub graph_status: GraphStatus,
+}
+
+/// 合并器**向量侧**走了哪条路（`MergeReport.vector_strategy`）。
+///
+/// 取形见设计 `v2-step8-design.md` §4.9.3；**由 spike S8-S1 标定**
+/// （`crates/core/examples/spike_s8s1.rs`，2026-09-20 实测：12000 + 1200 点 / 384 维）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorMergeStrategy {
+    /// 本次**没有向量侧工作**：库是纯 BM25 装配（无向量索引）⇒ 无图可合并、也无图可建。
+    None,
+    /// **方案 A**：主段图 `dump` → `load`（保住旧点拓扑）→ 把增量段的点 `insert` 进去。
+    ///
+    /// 成本 `O(delta)`。spike 实测：A 合计 **639ms**（dump 30 + load 33 + insert 576）
+    /// vs 全量重建 **4774ms** ⇒ **A/B = 0.134**（判据是 ≤ 1/5）。
+    Incremental,
+    /// **方案 B**：把「主段 + 增量段」的全部原始向量**全量重建**一张图。
+    ///
+    /// 成本 `O(N·logN)`。**它是方案 A 的兜底**：Brute 后端无图（`as_graph_persist()`
+    /// 是 `None` —— 类型事实）、增量段无原始向量、或 dump/load/insert 任一失败 ⇒ 走这条。
+    /// ⚠️ 它**重写图的拓扑** ⇒ ANN 排名会漂移（既不承诺也不要求逐位一致，见设计 §4.6.2）。
+    Rebuild,
+}
+
+/// 一次合并的**可观测**（`merge_pending` / `merge_all` 的返回值；设计 §4.9.1）。
+///
+/// ⚠️ 合并**不改 ID**（`D-S8-04`）：`chunk_id` / `doc_id` 在合并前后不变
+/// （`compact()` 是唯一会重编号的操作，且它必须在 `merge_all()` **之后**跑，见 `D-S8-12`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MergeReport {
+    /// 本次合并进主段的**增量段数**（`merge_pending` 恒 ≤ 1）
+    pub segments_merged: usize,
+    /// 本次并入的**活分片数**（不含被墓碑挡住的位）
+    pub chunks_merged: usize,
+    /// 本次**物理化**（真删）的跨段墓碑条数。合并后这些条目**从 `View.tombstones` 移除**
+    /// ⇒ 降级谓词可回到「零谓词」（§4.7.3 / R52 的回归**可逆**）。
+    pub tombstones_applied: usize,
+    /// 向量侧走了哪条路（见 [`VectorMergeStrategy`]）
+    pub vector_strategy: VectorMergeStrategy,
+    /// 向量侧耗时（毫秒）
+    pub vector_merge_ms: u128,
+    /// 本次合并总耗时（毫秒）
+    pub total_ms: u128,
+    /// 合并后视图的 `generation`（发布序号）
+    pub generation: u64,
+}
+
+/// 临时图文件的 **RAII 清理器**（方案 A 的 dump 目标）。
+///
+/// `hnsw_rs` 只提供**文件** IO（无内存序列化）⇒ 方案 A 必须落盘再读回；
+/// ⚠️ `tempfile` 是 **dev-dependency**（生产代码不可用）⇒ 自己管。
+/// 用 `Drop` 保证**任何路径**（含 `?` 早退与 panic）都清理 —— 每次合并会写数十 MB，
+/// 漏了会静默堆在 `/tmp`。
+struct GraphTempFiles(std::path::PathBuf);
+
+impl Drop for GraphTempFiles {
+    fn drop(&mut self) {
+        let paths = crate::storage::graph_paths(&self.0);
+        for p in [&paths.graph, &paths.data] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
 }
 
 /// 写端门面（拥有型）。持 `Shared`（与读端共享的视图 + 装配）与**私有**写缓冲。
@@ -970,7 +1032,7 @@ impl SearchIndex {
         // `D-S8-01`：**第一步就合并** ⇒ 落盘形态仍是**单段 `Index`**
         // （`SnapshotSections` / `FORMAT_VERSION` / `GraphManifest` 一个字节都不用改）
         self.commit()?;
-        self.fold_deltas()?;
+        self.merge_all()?;
         let seg = Arc::clone(&self.view().main);
         let vectors: Vec<(ChunkId, Vec<f32>)> = seg.raw_vectors.as_deref().unwrap_or(&[]).to_vec();
         let body_crc = crate::storage::save_with_crc(
@@ -1118,15 +1180,24 @@ impl SearchIndex {
 
     /// 把**全部**未合并段（`deltas`）按 FIFO 合并进主段 —— `save()` / `compact()` 的**前置**。
     ///
-    /// # 这是 `S8-06`（合并器）的**最小文本侧形态**
+    /// # 它做什么（`S8-06` 起是**完整合并器**）
     ///
-    /// 只做「文本侧 append + 跨段墓碑**物理化**（§4.9.2）+ 向量侧重建」，**不含**增量式
-    /// 向量合并、`MergeReport`、`merge_pending` / `merge_all` 的公开面、字段索引等价性用例
-    /// （那些留给 `S8-06`）。
+    /// - **文本侧**：克隆主段 → `Index::merge_from` 追加**前 `take` 个**增量段 →
+    ///   跨段墓碑**物理化**（§4.9.2：走既有 `Index::remove` 语义 + 从 `View.tombstones` 移除）。
+    /// - **向量侧**：**方案 A 优先**（`merge_vectors_incremental`：`dump→load→增量 insert`，
+    ///   `O(delta)`），失败或不支持（Brute / 无原始向量 / 点数不符）**回落方案 B**（全量重建，
+    ///   `O(N·logN)`）。由 **spike S8-S1** 标定，`MergeReport.vector_strategy` 如实记录走了哪条。
+    /// - **字段索引**：走 `FieldIndex::rebuild`（`Index::merge_from` 内），等价性由 `S8-T13` 钉住。
     ///
-    /// ⇒ 它存在的**唯一理由**：`D-S8-01` / `D-S8-12` 要求 `save` / `compact` 的**第一步**
-    ///    就是合并 —— 否则落盘只有 `main`，会**静默丢内容**。⚠️ 与设计 §8 的 PR 切分表
-    ///    （合并器属 `S8-06`）的偏差见 PR 正文。
+    /// # `take` 的语义
+    ///
+    /// `merge_all()` 传全部（`deltas.len()`）、`merge_pending()` 传 **1**（严格 FIFO）。
+    /// ⚠️ **跳段会破坏基址不变式**（§4.4.2）：后续段的 `base_*` 会指向尚未并入的内容。
+    ///
+    /// # 它为什么必须存在
+    ///
+    /// `D-S8-01` / `D-S8-12` 要求 `save` / `compact` 的**第一步**就是合并 ——
+    /// 否则落盘只有 `main`，会**静默丢内容**。
     ///
     /// # 与并发读的关系
     ///
@@ -1138,16 +1209,26 @@ impl SearchIndex {
     /// # 返回
     ///
     /// 本次合并掉的 delta 段数。
-    fn fold_deltas(&mut self) -> Result<usize> {
+    fn merge_n(&mut self, take: usize) -> Result<MergeReport> {
         // 🔴 **顺序是硬要求**（`S8-03` 评审 P2-4）：**先记世代、后取视图快照**。
         //    反过来的话，若 `compact()` 恰好落在两次读之间，我们会拿到「旧进程内的视图 +
         //    新世代的 epoch」⇒ `commit_view` 的世代对账**通过** ⇒ 把基于旧 `main` 克隆出来的
         //    `merged` 发布进新视图（旧 ID 空间覆盖新 ID 空间）。
         //    先记世代则相反：期间任何 `compact()` 都会让 epoch 变化 ⇒ 发布被拒（保守但正确）。
         let snapshot_epoch = self.shared.epoch();
+        let t_total = std::time::Instant::now();
         let view = self.view();
-        if view.deltas.is_empty() {
-            return Ok(0);
+        let take = take.min(view.deltas.len());
+        if take == 0 {
+            return Ok(MergeReport {
+                segments_merged: 0,
+                chunks_merged: 0,
+                tombstones_applied: 0,
+                vector_strategy: VectorMergeStrategy::None,
+                vector_merge_ms: 0,
+                total_ms: 0,
+                generation: view.generation,
+            });
         }
         let cfg = Arc::clone(&self.shared.cfg);
 
@@ -1163,18 +1244,19 @@ impl SearchIndex {
             view.main.raw_vectors.as_deref().unwrap_or(&[]).to_vec();
         let had_vectors = view.main.vector_index.is_some();
         let segment_generation = view.main.generation;
-        let merged_segments = view.deltas.len();
+        let merged_segments = take;
         // ⚠️ delta 段里的 `raw_vectors` 记的是**段内本地** `chunk_id`（builder 侧分配的），
         //    而 `main.raw_vectors` 记的是全局（`base = 0`）⇒ 拼接时必须**全局化**，
         //    否则落盘的原始向量带着错位的 ID（`load` 后向量与分片对不上）。
         let mut delta_raw: Vec<(ChunkId, Vec<f32>)> = Vec::new();
-        for seg in view.deltas.iter() {
+        let mut chunks_merged_now: usize = 0;
+        for seg in view.deltas.iter().take(take) {
             if let Some(raw) = seg.raw_vectors.as_deref() {
                 for (local, v) in raw {
                     delta_raw.push((seg.base_chunk + local, v.clone()));
                 }
             }
-            merged.merge_from(seg.index.clone())?;
+            chunks_merged_now += merged.merge_from(seg.index.clone())?;
         }
         raw_all.extend_from_slice(&delta_raw);
 
@@ -1212,16 +1294,50 @@ impl SearchIndex {
         // - ⚠️ **spike S8-S1 一条判据都还没测**（本 PR 只落地、未标定）⇒ 这个取形是
         //   **暂定**的，不是标定结论。
         // - `MergeReport.vector_strategy` / spike 结论 → `S8-06`。
-        let vector_index = if had_vectors {
-            Some(rebuild_vector_index(
-                self.shared.backend,
-                &raw_all,
-                cfg.ef_search,
-                cfg.parallel_build,
-            )?)
+        //
+        // 🔑 **`S8-06` 起改为「方案 A 优先、失败/不支持回落 B」**（设计 §4.9.3；spike S8-S1 标定）：
+        //    A = 主段图 `dump` → `load`（**保住旧点拓扑**）→ 把增量段的点 `insert` 进去
+        //    ⇒ 成本 **O(delta)** 而非 O(N·logN)。spike 实测（12000 + 1200 点 / 384 维）：
+        //    A 合计 **639ms** vs B **4774ms** ⇒ **A/B = 0.134**（判据 ≤ 1/5）；A 的召回与 B
+        //    同量级（以 Brute 为参照 0.9170 vs 0.9270）。
+        //    `MergeReport.vector_strategy` **如实记录**本次走了哪条（不统一口径、不猜）。
+        let t_vec = std::time::Instant::now();
+        let (vector_index, vector_strategy) = if !had_vectors {
+            (None, VectorMergeStrategy::None)
         } else {
-            None
+            let a = self.merge_vectors_incremental(&view.main, &delta_raw);
+            let (vi, strat) = match a {
+                Ok(Some(vi)) => (vi, VectorMergeStrategy::Incremental),
+                Ok(None) => (
+                    rebuild_vector_index(
+                        self.shared.backend,
+                        &raw_all,
+                        cfg.ef_search,
+                        cfg.parallel_build,
+                    )?,
+                    VectorMergeStrategy::Rebuild,
+                ),
+                Err(e) => {
+                    // ⚠️ **不静默**（NFR-07）：A 是**优化**路径，失败必须可见；但它**不是错误**
+                    //    —— B 是全功能的兜底（图是缓存，丢弃不丢功能）。
+                    tracing::warn!(
+                        error = %e,
+                        "向量增量合并（方案 A）失败 ⇒ 回落全量重建（方案 B）"
+                    );
+                    (
+                        rebuild_vector_index(
+                            self.shared.backend,
+                            &raw_all,
+                            cfg.ef_search,
+                            cfg.parallel_build,
+                        )?,
+                        VectorMergeStrategy::Rebuild,
+                    )
+                }
+            };
+            (Some(vi), strat)
         };
+        let vector_merge_ms = t_vec.elapsed().as_millis();
 
         // ⑤ 原子发布：`main` 吸收全部内容、`deltas` 清空、墓碑清空（已物理化）。
         //    ⚠️ 合并**不改 ID** ⇒ 已用长度不变（后续段的基址继续有效）。
@@ -1253,9 +1369,11 @@ impl SearchIndex {
         //    这一格会被 D2 **顶替**，而长度恰好相等 ⇒ 长度判据**看不出来** ⇒ **D2 静默消失**
         //    （而 `ids.next_*` 已把它的槽位记账）。段不可变（`I8-2`）⇒ 用 `Arc::ptr_eq` 判**身份**。
         //    `Vec<Arc<_>>` 的 clone 是 O(1)（只加引用计数）。
-        let snapshot_deltas: Vec<Arc<Segment>> = view.deltas.iter().cloned().collect();
+        let snapshot_deltas: Vec<Arc<Segment>> = view.deltas.iter().take(take).cloned().collect();
         let physicalized = (*view.tombstones).clone();
-        self.shared.commit_view(
+        // ⚠️ 必须在**下面那个闭包 move 掉它之前**取长度（闭包按值捕获）
+        let physicalized_count = physicalized.len();
+        let published = self.shared.commit_view(
             snapshot_epoch,
             PublishCaller::Fold,
             move |cur, generation, base_doc, base_chunk| {
@@ -1293,7 +1411,144 @@ impl SearchIndex {
                 ))
             },
         )?;
-        Ok(merged_segments)
+        let published_generation = published;
+        Ok(MergeReport {
+            segments_merged: merged_segments,
+            chunks_merged: chunks_merged_now,
+            tombstones_applied: physicalized_count,
+            vector_strategy,
+            vector_merge_ms,
+            total_ms: t_total.elapsed().as_millis(),
+            generation: published_generation,
+        })
+    }
+
+    /// 向量侧**增量合并**（设计 §4.9.3 的**方案 A**）。
+    ///
+    /// 返回 `Ok(None)` = **本装配走不了 A**（纯 BM25 / Brute 后端无图 / 增量段没有原始向量）
+    /// ⇒ 调用方**回落方案 B**（全量重建）。`Err` = A 跑到一半失败（同样回落 B，但会告警）。
+    ///
+    /// # 它为什么可以「不用旧图的所有权」
+    ///
+    /// `dump_graph` 是 `&self`（**对内存图也能做**）⇒ 不需要 `Arc::try_unwrap` 那种
+    /// 「拿到独占」的强前提（`main` 是共享的 `Arc<Segment>`，永远拿不到独占）。
+    ///
+    /// # 固有代价（设计 §4.9.3 已登记）
+    ///
+    /// `hnsw_rs` 只提供**文件** IO ⇒ 每次合并一次**全量 dump I/O**（12K 点实测 30ms，
+    /// 落盘数十 MB）。spike 实测它被 `insert` 的节省覆盖有余（A 合计 639ms vs B 4774ms）。
+    fn merge_vectors_incremental(
+        &self,
+        main: &Arc<Segment>,
+        delta_raw: &[(ChunkId, Vec<f32>)],
+    ) -> Result<Option<Box<dyn VectorIndex>>> {
+        // trait 方法（`as_graph_persist` / `dump_graph` / `len` / `add_batch`）需要 trait 在作用域；
+        // 用 `as _` 匿名导入 ⇒ 不与外层可能存在的具名导入冲突。
+        use crate::vector::{VectorGraphPersist as _, VectorIndex as _};
+
+        let Some(vi) = main.vector_index.as_deref() else {
+            return Ok(None);
+        };
+        // 只有 Hnsw 有图 —— `as_graph_persist()` 对 Brute 返回 `None`（类型事实，不是运行时 if）
+        let Some(store) = vi.as_graph_persist() else {
+            return Ok(None);
+        };
+        if delta_raw.is_empty() {
+            // 没有增量 ⇒ 图就是主图本身，不必白付一次 dump/load
+            return Ok(None);
+        }
+        // 🔴 **主段为空时 A 结构上不可用**（首次合并：内容**全在**增量段里）：
+        //    此时主段图是**空图**，而 `hnsw_rs` 的 `file_dump` 对空图报
+        //    「向量图读写失败: unexpected error」（**实测**）。
+        //    ⇒ **显式**走 B（比依赖 dump 报错更清楚，也省一次无谓的临时文件写）。
+        //    ⚠️ 这不是性能问题：该场景下 B 只需重建增量段那一批点（本就很小）。
+        if main.index.total_chunks() == 0 {
+            return Ok(None);
+        }
+        let cfg = &self.shared.cfg;
+
+        // 临时目标：`pid` + 进程内单调序号保证唯一（并发/多次合并不互相覆盖）
+        static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+        let base = std::env::temp_dir().join(format!(
+            "helix-merge-{}-{}.idx",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _guard = GraphTempFiles(base.clone());
+
+        // ① dump 主段图 → ② load 回一张**新**图（旧点拓扑与层级原样保住）
+        let stats = store.dump_graph(&base)?;
+        //
+        // ⚠️ `HnswRsIndex::load_graph` 的 manifest 形参**不被使用**（形参名是 `_m`；
+        //    真校验在门面层的 `load_graph_checked` 里做，属 CRC / manifest 流程）
+        //    ⇒ 这里传占位值。**已核源码**（`vector/persist.rs:197`），不是假设。
+        let m = crate::storage::GraphManifest {
+            manifest_version: 1,
+            producer: "helix-core/merge".to_string(),
+            graph_format: 4,
+            dist_id: "DistDotClamped".to_string(),
+            platform: 0,
+            max_nb_connection: 0,
+            ef_construction: 0,
+            snapshot_crc: 0,
+            snapshot_len: 0,
+            dim: 0,
+            nb_point: 0,
+            graph_crc: 0,
+            graph_len: 0,
+            data_crc: 0,
+            data_len: 0,
+        };
+        let ef = cfg.ef_search.unwrap_or(HnswRsIndex::default_ef_search());
+        let mut loaded = HnswRsIndex::load_graph(&base, &m, ef, cfg.parallel_build)?;
+        if loaded.len() != stats.nb_point as usize {
+            // 点数不吻合 ⇒ 图不可信 ⇒ **保守回落 B**（不猜、不修）
+            return Err(crate::error::Error::VectorGraph(format!(
+                "增量合并：load 回来的点数 {} 与 dump 时记录的 {} 不一致",
+                loaded.len(),
+                stats.nb_point
+            )));
+        }
+
+        // ③ 把增量段的点 insert 进去（`raw_vectors` 记的是**已全局化**的 chunk_id）
+        let entries: Vec<(ChunkId, NormalizedVector)> = delta_raw
+            .iter()
+            .map(|(id, v)| (*id, NormalizedVector::new(v.clone())))
+            .collect();
+        loaded.add_batch(&entries)?;
+        Ok(Some(Box::new(loaded) as Box<dyn VectorIndex>))
+    }
+
+    /// 合并**全部**未合并段（`save()` / `compact()` 的前置 —— D-S8-01 / D-S8-12）。
+    ///
+    /// # 为什么 `save` 之前必须合并完
+    ///
+    /// `save` 落盘的是**单段 `Index`** ⇒ 快照格式（`FORMAT_VERSION` = 2）、`GraphManifest`
+    /// 与 ID 语义**一个字节都不用改**（设计 §4.10 的 H4 结论：**不开 ADR-B**）。
+    ///
+    /// # 与并发读的关系
+    ///
+    /// 段一旦进过 `View` 就不可变（`I8-2`）⇒ 合并**不改旧段**，而是克隆主段内容后追加、
+    /// 再**一次原子指针替换**发布新 `View` ⇒ **读端全程无感**（`FR-17` 的「合并期不得阻塞
+    /// 读请求」在**结构层面**成立）。代价是一次 `O(N)` 克隆 —— 与合并本身的量级相同。
+    pub fn merge_all(&mut self) -> Result<MergeReport> {
+        let n = self.view().deltas.len();
+        self.merge_n(n)
+    }
+
+    /// 合并**一个**未合并段（FIFO 队首）；无未合并段时返回 `Ok(None)`。
+    ///
+    /// 宿主（CLI / `helix serve`）可循环调用它做**后台**合并 —— 库**不 `spawn` 线程**
+    /// （`D-S8-08`：线程与生命周期归宿主）。建议宿主在 `deltas.len() > K`（默认 **4**）
+    /// 时优先合并（读路径成本随段数线性增长，见设计 §9.2 Q6）。
+    ///
+    /// ⚠️ **严格 FIFO**：只并队首那一段 —— 这是 §4.4.2 基址不变式的要求
+    /// （跳段会让后续段的 `base_*` 指向尚未并入的内容）。
+    pub fn merge_pending(&mut self) -> Result<Option<MergeReport>> {
+        if self.view().deltas.is_empty() {
+            return Ok(None);
+        }
+        self.merge_n(1).map(Some)
     }
 
     /// 在**内存**里按存活集重新物化一次并重建向量图。**不落盘**。
@@ -1361,7 +1616,7 @@ impl SearchIndex {
         self.commit()?;
         // `D-S8-12`：**先合并再重编号** —— `compact` 会重编号，而合并依赖「基址不变」
         // ⇒ 顺序反了会让 `deltas` 里段的 `base_*` 指向已重编号的旧空间
-        self.fold_deltas()?;
+        self.merge_all()?;
 
         let before = self.tombstone_stats();
         let has_tombstones = before.chunks_total > before.chunks_alive;
