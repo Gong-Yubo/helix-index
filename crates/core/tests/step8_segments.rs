@@ -998,27 +998,48 @@ fn t5_two_segments(corpus: &[&str], split: usize) -> Searcher {
     idx.searcher()
 }
 
-/// **`S8-T5`（本 PR 的门）**：`Brute` 后端下 `vector` 模式**跨段 == 单段**、**逐位一致**。
+/// 造**「`main` 非空 + 两个 delta」**布局：`main(2) + delta(2) + delta(2)`。
 ///
-/// # 为什么只承诺 `Brute`（设计 §4.6.2）
+/// # 为什么必须有这个夹具（`S8-05` 第 1 轮评审 **P3-1**，**已实证的覆盖盲区**）
 ///
-/// 每段的线性扫描是**精确**的，归并又复用同一个 `to_scored`（`score = 1 − d²/2` 单调
-/// ⇒ 距离升序 ≡ 相似度降序）⇒ 「每段各自前 `k`」的并集截断**就是**全局前 `k`
-/// （无损证明见 `SegmentedVectorRetriever` 的类型文档）。
-/// ⚠️ `Hnsw` 下**不承诺**逐位一致（两张图 ≠ 一张图）—— 本用例**刻意只用 `Brute`**，
-/// 把「归并写对了」与「ANN 本身的近似性」两件事**分开**：否则一条红无法归因。
+/// 其余跨段向量用例的 `main` **恒为空**（`t5_two_segments` / 逐段谓词用例 / `S8_02_旧API`
+/// 的 `into_searcher` 路径）⇒ 「向量路静默漏查 `main`」（= 库里**最大、最先建**的那一段）
+/// 这一类变异**全仓不可检测**：实测在 `search_segmented` 的循环里注入
+/// `if i == 0 { continue; }`（向量路**永不**查 `main`）之后，那三条用例**全部照常绿**。
 ///
-/// # 判据里的三处前提自证（否则本用例会退化成「空 == 空」）
+/// ⚠️ 而 `helix serve` 的常态恰恰是「`main` 有存量 + `delta` 有增量」（`save`/`compact`
+/// 之后又 `commit`）⇒ 该变异若真实发生（例如有人把段来源换成 `deltas.iter()`、
+/// 或归并循环的起点写错），**存量内容的向量召回会静默消失**。
+/// 本夹具让 `main` 非空 ⇒ 漏查 `main` 立刻表现为**结果少 / 错**，判据才有牙齿。
 ///
-/// ① 参照系 `vector_segments == segments == 1`（真的走了单段路径）；
-/// ② 被测侧 `vector_segments == segments == 3`（`main` + 两个 delta，**真的跨段**）；
-/// ③ 命中非空。
-#[test]
-fn S8_T5_Brute后端vector模式跨段逐位一致() {
-    let dir = tempfile::tempdir().unwrap();
-    let one = t5_single_segment(&T5_CORPUS, &dir.path().join("t5-one.idx"));
-    let many = t5_two_segments(&T5_CORPUS, T5_SPLIT);
+/// 造法：`add ×2 → commit → save`（`D-S8-01`：`save` 第一步 `fold_deltas` ⇒ 折进 `main`）
+/// `→ add ×2 → commit → add ×2 → commit`。
+/// 🔑 它同时锁住**两个分支**：「空段参与归并只贡献空集」与「非空段正常并入」。
+fn t5_main_and_two_deltas(corpus: &[&str], split: usize, path: &std::path::Path) -> Searcher {
+    let mut idx = hybrid_builder().build();
+    for t in &corpus[..split] {
+        idx.add(Document::new(*t)).unwrap();
+    }
+    idx.commit().unwrap();
+    idx.save(path).unwrap(); // `save` 的第一步就是 `fold_deltas` ⇒ 此后 `main` 非空
+    for t in &corpus[split..split * 2] {
+        idx.add(Document::new(*t)).unwrap();
+    }
+    idx.commit().unwrap();
+    for t in &corpus[split * 2..] {
+        idx.add(Document::new(*t)).unwrap();
+    }
+    idx.commit().unwrap();
+    idx.searcher()
+}
 
+/// 「跨段视图」与「**同一份内容**的单段参照系」在 `vector` 模式下必须**逐位一致**。
+///
+/// 🔑 抽成助手（`S8-05` 评审 P3-1 的配套）：两个布局变体（`main` 空 / `main` 非空）
+/// 用**同一套判据** —— 否则将来改判据会漏掉一个，正是「一类缺陷只修被点到的那一处」的同族错误。
+/// `label` 只进断言消息，让变异下能一眼看出**是哪个布局**红的。
+/// `segments` 是被测侧应有的段数（两个布局都是 3，但显式传入以免助手隐含假设）。
+fn assert_vector_cross_eq_single(one: &Searcher, many: &Searcher, segments: usize, label: &str) {
     for q in T5_QUERIES {
         let a = one
             .search_with(q)
@@ -1035,30 +1056,80 @@ fn S8_T5_Brute后端vector模式跨段逐位一致() {
 
         assert!(
             !a.hits.is_empty(),
-            "query `{q}`：参照系必须有命中（否则下面的逐位比较是空转）"
+            "[{label}] query `{q}`：参照系必须有命中（否则下面的逐位比较是空转）"
         );
         assert_eq!(
             (a.metrics.segments, a.metrics.vector_segments),
             (1, 1),
-            "参照系必须是**单段**视图（`deltas` 空 ⇒ 走单索引路径）"
+            "[{label}] 参照系必须是**单段**视图（`deltas` 空 ⇒ 走单索引路径）"
         );
         assert_eq!(
             (b.metrics.segments, b.metrics.vector_segments),
-            (3, 3),
-            "被测侧必须**真的跨段**（main + 两个 delta）；\
+            (segments, segments),
+            "[{label}] 被测侧必须**真的跨段**（{segments} 段）；\
              ⚠️ 这也是 `S8-05` 的验收项：`vector_segments` 恒等于 `segments`"
         );
         assert_eq!(
             a.metrics.vector_route, b.metrics.vector_route,
-            "`Brute` 恒精确 ⇒ 两侧的逐段并集分类都应是 `Exact`（不能是 `Mixed`）"
+            "[{label}] `Brute` 恒精确 ⇒ 两侧的逐段并集分类都应是 `Exact`（不能是 `Mixed`）"
         );
         assert_eq!(
             format!("{:?}", a.hits),
             format!("{:?}", b.hits),
-            "query `{q}`：`Brute` 后端下跨段必须与单段**逐位一致**（含 score / explain）—— \
-             本条即 `S8-T5` 的红因判据"
+            "[{label}] query `{q}`：`Brute` 后端下跨段必须与单段**逐位一致**（含 score / explain）"
         );
     }
+}
+
+/// **`S8-T5`（本 PR 的门）**：`Brute` 后端下 `vector` 模式**跨段 == 单段**、**逐位一致**。
+///
+/// # 为什么只承诺 `Brute`（设计 §4.6.2）
+///
+/// 每段的线性扫描是**精确**的，归并又复用同一个 `to_scored`（`score = 1 − d²/2` 单调
+/// ⇒ 距离升序 ≡ 相似度降序）⇒ 「每段各自前 `k`」的并集截断**就是**全局前 `k`
+/// （无损证明见 `SegmentedVectorRetriever` 的类型文档）。
+/// ⚠️ `Hnsw` 下**不承诺**逐位一致（两张图 ≠ 一张图）—— 本用例**刻意只用 `Brute`**，
+/// 把「归并写对了」与「ANN 本身的近似性」两件事**分开**：否则一条红无法归因。
+///
+/// # 判据里的三处前提自证（否则本用例会退化成「空 == 空」）
+///
+/// ① 参照系 `vector_segments == segments == 1`（真的走了单段路径）；
+/// ② 被测侧 `vector_segments == segments == 3`（`main` + 两个 delta，**真的跨段**）；
+/// ③ 命中非空。
+///
+/// ⚠️ **本变体的 `main` 是空的**（布局 `main(0) + delta(2) + delta(4)`）——
+/// 单靠它**抓不住「漏查 `main`」**（评审 P3-1 已实证）。那一类由**同批的**
+/// `S8_T5_main非空与delta并存时跨段仍逐位一致` 钉住，两者必须**都在**。
+#[test]
+fn S8_T5_Brute后端vector模式跨段逐位一致() {
+    let dir = tempfile::tempdir().unwrap();
+    let one = t5_single_segment(&T5_CORPUS, &dir.path().join("t5-one.idx"));
+    let many = t5_two_segments(&T5_CORPUS, T5_SPLIT);
+    assert_vector_cross_eq_single(&one, &many, 3, "main 空");
+}
+
+/// **`S8-T5` 的第二布局变体（`S8-05` 第 1 轮评审 P3-1 的回归锁）**：
+/// `main` **非空** + 两个 delta 时，跨段仍必须与单段**逐位一致**。
+///
+/// # 它堵的是什么
+///
+/// 上一条（以及逐段谓词 / `S8_02_旧API`）的夹具里 `main` **恒为空** ⇒
+/// 「向量路**漏查 `main`**」这一类变异在那些用例上**全部照常绿**（**修前已实证**：
+/// 在 `search_segmented` 的循环注入 `if i == 0 { continue; }`，三条用例 17/17 绿）。
+/// 本变体的 `main` 里有 2 篇（且是**全局 `chunk_id` 最小**的那两篇）⇒
+/// 漏查它必然让结果**少条目 / 错排序** ⇒ 逐位断言当场红。
+///
+/// 🔑 这也正是「**夹具的要害**」在**段维度**上的同一教训（对照：逐段谓词用例最初的
+/// tag 图样与分段点周期对齐 ⇒ 变异零命中）：**判据的鉴别力取决于夹具覆盖到哪些分支**，
+/// 而「`main` 是否非空」是归并路径上的一条**真实分叉**，不是可有可无的装饰。
+#[test]
+fn S8_T5_main非空与delta并存时跨段仍逐位一致() {
+    let dir = tempfile::tempdir().unwrap();
+    // 参照系与上一条**共用同一份 6 篇内容与同一顺序** ⇒ 两次比较的期望值同一个
+    // （全局 `chunk_id` 按插入顺序分配 ⇒ 两套布局的 ID 空间一致）。
+    let one = t5_single_segment(&T5_CORPUS, &dir.path().join("t5-one.idx"));
+    let many = t5_main_and_two_deltas(&T5_CORPUS, T5_SPLIT, &dir.path().join("t5-main.idx"));
+    assert_vector_cross_eq_single(&one, &many, 3, "main 非空");
 }
 
 /// **`S8-05`：逐段谓词必须折算成「段内本地」语义**（`SegmentPredicate`）。
