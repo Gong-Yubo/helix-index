@@ -40,7 +40,9 @@ use helix_core::chunk::Chunker;
 use helix_core::document::Document;
 use helix_core::embed::Embedder;
 use helix_core::error::{Error, Result};
-use helix_core::query::{Hit, SearchMode, SearchResponse};
+use helix_core::query::{Hit, SearchMode, SearchResponse, VectorRoute};
+use helix_core::retriever::union_route;
+use helix_core::schema::Filter;
 use helix_core::search::{SearchIndex, SearchIndexBuilder, Searcher, VectorBackend};
 use helix_core::types::{ChunkId, DocId, Score};
 
@@ -305,19 +307,16 @@ fn S8_02_旧API与新API结果逐位一致() {
         .iter()
         .filter(|h| h.explain.vector_score.is_some() || h.explain.vector_rank.is_some())
         .count();
-    // 🔴 **`S8-03` 起的已知边界（本 PR 显式钉住，不掩盖）**：`S8-03` 后内容落在 `deltas`，
-    //    而**向量路只覆盖 `main`**（跨段向量属 `S8-05` / PR5）⇒ 本夹具下 hybrid 的命中
-    //    **全部来自 BM25 lane**。⇒ 断言由 `S8-02` 期的「必须有向量路召回」**反转**为
-    //    「当前不应有」，**PR5 落地后必须再反转回 `> 0`**。
-    //    ⚠️ 被替换掉的那条前提（「必须用带向量 lane 的装配」）在 PR4→PR5 窗口内**结构上
-    //    无法成立**；但本用例的鉴别力**并不依赖它**：`S8-03` 后「旧 API（隐含 `commit`）」
-    //    与「新 API（显式 `commit`）」的差异在**任何装配**下都可见（不 `commit` 就什么都没
-    //    发布 ⇒ 命中数 `0` vs `N`），纯 BM25 也一样。
-    assert_eq!(
-        vector_recalled,
-        0,
-        "PR4→PR5 窗口：向量路只覆盖 main，而本夹具内容全在 deltas ⇒ 不应出现向量路召回\
-         （PR5 落地后本断言必须反转）。explain = {:?}",
+    // ✅ **`S8-05` 已反转（2026-09-20，PR5）**：`S8-03` 起内容落在 `deltas`，当时**向量路只覆盖
+    //    `main`** ⇒ 本夹具下 hybrid 的命中全部来自 BM25 lane，故 PR4 把断言从「必须有向量路
+    //    召回」**反转**为「当前不应有」，并在注释里写明「**PR5 落地后必须再反转回 `> 0`**」。
+    //    `S8-05`（逐段向量检索）落地后，`deltas` 里的向量**会被召回** ⇒ 本断言按承诺反转回
+    //    `> 0`。这一条现在是**跨段向量真的通了**的最低成本信号（真正的门是 `S8_T5_*`）。
+    //    ⚠️ 判据同时保留「命中非空」（上面那条）⇒ 不会退化成「空 == 空」。
+    assert!(
+        vector_recalled > 0,
+        "S8-05 起向量路覆盖全部段 ⇒ 本夹具（内容全在 deltas）必须出现向量路召回；\
+         实得 0 ⇒ 逐段向量检索没有接上。explain = {:?}",
         probe.hits.iter().map(|h| &h.explain).collect::<Vec<_>>()
     );
 }
@@ -951,5 +950,240 @@ fn S8_03_compact换代后另一写端的提交被拒() {
         searcher.search("边车代理").unwrap().hits.len(),
         0,
         "被拒的提交不得留下任何已发布内容"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// 8) `S8-T5`：跨段向量检索（`S8-05` 的**门测试**，设计 §7 明写）
+// ══════════════════════════════════════════════════════════════════════════
+
+/// `S8-T5` 语料（6 篇）。⚠️ 顺序是判据的一部分：跨段侧按 `T5_SPLIT` 切成两段。
+const T5_CORPUS: [&str; 6] = [
+    "向量检索把文本编码成稠密向量",
+    "分段写入把新内容追加成独立的段",
+    "跨段向量检索必须对每段各查一次",
+    "全局归并按距离与全局分片编号排序",
+    "批量写入先落在写端私有的增量段",
+    "查询向量只编码一次以免成本翻倍",
+];
+const T5_SPLIT: usize = 2;
+const T5_QUERIES: [&str; 3] = ["向量检索", "分段写入", "全局归并"];
+
+/// 造「**单段视图**」的参照系：内容全在 `main` 里（`deltas` 空）⇒ 本地 `chunk_id` == 全局。
+///
+/// 🔑 用 `save`/`load` 而不是裸 `commit`：`commit` 会把内容放进 **delta**（那样两侧都是跨段
+/// 路径，「跨段 vs 单段」就比不出来了）。`D-S8-01` 的 `save` 第一步就是 `fold_deltas`
+/// ⇒ 折进 `main`；`Brute` 后端下 `load` 重建的向量与原件**同值同 id** ⇒ 逐位比较仍然严格。
+fn t5_single_segment(corpus: &[&str], path: &std::path::Path) -> Searcher {
+    let mut idx = hybrid_builder().build();
+    for t in corpus {
+        idx.add(Document::new(*t)).unwrap();
+    }
+    idx.commit().unwrap();
+    idx.save(path).unwrap();
+    hybrid_builder().load(path).unwrap().searcher()
+}
+
+/// 造**跨段**布局：前 `T5_SPLIT` 篇一个 delta、其余一个 delta（`main` 为空）。
+fn t5_two_segments(corpus: &[&str], split: usize) -> Searcher {
+    let mut idx = hybrid_builder().build();
+    for t in &corpus[..split] {
+        idx.add(Document::new(*t)).unwrap();
+    }
+    idx.commit().unwrap();
+    for t in &corpus[split..] {
+        idx.add(Document::new(*t)).unwrap();
+    }
+    idx.commit().unwrap();
+    idx.searcher()
+}
+
+/// **`S8-T5`（本 PR 的门）**：`Brute` 后端下 `vector` 模式**跨段 == 单段**、**逐位一致**。
+///
+/// # 为什么只承诺 `Brute`（设计 §4.6.2）
+///
+/// 每段的线性扫描是**精确**的，归并又复用同一个 `to_scored`（`score = 1 − d²/2` 单调
+/// ⇒ 距离升序 ≡ 相似度降序）⇒ 「每段各自前 `k`」的并集截断**就是**全局前 `k`
+/// （无损证明见 `SegmentedVectorRetriever` 的类型文档）。
+/// ⚠️ `Hnsw` 下**不承诺**逐位一致（两张图 ≠ 一张图）—— 本用例**刻意只用 `Brute`**，
+/// 把「归并写对了」与「ANN 本身的近似性」两件事**分开**：否则一条红无法归因。
+///
+/// # 判据里的三处前提自证（否则本用例会退化成「空 == 空」）
+///
+/// ① 参照系 `vector_segments == segments == 1`（真的走了单段路径）；
+/// ② 被测侧 `vector_segments == segments == 3`（`main` + 两个 delta，**真的跨段**）；
+/// ③ 命中非空。
+#[test]
+fn S8_T5_Brute后端vector模式跨段逐位一致() {
+    let dir = tempfile::tempdir().unwrap();
+    let one = t5_single_segment(&T5_CORPUS, &dir.path().join("t5-one.idx"));
+    let many = t5_two_segments(&T5_CORPUS, T5_SPLIT);
+
+    for q in T5_QUERIES {
+        let a = one
+            .search_with(q)
+            .mode(SearchMode::Vector)
+            .top_n(6)
+            .exec()
+            .unwrap();
+        let b = many
+            .search_with(q)
+            .mode(SearchMode::Vector)
+            .top_n(6)
+            .exec()
+            .unwrap();
+
+        assert!(
+            !a.hits.is_empty(),
+            "query `{q}`：参照系必须有命中（否则下面的逐位比较是空转）"
+        );
+        assert_eq!(
+            (a.metrics.segments, a.metrics.vector_segments),
+            (1, 1),
+            "参照系必须是**单段**视图（`deltas` 空 ⇒ 走单索引路径）"
+        );
+        assert_eq!(
+            (b.metrics.segments, b.metrics.vector_segments),
+            (3, 3),
+            "被测侧必须**真的跨段**（main + 两个 delta）；\
+             ⚠️ 这也是 `S8-05` 的验收项：`vector_segments` 恒等于 `segments`"
+        );
+        assert_eq!(
+            a.metrics.vector_route, b.metrics.vector_route,
+            "`Brute` 恒精确 ⇒ 两侧的逐段并集分类都应是 `Exact`（不能是 `Mixed`）"
+        );
+        assert_eq!(
+            format!("{:?}", a.hits),
+            format!("{:?}", b.hits),
+            "query `{q}`：`Brute` 后端下跨段必须与单段**逐位一致**（含 score / explain）—— \
+             本条即 `S8-T5` 的红因判据"
+        );
+    }
+}
+
+/// **`S8-05`：逐段谓词必须折算成「段内本地」语义**（`SegmentPredicate`）。
+///
+/// # 这条抓的是什么
+///
+/// `VectorIndex::search_filtered` 的谓词收的是**段内本地 `chunk_id`**，而跨段谓词
+/// （`ViewFilter`）收的是**全局 `chunk_id`**。若逐段下推时把**全局**谓词直接交下去：
+/// 主段（`base_chunk == 0`）**看不出问题**，而 delta 段会把「本地 id」当成「全局 id」去判
+/// ⇒ 过滤决策**来自别的段**⇒ 结果错（不是少召回，是**答错**）。
+///
+/// 判据：带**用户过滤**（`FilterKind::Filtered`）的跨段结果必须与**单段参照系**逐位一致。
+#[test]
+fn S8_05_逐段谓词的语义折算_带过滤的跨段向量与单段一致() {
+    // 🔴 **tag 图样必须与分段点「错位」**（两条 delta 的 tag 序列互为反相）——
+    //    这是本条判据的**夹具要害**：若两段的 tag 序列相同（周期 == 分段长度），
+    //    那么「把本地 id 当成全局 id 查」会**恰好得到相同结论** ⇒ 变异下断言**照样绿**
+    //    （实测：M-S8-05-b 在「周期对齐」的语料上零命中 ⇒ 换成本图样后才命中）。
+    //    本图样下 A=[keep,drop]、B=[drop,keep] ⇒ 错位查表**必然**既漏又错。
+    let docs = [
+        ("向量检索把文本编码成稠密向量", "keep"),
+        ("分段写入把新内容追加成独立的段", "drop"),
+        ("跨段向量检索必须对每段各查一次", "drop"),
+        ("全局归并按距离与全局分片编号排序", "keep"),
+    ];
+    let make = |idx: &mut SearchIndex| {
+        for (t, tag) in docs {
+            let mut d = Document::new(t);
+            d.metadata = serde_json::json!({ "tag": tag });
+            idx.add(d).unwrap();
+        }
+    };
+
+    // 参照系：单段视图
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t5-filt.idx");
+    let mut one = hybrid_builder().build();
+    make(&mut one);
+    one.commit().unwrap();
+    one.save(&path).unwrap();
+    let one = hybrid_builder().load(&path).unwrap().searcher();
+
+    // 被测：**两段**布局（「前 2 篇 / 后 2 篇」两个 delta，`tag=keep` 恰好横跨两段）。
+    // ⚠️ 单 delta 时「本地 `chunk_id` == 全局」⇒ 该布局**测不出**折算错误 ⇒ 必须真的两段。
+    let mut split = hybrid_builder().build();
+    for (t, tag) in &docs[..2] {
+        let mut d = Document::new(*t);
+        d.metadata = serde_json::json!({ "tag": tag });
+        split.add(d).unwrap();
+    }
+    split.commit().unwrap();
+    for (t, tag) in &docs[2..] {
+        let mut d = Document::new(*t);
+        d.metadata = serde_json::json!({ "tag": tag });
+        split.add(d).unwrap();
+    }
+    split.commit().unwrap();
+    let split = split.searcher();
+
+    let keep = Filter::eq("tag", "keep");
+    let q = "向量";
+    let a = one
+        .search_with(q)
+        .mode(SearchMode::Vector)
+        .filter(&keep)
+        .top_n(10)
+        .exec()
+        .unwrap();
+    let b = split
+        .search_with(q)
+        .mode(SearchMode::Vector)
+        .filter(&keep)
+        .top_n(10)
+        .exec()
+        .unwrap();
+
+    assert_eq!(a.metrics.segments, 1, "参照系是单段");
+    assert_eq!(b.metrics.segments, 3, "被测侧是 main + 两个 delta");
+    assert_eq!(
+        b.metrics.allowed, a.metrics.allowed,
+        "前提：两侧的**全局** allowed 必须相同（同一个过滤条件）"
+    );
+    assert!(!a.hits.is_empty(), "前提：必须有命中（否则退化成空 == 空）");
+    assert!(
+        a.hits.iter().all(|h| {
+            matches!(
+                &h.metadata,
+                serde_json::Value::Object(m) if m.get("tag") == Some(&serde_json::json!("keep"))
+            )
+        }),
+        "前提：过滤真的生效（参照系结果里不得出现 tag=drop）"
+    );
+    assert_eq!(
+        format!("{:?}", a.hits),
+        format!("{:?}", b.hits),
+        "带过滤的跨段向量必须与单段逐位一致 —— \
+         若把**全局**谓词直接下推给 delta 段（本地 id 被当成全局 id 判），本行必红"
+    );
+}
+
+/// **`S8-05`：`union_route` 的并集分类**（设计 §4.6.1 / Q5）。
+///
+/// 单测而非端到端：造「一段 `Exact` + 一段 `Ann`」需要 `hnsw` 的 `allowed` 跨过
+/// `BRUTE_FALLBACK_MAX_ALLOWED`（8192 个活分片）⇒ 端到端要万级语料。**分类规则**本身是纯函数
+/// ⇒ 在这里锁死；「逐段 route 真的被收集并归并」由 `S8_T5` 的 `vector_route` 相等断言锁
+/// （`Brute` 两端都 `Exact` ⇒ 若实现写死 `Ann` 就会红）。
+#[test]
+fn S8_05_union_route的并集分类() {
+    use VectorRoute::{Ann, Exact, Mixed, None as RNone};
+    assert_eq!(union_route(&[]), RNone, "没有任何参与段 ⇒ 未走向量路");
+    assert_eq!(
+        union_route(&[RNone, RNone]),
+        RNone,
+        "`None` 项（未参与的段）必须被忽略"
+    );
+    assert_eq!(union_route(&[RNone, Ann]), Ann, "全 Ann ⇒ Ann");
+    assert_eq!(
+        union_route(&[Exact, Exact, RNone]),
+        Exact,
+        "全 Exact ⇒ Exact（`None` 项忽略）"
+    );
+    assert_eq!(union_route(&[Ann, Exact]), Mixed, "混合 ⇒ Mixed");
+    assert_eq!(
+        union_route(&[Exact, Ann, Exact]),
+        Mixed,
+        "混合 ⇒ Mixed（与顺序无关）"
     );
 }
