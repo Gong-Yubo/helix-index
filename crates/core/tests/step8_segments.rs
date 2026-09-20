@@ -938,6 +938,17 @@ fn S8_03_compact换代后另一写端的提交被拒() {
         err.to_string().contains("epoch 0 → 1"),
         "错误消息必须点名换代（可诊断，NFR-07），实际 = {err}"
     );
+    // 🔑 **接线判据**（第 3 轮评审 **P4**）：这条拒绝来自 `commit()` ⇒ 恢复指引必须是 **commit 版**。
+    //    世代对账被 `commit()` 与 `fold_deltas()` **共用**（`PublishCaller`）⇒ 若有人把两个调用方
+    //    的身份**误传**（例如 `commit()` 传了 `Fold`），「两条文案不同」那条单测是**抓不到**的。
+    //    这里把**生产接线**钉在端到端路径上。
+    //    ⚠️ `fold` 侧的接线仍无确定性判据（要构造「另一写端在 `fold` 窗口内 `compact()`」的交错）
+    //    ⇒ 见 CHANGELOG 的「覆盖边界」。
+    assert!(
+        err.to_string().contains("已被丢弃"),
+        "`commit()` 这条拒绝必须带 **commit 版**恢复指引（`fold` 版的文案里**没有**「已被丢弃」）；\
+         实际 = {err}"
+    );
 
     // 反向自证：A 的文档不得被 B 的过期墓碑挡住（放行的后果）
     assert_eq!(

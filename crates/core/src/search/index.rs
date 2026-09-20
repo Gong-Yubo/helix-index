@@ -24,7 +24,7 @@ use crate::vector::{
 };
 
 use super::config::{Config, GraphPersistMode, SearchIndexBuilder, VectorBackend};
-use super::view::{Segment, Shared, Tombstones, View};
+use super::view::{PublishCaller, Segment, Shared, Tombstones, View};
 
 /// 图 sidecar 的状态（V2 Step 2 / NFR-07：降级不能静默）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -718,65 +718,67 @@ impl SearchIndex {
         let expected = (builder.base_doc, builder.base_chunk);
         let expected_epoch = builder.epoch;
 
-        let published =
-            self.shared
-                .commit_view(expected_epoch, |cur, generation, base_doc, base_chunk| {
-                    // 基址不符 **或** builder 为空 ⇒ 不追加任何段（视图内容不变），但仍推进序号
-                    // （「每次 commit 都发布」是既有契约，见单测 `S8_02_commit递增视图序号`；
-                    //  空段**不入列**则避免 `deltas` 被空段撑大，设计 §4.8.3 ③）。
-                    // ⚠️ 「**墓碑-only**」不算空（见 `SegmentBuilder::is_empty`）⇒ 会追加一个
-                    //    **零内容段**（发布墓碑所必需）；其两个次生成本见该方法文档（P4-1 / `S8-06`）。
-                    if (base_doc, base_chunk) != expected || builder.is_empty() {
-                        if (base_doc, base_chunk) != expected {
-                            mismatched.set(true);
-                        }
-                        return Ok((
-                            View {
-                                main: Arc::clone(&cur.main),
-                                deltas: Arc::clone(&cur.deltas),
-                                tombstones: Arc::clone(&cur.tombstones),
-                                generation,
-                            },
-                            base_doc,
-                            base_chunk,
-                        ));
+        let published = self.shared.commit_view(
+            expected_epoch,
+            PublishCaller::Commit,
+            |cur, generation, base_doc, base_chunk| {
+                // 基址不符 **或** builder 为空 ⇒ 不追加任何段（视图内容不变），但仍推进序号
+                // （「每次 commit 都发布」是既有契约，见单测 `S8_02_commit递增视图序号`；
+                //  空段**不入列**则避免 `deltas` 被空段撑大，设计 §4.8.3 ③）。
+                // ⚠️ 「**墓碑-only**」不算空（见 `SegmentBuilder::is_empty`）⇒ 会追加一个
+                //    **零内容段**（发布墓碑所必需）；其两个次生成本见该方法文档（P4-1 / `S8-06`）。
+                if (base_doc, base_chunk) != expected || builder.is_empty() {
+                    if (base_doc, base_chunk) != expected {
+                        mismatched.set(true);
                     }
-                    let SegmentBuilder {
-                        index,
-                        raw_vectors,
-                        vector,
-                        tombstones,
-                        ..
-                    } = builder;
-                    let used_doc = base_doc + index.total_docs() as DocId;
-                    let used_chunk = base_chunk + index.total_chunks() as ChunkId;
-                    let seg = Arc::new(Segment {
-                        index,
-                        vector_index: vector,
-                        raw_vectors: Some(raw_vectors),
-                        base_doc,
-                        base_chunk,
-                        generation,
-                    });
-                    // 追加进 `deltas` **尾部**（FIFO 不变式：`main, deltas[0], …`，§4.4.2）
-                    let mut deltas: Vec<Arc<Segment>> = cur.deltas.iter().cloned().collect();
-                    deltas.push(seg);
-                    // builder 的墓碑并入视图（全局 doc_id；`add` 幂等去重）
-                    let mut acc = (*cur.tombstones).clone();
-                    for d in tombstones.iter() {
-                        acc.add(d);
-                    }
-                    Ok((
+                    return Ok((
                         View {
                             main: Arc::clone(&cur.main),
-                            deltas: Arc::from(deltas),
-                            tombstones: Arc::new(acc),
+                            deltas: Arc::clone(&cur.deltas),
+                            tombstones: Arc::clone(&cur.tombstones),
                             generation,
                         },
-                        used_doc,
-                        used_chunk,
-                    ))
+                        base_doc,
+                        base_chunk,
+                    ));
+                }
+                let SegmentBuilder {
+                    index,
+                    raw_vectors,
+                    vector,
+                    tombstones,
+                    ..
+                } = builder;
+                let used_doc = base_doc + index.total_docs() as DocId;
+                let used_chunk = base_chunk + index.total_chunks() as ChunkId;
+                let seg = Arc::new(Segment {
+                    index,
+                    vector_index: vector,
+                    raw_vectors: Some(raw_vectors),
+                    base_doc,
+                    base_chunk,
+                    generation,
                 });
+                // 追加进 `deltas` **尾部**（FIFO 不变式：`main, deltas[0], …`，§4.4.2）
+                let mut deltas: Vec<Arc<Segment>> = cur.deltas.iter().cloned().collect();
+                deltas.push(seg);
+                // builder 的墓碑并入视图（全局 doc_id；`add` 幂等去重）
+                let mut acc = (*cur.tombstones).clone();
+                for d in tombstones.iter() {
+                    acc.add(d);
+                }
+                Ok((
+                    View {
+                        main: Arc::clone(&cur.main),
+                        deltas: Arc::from(deltas),
+                        tombstones: Arc::new(acc),
+                        generation,
+                    },
+                    used_doc,
+                    used_chunk,
+                ))
+            },
+        );
 
         // 换一个与**新**「已发布长度」对齐的空 builder
         self.builder = Self::new_builder(&self.shared);
@@ -1255,6 +1257,7 @@ impl SearchIndex {
         let physicalized = (*view.tombstones).clone();
         self.shared.commit_view(
             snapshot_epoch,
+            PublishCaller::Fold,
             move |cur, generation, base_doc, base_chunk| {
                 let Some((carried, tombstones)) = Shared::absorb_window(
                     &cur.deltas,
