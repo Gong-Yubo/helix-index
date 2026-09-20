@@ -16,6 +16,10 @@
 //! - CLI-4 `--output` 另存（A/B）：源 `--index` 文件**不被覆盖**（体积保持墓碑态），
 //!   `bytes_before == None`（目标原不存在）而 `bytes_after` 反映回收后体积；回收判据
 //!   落在「源三体积 vs 结果三体积」（`bytes_source` 语义）。
+//!   🔴 **2026-09-19（PR4 第 2 轮）更正**：原写「回收判据落在**源 vs 结果三体积**」——
+//!   `D-S8-01` 之后**源与结果都是 4 点图**（第二次 `save` 已物理化墓碑并重建图），
+//!   该比较只剩 `OsRng` 抖动（实测 ≈1/8 假红）⇒ 参照系改为**同一装配的 8 点基线**，
+//!   与 CLI-3 同法。注意「源不被覆盖」那条断言**保留**（它比的是源与自身，无噪声）。
 //! - CLI-5 纯 BM25 快照在带 embedder 装配下 load 静默（不打印降级警告），见
 //!   `step4_compaction.rs::R_建议6`；这里补一条「纯 BM25 no-op compact 后 reload 可检索」。
 
@@ -178,11 +182,30 @@ fn CLI3_原地compact回收墓碑并收缩体积() {
         ids.push(out.doc_id);
     }
     idx.save(&path).unwrap();
+    // 🔑 **参照基线（8 点、无墓碑）**：`D-S8-01`（`S8-03`/PR4 起 `save` 第一步就 `fold_deltas`）
+    //    之前，它与下面的 `graph_tomb` 是同一个量；**之后不再是** —— 见下。
+    let graph_baseline = on_disk_sizes(&path).1;
+    let total_baseline = total_bytes(&path);
 
     // 删 4 篇（全「删除目标」）→ 墓碑落盘。hnsw 图无 remove API ⇒ 墓碑点留在图 sidecar，
     // 故此刻 graph 体积 = 8 点（含 4 墓碑）；raw_vectors/data 已被 remove 的 retain 摘除
     // 4 条，故只看 total 不一定变大。以 **graph sidecar 体积**作为 compaction 回收的
     // 判别信号：compact 把图重建为 4 存活点 ⇒ graph 必须显著回落。
+    // ⚠️ **上面这句（`PR4` 之前在 `main` 上成立的版本）在本 PR 之后已作废** ——
+    //    `D-S8-01` 让第二次 `save` 就把墓碑物理化并重建图 ⇒ 「墓碑态」已是 4 点图。
+    //    保留原文是为了留痕（判据为什么必须换参照系），**不要按它理解当前状态**，见下。
+    //
+    // 🔴 **2026-09-19（`S8-03` / PR4）前提更正** —— 本节原本断言
+    // `graph_after < graph_tomb`，其中 `graph_tomb` 被当作「8 点含墓碑」的图。PR4 起不再是：
+    // 第二次 `save()`（`D-S8-01`：第一步 `commit()`、第二步 `fold_deltas()`）在**落盘前**就
+    // 把 4 条跨段墓碑**物理化**、并用 `retain` 后的 4 条原始向量**重建了图**
+    // ⇒ 磁盘上的「墓碑态」已经是一张 **4 点图** ⇒ 两侧同量级。
+    // 实测：`graph_tomb = 1097`、`graph_after = 1097`（**相等**）—— 这不是「图没收缩」，
+    // 而是**已经收缩过了**；旧断言据此必红（且 `hnsw_rs` 的层级分配用无种子 `OsRng`
+    // ⇒ 两棵同点数的图的字节数会上下浮动 ⇒ 旧断言**偶发通过** = flaky）。
+    // ⇒ 参照系改为**同一装配的 8 点基线**（`graph_baseline`）：这个判据与「回收发生在
+    // `fold` 还是 `compact`」**无关**（`S8-06` 若改成增量合并，结论不变），仍然钉住
+    // 「墓碑态 + 重编号 + 重建之后，图与总体积都必须回落到存活规模」。
     for d in ids[1..8].iter().step_by(2) {
         idx.remove(*d).unwrap();
     }
@@ -197,13 +220,21 @@ fn CLI3_原地compact回收墓碑并收缩体积() {
     let total_after = total_bytes(&path);
     let graph_after = on_disk_sizes(&path).1;
     assert!(
-        graph_after < graph_tomb,
-        "图 sidecar 应从墓碑态 {graph_tomb} 字节收缩到 {graph_after}（4 存活点）"
+        graph_after < graph_baseline,
+        "图 sidecar 必须相对 **8 点基线** {graph_baseline} 字节收缩（compact 后 {graph_after} 字节 / \
+         4 存活点；墓碑态 {graph_tomb} 已经是 4 点图，见上方前提更正）"
     );
     assert!(
-        total_after < total_tomb,
-        "compact 后总字节 {total_after} 应小于墓碑态 {total_tomb}"
+        total_after < total_baseline,
+        "compact 后总字节 {total_after} 应小于 **8 点基线** {total_baseline}（墓碑态 {total_tomb}）"
     );
+    // ⚠️ 原第三条断言 `total_after < total_tomb`（「compact 后应小于墓碑态」）**已删除**
+    //    （2026-09-19 补）：它与上面两条同源 —— 墓碑态**已经是 4 点状态**，两者的差距只剩
+    //    `hnsw_rs` 用无种子 `OsRng` 带来的**几字节抖动**。实测两侧读数：墓碑态 **2619**、
+    //    compact 后 **2624**（`--features local-rerank` 下）⇒ 该断言是**纯噪声判据**
+    //    （默认 feature 下侥幸通过、换一个 feature 组合就红，与实现无关）。
+    //    「体积必须回落」的语义**已被 `graph_baseline` / `total_baseline` 两条完整覆盖**，
+    //    且它们以「8 点无墓碑状态」为参照 ⇒ 与「回收发生在 `fold` 还是 `compact`」无关。
 
     // reload Loaded + 检索命中的正文不含任何「删除目标」
     let loaded = cli_style_builder().load(&path).unwrap();
@@ -227,6 +258,17 @@ fn CLI3_原地compact回收墓碑并收缩体积() {
 /// 体积），DST 是新建的回收后快照。CLI 的 `bytes_before` 是对目标路径 stat——DST 原本
 /// 不存在故为 `None`（诚实，不是 0），回收判据落在「SRC 源三体积 vs DST 结果三体积」。
 /// 本测试用 core `compact_and_save(DST)` 复刻该路径。
+///
+/// 🔴 **2026-09-19 第 2 轮评审期间实测：本用例原是 flaky（≈1/8 假红）** ——
+/// 原断言 `dst_total < src_tomb`（「回收后应小于**墓碑态**」）把 `src_tomb` 当作「8 点含墓碑的图」，
+/// 而 `D-S8-01`（`save` 第一步 `fold_deltas`）之后**第二次 `save` 就已经把 4 条墓碑物理化、
+/// 并用 4 条存活原始向量重建了图** ⇒ `src_tomb` 与 `dst_total` **都是 4 点图**，本就没有「可回收」的
+/// 差量可比。实测 8 次：`src_tomb` 恒 **2556**；`dst_total` ∈ {**2528** ×7, **2579** ×1}
+/// —— 差别只来自 `hnsw_rs` 层级分配的**无种子 `OsRng`** ⇒ 断言符号随机翻转。
+/// ⇒ 参照系改为**同一装配的 8 点基线**（`total_baseline` / `graph_baseline`，在删除**之前**量取）：
+/// 该判据与「回收发生在 `fold` 还是 `compact`」**无关**（`S8-06` 若改增量合并，结论不变），
+/// 且 8 点 vs 4 点有 **≈2.2×** 裕度。**其余断言一条未放宽**（`remapped` / `reclaimed_docs` /
+/// 源不被覆盖 / reload 后 4 存活且图 `Loaded` / 检索 4 条）。
 #[test]
 fn CLI4_output另存源不变回收看源vs结果() {
     let dir = tempfile::tempdir().unwrap();
@@ -240,10 +282,13 @@ fn CLI4_output另存源不变回收看源vs结果() {
         ids.push(out.doc_id);
     }
     idx.save(&src).unwrap();
+    // 🔑 回收判据的参照系：**8 点、无墓碑**的同一装配（删除发生前量取）
+    let total_baseline = total_bytes(&src);
+    let graph_baseline = on_disk_sizes(&src).1;
     for d in &ids[0..4] {
         idx.remove(*d).unwrap();
     }
-    idx.save(&src).unwrap(); // SRC = 含 4 墓碑
+    idx.save(&src).unwrap(); // SRC = 含 4 墓碑（⚠️ 图在这一步已被重建为 4 点）
     let src_tomb = total_bytes(&src);
 
     // A/B：compact 到 dst（src 保持只读源）
@@ -264,10 +309,17 @@ fn CLI4_output另存源不变回收看源vs结果() {
         "--output 不得改动源 --index 文件"
     );
     let dst_total = total_bytes(&dst);
+    let graph_dst = on_disk_sizes(&dst).1;
     assert!(dst_total > 0, "目标快照已生成");
+    // 回收的信号用 **graph sidecar**（与 `CLI3` 同法）：它是「图里有几个点」的直接反映，
+    // 不会被 `raw_vectors` / postings 的字节量淹没。
     assert!(
-        dst_total < src_tomb,
-        "回收后 dst 总字节应小于 src（墓碑态）"
+        graph_dst < graph_baseline,
+        "图 sidecar 应从 8 点基线 {graph_baseline} 字节收缩到 {graph_dst}（4 存活点）"
+    );
+    assert!(
+        dst_total < total_baseline,
+        "compact 后的 dst 应为 4 点形态：总字节 {dst_total} 应小于 8 点基线 {total_baseline}"
     );
 
     // 源仍是可 load 的墓碑快照（含 4 存活）；dst reload 后只有 4 存活且 Loaded

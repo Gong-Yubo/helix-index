@@ -8,7 +8,7 @@
 mod bm25;
 mod vector;
 
-pub use bm25::{Bm25Params, Bm25Retriever};
+pub use bm25::{Bm25Params, Bm25Retriever, SegmentRef, SegmentSet, SegmentedBm25Retriever};
 pub use vector::VectorRetriever;
 
 use crate::error::Result;

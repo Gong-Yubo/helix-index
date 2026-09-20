@@ -336,10 +336,20 @@ fn TI5_strict失败后快照仍可加载并恢复() {
         "失败后的残留 sidecar 绝不能让 load 假装快路径，实测 {:?}",
         loaded.graph_status()
     );
+    // ⚠️ 本断言用 **`bm25` 模式**（不是默认 `hybrid`）—— 它验的是「快照内容完整」，
+    //    而 hybrid 的召回依赖 **ANN 图的拓扑**（`v2-step8-design.md` §4.6.2：ANN 路径
+    //    **不承诺**跨布局逐位一致）。`S8-03` 起 `save` 的第一步是**合并**（`D-S8-01`）
+    //    ⇒ 图按合并后的全量原始向量**重建** ⇒ 拓扑与「逐批 `flush` 增量建图」不同
+    //    ⇒ hybrid 的 top-10 会漂移（实测：改前用整串 query + hybrid 时，目标文档恰好在
+    //    top-10 内；改后不进 ⇒ 断言红）。**BM25 是确定性的、与图无关** ⇒ 换成它之后
+    //    本断言仍然验同一件事（「最后一次 `save` 的内容在快照里」），且不再受拓扑抖动影响。
     let hits = loaded
         .into_searcher()
         .unwrap()
-        .search("新增文档 CHANGEZZZ")
+        .search_with("CHANGEZZZ")
+        .mode(helix_core::query::SearchMode::Bm25)
+        .top_n(10)
+        .exec()
         .unwrap();
     assert!(
         hits.hits.iter().any(|h| h.text.contains("CHANGEZZZ")),

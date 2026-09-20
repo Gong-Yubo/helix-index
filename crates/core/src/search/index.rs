@@ -2,10 +2,12 @@
 //!
 //! # 可见性语义（p6-design 6.3；`S8-02` 起见 `super::view`）
 //!
-//! ⚠️ **本阶段（`S8-02` 视图骨架）的可见性语义与重构前逐位一致**：倒排在 `add` 时
-//! **立即**写入当前段（`deltas` 恒空 ⇒ 只有一段）⇒「`add` 后未 `commit` 也能查到倒排」；
-//! 向量侧由 `flush` 灌入。`commit()` = `flush()` + **发布新视图**（`generation` +1）。
-//! 「未 `commit` 不可见」由 `S8-03`（delta 写入）收紧，届时收窄到的判据见设计 §1.3 第 7 条。
+//! **`S8-03` 起：可见性 = `commit()` 后**（NFR-11 / 设计 §1.3 第 7 条）。`add` / `flush`
+//! 写的是**写端私有的** `SegmentBuilder` ⇒ 读端看不到；`commit()` = `flush` → **封段** →
+//! 持 `ids` 锁**原子追加进 `View.deltas`** → 发布新 `View`（`generation` +1）。
+//! ⚠️ `S8-02`（视图骨架）期**恰好相反**（`deltas` 恒空、`add` 直写 `main` ⇒ 立即可见，
+//! 与重构前逐位一致）；那条语义**按计划在本 PR 收紧**，对应用例已改名 + 反转
+//! （`tests/step8_segments.rs` 的 `S8_03_未commit不可见_commit后立即可见`）。
 //!
 //! `searcher(&self)` **不隐含 flush**（对齐 NFR-11：可见性 = `commit()` 后）；
 //! 旧的 `into_searcher()` 保留为 `#[deprecated]` 薄封装 = `commit()` + `searcher()`，
@@ -15,13 +17,14 @@ use std::sync::Arc;
 
 use crate::document::{content_hash, DocRecord, Document};
 use crate::error::{Error, Result};
+use crate::index::Index;
 use crate::types::{ChunkId, DocId};
 use crate::vector::{
     BruteForceIndex, HnswRsIndex, NormalizedVector, VectorGraphPersist, VectorIndex,
 };
 
 use super::config::{Config, GraphPersistMode, SearchIndexBuilder, VectorBackend};
-use super::view::{Segment, Shared};
+use super::view::{PublishCaller, Segment, Shared, Tombstones, View};
 
 /// 图 sidecar 的状态（V2 Step 2 / NFR-07：降级不能静默）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,8 +184,8 @@ fn snapshot_bytes(path: &std::path::Path) -> std::io::Result<SizeBytes> {
 }
 
 // ⚠️ 原 `pub(crate) struct Inner`（`index` / `vector_index` / `raw_vectors`）已上移为
-// [`super::view::Segment`]：`S8-02` 起「内容容器」= 段，写端经
-// [`super::view::Shared::with_main_mut`] 独占访问（见 `view` 模块的 I8-2 说明）。
+// `super::view::Segment`（私有项，故不用 intra-doc 链接）：`S8-02` 起「内容容器」= 段；
+// `S8-03` 起写入落在写端私有的 `SegmentBuilder` 上、由 `commit()` 追加为 `View.deltas` 的一段。
 
 /// 待 embed 的缓冲项（写缓冲，p6-design 6.2）。
 pub(crate) struct PendingChunk {
@@ -280,19 +283,117 @@ pub struct CompactionReport {
 /// 内容**不在**本结构里，而在 `shared.view.main`（`Segment`）。本结构只持
 /// 「写缓冲 `pending`」与「诊断计数」。
 ///
-/// ⚠️ **过渡约束**：`deltas` 恒空 ⇒ 写入需独占 `main`（`Shared::with_main_mut`）⇒
-/// 有并发检索进行中时写操作返回 `Err`。`S8-03` 起写入落在写端私有 builder 上、该约束消失。
+/// ⚠️ **`S8-03` 起不再有「写入需独占」的过渡约束**：`add` / `flush` / `remove` 只写
+/// **写端私有的 builder**，`commit()` 持 `Shared::ids` 锁把段原子追加进 `View.deltas`
+/// ⇒ **并发检索进行中也能写**。（`S8-02` 期 `deltas` 恒空、内容唯一，写端就地改 `main`，
+/// 那时才有该约束；`S8-03` 评审 P3-4 指出该段已过时。）
 ///
 /// # 所有权切换（p6-design 6.4 方案 A → `S8-02` 起改用共享视图）
 ///
 /// `shared` 是 `Arc<Shared>`：`searcher(&self)` 只克隆该 `Arc`（不消耗写端）；
 /// `Searcher::into_index()` 同样只克隆该 `Arc`（**总是成功**，不再要求 refcount==1
 /// ——「Searcher clone 残留」与「写端存活」在新模型下不可区分，后者是合法状态）。
+/// 写端的**段构建器**（`S8-03`）：一块**尚未发布**的内容。
+///
+/// 生命周期：`add` / `flush` 往里写 → [`SearchIndex::commit`] 把它**冻结成 `Segment`**
+/// 并追加进 `View.deltas` → 换一个空的。⇒ **未 `commit` 的内容对读端不可见**
+/// （这正是 NFR-11 的可见性边界，也是 §1.3 第 7 条的落地形态）。
+///
+/// # 为什么 `base_*` 记在这里（而不是每次 `add` 重算）
+///
+/// 本 builder 的本地 ID `i` 对应的全局 ID 恒为 `base + i`（`base` = 它被创建时的
+/// 「已发布长度」，§4.4.1）。把它**钉在创建时刻**有两个好处：
+/// ① `add` 不需要每篇文档读一次锁；
+/// ② `commit` 时可以拿锁内的真实基址与它**对账** —— 不等即说明**另一个写端插过队**
+///    （`into_index()` 让同一 `Arc<Shared>` 上可以有两个写端），此时段内 ID 与全局 ID
+///    已不对应 ⇒ 必须**报错**而不是把错位的 ID 发布出去。
+pub(crate) struct SegmentBuilder {
+    /// 段内容（**段内**本地 ID 从 0 起）
+    index: Index,
+    /// 写缓冲（批量 embed；`add` 入缓冲前已分配段内 `chunk_id`）
+    pending: Vec<PendingChunk>,
+    /// 段内原始向量（快照用，本地 `chunk_id`）
+    raw_vectors: Vec<(ChunkId, Vec<f32>)>,
+    /// 该段的向量索引（纯 BM25 段为 `None`）
+    vector: Option<Box<dyn VectorIndex>>,
+    /// 针对**既往段**的全局 `doc_id` 墓碑（`remove` 命中既往段时记这里，§4.8.3 分支 ②）
+    tombstones: Tombstones,
+    /// 本段的全局基址（创建时刻的「已发布长度」，见类型文档）
+    base_doc: DocId,
+    base_chunk: ChunkId,
+    /// 创建时刻的 **ID 空间世代**（`S8-03` 评审 **P2-4**）。
+    ///
+    /// 与 `base_*` 一起**在同一把锁内**取回（[`Shared::next_origin`]），并在 `commit()` 时
+    /// 回报给 [`Shared::commit_view`] ⇒ `compact()` 的重编号（[`Shared::publish_reset`]）
+    /// 会把本 builder 的发布**整条拒掉**。
+    /// ⚠️ 光有基址对账**不够**：重编号后基址可能恰好又相等（ABA），而本 builder 记的
+    /// 墓碑 / 去重条目仍指向旧 ID 空间 ⇒ 会静默错挂到无辜文档上。
+    epoch: u64,
+}
+
+impl SegmentBuilder {
+    pub(crate) fn new(
+        vector: Option<Box<dyn VectorIndex>>,
+        base_doc: DocId,
+        base_chunk: ChunkId,
+        epoch: u64,
+    ) -> Self {
+        Self {
+            index: Index::new(),
+            pending: Vec::new(),
+            raw_vectors: Vec::new(),
+            vector,
+            tombstones: Tombstones::default(),
+            base_doc,
+            base_chunk,
+            epoch,
+        }
+    }
+
+    /// 段内本地 `doc_id` → 全局（`base + local`）。
+    fn global_doc(&self, local: DocId) -> DocId {
+        self.base_doc + local
+    }
+
+    /// 该 builder 是否**空**（无内容、无墓碑）⇒ `commit()` 不追加空段（设计 §4.8.3 ③）。
+    ///
+    /// ⚠️ **「墓碑-only」builder 被判为非空是有意的**：跨段墓碑**只能**搭一次发布的便车进
+    /// `View.tombstones`（`commit()` 的追加路径），所以哪怕零内容也必须入列。两个次生效应
+    /// （`S8-03` 第 2 轮评审 **P4-1**，**本 PR 不修**、登记给 `S8-06` 合并器）：
+    /// ① `Metrics.segments` 被零内容段**膨胀**（删除密集型负载下持续偏大）；
+    /// ② `fold` 期 `merge_from(空 Index)` 仍走一遍 `append_from` 的 `ForwardStore::rebuild`
+    ///    + `field_index.rebuild`（各 O(N)）⇒ 每个墓碑-only 段白付一次**全量 pass**。
+    ///
+    /// 预期取形：零内容段不占 `deltas` 名额、墓碑直接并入 `View` 层。
+    fn is_empty(&self) -> bool {
+        self.index.total_chunks() == 0 && self.tombstones.is_empty()
+    }
+}
+
+/// 写端门面（拥有型）。持 `Shared`（与读端共享的视图 + 装配）与**写端私有**的
+/// `SegmentBuilder`（`S8-03` 起：未 `commit` 的内容都在那里，读端看不到）。
+///
+/// 注意：`SearchIndex` 仍是 **`!Sync`**（`add(&mut self)`）——但 `S8-02` 起这**不再**
+/// 是「读写互斥」的来源：读端持独立的 `Searcher`（`Arc<Shared>`），与写端**并存**。
+///
+/// # `S8-03` 起的写路径
+///
+/// | 方法 | 落点 |
+/// | --- | --- |
+/// | `add` / `flush` | **自己的 builder**（不碰已发布的段）⇒ **并发检索进行中也能写** |
+/// | `commit()` | 把 builder 冻成 `Segment`，**持 `ids` 锁原子追加**进 `View.deltas` |
+/// | `remove` | 三分支：当前 builder 就地物理删 / 既往段记**跨段墓碑** / 不存在 no-op |
+///
+/// # 所有权切换
+///
+/// [`Self::searcher`] 只克隆 `Arc<Shared>`（不消耗写端）；`Searcher::into_index()` 同样
+/// 只克隆（**总是成功** ——「`Searcher` clone 残留」与「写端存活」不可区分）。⚠️ 后者是
+/// **双写端**的入口 ⇒ `commit()` 里那条「基址对账」就是为它准备的。
 pub struct SearchIndex {
     /// 与读端共享的视图 + 装配（唯一内容来源）
     pub(crate) shared: Arc<Shared>,
-    /// 写缓冲（`S8-02` 期仍是写端私有的唯一可变状态）
-    pub(crate) pending: Vec<PendingChunk>,
+    /// 写端的段构建器（`S8-03` 起取代裸 `pending`：未 `commit` 的内容都在这里）
+    pub(crate) builder: SegmentBuilder,
     /// 累计 embed 推理耗时（`flush` 中累加，供 NFR-03 构建耗时口径观测）。
     /// 只计 `embed_documents` 推理本身，不含归一化 / 灌向量索引。
     pub(crate) embed_elapsed: std::time::Duration,
@@ -321,8 +422,27 @@ impl SearchIndex {
         backend: VectorBackend,
         graph: super::config::GraphOpts,
     ) -> Self {
+        let cfg = Arc::new(cfg);
+        // 主段与 builder **各自**持一个空的向量索引（两者独立演进：主段已发布、builder 在写）
+        let main = Arc::new(Segment::empty(Self::make_vector_index(&cfg, backend)));
+        Self {
+            shared: Arc::new(Shared::new(Arc::clone(&cfg), graph, backend, main)),
+            builder: SegmentBuilder::new(Self::make_vector_index(&cfg, backend), 0, 0, 0),
+            embed_elapsed: std::time::Duration::ZERO,
+            embed_count: 0,
+            graph_status: GraphStatus::NotApplicable,
+            graph_dump_elapsed: None,
+        }
+    }
+
+    /// 按配置与后端造一个**空的**向量索引（`None` = 纯 BM25）。
+    ///
+    /// ⚠️ `from_config`（主段 + 首任 builder）与 [`Self::new_builder`]（`into_index()`
+    /// 换回写端时）**必须共用本函数** —— 各写一遍就会给「换回写端后段类型与
+    /// `shared.backend` 不一致」留后门。
+    fn make_vector_index(cfg: &Config, backend: VectorBackend) -> Option<Box<dyn VectorIndex>> {
         let ef_search = cfg.ef_search;
-        let vector_index = match cfg.embedder.as_ref() {
+        match cfg.embedder.as_ref() {
             Some(_) => Some(match backend {
                 VectorBackend::Brute => Box::new(BruteForceIndex::new()) as Box<dyn VectorIndex>,
                 VectorBackend::Hnsw => {
@@ -335,24 +455,74 @@ impl SearchIndex {
                 }
             }),
             None => None,
-        };
-        let main = Arc::new(Segment::empty(vector_index));
-        Self {
-            shared: Arc::new(Shared::new(Arc::new(cfg), graph, backend, main)),
-            pending: Vec::new(),
-            embed_elapsed: std::time::Duration::ZERO,
-            embed_count: 0,
-            graph_status: GraphStatus::NotApplicable,
-            graph_dump_elapsed: None,
         }
     }
 
-    /// 当前主段的快照（`I8-3`：一次操作只取一次读锁）。
+    /// 造一个与 `shared` 装配一致的空 builder（基址 **+ 世代**取当前「出生点」）。
     ///
-    /// ⚠️ `S8-02` 期 `deltas` 恒空 ⇒ 读路径只看 `main`；`S8-03` 起读端遍历
-    /// `main + deltas`（跨段检索在 `S8-04` / `S8-05`）。
-    fn seg(&self) -> Arc<Segment> {
-        Arc::clone(&self.shared.snapshot().main)
+    /// ⚠️ 基址与 `epoch` **必须一次取回**（[`Shared::next_origin`]）：分两次取时另一个写端
+    /// 可以在两次调用之间 `compact()` ⇒ 得到「旧世代基址 + 新世代 epoch」的 builder，
+    /// 它的对账会通过（`S8-03` 评审 P2-4 的窗口）。
+    pub(crate) fn new_builder(shared: &Shared) -> SegmentBuilder {
+        let (base_doc, base_chunk, epoch) = shared.next_origin();
+        SegmentBuilder::new(
+            Self::make_vector_index(&shared.cfg, shared.backend),
+            base_doc,
+            base_chunk,
+            epoch,
+        )
+    }
+
+    /// 当前视图的快照（`I8-3`：一次操作只取一次读锁）。
+    ///
+    /// ⚠️ `S8-03` 起内容分布在 `main + deltas` ⇒ **任何**「全量」语义（统计、查重、
+    /// 遍历）都必须走 `view`，不能只看 `main`。
+    fn view(&self) -> Arc<View> {
+        self.shared.snapshot()
+    }
+
+    /// **跨段** `content_hash` 查重（FR-15 幂等 upsert 的必要条件，设计 §4.8.3）。
+    ///
+    /// 顺序：当前 builder（未发布、最新）→ `deltas` 逆序 → `main`。
+    ///
+    /// 🔑 **命中后还要判「该 doc 是否已被墓碑挡住」**：被挡住 ⇒ **不算命中**（可重新 upsert）。
+    /// 今天 `remove` 会 `content_hashes.remove(&hash)`（`Index::remove`）⇒「删除后可重新
+    /// upsert」自然成立；跨段后**主段的 hash 表删不掉**（`remove` 只作用于它自己那段），
+    /// 同一语义只能靠墓碑在这里挡一下 —— 由 `S8-T6` 钉住。
+    ///
+    /// 🔴 **两处墓碑都要查**（`S8-03` 第 2 轮评审 **P1-1**）：`remove` 的**分支②**（目标在
+    /// 既往段）把墓碑记在 **`self.builder.tombstones`** 上，要 `commit()` 才进
+    /// `View.tombstones`。只查后者的话——「`remove(X)` 后**不 `commit()`** 直接重加同 hash
+    /// 内容」——查重会命中**刚被删除的** X ⇒ 返回 `deduped = true` + `doc_id = X`
+    /// ⇒ **替换 / 重加静默丢失**（`commit()` 后 X 被墓碑挡住，而新内容**根本没被创建**，
+    /// 调用方还拿到一个已死 doc 的 ID）。
+    ///
+    /// 🔑 为什么这**是缺口而不是设计**：同一序列在**分支①**（目标未发布）下是
+    /// 「就地物理删 + 条件式摘 hash 条目」⇒ 重加正常工作。而 FR-15 的「替换文档」流程
+    /// （`remove(id)` 后用同 `dedup_key`、不同正文重新 upsert）**总是**落在分支②
+    /// （目标必然已发布才谈得上"替换"）⇒ 它是用户会真的走到的那条路。
+    fn doc_id_by_hash_global(&self, hash: u64) -> Option<DocId> {
+        // ① 未发布的 builder：它是最新的，且它的 doc 不可能被墓碑挡（墓碑只针对既往段）
+        if let Some(local) = self.builder.index.doc_id_by_hash(hash) {
+            return Some(self.builder.global_doc(local));
+        }
+        // ② 已发布的段：**最新优先**（deltas 末尾 → … → main）
+        let view = self.view();
+        for seg in view.segments_newest_first() {
+            if let Some(local) = seg.index.doc_id_by_hash(hash) {
+                let global = seg.global_doc(local);
+                // ⚠️ **两处都查**：已发布的墓碑 + 本 builder 上**尚未发布**的墓碑（P1-1）。
+                //    「命中即 return」仍成立：单写端不变式下，若最新命中被墓碑挡住，更旧的
+                //    同 hash 命中必然也已被挡住（同一条替换链上的前身）；
+                //    而「已替换 + 已删除」的旧 doc 本就不该被新的 upsert 复用。
+                if view.tombstones.blocks_doc(global) || self.builder.tombstones.blocks_doc(global)
+                {
+                    return None; // 已被墓碑挡住 ⇒ 视为未命中（可重新 upsert）
+                }
+                return Some(global);
+            }
+        }
+        None
     }
 
     /// 摄入一篇文档：查重 → 分块 → 倒排 → 写缓冲（p6-design 6.1）。
@@ -362,24 +532,21 @@ impl SearchIndex {
     /// - 向量化**延后到 `flush`**（批量 embed，NFR-03）；此刻只进倒排与写缓冲。
     /// - 缓冲满（`batch_size`）时自动同步 flush。
     ///
-    /// # ⚠️ `S8-02` 期失败可能是**部分生效**（评审 P4-5b）
+    /// # 失败语义（`S8-03` 起）
     ///
-    /// 本方法有**两处**写点：① 倒排（第一处 `Shared::with_main_mut`）；
-    /// ② 缓冲满时的 `flush()`（内部再取一次 `with_main_mut`）。
-    /// **① 成功后 ② 可能失败**（读者恰在两步之间插入 ⇒ 见 `Shared::with_main_mut`
-    /// 的过渡约束）⇒ 返回 `Err` **但倒排已写入、内容已可查**。
+    /// 全部写入都落在**写端私有的 builder** 上（不碰已发布的段）⇒ `add` **没有**
+    /// 「部分生效」形态：`Ok` = 已进 builder；`Err` = 本次未写入。
+    /// ⚠️ 但 builder 里的内容要 `commit()` 才对外可见（§1.3 第 7 条 / NFR-11）。
     ///
-    /// - **重试是安全的**：`content_hash` 查重短路 ⇒ 第二次 `add` 返回 `deduped = true`，
-    ///   不会重复插入；`pending` 保留待下次 `flush()` 自愈。
-    /// - 但调用方**不能**假定「`Err` ⇒ 什么都没发生」。
-    /// - `S8-03`（delta 分段）后写入不再需要独占 ⇒ 该情形消失。
+    /// （`S8-02` 期那套「两处写点、① 成功后 ② 可能失败 ⇒ 部分生效」的描述已**作废**；
+    /// `S8-03` 评审 P3-4.2 指出它当时已与实现矛盾。）
     pub fn add(&mut self, doc: impl Into<Document>) -> Result<AddOutcome> {
         let doc = doc.into();
         let text = doc.text.clone();
         let hash = content_hash(doc.dedup_key.as_deref().unwrap_or(&text));
 
-        // 短路查重（与 Index::add 内部去重语义一致）
-        if let Some(existing) = self.seg().index.doc_id_by_hash(hash) {
+        // ① **跨段**查重（builder → deltas 逆序 → main；被墓碑挡住的**不算命中**）
+        if let Some(existing) = self.doc_id_by_hash_global(hash) {
             return Ok(AddOutcome {
                 doc_id: existing,
                 chunk_ids: Vec::new(),
@@ -394,23 +561,35 @@ impl SearchIndex {
             content_hash: hash,
         };
 
-        // 分块 → 倒排（立即完成）
-        let chunks = self.shared.cfg.chunker.chunk(0, &text);
+        // ② 分块 → 写进**写端私有的 builder**（段内本地 ID）
+        //
+        // 🔑 `S8-03` 的核心：这里**不再就地改 `main`** —— 写的是自己的 builder，
+        // 不碰任何已发布的段 ⇒ **并发检索进行中照样能写**（`FR-17` 的「读不阻塞写」
+        // 从「靠约束绕开」变成「结构上不冲突」）。
+        let cfg = Arc::clone(&self.shared.cfg);
+        let chunks = cfg.chunker.chunk(0, &text);
         let chunk_texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
-        let (doc_id, chunk_ids) = self.shared.with_main_mut(|seg| {
-            seg.index
-                .add(record, chunks, self.shared.cfg.analyzer.as_ref())
-        })??;
+        let (local_doc, local_chunks) =
+            self.builder
+                .index
+                .add(record, chunks, cfg.analyzer.as_ref())?;
 
-        // 进写缓冲（有向量侧时才需要 embed）
-        if self.shared.cfg.embedder.is_some() {
-            for (chunk_id, text) in chunk_ids.iter().zip(chunk_texts) {
-                self.pending.push(PendingChunk {
-                    chunk_id: *chunk_id,
+        // ③ 段内 → 全局（`AddOutcome` 的公开契约是**全局** ID，设计 §4.4.1）
+        let doc_id = self.builder.global_doc(local_doc);
+        let chunk_ids: Vec<ChunkId> = local_chunks
+            .iter()
+            .map(|c| self.builder.base_chunk + c)
+            .collect();
+
+        // ④ 进写缓冲（有向量侧时才需要 embed；缓冲里存的是**段内** chunk_id —— 灌索引用）
+        if cfg.embedder.is_some() {
+            for (local, text) in local_chunks.iter().zip(chunk_texts) {
+                self.builder.pending.push(PendingChunk {
+                    chunk_id: *local,
                     text,
                 });
             }
-            if self.pending.len() >= self.shared.cfg.batch_size {
+            if self.builder.pending.len() >= cfg.batch_size {
                 self.flush()?;
             }
         }
@@ -438,17 +617,22 @@ impl SearchIndex {
     /// - **L2 归一化在此内部调用 `NormalizedVector::new` 保证**（消除静默陷阱 ⑥）
     /// - 纯 BM25（无 embedder）时为 no-op
     pub fn flush(&mut self) -> Result<()> {
-        if self.pending.is_empty() {
+        if self.builder.pending.is_empty() {
             return Ok(());
         }
         let cfg = Arc::clone(&self.shared.cfg);
         let Some(embedder) = cfg.embedder.as_ref() else {
             // 无向量侧：缓冲不应存在（add 里已短路）；防御性清空
-            self.pending.clear();
+            self.builder.pending.clear();
             return Ok(());
         };
 
-        let texts: Vec<String> = self.pending.iter().map(|p| p.text.clone()).collect();
+        let texts: Vec<String> = self
+            .builder
+            .pending
+            .iter()
+            .map(|p| p.text.clone())
+            .collect();
         let t = std::time::Instant::now();
         let vecs = embedder.embed_documents(&texts)?;
         self.embed_elapsed += t.elapsed();
@@ -478,22 +662,21 @@ impl SearchIndex {
         // 刻意**先整批 embed、再过滤**（不改变 `embed_documents` 入参组成）：fastembed
         // 推理是否受 batch 组成影响未经实测（Step 2 教训是「别赌」），「白算一条 embed」
         // 的代价只是时间；若后续实测证明组成无关，可再改「先过滤再 embed」（见设计 §9 Q5）。
+        // ⚠️ 同样写**自己的 builder**（不再就地改 `main`）⇒ 与并发读者无冲突。
+        // `pending` 与 `raw_vectors` 都要可变 ⇒ 先把缓冲 `take` 出来（避免同时借两个字段）。
+        let b = &mut self.builder;
+        let pending = std::mem::take(&mut b.pending);
+        let vi = b.vector.as_mut().ok_or(Error::NoEmbedder)?;
         let mut items: Vec<(ChunkId, NormalizedVector)> = Vec::new();
-        self.shared.with_main_mut(|seg| -> Result<()> {
-            let vi = seg.vector_index.as_mut().ok_or(Error::NoEmbedder)?;
-            for (pending, v) in self.pending.iter().zip(vecs) {
-                if !seg.index.is_live_chunk(pending.chunk_id) {
-                    continue; // 墓碑 chunk：向量丢弃，不落 raw_vectors、不进图
-                }
-                let nv = NormalizedVector::new(v);
-                if let Some(raw) = seg.raw_vectors.as_mut() {
-                    raw.push((pending.chunk_id, nv.as_slice().to_vec()));
-                }
-                items.push((pending.chunk_id, nv));
+        for (p, v) in pending.iter().zip(vecs) {
+            if !b.index.is_live_chunk(p.chunk_id) {
+                continue; // 墓碑 chunk：向量丢弃，不落 raw_vectors、不进图
             }
-            vi.add_batch(&items)
-        })??;
-        self.pending.clear();
+            let nv = NormalizedVector::new(v);
+            b.raw_vectors.push((p.chunk_id, nv.as_slice().to_vec()));
+            items.push((p.chunk_id, nv));
+        }
+        vi.add_batch(&items)?;
         Ok(())
     }
 
@@ -509,48 +692,160 @@ impl SearchIndex {
     /// → 发布」，届时它才成为**唯一的可见性边界**（设计 §4.8.3 / §1.3 第 7 条）。
     pub fn commit(&mut self) -> Result<()> {
         self.flush()?;
-        // ⚠️ **四步（取快照 / 算下一段基址 / 推进序号 / 发布）全部在
-        // `Shared::commit_view` 的 `ids` 锁内完成** —— 两写端并发 `commit()` 时
-        // 序号不会回退、段基址不会重叠（`S8-02` 评审 P2 / 设计 §4.4.3）。
-        //
-        // 🔑 `publish` 已**不再是公开入口**：发布逻辑内联在 `commit_view` 里
-        // ⇒ 「锁外三段」在可见性层面写不出来（结构性对策，不是加检查）。
-        // ⚠️ 原先的「单调性告警」已删除：它比较的是**发布前的旧 `cur`**
-        // （`generation <= cur.generation`），在上述交错下 `1 <= 0` = false
-        // ⇒ **永不触发、形同虚设**（评审 P2 复核 + 实测）。真正的守卫在
-        // `commit_view` 的 `debug_assert`（防旁路）与
-        // `S8_02_并发commit不丢失视图序号`（行为判据）。
-        let generation = self.shared.commit_view();
-        // 可观测性（NFR-07）：发布是新模型下唯一的状态跃迁，必须留痕。
-        let (base_doc, base_chunk) = self.shared.next_base();
+
+        // ⚠️ **对账（两项）**：① **世代**（`epoch`）—— 本 builder 创建后是否有另一个写端
+        //    `compact()` 过（重编号 ⇒ 整个旧 ID 空间作废）；② **基址** —— 是否有另一个写端
+        //    在本写端 `add` 之后提交过（`into_index()` 让同一 `Arc<Shared>` 上可以有两个写端）。
+        //    任一项不符 ⇒ 段内 ID / 墓碑 / 去重条目已与全局不对应 ⇒ **必须报错**，
+        //    不能把错位的 ID 发布出去（单写端下两项恒不触发）。
+        // 🔴 **① 是 P2-4 的修复**：只有 ② 时存在 **ABA 窗口** —— `compact()` 允许「已用长度
+        //    变小」，若此后恰好又提交了等量内容，`ids.next_*` 会回到与本 builder 记录的基址
+        //    **完全相等**的值 ⇒ 基址对账**通过** ⇒ 本 builder 里那条指向旧 ID 空间的跨段墓碑
+        //    被并进视图，下一次物理化就会删掉**重编号后的另一个无辜文档**（静默错删）。
+        //    世代号把这条窗口变成「结构上不存在」。
+        // 🔴 **但本路径的语义不满足 `Error::Busy` 的「重试即可」承诺**（`S8-03` 评审 P2-1）：
+        //    不匹配分支**不追加段**，而末尾**无条件**换新 builder ⇒ builder 里未提交的内容
+        //    （含已返回给调用方的 ID 与已记的墓碑）**被丢弃**，重试**不会**恢复它。
+        //    ⇒ 本次已在错误消息里如实声明；「无损重基」（保留 builder、把 `base_*` 对齐到
+        //    锁内真实值后重新发布）留给下一提交，与 `error.rs` 的文档同步。
+        // 🔴 **恢复指引必须同时点名 `remove`**（`S8-03` 第 2 轮评审 **P3-1**）：被丢弃的
+        //    builder 内容**含分支②记下的跨段墓碑** ⇒ 对「`remove(X)` → `commit()` 被拒」的
+        //    流程，只让用户「重新 `add`」的话他**什么都不会恢复** —— X 的删除静默失效
+        //    （X 继续可检索）。NFR-07：**恢复路径也要如实**。
+        let mismatched = std::cell::Cell::new(false);
+        // 取出 builder（下面在锁内被消耗）；先用占位顶上，末尾统一换成新的
+        let builder = std::mem::replace(&mut self.builder, SegmentBuilder::new(None, 0, 0, 0));
+        let expected = (builder.base_doc, builder.base_chunk);
+        let expected_epoch = builder.epoch;
+
+        let published = self.shared.commit_view(
+            expected_epoch,
+            PublishCaller::Commit,
+            |cur, generation, base_doc, base_chunk| {
+                // 基址不符 **或** builder 为空 ⇒ 不追加任何段（视图内容不变），但仍推进序号
+                // （「每次 commit 都发布」是既有契约，见单测 `S8_02_commit递增视图序号`；
+                //  空段**不入列**则避免 `deltas` 被空段撑大，设计 §4.8.3 ③）。
+                // ⚠️ 「**墓碑-only**」不算空（见 `SegmentBuilder::is_empty`）⇒ 会追加一个
+                //    **零内容段**（发布墓碑所必需）；其两个次生成本见该方法文档（P4-1 / `S8-06`）。
+                if (base_doc, base_chunk) != expected || builder.is_empty() {
+                    if (base_doc, base_chunk) != expected {
+                        mismatched.set(true);
+                    }
+                    return Ok((
+                        View {
+                            main: Arc::clone(&cur.main),
+                            deltas: Arc::clone(&cur.deltas),
+                            tombstones: Arc::clone(&cur.tombstones),
+                            generation,
+                        },
+                        base_doc,
+                        base_chunk,
+                    ));
+                }
+                let SegmentBuilder {
+                    index,
+                    raw_vectors,
+                    vector,
+                    tombstones,
+                    ..
+                } = builder;
+                let used_doc = base_doc + index.total_docs() as DocId;
+                let used_chunk = base_chunk + index.total_chunks() as ChunkId;
+                let seg = Arc::new(Segment {
+                    index,
+                    vector_index: vector,
+                    raw_vectors: Some(raw_vectors),
+                    base_doc,
+                    base_chunk,
+                    generation,
+                });
+                // 追加进 `deltas` **尾部**（FIFO 不变式：`main, deltas[0], …`，§4.4.2）
+                let mut deltas: Vec<Arc<Segment>> = cur.deltas.iter().cloned().collect();
+                deltas.push(seg);
+                // builder 的墓碑并入视图（全局 doc_id；`add` 幂等去重）
+                let mut acc = (*cur.tombstones).clone();
+                for d in tombstones.iter() {
+                    acc.add(d);
+                }
+                Ok((
+                    View {
+                        main: Arc::clone(&cur.main),
+                        deltas: Arc::from(deltas),
+                        tombstones: Arc::new(acc),
+                        generation,
+                    },
+                    used_doc,
+                    used_chunk,
+                ))
+            },
+        );
+
+        // 换一个与**新**「已发布长度」对齐的空 builder
+        self.builder = Self::new_builder(&self.shared);
+
+        // ① 世代对账失败（`P2-4`）：`commit_view` 在**进入闭包前**就返回了 `Err` ⇒
+        //    本次既没追加段、也没推进任何计数器（`generation` 都不消耗）。
+        //    ⚠️ 注意这里是**发布之后**才 `?`：builder 已换成与**当前**世代对齐的新的一枚，
+        //    契约与下面的基址分支一致（未提交内容被丢弃、重试不恢复）。
+        let generation = published?;
+
+        if mismatched.get() {
+            return Err(Error::Busy(
+                "另一个写端在本写端 add 之后提交过 ⇒ 本次段基址已过期（段内 ID 与全局 ID \
+                 不再对应）；单写端下不会发生 —— 同一 Arc<Shared> 上请勿并发写。\
+                 ⚠️ 本次**未提交内容已被丢弃**（builder 已换成新的），重试**不会**恢复它；\
+                 请重新执行未成功的 `add` **与 `remove`** 后再 `commit()`"
+                    .to_string(),
+            ));
+        }
+
+        // 可观测性（NFR-07）：发布是唯一的状态跃迁，必须留痕。
+        let view = self.shared.snapshot();
         tracing::debug!(
             generation,
-            base_doc,
-            base_chunk,
-            segments = 1 + self.shared.snapshot().deltas.len(),
-            "视图已发布（S8-02 骨架：`deltas` 恒空 ⇒ segments 恒为 1）"
+            segments = view.segments_in_order().count(),
+            deltas = view.deltas.len(),
+            tombstones = view.tombstones.len(),
+            "视图已发布（S8-03：封段进 deltas）"
         );
         Ok(())
     }
 
-    /// 当前已提交的分片数（不含 pending）。
+    /// 当前已提交的分片数（不含 `builder` 里未提交的内容）。
+    ///
+    /// ⚠️ `S8-03` 起是**跨段求和**（`main + deltas`），不是只看 `main`。
     pub fn num_chunks(&self) -> u32 {
-        self.seg().index.num_chunks()
+        self.view().bm25_totals().0
     }
 
-    /// 当前已提交的文档数（不含墓碑）。
+    /// 当前已提交的文档数。
+    ///
+    /// ⚠️ **不扣跨段墓碑**：墓碑指向的 doc 在它所属的段里仍然存活 ⇒ 会被计入。
+    /// 需要「对外真实的存活文档数」请用 [`Self::tombstone_stats`] 的 `docs_alive`
+    /// （`S8-03` 评审 P3-3 指出两者在存在跨段删除时会 silently 分叉）。
     pub fn num_docs(&self) -> usize {
-        self.seg().index.num_docs()
+        self.view()
+            .segments_in_order()
+            .map(|seg| seg.index.num_docs())
+            .sum()
     }
 
     /// 全语料词项总数（所有分片的分词数之和）。
     pub fn total_len(&self) -> u64 {
-        self.seg().index.total_len()
+        self.view().bm25_totals().1
     }
 
     /// 平均分片长度（BM25 长度归一化用）。
+    ///
+    /// 🔴 用**全局** `total_len / N` 算一次（`I8-5`）：各段各算再平均会引入两次浮点舍入
+    /// ⇒ 分数只在分段布局下漂移。
     pub fn avgdl(&self) -> f32 {
-        self.seg().index.avgdl()
+        let (n, total) = self.view().bm25_totals();
+        if n == 0 {
+            0.0
+        } else {
+            total as f32 / n as f32
+        }
     }
 
     /// 累计 embed 推理耗时（NFR-03 构建耗时口径观测）。
@@ -584,8 +879,8 @@ impl SearchIndex {
     /// ⚠️ **「不隐含 flush」是有意的语义收紧**：它让「可见性 = `commit()` 后」在 API
     /// 层面显式化（对齐 NFR-11），而不是靠一个隐式副作用。
     ///
-    /// ⚠️ **`S8-02` 过渡约束**：写端此后若在**有并发检索**时写入，会返回 `Err`
-    /// （见 `Shared::with_main_mut`）；`S8-03` 起消失。
+    /// ⚠️ **`S8-02` 期有过一条过渡约束**（写端在有并发检索时写入会返回 `Err`）——
+    /// `S8-03` 起**已解除**（写入落在写端私有的 builder 上）。
     ///
     /// ⚠️ **可见性口径要连读模块文档**（评审 P4-6b）：「不隐含 `flush`」说的是
     /// **向量 / 写缓冲**的落地；`S8-02` 期**倒排是边 `add` 边可见的**（内容就在 `main` 里，
@@ -625,21 +920,39 @@ impl SearchIndex {
     /// > **这是错的**：`raw_vectors` 没有任何移除路径，`save` 原样导出、`load` 全量重灌，
     /// > 幽灵候选因此会跨快照永续。现在 `remove` 主动摘除，另由存活位图在检索期兜底。
     pub fn remove(&mut self, doc_id: DocId) -> Result<()> {
-        // 顺带摘除原始向量（O(len)，与 `Index::remove` 的 O(N) 同量级）：
-        // 这既缩小快照体积，也断掉「删除 → save → load → 幽灵候选复活」的路径。
-        // 内存中的 HNSW 图仍需靠存活位图过滤（物理回收归 Step 4 的 compaction，S4-03~S4-07）。
-        //
-        // ⚠️ **两步必须在同一个 `with_main_mut` 内**：拆成两次会释放写锁，读者可能
-        // 在中间态（postings 已摘、`raw_vectors` 未摘）取到快照 —— 重构前不会
-        // （那时读写在类型上互斥）。
         let cfg = Arc::clone(&self.shared.cfg);
-        self.shared.with_main_mut(|seg| -> Result<()> {
-            seg.index.remove(doc_id, cfg.analyzer.as_ref())?;
-            if let Some(raw) = seg.raw_vectors.as_mut() {
-                raw.retain(|(id, _)| seg.index.is_live_chunk(*id));
-            }
-            Ok(())
-        })??;
+
+        // ── 分支 ①：目标在**当前 builder**（未发布）⇒ 就地物理删（与今天同语义）
+        //
+        // 这是最常见的一支（`add` 后立刻 `remove` 同一篇）：不产生墓碑、不留半修改状态。
+        if doc_id >= self.builder.base_doc
+            && ((doc_id - self.builder.base_doc) as usize) < self.builder.index.total_docs()
+        {
+            let local = doc_id - self.builder.base_doc;
+            self.builder.index.remove(local, cfg.analyzer.as_ref())?;
+            // 顺带摘除原始向量（O(len)，与 `Index::remove` 的 O(N) 同量级）：既缩小快照体积，
+            // 也断掉「删除 → save → load → 幽灵候选复活」的路径。内存中的 HNSW 图仍需靠
+            // 存活位图过滤（物理回收归 compaction）。
+            let b = &mut self.builder;
+            b.raw_vectors.retain(|(id, _)| b.index.is_live_chunk(*id));
+            return Ok(());
+        }
+
+        // ── 分支 ②：目标在**既往段**（已发布的 `main` / `deltas`）⇒ 记墓碑，**不动既往段**
+        //
+        // 为什么不能就地删：段一旦进过任何 `View` 就**不可变**（`I8-2`）—— 那是读端拿到
+        // 一致快照的前提。⇒ 只能记一条**跨段墓碑**，由合并时**物理化**（§4.9.2）。
+        // 代价：热路径上有墓碑时要传存活谓词（`R52`，见 §4.7.3）—— 但**可逆**（合并后消失）。
+        let view = self.view();
+        let in_past = view.segments_in_order().any(|seg| {
+            doc_id >= seg.base_doc && ((doc_id - seg.base_doc) as usize) < seg.index.total_docs()
+        });
+        if in_past {
+            self.builder.tombstones.add(doc_id);
+            return Ok(());
+        }
+
+        // ── 分支 ③：不存在 ⇒ no-op（与既有 `Index::remove` 对未知 ID 的越界安全行为一致）
         Ok(())
     }
 
@@ -654,8 +967,11 @@ impl SearchIndex {
     /// 图 dump 失败时（P0-3）默认只警告、不发布 manifest，`save` 仍返回 Ok——
     /// 图是缓存，下次冷启动降级重建即可，快照本身完好。
     pub fn save(&mut self, path: &std::path::Path) -> Result<()> {
+        // `D-S8-01`：**第一步就合并** ⇒ 落盘形态仍是**单段 `Index`**
+        // （`SnapshotSections` / `FORMAT_VERSION` / `GraphManifest` 一个字节都不用改）
         self.commit()?;
-        let seg = self.seg();
+        self.fold_deltas()?;
+        let seg = Arc::clone(&self.view().main);
         let vectors: Vec<(ChunkId, Vec<f32>)> = seg.raw_vectors.as_deref().unwrap_or(&[]).to_vec();
         let body_crc = crate::storage::save_with_crc(
             path,
@@ -714,7 +1030,7 @@ impl SearchIndex {
     ) -> Result<GraphStatus> {
         // 逃生舱 / 无向量 / Brute 后端：不写图，并清掉可能存在的僵尸 sidecar
         //（否则「关掉向量重建库」会留下永远匹配不上的旧图文件，§5.4）
-        let seg = self.seg();
+        let seg = Arc::clone(&self.view().main);
         let Some(vi) = seg.vector_index.as_ref() else {
             crate::storage::remove_sidecars(path)?;
             return Ok(GraphStatus::NotApplicable);
@@ -782,11 +1098,8 @@ impl SearchIndex {
         // debug 下断言红、**release 下静默少算**。现改为真求和。
         let sums = view.sums();
         // 跨段墓碑指向的是**既往段里仍存活**的 doc ⇒ 必须从「存活文档数」扣掉，
-        // 否则 `S8-03` 起该数会偏大。`S8-02` 期恒空 ⇒ 扣 0、结果不变。
-        debug_assert!(
-            view.tombstones.is_empty(),
-            "S8-02 期不应出现跨段墓碑（删除走 `Index::remove` 的物理路径）"
-        );
+        // 否则该数会偏大。⚠️ `S8-03` 起墓碑是**正常状态**（`remove` 命中既往段即记），
+        // 合并时**物理化**（§4.9.2）⇒ 不再有「S8-02 期恒空」的断言。
         let docs_alive = sums.docs_alive.saturating_sub(view.tombstones.len());
         TombstoneStats {
             chunks_total: sums.chunks_total,
@@ -803,6 +1116,186 @@ impl SearchIndex {
         }
     }
 
+    /// 把**全部**未合并段（`deltas`）按 FIFO 合并进主段 —— `save()` / `compact()` 的**前置**。
+    ///
+    /// # 这是 `S8-06`（合并器）的**最小文本侧形态**
+    ///
+    /// 只做「文本侧 append + 跨段墓碑**物理化**（§4.9.2）+ 向量侧重建」，**不含**增量式
+    /// 向量合并、`MergeReport`、`merge_pending` / `merge_all` 的公开面、字段索引等价性用例
+    /// （那些留给 `S8-06`）。
+    ///
+    /// ⇒ 它存在的**唯一理由**：`D-S8-01` / `D-S8-12` 要求 `save` / `compact` 的**第一步**
+    ///    就是合并 —— 否则落盘只有 `main`，会**静默丢内容**。⚠️ 与设计 §8 的 PR 切分表
+    ///    （合并器属 `S8-06`）的偏差见 PR 正文。
+    ///
+    /// # 与并发读的关系
+    ///
+    /// 段一旦进过 `View` 就不可变（`I8-2`）⇒ 合并**不改旧段**，而是**克隆**主段内容后
+    /// 追加、再发布一个**新** `View`（一次原子指针替换）⇒ **读端全程无感**
+    /// （`FR-17` 的「合并期间不得阻塞读请求」在结构层面成立）。代价是一次 `O(N)` 克隆
+    /// —— 与合并本身的量级相同。
+    ///
+    /// # 返回
+    ///
+    /// 本次合并掉的 delta 段数。
+    fn fold_deltas(&mut self) -> Result<usize> {
+        // 🔴 **顺序是硬要求**（`S8-03` 评审 P2-4）：**先记世代、后取视图快照**。
+        //    反过来的话，若 `compact()` 恰好落在两次读之间，我们会拿到「旧进程内的视图 +
+        //    新世代的 epoch」⇒ `commit_view` 的世代对账**通过** ⇒ 把基于旧 `main` 克隆出来的
+        //    `merged` 发布进新视图（旧 ID 空间覆盖新 ID 空间）。
+        //    先记世代则相反：期间任何 `compact()` 都会让 epoch 变化 ⇒ 发布被拒（保守但正确）。
+        let snapshot_epoch = self.shared.epoch();
+        let view = self.view();
+        if view.deltas.is_empty() {
+            return Ok(0);
+        }
+        let cfg = Arc::clone(&self.shared.cfg);
+
+        // ① 文本侧：**克隆**主段内容后 append。
+        //
+        // 🔑 这里**刻意不用 `Arc::try_unwrap` 取独占**：`shared.view` 自己就挂着那个
+        //    `Arc<View>`（其 `.main` 也被计数）⇒ `try_unwrap` **永远失败**，除非先把
+        //    视图换掉（那就成了先发布再合并的循环）。⇒ 取形 = **克隆**（`O(N)`，
+        //    与合并本身的量级相同）：段不可变（`I8-2`）⇒ 不改旧段、不需要「无读者」，
+        //    因此合并**与并发读并存**（`FR-17` 的「合并不阻塞读」在结构层面成立）。
+        let mut merged = view.main.index.clone();
+        let mut raw_all: Vec<(ChunkId, Vec<f32>)> =
+            view.main.raw_vectors.as_deref().unwrap_or(&[]).to_vec();
+        let had_vectors = view.main.vector_index.is_some();
+        let segment_generation = view.main.generation;
+        let merged_segments = view.deltas.len();
+        // ⚠️ delta 段里的 `raw_vectors` 记的是**段内本地** `chunk_id`（builder 侧分配的），
+        //    而 `main.raw_vectors` 记的是全局（`base = 0`）⇒ 拼接时必须**全局化**，
+        //    否则落盘的原始向量带着错位的 ID（`load` 后向量与分片对不上）。
+        let mut delta_raw: Vec<(ChunkId, Vec<f32>)> = Vec::new();
+        for seg in view.deltas.iter() {
+            if let Some(raw) = seg.raw_vectors.as_deref() {
+                for (local, v) in raw {
+                    delta_raw.push((seg.base_chunk + local, v.clone()));
+                }
+            }
+            merged.merge_from(seg.index.clone())?;
+        }
+        raw_all.extend_from_slice(&delta_raw);
+
+        // ② 跨段墓碑**物理化**（§4.9.2，评审 P3-1 的取形）：FIFO 保证「墓碑的目标段必已
+        //    先被合入」⇒ 直接走既有 `Index::remove` 语义（摘 postings + 清
+        //    `content_hashes` + 回滚统计量 + 同步字段索引），**然后**从集合里移除墓碑
+        //    ⇒ 热路径回到零谓词（§4.7.3，R52 的回归**可逆**）。
+        //    主段的 `base_doc` 恒 0 ⇒ 全局 `doc_id` == 本地 `doc_id`。
+        debug_assert_eq!(view.main.base_doc, 0, "主段的 base_doc 恒为 0");
+        for doc in view.tombstones.iter() {
+            merged.remove(doc, cfg.analyzer.as_ref())?;
+        }
+
+        // ②b `raw_vectors` 只保留**仍存活**的 chunk（与既有 `remove` 的 `retain` 同语义）：
+        //     ① delta 段内部的墓碑位（就地删过的 chunk）与 ② 刚被物理化的跨段墓碑目标
+        //     都可能留下向量 ⇒ 不滤掉，快照就会带着死 chunk 的向量
+        //     （既有用例 `T5b_remove在flush后raw_vectors被retain摘净` 正是钉这个）。
+        raw_all.retain(|(id, _)| merged.is_live_chunk(*id));
+
+        // ③ 向量侧：**全量重建**（本 PR 暂取的保守取形，= 设计 §4.6.2 的「方案 B」）。
+        //
+        // ⚠️ **如实陈述**（`S8-03` 评审 P2-3 更正了本文原有的自相矛盾与一个绝对命题）：
+        //
+        // - **为什么现在只能重建**：合并**拿不到**主段图的所有权 —— `main` 是
+        //   `Arc<Segment>` 共享（段不可变，`I8-2`）、`Box<dyn VectorIndex>` 也**不是
+        //   `Clone`** ⇒ 「把 delta 的点直接 add 进旧图」这条就地路径在本 PR 的取形下**走不通**。
+        // - 🔴 **但「所有权」不构成「只能重建」的证明**：`D-S8-09` 的**默认方案 A**
+        //   （dump→load→增量 insert）**根本不需要旧图所有权** —— `dump_graph` 是 `&self`
+        //   （设计 §4.9.3 已写明「对内存图也能做」），load 产出**新**图、再往新图 insert
+        //   delta 的点 ⇒ 保住旧点拓扑，成本 O(delta) 而非 O(N·logN)。
+        //   本 PR **不**实现方案 A（留给 `S8-06`），也**不**声称它不可行。
+        // - **代价（方案 B）**：每次 `save`/`compact` 只要有 delta 就 O(N·logN) 重建 +
+        //   **拓扑被重写** ⇒ ANN 排名会漂移。实测已显形：`atomic_snapshot::TI5…` 的检索手段
+        //   被迫从 hybrid 改为 bm25（`CHANGELOG` 同条目）。
+        // - ⚠️ **spike S8-S1 一条判据都还没测**（本 PR 只落地、未标定）⇒ 这个取形是
+        //   **暂定**的，不是标定结论。
+        // - `MergeReport.vector_strategy` / spike 结论 → `S8-06`。
+        let vector_index = if had_vectors {
+            Some(rebuild_vector_index(
+                self.shared.backend,
+                &raw_all,
+                cfg.ef_search,
+                cfg.parallel_build,
+            )?)
+        } else {
+            None
+        };
+
+        // ⑤ 原子发布：`main` 吸收全部内容、`deltas` 清空、墓碑清空（已物理化）。
+        //    ⚠️ 合并**不改 ID** ⇒ 已用长度不变（后续段的基址继续有效）。
+        let new_main = Arc::new(Segment {
+            index: merged,
+            vector_index,
+            raw_vectors: Some(raw_all),
+            base_doc: 0,
+            base_chunk: 0,
+            generation: segment_generation,
+        });
+        let used_doc = new_main.index.total_docs() as DocId;
+        let used_chunk = new_main.index.total_chunks() as ChunkId;
+        // 🔴 **P1-1 的修复**（`S8-03` 第 1 轮评审）：发布闭包**必须消费锁内的 `cur`**。
+        //
+        // 原写法 `move |_cur, …|` 恒发布 `deltas = []` + 锁外算出的 `used_*` ⇒ 若另一个写端
+        // 在「取快照」与「拿这把锁」之间提交了新 delta，那个 delta 会**从视图里消失**、
+        // 且 `ids.next_*` **回缩**（⇒ 后续内容复用已发号的 ID）。
+        // 现在改为把窗口内新提交的 delta **无损吸收**（合并不改 ID ⇒ 基址仍有效），
+        // 并只摘掉**本次已物理化**的墓碑（`Shared::absorb_window`，纯函数 + 单测）。
+        //
+        // 🔴 **P1-2 的修复**（`S8-03` 第 2 轮评审）：吸收**必须校验前缀身份**，不能只看长度。
+        //    `fold` **不改 `epoch`** ⇒ 世代对账拦不住并发 fold；而「B fold 过（D1 → main、
+        //    `deltas` 清空）⇒ B 又提交 D2」之后，`cur.deltas = [D2]` 与快照 `[D1]` **长度相等**
+        //    ⇒ 长度判据放行 ⇒ `skip(1)` 跳过 D2 ⇒ **D2 静默消失**（`ids.next_*` 却已记账 = 永久孤儿）。
+        //    现在不符即 `Err(Busy)`（与 epoch 同型：不记账、不发布、如实声明丢弃）。
+        // 🔴 **快照必须连 `Arc` 一起带进闭包**（`S8-03` 第 2 轮评审 **P1-2**）：只带**长度**的话，
+        //    「另一个写端 `fold` 过（D1 进 `main`、`deltas` 清空）⇒ 它又 `add` + `commit` 了 D2」
+        //    这一格会被 D2 **顶替**，而长度恰好相等 ⇒ 长度判据**看不出来** ⇒ **D2 静默消失**
+        //    （而 `ids.next_*` 已把它的槽位记账）。段不可变（`I8-2`）⇒ 用 `Arc::ptr_eq` 判**身份**。
+        //    `Vec<Arc<_>>` 的 clone 是 O(1)（只加引用计数）。
+        let snapshot_deltas: Vec<Arc<Segment>> = view.deltas.iter().cloned().collect();
+        let physicalized = (*view.tombstones).clone();
+        self.shared.commit_view(
+            snapshot_epoch,
+            PublishCaller::Fold,
+            move |cur, generation, base_doc, base_chunk| {
+                let Some((carried, tombstones)) = Shared::absorb_window(
+                    &cur.deltas,
+                    &snapshot_deltas,
+                    &cur.tombstones,
+                    &physicalized,
+                ) else {
+                    // 与 `expected_epoch` 同型处置：**拒绝发布**（本次不记账、不发布）。
+                    // ⚠️ 但**声明的内容与另外两条不同**：合并是**维护性**操作，被拒时
+                    //    「增量段仍在视图里、内容**没有**丢失」，丢掉的只是本次合并的**计算**
+                    //    ⇒ 恢复指引必须是「重试本次 `save`/`compact`」，**不是**「重新 add/remove」。
+                    //    （`add` 那条路径才是真的丢内容：builder 已被换掉。）
+                    return Err(Error::Busy(
+                        "本次合并依据的增量段快照已失效（窗口内有另一个写端 `fold` 过同一个 \
+                         `Arc<Shared>` ⇒ 视图的增量段列表已不是当初那一批；长度可能相同，\
+                         但段的身份不同）⇒ 本次发布已拒绝。\
+                         ✅ **内容没有丢失**：那些增量段仍然在视图里、照旧可检索；\
+                         丢掉的只是本次合并的计算结果 —— **重试本次 `save()` / `compact()` 即可**，\
+                         不需要重新执行 `add` / `remove`"
+                            .to_string(),
+                    ));
+                };
+                Ok((
+                    View {
+                        main: Arc::clone(&new_main),
+                        deltas: carried,
+                        tombstones,
+                        generation,
+                    },
+                    // 吸收后「已用长度」= 锁内真实值（新 delta 的末端）⇒ 不得回退
+                    used_doc.max(base_doc),
+                    used_chunk.max(base_chunk),
+                ))
+            },
+        )?;
+        Ok(merged_segments)
+    }
+
     /// 在**内存**里按存活集重新物化一次并重建向量图。**不落盘**。
     ///
     /// - 内部第一步是 `self.commit()?`（D-S4-10）：先把写缓冲 flush 掉再重编号，
@@ -815,12 +1308,12 @@ impl SearchIndex {
     ///   `source` / `content_hash`，不要用 `doc_id` / `chunk_id`。
     /// - `bytes_before` / `bytes_after` 均为 `None`（无路径可 stat）；要持久化请用
     ///   [`Self::compact_and_save`]。
-    /// - ⚠️ **末步失败会丢弃整套重建结果**（评审 P4-6a）：重建（新 `Index` + 新向量图）
-    ///   在局部变量里完成，**最后一步**才是 `with_main_mut` 的原子替换；该步若因
-    ///   **并发读者**失败（见 `Shared::with_main_mut` 的过渡约束），已付出的重建代价
-    ///   **全部丢弃**并返回 `Err` —— 旧模型（写端独占）下类型上不可能发生。
-    ///   ⇒ `S8-02` 期请在**无活动读者**时调用 `compact()` / `compact_and_save()`；
-    ///   `S8-03` 起该约束消失。
+    /// - ⚠️ **ID 会重编号**（`D-S4-01`）：`compact` 是 `I8-7`（段 ID 空间不重叠）的
+    ///   **唯一合法例外** —— 它把存活内容稠密化 ⇒ **已用长度变小** ⇒ 走 `Shared::publish_reset`
+    ///   （允许回退）而不是 `commit_view`（要求只增），并**清空 `deltas` 与跨段墓碑**
+    ///   （它们引用的是旧 ID 空间）⇒ 之后本写端会换一个与新「已用长度」对齐的 builder。
+    /// - `S8-02` 期那条「末步 `with_main_mut` 失败 ⇒ 丢弃整套重建结果 / 请在无活动读者时调用」
+    ///   的说明随该入口退出生产路径而**作废**（`S8-03` 评审 P3-4.3）。
     pub fn compact(&mut self) -> Result<CompactionReport> {
         self.compact_with_bytes(None)
     }
@@ -866,6 +1359,9 @@ impl SearchIndex {
 
         // 步骤 0（D-S4-10 / I8）：先清空写缓冲，再谈重编号
         self.commit()?;
+        // `D-S8-12`：**先合并再重编号** —— `compact` 会重编号，而合并依赖「基址不变」
+        // ⇒ 顺序反了会让 `deltas` 里段的 `base_*` 指向已重编号的旧空间
+        self.fold_deltas()?;
 
         let before = self.tombstone_stats();
         let has_tombstones = before.chunks_total > before.chunks_alive;
@@ -893,7 +1389,7 @@ impl SearchIndex {
         }
 
         // 步骤 1~2：取存活集 + 建 ID 映射（重编号，D-S4-01）
-        let seg = self.seg();
+        let seg = Arc::clone(&self.view().main);
         let remap = seg.index.build_remap();
 
         // 步骤 3：Index 重新物化（返回新实例，self.inner.index 未动 → I5）
@@ -931,21 +1427,46 @@ impl SearchIndex {
         };
         let vector_rebuild_ms = t_vec.elapsed().as_millis();
 
-        // 全部构建成功 → 一次性原子替换（I5：任一 Err 都已 return，旧状态未动）
-        // ⚠️ 必须先释放上面为「读旧状态」持有的 `Arc<Segment>`：`with_main_mut` 用
-        // `Arc::get_mut`，refcount > 1 会直接失败。
+        // 全部构建成功 → **原子替换**（I5：任一 Err 都已 return，旧状态未动）。
+        //
+        // 🔴 `S8-03` 起走 [`Shared::commit_view`]（持 `ids` 锁的**唯一发布路径**）而不是
+        //    就地改 `main`，因为 `compact` 会**重编号**（稠密化）⇒ 新主段**比原来短**
+        //    ⇒ 必须把「已用长度」重置为新主段的长度。否则后续 `commit()` / 合并算出的
+        //    `base_*` 会落在新主段之外（`commit_view` 的 `debug_assert` 会当场抓住 ——
+        //    实测于 `step4_compaction` 的多条用例）。
+        //    ⚠️ 旧实现（就地替换 `main`）在「单段 + 发号器恒 0」的骨架期恰好成立，
+        //    多段之后不再够用；`deltas` / 跨段墓碑也必须一并清空（否则它们指向的 ID 空间
+        //    已被重编号破坏）。
         let generation = seg.generation;
+        let new_seg = Arc::new(Segment {
+            index: new_index,
+            vector_index: new_vi,
+            raw_vectors: new_raw,
+            base_doc: 0,
+            base_chunk: 0,
+            generation,
+        });
+        let used_doc = new_seg.index.total_docs() as DocId;
+        let used_chunk = new_seg.index.total_chunks() as ChunkId;
         drop(seg);
-        self.shared.with_main_mut(move |slot| {
-            *slot = Segment {
-                index: new_index,
-                vector_index: new_vi,
-                raw_vectors: new_raw,
-                base_doc: slot.base_doc,
-                base_chunk: slot.base_chunk,
-                generation,
-            };
-        })?;
+        // ⚠️ 用 `publish_reset`（**允许**已用长度变小）而不是 `commit_view`（要求只增）：
+        //    `compact` 会**重编号** ⇒ 新主段比原来短，这是 `I8-7` 的唯一合法例外。
+        //    也正因为重编号，`deltas` 与跨段墓碑**必须一并清空**（它们引用的是旧 ID 空间）。
+        self.shared.publish_reset(
+            View {
+                main: Arc::clone(&new_seg),
+                deltas: Arc::from(Vec::<Arc<Segment>>::new()),
+                tombstones: Arc::new(Tombstones::default()),
+                // 占位：`publish_reset` 会用锁内推进出的序号覆盖它
+                generation: 0,
+            },
+            used_doc,
+            used_chunk,
+        );
+        // ⚠️ 重编号后「已用长度」变小 ⇒ **必须换掉 builder**（它记着旧基址）：
+        //    否则后续任何 `commit()` 的基址对账都会不符并报 `Busy`
+        //    （实测：`step4_compaction` 的 7 条用例全由此而来）。
+        self.builder = Self::new_builder(&self.shared);
 
         let after = self.tombstone_stats();
 
@@ -954,7 +1475,8 @@ impl SearchIndex {
             reclaimed_docs: before.docs_total.saturating_sub(after.docs_total),
             reclaimed_terms,
             reclaimed_graph_points: before.graph_points.saturating_sub(
-                self.seg()
+                self.view()
+                    .main
                     .vector_index
                     .as_ref()
                     .map(|v| v.len())
@@ -1091,9 +1613,11 @@ impl SearchIndex {
             base_chunk: 0,
             generation: 0,
         });
+        let shared = Arc::new(Shared::new(Arc::new(cfg), graph, backend, main));
+        let builder = Self::new_builder(&shared);
         Ok(Self {
-            shared: Arc::new(Shared::new(Arc::new(cfg), graph, backend, main)),
-            pending: Vec::new(),
+            shared,
+            builder,
             embed_elapsed: std::time::Duration::ZERO,
             embed_count: 0,
             graph_status,
@@ -1220,23 +1744,42 @@ mod tests {
     fn 空索引可构造() {
         let idx = bm25_index();
         assert_eq!(idx.num_chunks(), 0);
-        assert!(idx.pending.is_empty());
+        assert!(idx.builder.pending.is_empty());
     }
 
+    /// **`S8-03` 口径反转**（原用例名：`add后未commit也能查到倒排`）。
+    ///
+    /// `delta` 分段后 `add` 写进**写端私有的 builder**，直到 `commit()` 才被冻结成新段并
+    /// 发布 ⇒ 「**未 `commit` 即不可见**」成为**唯一**的可见性语义（`NFR-11` / §1.3 第 7 条）。
+    /// ⚠️ 这是**有意的语义收紧**，不是行为回归 —— 设计早已写明 `S8-03` 落地时本用例
+    /// **必须反转**（见 `v2-step8-design.md` §1.3 与 `tests/step8_segments.rs` 的模块文档）。
     #[test]
-    fn add后未commit也能查到倒排() {
-        // 倒排在 add 时立即写入（可见性语义只影响向量侧 flush）
+    fn add后未commit查不到() {
         let mut idx = bm25_index();
         let out = idx.add("BM25 检索算法").unwrap();
         assert!(!out.deduped);
         assert_eq!(out.chunk_ids.len(), 1);
+
+        // 未 commit ⇒ 既不在已发布统计量里，也检索不到
+        assert_eq!(idx.num_chunks(), 0, "未 commit 的内容不计入已发布统计量");
+        assert!(
+            idx.searcher().search("BM25").unwrap().hits.is_empty(),
+            "未 commit ⇒ 查不到（NFR-11 的可见性边界）"
+        );
+
+        // commit ⇒ 立即可见
+        idx.commit().unwrap();
         assert_eq!(idx.num_chunks(), 1);
+        assert!(!idx.searcher().search("BM25").unwrap().hits.is_empty());
     }
 
     #[test]
     fn 幂等upsert返回deduped() {
         let mut idx = bm25_index();
         let a = idx.add("BM25 检索算法").unwrap();
+        // ⚠️ `S8-03` 起必须 `commit()`：查重是**跨段**的（builder → deltas 逆序 → main），
+        //    未发布的 builder 也能被查到 —— 这里显式 commit 是为了同时覆盖「已发布段」那一支
+        idx.commit().unwrap();
         let b = idx.add("BM25 检索算法").unwrap();
         assert!(!a.deduped);
         assert!(b.deduped, "第二次同内容应 deduped");
@@ -1273,6 +1816,8 @@ mod tests {
         let mut idx = bm25_index();
         idx.add(String::from("字符串")).unwrap();
         idx.add("字符串字面量").unwrap();
+        // `S8-03`：`num_chunks()` 只统计**已提交**的段 ⇒ 先 commit（可见性边界）
+        idx.commit().unwrap();
         assert_eq!(idx.num_chunks(), 2);
     }
 
@@ -1295,18 +1840,59 @@ mod tests {
 
         // 检索能力保留：doc_freq 一致
         assert_eq!(
-            loaded.seg().index.doc_freq("检索"),
-            idx.seg().index.doc_freq("检索")
+            loaded.view().main.index.doc_freq("检索"),
+            idx.view().main.index.doc_freq("检索")
         );
     }
 
+    /// **`S8-03` 口径变更**：`remove` 的目标若在**已发布段**里，不再就地物理删
+    /// （段不可变 `I8-2`），而是记一条**跨段墓碑** ⇒ 段内计数**不变**，但对外
+    /// （`tombstone_stats` / 检索）**立刻**表现为已删；**合并时物理化**（§4.9.2）。
+    ///
+    /// 原用例（`add` → `remove` → 断言 `num_chunks() == 0`）描述的是「就地物理删」，
+    /// 那条路径现在只适用于**未发布的 builder**（分支 ①）⇒ 用例随之分成两段。
     #[test]
     fn remove删除文档并回滚统计量() {
         let mut idx = bm25_index();
         let out = idx.add("BM25 检索算法").unwrap();
-        assert_eq!(idx.num_chunks(), 1);
+        // ① 目标还在 **builder**（未发布）⇒ 就地物理删 ⇒ 活计数立刻回落
+        // ⚠️ 判据必须是 `alive_count()`（**活**分片数）而不是 `total_chunks()`（**槽位**数）：
+        //    删除只把槽位置成墓碑、不缩短 `Vec`（基址不变式的基石，§2.4）
+        assert_eq!(idx.builder.index.alive_count(), 1);
         idx.remove(out.doc_id).unwrap();
+        assert_eq!(idx.builder.index.alive_count(), 0, "builder 内就地物理删");
+        assert_eq!(idx.builder.index.total_chunks(), 1, "槽位不缩短（墓碑位）");
         assert_eq!(idx.num_chunks(), 0);
+
+        // ② 再来一轮：这次先 commit（目标进**已发布段**）⇒ 记墓碑，段内计数不变
+        let out = idx.add("BM25 检索算法").unwrap();
+        idx.commit().unwrap();
+        assert_eq!(idx.num_chunks(), 1);
+
+        idx.remove(out.doc_id).unwrap();
+        // ⚠️ 墓碑记在**未发布的 builder** 上（设计 §4.8.3 分支 ②）⇒ 与内容一样，
+        //    要 `commit()` 才对外生效（**同一条可见性边界**，不搞两套语义）
+        assert_eq!(
+            idx.num_chunks(),
+            1,
+            "跨段墓碑不改变段内计数（物理化在合并时）"
+        );
+        idx.commit().unwrap();
+        assert_eq!(
+            idx.tombstone_stats().docs_alive,
+            0,
+            "commit 后对外是「已删」"
+        );
+        assert!(
+            idx.searcher().search("BM25").unwrap().hits.is_empty(),
+            "墓碑必须挡住检索（否则是数据错误）"
+        );
+
+        // ③ 合并（`save` 的第一步）⇒ 墓碑**物理化** ⇒ 段内计数才真正回落
+        let dir = tempfile::tempdir().unwrap();
+        idx.save(&dir.path().join("s.idx")).unwrap();
+        assert_eq!(idx.num_chunks(), 0, "合并（物理化）后计数回落");
+        assert_eq!(idx.tombstone_stats().docs_alive, 0);
     }
 
     #[test]

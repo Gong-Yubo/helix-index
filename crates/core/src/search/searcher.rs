@@ -9,12 +9,43 @@
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
+use crate::predicate::CandidateFilter;
+use crate::query::filter::PredicateBuilder;
 use crate::query::searcher::{search_parts, SearchParts};
 use crate::query::{SearchMode, SearchResponse};
 use crate::schema::Filter;
 
 use super::index::SearchIndex;
-use super::view::{Shared, View};
+use super::view::{Shared, View, ViewFilter};
+
+/// **跨段**谓词构造器（`S8-04`）：持 `&View`，按 `filter` **逐段**求值。
+///
+/// 放在门面层（而不是 `query`）的理由：它需要 `&View`，而 `View` 是 `pub(crate)`
+/// ⇒ 只有这里能实现 [`PredicateBuilder`]，公开面只多一个 trait 对象。
+struct ViewPredicate<'a> {
+    view: &'a View,
+}
+
+impl PredicateBuilder for ViewPredicate<'_> {
+    fn build<'a>(&'a self, filter: Option<&Filter>) -> Option<Box<dyn CandidateFilter + 'a>> {
+        match filter {
+            // 无用户过滤：各段位图**借用**，零重建（`Alive` 形态）
+            None => Some(Box::new(ViewFilter::alive_only(self.view))),
+            Some(f) => {
+                // 逐段求 `doc_bits`（字段索引是**段内**结构，见 `query::filter::doc_bits`）
+                let per_seg: Vec<crate::bitmap::DocBits> = self
+                    .view
+                    .segments_in_order()
+                    .map(|seg| crate::query::filter::doc_bits(f, &seg.index))
+                    .collect();
+                if per_seg.iter().all(|b| b.is_empty()) {
+                    return None; // 过滤排空 ⇒ 编排层短路（与单段版同语义）
+                }
+                Some(Box::new(ViewFilter::filtered(self.view, per_seg)))
+            }
+        }
+    }
+}
 
 /// 只读检索器（owned）。持有与写端**共享**的 `Shared`（`S8-02` 起）。
 ///
@@ -59,14 +90,45 @@ impl Searcher {
     ///
     /// ⚠️ `S8-02` 期 `deltas` 恒空 ⇒ 只用 `view.main`；跨段在 `S8-04` / `S8-05`。
     fn parts<'a>(&'a self, view: &'a View) -> SearchParts<'a> {
+        // 跨段载具（`S8-04`）：**只有真的多段 / 有跨段墓碑时才填**。
+        // ⚠️ 单段时必须留 `None`：那条路径与 `S8-03` 之前**同一份实现**（零回归），
+        //    也避免热路径平白多一层段遍历（R52）。
+        let multi = !view.deltas.is_empty() || !view.tombstones.is_empty();
+        let (segment_set, predicate_builder) = if multi {
+            let segments: Vec<crate::retriever::SegmentRef<'a>> = view
+                .segments_in_order()
+                .map(|seg| crate::retriever::SegmentRef {
+                    index: &seg.index,
+                    base_doc: seg.base_doc,
+                    base_chunk: seg.base_chunk,
+                })
+                .collect();
+            let (n, total_len) = view.bm25_totals();
+            (
+                Some(crate::retriever::SegmentSet {
+                    segments,
+                    n,
+                    total_len,
+                    tombstones: view.tombstones.len(),
+                }),
+                Some(Box::new(ViewPredicate { view }) as Box<dyn PredicateBuilder + 'a>),
+            )
+        } else {
+            (None, None)
+        };
+
         SearchParts {
             index: &view.main.index,
             analyzer: self.shared.cfg.analyzer.as_ref(),
             embedder: self.shared.cfg.embedder.as_ref().map(|e| e.as_ref()),
+            // ⚠️ 跨段时**只给主段**的向量索引：向量侧的跨段归并是 `S8-05`（PR5）
+            // ⇒ `vector` 模式在 `deltas` 非空时**只召回主段**（已知边界，见 PR 正文）。
             vector_index: view.main.vector_index.as_ref().map(|vi| vi.as_ref()),
             fusion: self.shared.cfg.fusion.as_ref(),
             reranker: self.shared.cfg.reranker.as_ref(),
             bm25_params: self.shared.cfg.bm25_params,
+            segment_set,
+            predicate_builder,
         }
     }
 
@@ -115,11 +177,14 @@ impl Searcher {
     /// 锁的**前置理由**（设计 §4.4.3 / 评审 P3-4）。
     #[deprecated(note = "写端不必再「换回」：用 SearchIndex::searcher(&self) 让读写并存")]
     pub fn into_index(self) -> Result<SearchIndex> {
+        // ⚠️ 先按当前「已发布长度」造 builder，再把 `shared` move 进新写端
+        //    （`new_builder` 借用 `self.shared`，顺序反了会借用已 move 的值）。
+        let builder = SearchIndex::new_builder(&self.shared);
         Ok(SearchIndex {
             // ⚠️ 克隆 `Arc`（不是 `try_unwrap`）：写端与读端**共享**同一视图，
             //    因此换回写端**不**要求「无其他持有者」。
             shared: self.shared,
-            pending: Vec::new(),
+            builder,
             embed_elapsed: std::time::Duration::ZERO,
             // 读端从未 embed 过（换回写端后重新计数）
             embed_count: 0,
@@ -313,6 +378,8 @@ mod tests {
         let mut idx = s.into_index().unwrap();
         let out = idx.add("新文档继续写入").unwrap();
         assert!(!out.deduped);
+        // `S8-03`：未 commit 的内容不计入统计量 ⇒ 先 commit（可见性边界）
+        idx.commit().unwrap();
         assert!(idx.num_chunks() >= 4);
     }
 

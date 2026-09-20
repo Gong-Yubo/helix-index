@@ -117,6 +117,36 @@ pub struct Metrics {
     ///
     /// 早退路径（索引为空 / 过滤排空 / 融合为空）保持默认 `0`，语义 = 「本次没跑精排」。
     pub rerank_window: usize,
+    /// 本次检索所依据的**视图里的段数**（`main + deltas`）。
+    ///
+    /// `1` = 只有主段 ⇒ 与 `S8-03` 之前**逐位一致**（零回归）；`> 1` = 本次走了跨段路径。
+    /// 空库早退路径下仍为 `1`（视图里确实有一个空的 `main` 段）。
+    ///
+    /// ⚠️ **与 `vector_segments` 必须连看**：段数本身不是缺陷信号，**「向量路只覆盖了一部分段」
+    /// 才是**（见下）。
+    pub segments: usize,
+    /// 向量路本次**实际覆盖的段数**；`0` = 本次没走向量路（`SearchMode::Bm25`）。
+    ///
+    /// 🔴 `0 < vector_segments < segments` ⇒ **向量路只召回了一部分段的内容**。
+    /// 这不是边角情形：默认 `mode` 是 `Hybrid`（`Searcher::infer_mode`）⇒ 只要有向量能力，
+    /// **每次 `commit()` 之后、`save`/`compact` 之前**都处于这个状态；`helix serve` 那种
+    /// 「写端持续 commit、没人调 fold」的形态下**长期**如此。
+    ///
+    /// ⚠️ `S8-05`（PR5）落地前**恒为 1**（向量索引只给 `main`，见 `Searcher::parts` 的注释）；
+    /// PR5 之后应恒等于 [`Self::segments`]。⇒ 本字段是 NFR-07 要的那条信号：
+    /// **调用方现在能发现「向量路只扫了 1/N 的内容」，而不是静默半盲**。
+    pub vector_segments: usize,
+    /// 本次检索所依据的视图里的**跨段墓碑条数**（`0` = 无墓碑）。
+    ///
+    /// 🔑 为什么要有它：墓碑 > 0 会把 BM25 路从「零谓词」推回「每 posting 一次谓词」
+    /// （`R52`），也是向量路存活判定的额外一层；这个跃迁在今天**完全不可观测**。
+    ///
+    /// ⚠️ **口径 = 视图层的墓碑条数（精确、O(1)），不是「被挡掉的候选数」**
+    /// （设计 §4.13.3 原文如此，本 PR 已同步更正该行）：按候选计数在召回层**不可良定义** ——
+    /// 同一个 chunk 会被「BM25 路 / 向量路」各取一次、甚至在同一路的多个 posting 上重复出现
+    /// ⇒ 计数会随 lane 数与 term 命中数虚增，读出来无法解释。「还有几条墓碑没物理化」才是
+    /// 调用方真正要的那个量（`0` ⇒ 热路径已回到零谓词）。
+    pub tombstoned: usize,
 }
 
 impl Metrics {
@@ -137,6 +167,9 @@ impl Metrics {
             vector_ms = self.vector_elapsed.as_secs_f64() * 1000.0,
             rerank_window = self.rerank_window,
             rerank_ms = self.rerank_elapsed.as_secs_f64() * 1000.0,
+            segments = self.segments,
+            vector_segments = self.vector_segments,
+            tombstoned = self.tombstoned,
             "search"
         );
     }
@@ -166,6 +199,14 @@ mod tests {
         // `rerank_window = 0` 对三条早退路径恰是真话（"本次没跑精排"）。
         assert_eq!(m.rerank_window, 0, "默认 = 没跑精排");
         assert_eq!(m.rerank_elapsed, Duration::ZERO);
+        // V2 Step 8 / S8-03 评审批次（P2-2）的三个观测字段：默认值必须**不撒谎**。
+        // ⚠️ `segments` 的默认 `0` **只在「`Metrics::default()` 草稿缓冲区」这个意义上成立** ——
+        // `search_parts` 的**每一条**返回路径（含三条早退）都会在入口处把它覆盖成真实段数
+        // （≥ 1，视图里至少有一个 `main` 段）。⇒ 这里断言的是"缓冲区未被填过"，
+        // 不是"没走向量路"以外的语义；后者由 `vector_segments = 0` 表达。
+        assert_eq!(m.segments, 0, "默认 = 草稿缓冲区（编排层入口必覆盖）");
+        assert_eq!(m.vector_segments, 0, "默认 = 没走向量路");
+        assert_eq!(m.tombstoned, 0, "默认 = 无跨段墓碑");
     }
 
     /// `VectorRoute` 三态齐全且 `Copy`（进 `Metrics` 后不该带来克隆成本）。
@@ -200,6 +241,9 @@ mod tests {
             vector_elapsed: Duration::from_micros(6100),
             rerank_elapsed: Duration::from_micros(900),
             rerank_window: 20,
+            segments: 3,
+            vector_segments: 1,
+            tombstoned: 2,
         };
         full.log("满指标");
     }
