@@ -209,13 +209,22 @@ mod tests {
         assert_eq!(m.tombstoned, 0, "默认 = 无跨段墓碑");
     }
 
-    /// `VectorRoute` 三态齐全且 `Copy`（进 `Metrics` 后不该带来克隆成本）。
+    /// `VectorRoute` **四态**齐全且 `Copy`（进 `Metrics` 后不该带来克隆成本）。
+    ///
+    /// ⚠️ `S8-05` 起是四态：`Mixed`（跨段逐段判定后各段不唯一）是与 `Ann` / `Exact`
+    /// **并列**的一个真实取值，不是它们的别名 ⇒ 本用例的「互不相等」判据必须把它也算进来
+    /// （漏了它就会让「`Mixed` 被误当成 `Ann` 上报」这类缺陷逃过）。
     #[test]
-    fn 向量路径三态可辨且可复制() {
-        let all = [VectorRoute::None, VectorRoute::Ann, VectorRoute::Exact];
+    fn 向量路径四态可辨且可复制() {
+        let all = [
+            VectorRoute::None,
+            VectorRoute::Ann,
+            VectorRoute::Exact,
+            VectorRoute::Mixed,
+        ];
         for (i, a) in all.iter().enumerate() {
             for (j, b) in all.iter().enumerate() {
-                assert_eq!(i == j, a == b, "三态必须互不相等");
+                assert_eq!(i == j, a == b, "四态必须互不相等");
             }
         }
         let copied = VectorRoute::Exact;

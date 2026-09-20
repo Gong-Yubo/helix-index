@@ -9,14 +9,14 @@
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
-use crate::predicate::CandidateFilter;
-use crate::query::filter::PredicateBuilder;
+use crate::predicate::{CandidateFilter, FilterKind};
+use crate::query::filter::{doc_bits, BuiltPredicates, PredicateBuilder};
 use crate::query::searcher::{search_parts, SearchParts};
 use crate::query::{SearchMode, SearchResponse};
 use crate::schema::Filter;
 
 use super::index::SearchIndex;
-use super::view::{Shared, View, ViewFilter};
+use super::view::{SegmentFilter, SegmentPredicate, Shared, View, ViewFilter};
 
 /// **跨段**谓词构造器（`S8-04`）：持 `&View`，按 `filter` **逐段**求值。
 ///
@@ -27,23 +27,74 @@ struct ViewPredicate<'a> {
 }
 
 impl PredicateBuilder for ViewPredicate<'_> {
-    fn build<'a>(&'a self, filter: Option<&Filter>) -> Option<Box<dyn CandidateFilter + 'a>> {
+    /// **一次求值给出两种形态**（`S8-05`）：全局（BM25 路 / 单段向量路）+ 逐段（跨段向量路）。
+    ///
+    /// 🔑 `doc_bits`（字段索引求值，O(该段文档数)）**只算一遍**，两份消费者各拿一份 `clone`
+    /// （位图 clone 是 memcpy，比重新求值便宜得多）。分成两次构造会让它白算一遍 ——
+    /// 那正是本方法存在的理由。
+    fn build_all<'a>(&'a self, filter: Option<&Filter>) -> BuiltPredicates<'a> {
+        let tombs = self.view.tombstones.as_ref();
         match filter {
-            // 无用户过滤：各段位图**借用**，零重建（`Alive` 形态）
-            None => Some(Box::new(ViewFilter::alive_only(self.view))),
-            Some(f) => {
-                // 逐段求 `doc_bits`（字段索引是**段内**结构，见 `query::filter::doc_bits`）
-                let per_seg: Vec<crate::bitmap::DocBits> = self
+            // 无用户过滤：逐段位图**借用**（`doc_bits = None`）⇒ 逐段谓词零重建成本
+            None => {
+                let per_seg: Vec<SegmentFilter<'a>> = self
                     .view
                     .segments_in_order()
-                    .map(|seg| crate::query::filter::doc_bits(f, &seg.index))
+                    .map(|seg| SegmentFilter::alive_only(seg))
                     .collect();
-                if per_seg.iter().all(|b| b.is_empty()) {
-                    return None; // 过滤排空 ⇒ 编排层短路（与单段版同语义）
+                let allowed = ViewFilter::allowed_per_segment(&per_seg, tombs);
+                let per: Vec<Box<dyn CandidateFilter + 'a>> = per_seg
+                    .into_iter()
+                    .zip(allowed)
+                    .map(|(s, a)| {
+                        Box::new(SegmentPredicate::new(s, tombs, a, FilterKind::Alive))
+                            as Box<dyn CandidateFilter + 'a>
+                    })
+                    .collect();
+                BuiltPredicates {
+                    global: Some(Box::new(ViewFilter::alive_only(self.view))),
+                    per_segment: Some(per),
                 }
-                Some(Box::new(ViewFilter::filtered(self.view, per_seg)))
+            }
+            Some(f) => {
+                // 逐段求 `doc_bits`（字段索引是**段内**结构，见 `query::filter::doc_bits`）
+                let bits: Vec<crate::bitmap::DocBits> = self
+                    .view
+                    .segments_in_order()
+                    .map(|seg| doc_bits(f, &seg.index))
+                    .collect();
+                if bits.iter().all(|b| b.is_empty()) {
+                    // 过滤排空 ⇒ 编排层短路（与单段版同语义）
+                    return BuiltPredicates {
+                        global: None,
+                        per_segment: None,
+                    };
+                }
+                let per_seg: Vec<SegmentFilter<'a>> = self
+                    .view
+                    .segments_in_order()
+                    .zip(bits.iter().cloned())
+                    .map(|(seg, b)| SegmentFilter::filtered(seg, b))
+                    .collect();
+                let allowed = ViewFilter::allowed_per_segment(&per_seg, tombs);
+                let per: Vec<Box<dyn CandidateFilter + 'a>> = per_seg
+                    .into_iter()
+                    .zip(allowed)
+                    .map(|(s, a)| {
+                        Box::new(SegmentPredicate::new(s, tombs, a, FilterKind::Filtered))
+                            as Box<dyn CandidateFilter + 'a>
+                    })
+                    .collect();
+                BuiltPredicates {
+                    global: Some(Box::new(ViewFilter::filtered(self.view, bits))),
+                    per_segment: Some(per),
+                }
             }
         }
+    }
+
+    fn build<'a>(&'a self, filter: Option<&Filter>) -> Option<Box<dyn CandidateFilter + 'a>> {
+        self.build_all(filter).global
     }
 }
 
@@ -94,12 +145,21 @@ impl Searcher {
         // ⚠️ 单段时必须留 `None`：那条路径与 `S8-03` 之前**同一份实现**（零回归），
         //    也避免热路径平白多一层段遍历（R52）。
         let multi = !view.deltas.is_empty() || !view.tombstones.is_empty();
-        let (segment_set, predicate_builder) = if multi {
+        let (segment_set, predicate_builder, vector_segments) = if multi {
             let segments: Vec<crate::retriever::SegmentRef<'a>> = view
                 .segments_in_order()
                 .map(|seg| crate::retriever::SegmentRef {
                     index: &seg.index,
                     base_doc: seg.base_doc,
+                    base_chunk: seg.base_chunk,
+                })
+                .collect();
+            // `S8-05`：**逐段**向量载具（FIFO）。判据与 `segment_set` **同一处**填 ⇒
+            // `Metrics.vector_segments` 与 `Metrics.segments` 的计数口径不会分叉。
+            let vec_segments: Vec<crate::retriever::VectorSegmentRef<'a>> = view
+                .segments_in_order()
+                .map(|seg| crate::retriever::VectorSegmentRef {
+                    index: seg.vector_index.as_deref(),
                     base_chunk: seg.base_chunk,
                 })
                 .collect();
@@ -112,23 +172,26 @@ impl Searcher {
                     tombstones: view.tombstones.len(),
                 }),
                 Some(Box::new(ViewPredicate { view }) as Box<dyn PredicateBuilder + 'a>),
+                Some(vec_segments),
             )
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         SearchParts {
             index: &view.main.index,
             analyzer: self.shared.cfg.analyzer.as_ref(),
             embedder: self.shared.cfg.embedder.as_ref().map(|e| e.as_ref()),
-            // ⚠️ 跨段时**只给主段**的向量索引：向量侧的跨段归并是 `S8-05`（PR5）
-            // ⇒ `vector` 模式在 `deltas` 非空时**只召回主段**（已知边界，见 PR 正文）。
+            // ⚠️ 单段路径的向量索引（`deltas` 恒空时它 == 全部内容）。
+            // ✅ `S8-05` 起跨段走 `vector_segments`（逐段），本字段只在**单段**与
+            //    「跨段但缺逐段谓词」的结构性兜底里被消费（见 `query::searcher::VecLane`）。
             vector_index: view.main.vector_index.as_ref().map(|vi| vi.as_ref()),
             fusion: self.shared.cfg.fusion.as_ref(),
             reranker: self.shared.cfg.reranker.as_ref(),
             bm25_params: self.shared.cfg.bm25_params,
             segment_set,
             predicate_builder,
+            vector_segments,
         }
     }
 

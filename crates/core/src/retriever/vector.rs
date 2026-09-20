@@ -24,6 +24,155 @@ use crate::vector::{NormalizedVector, VectorIndex, VectorRoute};
 
 use super::{Retriever, Scored};
 
+/// **一个段的**向量检索视图（`S8-05`）：段自己的向量索引 + 它在全局 ID 空间里的 `chunk_id` 基址。
+///
+/// ⚠️ 与 `SegmentSet` / `SegmentRef`（`retriever::bm25`）**刻意不共用**：本模块的硬约束是
+/// 「向量路不得 import BM25 路，反之亦然」（见文件头）—— 两条 lane 只共享 `SearchParts`
+/// 这一层**载具**，彼此不引用对方的类型。
+///
+/// ⚠️ **不含 `base_doc`**：向量路只按 `chunk_id` 取点（HNSW 的 `origin_id` 就是建索引时的
+/// `chunk_id`），`doc` 维度的折算归谓词（`SegmentFilter` 自己持有 `base_doc`）⇒ 这里放它
+/// 只会是一个**没有任何消费者**的字段。
+#[derive(Clone, Copy)]
+pub struct VectorSegmentRef<'a> {
+    /// 段自己的向量索引。
+    ///
+    /// `None` = 该段没有向量索引（纯 BM25 装配 / 该段无向量能力）⇒ 本段对向量路的贡献是
+    /// **空集**（不是错误：内容确实没有向量可召回）。
+    pub index: Option<&'a dyn VectorIndex>,
+    /// 该段的全局 `chunk_id` 基址（**本地 `chunk_id` + 它 = 全局**）
+    pub base_chunk: ChunkId,
+}
+
+/// **逐段 route 的并集分类**（设计 §4.6.1 / Q5）—— `S8-05` 的 `Metrics.vector_route` 取形。
+///
+/// - 全 `Ann` ⇒ `Ann`；全 `Exact` ⇒ `Exact`；**两者混合 ⇒ [`VectorRoute::Mixed`]**；
+/// - `None` 项（未参与的段）**被忽略**；一个有效项都没有 ⇒ `None`。
+///
+/// ⚠️ 不能「取最保守者」（会丢掉「有一部分段其实走了精确」这个事实）也不能「只报主段的」
+/// （那正是 `S8-05` 要修的半盲）—— 并集分类是唯一不说谎的取形。
+pub fn union_route(routes: &[VectorRoute]) -> VectorRoute {
+    let mut it = routes
+        .iter()
+        .copied()
+        .filter(|r| !matches!(r, VectorRoute::None));
+    let Some(first) = it.next() else {
+        return VectorRoute::None;
+    };
+    debug_assert!(
+        matches!(first, VectorRoute::Ann | VectorRoute::Exact),
+        "逐段 route 只应是 Ann / Exact（None 表示未参与，已被过滤）"
+    );
+    if it.all(|r| r == first) {
+        first
+    } else {
+        VectorRoute::Mixed
+    }
+}
+
+/// **跨段**向量检索（`S8-05`）：对每段各查一次（段内本地 id），再**全局归并**。
+///
+/// # 为什么是「逐段查 + 全局归并」而不是「拼一张大图」
+///
+/// 段一旦发布就**不可变**（`I8-2`），`Box<dyn VectorIndex>` 也**不是 `Clone`**，而
+/// `hnsw_rs` **没有图合并 API**（设计 §3.2）⇒ 只能逐段查、在结果层归并。
+///
+/// # 归并口径（设计 §4.6.1）
+///
+/// `(距离 asc, 全局 chunk_id asc)`。距离升序**等价于** `VectorRetriever::to_scored` 的
+/// 相似度降序（`score = 1 − d²/2` 单调）⇒ 归并**复用同一个 `to_scored`**，不另写一份
+/// 排序口径（否则「两条路径输出一致」会退化成两份代码的巧合）。
+///
+/// # 为什么 `Brute` 下「跨段 == 单段」逐位一致（承诺，§4.6.2）
+///
+/// 每段取自己的 top-`k`。全局 top-`k` 的**任一**成员，在它自己那一段里的排名必然 `< k`
+/// （比它更优的**同段**候选 ≤ 比它更优的**全局**候选数 `< k`）⇒ 它**不会**落在段内截断
+/// 之外 ⇒ 归并是**无损**的：并集的首 `k` 个 = 全局首 `k` 个，且两侧用同一个排序键。
+/// ⚠️ `Hnsw` 下**不承诺**逐位一致（两张图 ≠ 一张图）——那是 ANN 的定义域，不是缺陷。
+pub struct SegmentedVectorRetriever<'a> {
+    embedder: &'a dyn Embedder,
+    segments: &'a [VectorSegmentRef<'a>],
+}
+
+impl<'a> SegmentedVectorRetriever<'a> {
+    /// 构造：`segments` 必须是 **FIFO 顺序**（与 `View::segments_in_order()` 一致）。
+    ///
+    /// ⚠️ 顺序影响**同分时的稳定性**（`chunk_id` 已经是全局全序键，所以结果不变），
+    /// 但保留 FIFO 让「逐段」这件事在日志与调试里可读。
+    pub fn new(embedder: &'a dyn Embedder, segments: &'a [VectorSegmentRef<'a>]) -> Self {
+        Self { embedder, segments }
+    }
+
+    /// **是否有可查的段**（有向量索引且非空）—— 用于判定「本段是否参与归并」。
+    fn participates(seg: &VectorSegmentRef<'_>) -> bool {
+        seg.index.is_some_and(|vi| !vi.is_empty())
+    }
+
+    /// 逐段检索 + 全局归并。
+    ///
+    /// - `filters[i]` 是**第 `i` 段的段内谓词**（`CandidateFilter` 的 `contains` 收**本地**
+    ///   `chunk_id`）—— 跨段谓词的折算见 `SegmentPredicate`（`search::view`）；
+    /// - `route_of(i)` 回答「第 `i` 段走精确还是 ANN」（逐段判定，`S8-05`）；
+    /// - 查询向量**只编码一次**（逐段编码会让成本随段数线性放大：NFR-10 / `R43` 的教训）。
+    ///
+    /// 返回**全局** `chunk_id` 的 `Scored`，已排序并截断到 `k`。
+    pub fn search_segmented(
+        &self,
+        query: &str,
+        k: usize,
+        filters: &[Option<&dyn CandidateFilter>],
+        route_of: impl Fn(usize) -> VectorRoute,
+    ) -> Result<Vec<Scored>> {
+        debug_assert_eq!(
+            filters.len(),
+            self.segments.len(),
+            "逐段谓词必须与段列表一一对应（含顺序）"
+        );
+        if k == 0 || query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        // 查询侧编码**一次**（与单段路径同口径：`embed_query` 失败即上抛，不吞错）
+        let q = NormalizedVector::new(self.embedder.embed_query(query)?);
+
+        // `(全局 chunk_id, 平方欧氏距离)` 的并集；段之间 ID 区间不重叠（`I8-7`）⇒ 无重复项
+        let mut all: Vec<(ChunkId, f32)> = Vec::new();
+        for (i, seg) in self.segments.iter().enumerate() {
+            let Some(vi) = seg.index else { continue };
+            if vi.is_empty() {
+                continue; // 该段没有向量 ⇒ 贡献空集
+            }
+            let filter = filters[i];
+            // ⚠️ 每段都取 `k` 条（不是 `k / 段数`）：归并需要**每段自己的前 k** 才无损
+            //   （证明见类型文档）；真正的全局截断在下面的 `truncate(k)`。
+            let raw = match route_of(i) {
+                VectorRoute::Exact => vi.search_exact_filtered(&q, k, filter)?,
+                // `Ann` 与（不可达的）`None` / `Mixed` 都退化为 ANN：
+                // `Mixed` 是**上报口径**，逐段的分派已由 `route_of(i)` 各自决定。
+                _ => vi.search_filtered(&q, k, filter)?,
+            };
+            all.extend(
+                raw.into_iter()
+                    .map(|(local, d)| (seg.base_chunk + local, d)),
+            );
+        }
+
+        let mut scored = VectorRetriever::to_scored(all);
+        scored.truncate(k);
+        Ok(scored)
+    }
+
+    /// 本次**参与归并**的段数（= 段列表里「有向量索引且非空」的段数）。
+    ///
+    /// 语义与 `Metrics.vector_segments` 的差别见 `Searcher::parts` 的注释：
+    /// 那个字段报的是「**覆盖**了几个段」（含贡献为空集的段），本方法是「**实际查了**几个段」。
+    pub fn participating_segments(&self) -> usize {
+        self.segments
+            .iter()
+            .filter(|s| Self::participates(s))
+            .count()
+    }
+}
+
 /// 向量检索器。持有 embedder 与向量索引的引用，不拥有它们。
 pub struct VectorRetriever<'a> {
     embedder: &'a dyn Embedder,
