@@ -45,6 +45,21 @@ pub enum VectorRoute {
     Ann,
     /// 走了精确扫描（保证 `min(k, allowed)` 条、无召回缺口）。
     Exact,
+    /// **跨段混合**（`S8-05`，Q5 已结案）：本次检索**逐段判定**后，各段给出的 route **不唯一**
+    /// —— 一部分段走 ANN、另一部分走精确。
+    ///
+    /// # 为什么需要这个变体
+    ///
+    /// `S8-04` 起一次检索要**对每段各查一次向量**（设计 §4.6.1），而
+    /// `prefers_exact` 是**逐段判定**的（阈值输入是该段的 `allowed_count`，见 §4.6.3）。
+    /// 段越小越容易命中 `BRUTE_FALLBACK_MAX_ALLOWED` 的低选择度兜底 ⇒
+    /// 「主段走 ANN、某个小 delta 段走精确」是**常态**而不是边角情形。
+    /// 只报 `Ann` / `Exact` 都会**说谎**（把混合态说成单一态）。
+    ///
+    /// ⚠️ **破坏性变更**（`Q5`：`VectorRoute` 未标 `#[non_exhaustive]` ⇒ 下游 exhaustive
+    /// `match` 会编译失败；补 `#[non_exhaustive]` 同样会让它失败 ⇒ 两条路都 breaking，
+    /// **没有「零破坏」选项**）⇒ `S8-05` 的 CHANGELOG 记 `Breaking`。
+    Mixed,
 }
 
 /// 向量索引抽象。

@@ -24,8 +24,8 @@ use crate::index::Index;
 use crate::predicate::CandidateFilter;
 use crate::rerank::{NoOpReranker, Reranker};
 use crate::retriever::{
-    Bm25Params, Bm25Retriever, Retriever, Scored, SegmentSet, SegmentedBm25Retriever,
-    VectorRetriever,
+    union_route, Bm25Params, Bm25Retriever, Retriever, Scored, SegmentSet, SegmentedBm25Retriever,
+    SegmentedVectorRetriever, VectorRetriever, VectorSegmentRef,
 };
 use crate::types::{ChunkId, Score};
 use crate::vector::{VectorIndex, VectorRoute};
@@ -90,6 +90,16 @@ pub struct SearchParts<'a> {
     pub segment_set: Option<SegmentSet<'a>>,
     /// 跨段谓词构造器（与 `segment_set` **成对**给出）。
     pub predicate_builder: Option<Box<dyn PredicateBuilder + 'a>>,
+    /// **逐段向量载具**（`S8-05`）：`Some` ⇒ 向量路**对每段各查一次**再全局归并；
+    /// `None` ⇒ 单段（只用 `vector_index`，本地 `chunk_id` == 全局，与 `S8-03` 之前逐位一致）。
+    ///
+    /// ⚠️ **与 `segment_set` 同样按「是否真的多段 / 有跨段墓碑」填** —— 计数口径必须一致，
+    /// 否则 `Metrics.vector_segments` 与 `Metrics.segments` 会分叉（`S8-05` 的验收项
+    /// 是两者**恒等**）。
+    ///
+    /// 🔑 为什么**不复用** `segment_set`：那会把向量路与 BM25 路的类型绑在一起，而本仓
+    /// 有「两条 lane 不得互相引用」的硬约束（`retriever` 模块头注释）⇒ 载具各自一份。
+    pub vector_segments: Option<Vec<VectorSegmentRef<'a>>>,
 }
 
 /// 编排的唯一实现：两路召回 → 融合前过滤 → 融合 → 窗口回捞 → 精排 → 补齐 explain。
@@ -175,12 +185,21 @@ pub fn search_parts(
 
     // 1. 过滤求值 → 候选谓词（**下推的数据源**，只求值一次；空集直接短路）
     let t0 = Instant::now();
-    let predicate = match parts.predicate_builder.as_deref() {
+    // 🔑 `S8-05`：跨段路径走 `build_all` —— **一次**求值同时拿到两种形态：
+    //    ① `global`（全局 `chunk_id` 语义）：BM25 路 + **单段**向量路用；
+    //    ② `per_segment`（**段内本地**语义，`S8-05`）：**跨段**向量路用（向量索引只认本段本地 id）。
+    //    分成两次构造会让逐段 `doc_bits`（字段索引求值）白算一遍 ⇒ 这是单一入口的理由。
+    let built = match parts.predicate_builder.as_deref() {
         // 跨段：谓词构造在门面层完成（它才持有 `View`）
-        Some(b) => b.build(filter),
-        None => super::filter::try_build_predicate(parts.index, filter),
+        Some(b) => b.build_all(filter),
+        None => crate::query::filter::BuiltPredicates {
+            global: super::filter::try_build_predicate(parts.index, filter),
+            // 单段：本地 `chunk_id` == 全局 ⇒ 逐段形态无意义（向量路走单索引分支）
+            per_segment: None,
+        },
     };
-    let predicate = match predicate {
+    let per_seg_filters = built.per_segment;
+    let predicate = match built.global {
         Some(p) => Some(p),
         None => {
             // 过滤条件排空了所有文档：不必进两路召回（省掉一次完整检索）。
@@ -224,29 +243,72 @@ pub fn search_parts(
     let vec_f = pred;
 
     // 向量路依赖**只解析一次**：`Vector` / `Hybrid` 都要用它，`Bm25` 根本不需要。
-    let vec_parts = match mode {
+    //
+    // `S8-05`：**两种形态**——跨段（`vector_segments` 有值）⇒ 逐段载具 + 逐段谓词 + 逐段 route；
+    // 单段 ⇒ 单索引（本地 `chunk_id` == 全局），与 `S8-03` 之前**同一份实现**（零回归）。
+    let vec_lane: Option<VecLane<'_>> = match mode {
         SearchMode::Bm25 => None,
         SearchMode::Vector | SearchMode::Hybrid => {
-            Some(require_vector(parts.embedder, parts.vector_index)?)
+            let e = parts.embedder.ok_or(Error::NoEmbedder)?;
+            match (parts.vector_segments.as_deref(), per_seg_filters.as_deref()) {
+                (Some(segs), Some(per)) => {
+                    debug_assert_eq!(
+                        per.len(),
+                        segs.len(),
+                        "逐段谓词必须与向量段列表一一对应（含顺序）"
+                    );
+                    let filters: Vec<Option<&dyn CandidateFilter>> =
+                        per.iter().map(|b| Some(b.as_ref())).collect();
+                    // **逐段** route（各段问自己那份谓词）——`plan` 是它们的**并集分类**
+                    let routes: Vec<VectorRoute> = segs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| match s.index {
+                            Some(vi) => VectorRetriever::new(e, vi).plan(filters[i]),
+                            // 该段没有向量索引 ⇒ 不参与（`union_route` 会忽略）
+                            None => VectorRoute::None,
+                        })
+                        .collect();
+                    Some(VecLane::Segmented {
+                        embedder: e,
+                        segments: segs,
+                        filters,
+                        routes,
+                    })
+                }
+                // 🔑 **结构性兜底**（跨段载具必须与逐段谓词成对出现，见 `Searcher::parts`）：
+                //    万一只有前者，退回**单索引**（结果**正确但不完整** —— 即 `S8-05` 之前的
+                //    半盲态），而**不是**「所有段共用全局谓词」（那在 delta 段上会**错过滤**，
+                //    因为全局谓词的 `contains` 收的是全局 id）。两者的区别是「少召回」vs「错答」，
+                //    兜底必须选前者；`debug_assert` 让这条不该发生的路径在测试期炸出来。
+                _ => {
+                    debug_assert!(
+                        parts.vector_segments.is_none(),
+                        "跨段向量载具必须与逐段谓词成对出现（`build_all` 的 `per_segment`）"
+                    );
+                    let (e2, vi) = require_vector(parts.embedder, parts.vector_index)?;
+                    Some(VecLane::Single {
+                        embedder: e2,
+                        index: vi,
+                        route: VectorRetriever::new(e2, vi).plan(vec_f),
+                    })
+                }
+            }
         }
     };
     // 向量路本次**实际覆盖的段数**（`S8-03` 评审 P2-2）：`0` = 本次没走向量路。
-    // 🔴 `S8-05`（PR5）之前**恒为 1** —— `Searcher::parts` 只把 `view.main` 的向量索引交下来
-    //    ⇒ `deltas` 里已提交的内容不可向量召回。默认 `mode` 是 `Hybrid` ⇒ 这不是边角情形：
-    //    只要有向量能力，**每次 `commit()` 之后、`save`/`compact` 之前**都是这个状态。
-    //    这一行就是把那个「静默半盲」变成可断言 / 可告警的信号；`S8-05` 落地后应恒等于
-    //    `metrics.segments`（PR5 的验收项之一）。
-    metrics.vector_segments = if vec_parts.is_some() { 1 } else { 0 };
+    // 🔴 `S8-05`（PR5）之前恒为 1 —— `Searcher::parts` 只把 `view.main` 的向量索引交下来
+    //    ⇒ `deltas` 里已提交的内容不可向量召回；默认 `mode` 是 `Hybrid` ⇒ 不是边角情形
+    //    （只要有向量能力，**每次 `commit()` 之后、`save`/`compact` 之前**都是这个状态）。
+    //    ✅ **`S8-05` 起**：跨段时 = 载具里的段数 ⇒ **恒等于 `metrics.segments`**（验收项）。
+    metrics.vector_segments = vec_lane.as_ref().map_or(0, |l| l.covered_segments());
 
     // V2 Step 5：向量路**分派**（ANN / 精确）与**记账**（`Metrics.vector_route`）。
-    // 策略由后端 `VectorIndex::prefers_exact` 给出（见 `VectorRetriever::plan`），
-    // 编排层只做二选一——阈值规则不在这一层复制。
+    // 策略由后端 `VectorIndex::prefers_exact` 给出，编排层只做二选一——阈值规则不在这一层复制。
+    // `S8-05`：跨段时是**逐段判定 + 并集分类**（全 Ann/全 Exact/混合 ⇒ `Mixed`，见 `union_route`）。
     // `SearchMode::Bm25` 不走向量路 ⇒ `vector_route` 保持默认 `None`（本次检索
     // 有没有向量路是编排层的信息，不该由后端编码）。
-    let vec_route = match vec_parts {
-        Some((e, vi)) => VectorRetriever::new(e, vi).plan(vec_f),
-        None => VectorRoute::None,
-    };
+    let vec_route = vec_lane.as_ref().map_or(VectorRoute::None, |l| l.route());
 
     let (bm25_lane, vector_lane) = match mode {
         SearchMode::Bm25 => {
@@ -256,19 +318,17 @@ pub fn search_parts(
             (Some(lane), None)
         }
         SearchMode::Vector => {
-            // 上方已 `require_vector` 过一次，这里复用；用 `ok_or` 而非 `expect`
+            // 上方已解析过一次，这里复用；用 `ok_or` 而非 `expect`
             // ⇒ 检索主路径不留 panic 分支（不可达，但不可达不等于该 panic）。
-            let (e, vi) = vec_parts.ok_or(Error::NoEmbedder)?;
-            let vec = VectorRetriever::new(e, vi);
+            let vec = vec_lane.as_ref().ok_or(Error::NoEmbedder)?;
             metrics.vector_route = vec_route;
             let t = Instant::now();
-            let lane = to_lane(dispatch_vector(&vec, vec_route, query, candidate_k, vec_f)?);
+            let lane = to_lane(vec.run(query, candidate_k, vec_f)?);
             metrics.vector_elapsed = t.elapsed();
             (None, Some(lane))
         }
         SearchMode::Hybrid => {
-            let (e, vi) = vec_parts.ok_or(Error::NoEmbedder)?;
-            let vec = VectorRetriever::new(e, vi);
+            let vec = vec_lane.as_ref().ok_or(Error::NoEmbedder)?;
             metrics.vector_route = vec_route;
             // 并行执行；谓词是 Send + Sync，可安全跨 rayon 线程共享。
             // 每路各自计时：Hybrid 下单一 `took` 无法归因"是哪一路慢"
@@ -281,7 +341,7 @@ pub fn search_parts(
                 },
                 || {
                     let t = Instant::now();
-                    let r = dispatch_vector(&vec, vec_route, query, candidate_k, vec_f);
+                    let r = vec.run(query, candidate_k, vec_f);
                     (r, t.elapsed())
                 },
             );
@@ -471,6 +531,82 @@ pub fn search_parts(
         took,
         metrics,
     })
+}
+
+/// **向量路的两种形态**（`S8-05`）。
+///
+/// 抽成一个枚举的理由：`Vector` / `Hybrid` 两个模式臂与它们的计时/记账都要用同一份
+/// 「单段 or 跨段」的判断 —— 散在三处写会让「跨段时忘了逐段查」这类回退**静默**发生
+/// （那正是 `S8-05` 要修的半盲态）。
+enum VecLane<'v> {
+    /// **单段**：一个索引 + 全局谓词。本地 `chunk_id` == 全局 ⇒ 与 `S8-03` 之前逐位一致。
+    Single {
+        embedder: &'v dyn Embedder,
+        index: &'v dyn VectorIndex,
+        /// 单段 route（`plan` 的结果，构造时算好）
+        route: VectorRoute,
+    },
+    /// **跨段**（`S8-05`）：逐段索引（FIFO）+ 逐段**段内**谓词 + 逐段 route。
+    Segmented {
+        embedder: &'v dyn Embedder,
+        segments: &'v [VectorSegmentRef<'v>],
+        /// 与 `segments` 一一对应；`None` 项 = 该段不过滤
+        filters: Vec<Option<&'v dyn CandidateFilter>>,
+        /// 与 `segments` 一一对应；无向量索引的段为 `VectorRoute::None`（不参与并集）
+        routes: Vec<VectorRoute>,
+    },
+}
+
+impl VecLane<'_> {
+    /// 本次向量路**覆盖**的段数（`Metrics.vector_segments`）。
+    ///
+    /// ⚠️ 口径 = 「**参与归并**的段数」（跨段时是载具长度），**不是**「实际查到东西的段数」：
+    /// 某段内容为空 / 无向量索引时它对归并的贡献是**空集**，但它**被覆盖了**
+    /// （不存在「漏召回」）。`S8-05` 的验收项是 `vector_segments == segments` ⇒ 必须用这个口径。
+    fn covered_segments(&self) -> usize {
+        match self {
+            VecLane::Single { .. } => 1,
+            VecLane::Segmented { segments, .. } => segments.len(),
+        }
+    }
+
+    /// 本次向量路的 route（单段 = 它自己的；跨段 = **逐段并集分类**）。
+    fn route(&self) -> VectorRoute {
+        match self {
+            VecLane::Single { route, .. } => *route,
+            VecLane::Segmented { routes, .. } => union_route(routes),
+        }
+    }
+
+    /// 执行向量路召回。
+    fn run(
+        &self,
+        query: &str,
+        k: usize,
+        global_filter: Option<&dyn CandidateFilter>,
+    ) -> Result<Vec<Scored>> {
+        match self {
+            VecLane::Single {
+                embedder,
+                index,
+                route,
+            } => {
+                let r = VectorRetriever::new(*embedder, *index);
+                dispatch_vector(&r, *route, query, k, global_filter)
+            }
+            VecLane::Segmented {
+                embedder,
+                segments,
+                filters,
+                routes,
+            } => SegmentedVectorRetriever::new(*embedder, segments).search_segmented(
+                query,
+                k,
+                filters,
+                |i| routes[i],
+            ),
+        }
+    }
 }
 
 /// 向量路的分派（D-S5-01 的"分派归编排层"落地）。
@@ -675,6 +811,7 @@ impl<'a> QueryExecutor<'a> {
             // ⇒ 两个跨段字段恒为空 ⇒ 走的还是 `S8-03` 之前那条单段路径（逐位不变）。
             segment_set: None,
             predicate_builder: None,
+            vector_segments: None,
         }
     }
 

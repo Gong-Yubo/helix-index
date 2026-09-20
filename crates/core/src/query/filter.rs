@@ -179,6 +179,19 @@ impl CandidateFilter for ChunkFilter<'_> {
     }
 }
 
+/// [`PredicateBuilder::build_all`] 的产出：**同一次过滤求值**给出的两种谓词形态。
+///
+/// 分成两个字段（而不是调两次构造）的原因是**成本**：`global` 与 `per_segment` 都以
+/// 「逐段 `doc_bits`（字段索引求值，O(该段文档数)）」为输入；分成两次调用会让它白算一遍。
+pub struct BuiltPredicates<'a> {
+    /// **全局 `chunk_id` 语义**：BM25 路与单段向量路用（`None` = 过滤排空 ⇒ 编排层短路）。
+    pub global: Option<Box<dyn CandidateFilter + 'a>>,
+    /// **逐段本地 `chunk_id` 语义**（`S8-05` 的跨段向量路用）：与 FIFO 段列表一一对应。
+    ///
+    /// `None` = 本构造器不支持/不需要逐段形态（单段路径）⇒ 向量路走单索引分支。
+    pub per_segment: Option<Vec<Box<dyn CandidateFilter + 'a>>>,
+}
+
 /// **跨段**候选谓词的**构造器**（`S8-04`）。
 ///
 /// # 为什么要有这个 trait
@@ -187,10 +200,23 @@ impl CandidateFilter for ChunkFilter<'_> {
 /// `pub(crate)`、**不能**出现在公开的 `SearchParts` 里。⇒ 由门面层（能访问 `View` 的那一层）
 /// 实现本 trait，`search_parts` 只通过它构造谓词 —— 公开面因此只多一个 trait 对象。
 pub trait PredicateBuilder: Send + Sync {
-    /// 构造本 query 的谓词。
+    /// **一次求值**给出全局 + 逐段两种形态（`S8-05` 起编排层只调本方法）。
     ///
-    /// 返回 `None` = **用户过滤排空**（没有任何文档通过），编排层据此短路
+    /// `global == None` = **用户过滤排空**（没有任何文档通过），编排层据此短路
     /// （与 [`try_build_predicate`] 的同名语义一致）。
+    ///
+    /// ⚠️ **默认实现只给 `global`**（`per_segment = None`）⇒ 向量路退回单索引分支，
+    /// 这与 `S8-05` 之前的语义**逐位一致**（单段下本地 `chunk_id` == 全局）。
+    fn build_all<'a>(&'a self, filter: Option<&Filter>) -> BuiltPredicates<'a> {
+        BuiltPredicates {
+            global: self.build(filter),
+            per_segment: None,
+        }
+    }
+
+    /// 构造**全局**形态的谓词（`build_all` 的默认实现消费它）。
+    ///
+    /// 返回 `None` 语义同 [`Self::build_all`]。
     fn build<'a>(&'a self, filter: Option<&Filter>) -> Option<Box<dyn CandidateFilter + 'a>>;
 }
 

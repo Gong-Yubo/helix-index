@@ -659,7 +659,7 @@ pub(crate) struct SegmentFilter<'a> {
 
 impl<'a> SegmentFilter<'a> {
     /// 无用户过滤（只判存活）。
-    fn alive_only(seg: &'a Segment) -> Self {
+    pub(crate) fn alive_only(seg: &'a Segment) -> Self {
         Self {
             index: &seg.index,
             doc_bits: None,
@@ -669,7 +669,7 @@ impl<'a> SegmentFilter<'a> {
     }
 
     /// 有用户过滤（`doc_bits` 按**段内** `doc_id` 索引）。
-    fn filtered(seg: &'a Segment, doc_bits: crate::bitmap::DocBits) -> Self {
+    pub(crate) fn filtered(seg: &'a Segment, doc_bits: crate::bitmap::DocBits) -> Self {
         Self {
             index: &seg.index,
             doc_bits: Some(doc_bits),
@@ -732,24 +732,47 @@ impl<'a> ViewFilter<'a> {
             view.segments_in_order().count(),
             "per_seg 必须与 FIFO 段列表一一对应（含顺序）"
         );
-        let mut allowed: usize = per_seg.iter().map(|s| s.allowed_chunks()).sum();
-        // 🔴 精确扣减：墓碑 doc 在所属段里仍存活（postings 也在），必须从 `allowed` 里去掉
-        // 它**通过过滤**的那些活分片 —— 不得估算（硬契约，见类型文档）。
-        for doc in view.tombstones.iter() {
-            if let Some(s) = per_seg.iter().find(|s| s.owns_doc(doc)) {
-                let local_doc = doc - s.base_doc;
-                if s.doc_passes_filter(local_doc) {
-                    allowed =
-                        allowed.saturating_sub(s.index.chunk_count_of_doc(local_doc) as usize);
-                }
-            }
-        }
+        // 🔑 全局 `allowed` = **逐段值之和**（`S8-05` 起由 `per_segment_allowed` 统一计算）：
+        //    向量路的 `prefers_exact` 阈值输入是「**该段**的 `allowed_count`」（§4.6.3）
+        //    ⇒ 两者必须**同源**，否则会出现「全局和」与「逐段和」两个会漂移的口径。
+        let allowed: usize = Self::allowed_per_segment(&per_seg, view.tombstones.as_ref())
+            .iter()
+            .sum();
         Self {
             per_seg,
             tombstones: view.tombstones.as_ref(),
             allowed,
             kind,
         }
+    }
+
+    /// **逐段 `allowed`**（`S8-05`）：与 `per_seg` / FIFO 段列表**一一对应**，
+    /// 且**已扣除落在该段的跨段墓碑**。**单点实现** —— 全局 `allowed`（= 本函数之和）
+    /// 与逐段向量检索的阈值输入都由它给出。
+    ///
+    /// # 为什么是硬契约
+    ///
+    /// 这个量有两个消费者，且都要求**精确**（不得估算）：
+    /// ① 全局 `allowed_count()`（供 `prefers_exact` 与 `Metrics.allowed`）；
+    /// ② **逐段向量检索**的阈值输入 —— `HnswRsIndex` 的 `prefers_exact` 与过采样
+    ///    `alive_ratio = allowed / len` 都必须是**该段**的值（设计 §4.6.3）：
+    ///    段越小越容易命中 `BRUTE_FALLBACK_MAX_ALLOWED` 的低选择度兜底，这是分段的**预期副作用**。
+    pub(crate) fn allowed_per_segment(
+        per_seg: &[SegmentFilter<'_>],
+        tombstones: &Tombstones,
+    ) -> Vec<usize> {
+        let mut out: Vec<usize> = per_seg.iter().map(|s| s.allowed_chunks()).collect();
+        // 🔴 精确扣减：墓碑 doc 在所属段里仍存活（postings 也在），必须从**它所属那一段**的
+        //    `allowed` 里去掉它**通过过滤**的那些活分片 —— 不得估算（硬契约，见类型文档）。
+        for doc in tombstones.iter() {
+            if let Some((i, s)) = per_seg.iter().enumerate().find(|(_, s)| s.owns_doc(doc)) {
+                let local_doc = doc - s.base_doc;
+                if s.doc_passes_filter(local_doc) {
+                    out[i] = out[i].saturating_sub(s.index.chunk_count_of_doc(local_doc) as usize);
+                }
+            }
+        }
+        out
     }
 
     /// 无用户过滤形态：只判存活 + 墓碑（各段位图**借用**，零重建成本）。
@@ -789,6 +812,71 @@ impl<'a> ViewFilter<'a> {
             }
         }
         None
+    }
+}
+
+/// **段内谓词**（`S8-05`）：把 [`SegmentFilter`] 暴露成 [`CandidateFilter`]，供**该段自己的**
+/// 向量索引消费。
+///
+/// # 为什么必须有这一层折算
+///
+/// `VectorIndex::search_filtered` 的谓词是**段内本地 `chunk_id` 语义**（向量索引只认自己段的
+/// 本地 id —— HNSW 的 `origin_id` 就是建索引时拿到的那个 id），而跨段谓词 [`ViewFilter`] 是
+/// **全局 `chunk_id` 语义**。⇒ 逐段下推时必须把语义**折到段内**，否则过滤会落到别的段的
+/// 分片区间上：主段 `base_chunk == 0`（本地 == 全局）时**看不出来**，而 delta 段会**静默错过滤**
+/// （谓词判定在别的区间上，结果可能全通过或全挡掉）—— 这正是本条必须有定向用例的原因。
+///
+/// ⚠️ `allowed_count()` 是**该段**的值（`ViewFilter::allowed_per_segment` 的对应元素，
+/// **含落在该段的墓碑扣减**），不是全局和 —— `HnswRsIndex` 的过采样公式与 `prefers_exact`
+/// 阈值都以它为输入（设计 §4.6.3）。
+pub(crate) struct SegmentPredicate<'a> {
+    seg: SegmentFilter<'a>,
+    /// 与 [`ViewFilter`] 同源：跨段墓碑命中即挡（`contains` 里必须先判它）
+    tombstones: &'a Tombstones,
+    allowed: usize,
+    kind: FilterKind,
+}
+
+impl<'a> SegmentPredicate<'a> {
+    /// 由「本段过滤器 + 该段 `allowed`」构造。
+    ///
+    /// ⚠️ `allowed` **必须**来自 [`ViewFilter::allowed_per_segment`] 的对应元素 ——
+    /// 传全局和会让 `prefers_exact` 与过采样公式静默失真（结果仍正确，只是兜底失效）。
+    pub(crate) fn new(
+        seg: SegmentFilter<'a>,
+        tombstones: &'a Tombstones,
+        allowed: usize,
+        kind: FilterKind,
+    ) -> Self {
+        Self {
+            seg,
+            tombstones,
+            allowed,
+            kind,
+        }
+    }
+}
+
+impl CandidateFilter for SegmentPredicate<'_> {
+    /// 段内本地 `chunk_id` 是否通过 —— 判据与 [`ViewFilter::contains`] **逐条同源**，
+    /// 只是把「先 `locate` 到段」这一步换成了「调用方已经知道是本段」。
+    fn contains(&self, local_chunk: ChunkId) -> bool {
+        // ① 跨段墓碑（同 `ViewFilter::contains`）：doc 在本段内仍存活，只有墓碑知道它已删
+        if let Some(local_doc) = self.seg.index.doc_of(local_chunk) {
+            if self.tombstones.blocks_doc(self.seg.base_doc + local_doc) {
+                return false;
+            }
+        }
+        // ② 存活 + 用户过滤（本段）
+        self.seg.chunk_allowed(local_chunk)
+    }
+
+    fn allowed_count(&self) -> usize {
+        self.allowed
+    }
+
+    fn kind(&self) -> FilterKind {
+        self.kind
     }
 }
 
