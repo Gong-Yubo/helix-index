@@ -44,7 +44,7 @@ use helix_core::query::{Hit, SearchMode, SearchResponse, VectorRoute};
 use helix_core::retriever::union_route;
 use helix_core::schema::Filter;
 use helix_core::search::{
-    MergeReport, SearchIndex, SearchIndexBuilder, Searcher, VectorBackend, VectorMergeStrategy,
+    SearchIndex, SearchIndexBuilder, Searcher, VectorBackend, VectorMergeStrategy,
 };
 use helix_core::types::{ChunkId, DocId, Score};
 
