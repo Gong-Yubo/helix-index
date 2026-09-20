@@ -319,6 +319,60 @@ pub(crate) struct Shared {
 /// 抽别名只为过 `clippy::type_complexity`（嵌套 `Arc` + 元组）；语义就是「一段新的 `View` 内容」。
 pub(crate) type AbsorbedWindow = (Arc<[Arc<Segment>]>, Arc<Tombstones>);
 
+/// **发布失败的调用方上下文**（`S8-03` 第 3 轮评审 **P4**）。
+///
+/// # 为什么需要它
+///
+/// [`Shared::commit_view`] 的 **epoch 拒绝**被**两条路径共用**：
+/// `SearchIndex::commit()`（builder 里的未提交内容 + 跨段墓碑，**真的会丢**）与
+/// `SearchIndex::fold_deltas()`（经 `save()` / `compact()` 调用，**内容没丢**、只丢本次合并的计算）。
+/// 修复前两者共用同一段消息 ⇒ 对 `fold` 侧**三条声明全不成立**：
+///
+/// ① 「未提交内容已被丢弃」—— `save()` 是 `commit()?` **然后** `fold_deltas()?`
+///    ⇒ fold 那一刻「未提交内容」早已被 `commit()` **按设计提交**，不存在「被丢弃」；
+/// ② 「builder 已换成新 builder」—— `fold_deltas` **不碰** `self.builder`，且 `Err` 立即从
+///    `fold_deltas()?` 冒出 ⇒ builder **保持过期**（旧世代）直到下一次 `commit()` 尝试；
+/// ③ 恢复指引「重新执行 `add` 与 `remove`」—— **无可重做**；正确动作是
+///    **重试本次 `save()` / `compact()`**（首次重试会在其 `commit()` 处再吃一次 `Busy`、并顺手把
+///    builder 刷到新世代，第二次成功 —— 收敛、无数据损失）。
+///
+/// ⇒ 留着旧消息会把调用方带向**错误的恢复动作**（违反 NFR-07「语义偏差不得静默」）。
+/// 这也是第 2 轮评审 **P3-1**「三条 `Busy` 语义分家」**唯一剩下的缝隙**。
+///
+/// # 取形：调用方**声明身份**，而不是「事后转写」或「挂载字符串」
+///
+/// - **事后转写**（在 `fold_deltas` 里把 `Err` 换掉自己的文案）需要在 `Error::Busy(String)` 上做
+///   **字符串匹配**来辨认「这是不是 epoch 那条」—— 脆；
+/// - **传字符串**能编译，但调用方**忘传 / 传错**没有编译期保护；
+/// - **加变体** ⇒ 必须在本文件的 `PublishCaller::loss_and_recovery` 里补文案（穷尽 `match`），
+///   新增调用方时**漏不掉**。
+pub(crate) enum PublishCaller {
+    /// `SearchIndex::commit()`：builder 里可能有**未提交的内容 + 跨段墓碑**。
+    Commit,
+    /// `SearchIndex::fold_deltas()`（经 `save()` / `compact()`）：**内容没丢**，丢的只是本次合并的计算。
+    Fold,
+}
+
+impl PublishCaller {
+    /// 「丢了什么 + 怎么恢复」—— **两条路径唯一的不同之处**，也是各自消息的落点。
+    ///
+    /// 判据：`S8_03_epoch拒绝的恢复指引按调用方分家`（两条文案必须不同、且 `fold` 侧
+    /// **不得**含「已被丢弃」）。
+    fn loss_and_recovery(self) -> &'static str {
+        match self {
+            Self::Commit => {
+                "⚠️ 本写端**未提交内容已被丢弃**（`commit()` 末尾无条件换新 builder）\
+                 ⇒ 重试**不会**恢复它；请重新执行未成功的 `add` **与 `remove`** 后再 `commit()`"
+            }
+            Self::Fold => {
+                "⚠️ `fold` 是**维护性**操作：增量段**仍在视图里、内容没丢**（且它**不碰** \
+                 `builder`，builder 会保持过期直到下一次 `commit()` 顺手刷新）\
+                 ⇒ 丢的只是本次合并的计算，**重试本次 `save()` / `compact()`** 即可"
+            }
+        }
+    }
+}
+
 impl Shared {
     /// 构造：以给定段作为唯一主段。
     pub(crate) fn new(
@@ -472,21 +526,27 @@ impl Shared {
     /// 闭包在**锁内**做「快照前缀身份校验」之类的检查；不符时它必须能**中止发布**，
     /// 而检查又**只能**在锁内做（锁外做等于没做）⇒ 用 `Result` 把失败带出来。
     /// 🔑 **失败时不做任何记账**：`generation` 不消耗、`next_*` 不回退、`view` 不动 ——
-    /// 与 `expected_epoch` 不符那条路径的语义**完全一致**（调用方拿到 `Err` 后按「丢弃 +
-    /// 重新执行未成功的操作」处置，见两条 `Busy` 消息的指引）。
+    /// 与 `expected_epoch` 不符那条路径的语义**完全一致**（调用方拿到 `Err` 后按 `caller`
+    /// 给出的指引处置；⚠️ **两条路径的恢复动作不同**，见 [`PublishCaller`]）。
+    ///
+    /// # `caller`（`S8-03` 第 3 轮评审 **P4**）
+    ///
+    /// epoch 拒绝被 `commit()` 与 `fold_deltas()` **共用**，而「丢了什么 / 怎么恢复」
+    /// **按调用方而不同** ⇒ 由调用方**声明身份**，消息在**同一个地方**分家
+    /// （`PublishCaller::loss_and_recovery`）。
     pub(crate) fn commit_view(
         &self,
         expected_epoch: u64,
+        caller: PublishCaller,
         build_next: impl FnOnce(&Arc<View>, u64, DocId, ChunkId) -> Result<(View, DocId, ChunkId)>,
     ) -> Result<u64> {
         let mut ids = self.ids.lock().expect("发号锁中毒");
         if ids.epoch != expected_epoch {
             return Err(Error::Busy(format!(
                 "ID 空间已换代（epoch {expected_epoch} → {}，`compact()` 的重编号会作废整个旧 ID \
-                 空间）⇒ 本次发布依据的基址 / 跨段墓碑 / 去重条目都可能指向旧 ID 空间，已拒绝发布。\
-                 ⚠️ 本写端**未提交内容已被丢弃**（builder 已换成与当前世代对齐的新 builder），\
-                 重试**不会**恢复它；请重新执行未成功的 `add` **与 `remove`** 后再 `commit()`",
-                ids.epoch
+                 空间）⇒ 本次发布依据的基址 / 跨段墓碑 / 去重条目都可能指向旧 ID 空间，已拒绝发布。{}",
+                ids.epoch,
+                caller.loss_and_recovery()
             )));
         }
         let cur = Arc::clone(&self.view.read().expect("视图锁中毒"));
@@ -824,7 +884,9 @@ mod tests {
         assert_eq!(sh.next_origin(), (0, 0, 0), "未提交时应为 (0, 0) 且第 0 代");
         assert_eq!(sh.epoch(), 0, "未 compact ⇒ 恒第 0 代 ID 空间");
 
-        let g1 = sh.commit_view(0, empty_commit).expect("第 0 代发布应通过");
+        let g1 = sh
+            .commit_view(0, PublishCaller::Commit, empty_commit)
+            .expect("第 0 代发布应通过");
         assert_eq!(g1, 1, "序号应从 1 开始");
         let (bd, bc, ep) = sh.next_origin();
         assert_eq!(
@@ -841,7 +903,9 @@ mod tests {
             "骨架期提交必须复用同一个 main 段（不复制内容）"
         );
 
-        let g2 = sh.commit_view(0, empty_commit).expect("第 0 代发布应通过");
+        let g2 = sh
+            .commit_view(0, PublishCaller::Commit, empty_commit)
+            .expect("第 0 代发布应通过");
         assert_eq!(g2, 2, "序号必须单调递增");
     }
 
@@ -867,7 +931,9 @@ mod tests {
         assert_eq!((ep0, ep1), (0, 1), "publish_reset 必须换代");
 
         // 旧世代的发布被拒（★ 这条是新增的鉴别力：只有基址检查的实现会放行）
-        let err = sh.commit_view(0, empty_commit).unwrap_err();
+        let err = sh
+            .commit_view(0, PublishCaller::Commit, empty_commit)
+            .unwrap_err();
         assert!(
             matches!(err, Error::Busy(_)),
             "换代后旧世代的发布必须报 Busy，实际 = {err:?}"
@@ -879,7 +945,8 @@ mod tests {
 
         // 新世代的发布照常
         assert_eq!(
-            sh.commit_view(1, empty_commit).expect("新世代发布应通过"),
+            sh.commit_view(1, PublishCaller::Commit, empty_commit)
+                .expect("新世代发布应通过"),
             2,
             "被拒的那次不得消耗序号"
         );
@@ -899,6 +966,46 @@ mod tests {
     /// 🔑 为什么必须测：这个 `Err` 出口是 P1-2 新引入的（此前闭包不可能失败），而
     /// 「失败即无副作用 / 本次未提交内容被丢弃但账目不脏」是我在 `commit_view` 文档与两条
     /// `Busy` 消息里**写下的承诺** —— 承诺必须有判据，否则调用方按「重试」处置时会与实现不一致。
+    /// **`S8-03` 第 3 轮评审 P4 的判据**：epoch 拒绝的恢复指引**必须按调用方分家**。
+    ///
+    /// # 这条抓的是什么
+    ///
+    /// `Shared::commit_view` 的 epoch 拒绝被 `commit()` 与 `fold_deltas()` **共用**。修复前两者
+    /// 共用同一段消息，而那段消息的三条声明**对 `fold` 全不成立**（见 [`PublishCaller`] 的文档）
+    /// ⇒ 恢复指引会把人带向**错误的动作**（说「重新 add/remove」，实际应「重试 save/compact」）。
+    ///
+    /// 🔑 判据只钉**语义差别**，不逐字比文案（那会脆）：
+    /// ① 两条文案必须**不同**；② `commit` 侧必须承认丢内容并给「`add` + `remove`」；
+    /// ③ **`fold` 侧不得出现「已被丢弃」**（P4 的核心：不得把「无损失」说成「有损失」）；
+    /// ④ `fold` 侧必须给「重试 `save()` / `compact()`」。
+    #[test]
+    fn S8_03_epoch拒绝的恢复指引按调用方分家() {
+        let commit = PublishCaller::Commit.loss_and_recovery();
+        let fold = PublishCaller::Fold.loss_and_recovery();
+
+        assert_ne!(
+            commit, fold,
+            "两条路径的恢复指引必须不同（NFR-07：语义偏差不得静默）"
+        );
+        assert!(
+            commit.contains("已被丢弃"),
+            "`commit()` 侧确实丢内容（builder 里未提交的内容 + 跨段墓碑）"
+        );
+        assert!(
+            commit.contains("add") && commit.contains("remove"),
+            "`commit()` 侧要重做 `add` 与 `remove`（分支②的跨段墓碑也在 builder 上）"
+        );
+        assert!(
+            !fold.contains("已被丢弃"),
+            "🔴 `fold` 侧**没有**内容损失（增量段仍在视图里）⇒ 不得把「无损失」说成「有损失」—— \
+             这正是第 3 轮评审 P4 指出的那条"
+        );
+        assert!(
+            fold.contains("save()") && fold.contains("compact()"),
+            "`fold` 侧的正解是**重试本次 `save()` / `compact()`**"
+        );
+    }
+
     #[test]
     fn S8_03_发布失败时不消耗任何记账() {
         let sh = shared();
@@ -906,9 +1013,13 @@ mod tests {
         let before_view = sh.snapshot();
 
         let err = sh
-            .commit_view(0, |_cur, _generation, _base_doc, _base_chunk| {
-                Err(Error::Busy("模拟：前缀身份校验失败".to_string()))
-            })
+            .commit_view(
+                0,
+                PublishCaller::Commit,
+                |_cur, _generation, _base_doc, _base_chunk| {
+                    Err(Error::Busy("模拟：前缀身份校验失败".to_string()))
+                },
+            )
             .unwrap_err();
         assert!(
             matches!(err, Error::Busy(_)),
@@ -930,7 +1041,9 @@ mod tests {
         //    epoch)`、**看不到** `ids.generation` ⇒ 「不消耗序号」只能在这里观察
         //    （变异实测：把 `ids.generation = generation` 提前到 `?` 之前 ⇒ 本行红，
         //    而上面那条 `next_origin` 断言**照样绿** —— 所以两条都必须在）。
-        let g = sh.commit_view(0, empty_commit).expect("第 0 代发布应通过");
+        let g = sh
+            .commit_view(0, PublishCaller::Commit, empty_commit)
+            .expect("第 0 代发布应通过");
         assert_eq!(g, 1, "失败的那次不得消耗序号（否则这里会拿到 2）");
         assert_eq!(sh.snapshot().generation, 1, "成功的发布必须换视图");
     }
@@ -1075,7 +1188,9 @@ mod tests {
     fn S8_02_已取出的快照不受后续提交影响() {
         let sh = shared();
         let held = sh.snapshot();
-        let g = sh.commit_view(0, empty_commit).expect("第 0 代发布应通过");
+        let g = sh
+            .commit_view(0, PublishCaller::Commit, empty_commit)
+            .expect("第 0 代发布应通过");
         assert_eq!(g, 1);
         assert_eq!(held.generation, 0, "已取出的快照内容不得被后续提交改动");
         assert_eq!(sh.snapshot().generation, 1, "新快照必须看到新序号");
