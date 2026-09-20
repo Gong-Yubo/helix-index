@@ -43,7 +43,9 @@ use helix_core::error::{Error, Result};
 use helix_core::query::{Hit, SearchMode, SearchResponse, VectorRoute};
 use helix_core::retriever::union_route;
 use helix_core::schema::Filter;
-use helix_core::search::{SearchIndex, SearchIndexBuilder, Searcher, VectorBackend};
+use helix_core::search::{
+    MergeReport, SearchIndex, SearchIndexBuilder, Searcher, VectorBackend, VectorMergeStrategy,
+};
 use helix_core::types::{ChunkId, DocId, Score};
 
 const DOCS: [&str; 4] = [
@@ -1267,5 +1269,298 @@ fn S8_05_union_route的并集分类() {
         union_route(&[Exact, Ann, Exact]),
         Mixed,
         "混合 ⇒ Mixed（与顺序无关）"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// 10) `S8-06` 合并器（`merge_pending` / `merge_all` / `MergeReport`）
+// ══════════════════════════════════════════════════════════════════════════
+
+/// **`S8-06` 原语的契约**（新公开面）：
+/// `merge_pending()` 一次只并**队首一段**、无未合并段时返回 `Ok(None)`；
+/// `merge_all()` 并掉全部（无增量段时是 no-op）；`MergeReport` 的读数与视图状态一致。
+///
+/// # 为什么要单钉契约（而不是只靠端到端）
+///
+/// 「一次一段」是**宿主做后台合并**的唯一抓手（`D-S8-08`：库不 `spawn` 线程），
+/// 而它一旦写成「一次全并」，宿主就**无法控制单次合并的开销**（`O(N)` 与 `O(delta)` 差两个量级）。
+#[test]
+fn S8_06_合并原语的契约_一次一段与空段返回None() {
+    // ① 纯 BM25 装配 ⇒ 无向量侧工作 ⇒ `vector_strategy` 应为 `None`
+    let mut bm = bm25_builder().build();
+    for t in ["甲甲甲", "乙乙乙", "丙丙丙"] {
+        bm.add(Document::new(t)).unwrap();
+        bm.commit().unwrap();
+    }
+    let segs = |idx: &SearchIndex| {
+        idx.searcher()
+            .search_with("甲甲甲")
+            .mode(SearchMode::Bm25)
+            .top_n(10)
+            .exec()
+            .unwrap()
+            .metrics
+            .segments
+    };
+    assert_eq!(segs(&bm), 4, "前提：main + 3 个 delta = 4 段");
+
+    let r1 = bm
+        .merge_pending()
+        .unwrap()
+        .expect("有未合并段 ⇒ 应返回 Some");
+    assert_eq!(
+        r1.segments_merged, 1,
+        "merge_pending 一次只并 FIFO 队首那一段"
+    );
+    assert_eq!(r1.chunks_merged, 1, "本次并入 1 个活分片");
+    assert_eq!(segs(&bm), 3, "并掉一段后段数应减 1（其余段仍在）");
+    assert_eq!(
+        r1.vector_strategy,
+        VectorMergeStrategy::None,
+        "纯 BM25 装配没有向量侧工作 ⇒ 必须是 None（不是 Rebuild —— 别把「无」记成「重建」）"
+    );
+
+    let r2 = bm.merge_pending().unwrap().expect("还有两段");
+    let r3 = bm.merge_pending().unwrap().expect("还有一段");
+    assert_eq!((r2.segments_merged, r3.segments_merged), (1, 1));
+    assert_eq!(segs(&bm), 1, "三段并完 ⇒ 只剩主段");
+    assert!(
+        bm.merge_pending().unwrap().is_none(),
+        "无未合并段 ⇒ 必须返回 Ok(None)（而不是 Some(空报告)）—— 宿主靠它判「干完了」"
+    );
+
+    // ② 无增量段时 `merge_all` 是 no-op，且**不推进 generation**
+    let r4 = bm.merge_all().unwrap();
+    assert_eq!(r4.segments_merged, 0, "无增量段 ⇒ no-op");
+    assert_eq!(r4.tombstones_applied, 0);
+    assert_eq!(r4.vector_strategy, VectorMergeStrategy::None);
+
+    // ③ 带向量装配但后端无图（Brute）⇒ 走兜底 `Rebuild`：
+    //    `as_graph_persist()` 对 Brute 返回 `None`（类型事实）⇒ 方案 A 不可用。
+    let mut br = hybrid_builder().build();
+    for t in ["向量检索甲", "向量检索乙"] {
+        br.add(Document::new(t)).unwrap();
+        br.commit().unwrap();
+    }
+    let r5 = br.merge_all().unwrap();
+    assert_eq!(r5.segments_merged, 2);
+    assert_eq!(
+        r5.vector_strategy,
+        VectorMergeStrategy::Rebuild,
+        "Brute 无图 ⇒ 方案 A 不可用 ⇒ 必须如实记 Rebuild（不是 Incremental）"
+    );
+
+    // ④ 合并**不改 ID**（D-S8-04）：把 ID 抓在合并前后比
+    let mut idx = bm25_builder().build();
+    let mut ids = Vec::new();
+    for t in ["保持标识甲", "保持标识乙"] {
+        let out = idx.add(Document::new(t)).unwrap();
+        idx.commit().unwrap();
+        ids.push(out.chunk_ids[0]);
+    }
+    idx.merge_all().unwrap();
+    let hits = idx
+        .searcher()
+        .search_with("保持标识")
+        .mode(SearchMode::Bm25)
+        .top_n(10)
+        .exec()
+        .unwrap();
+    let got: Vec<ChunkId> = hits.hits.iter().map(|h| h.chunk_id).collect();
+    for want in &ids {
+        assert!(
+            got.contains(want),
+            "合并不得改 chunk_id（D-S8-04）：{want} 未出现在 {got:?}"
+        );
+    }
+}
+
+/// **`S8-T13`**：合并后的**字段索引**求值 == 全量重建（设计 §4.9.2）。
+///
+/// `Index::merge_from` **不能** `extend` 字段索引（它是 field → value → doc 位图，且带
+/// 「基数保护」的降级判定）⇒ 走 `FieldIndex::rebuild` 全量重建。**重建后的降级结论可能与
+/// 增量维护不同**，正是这条要钉的。
+///
+/// 判据：分段写入 + `merge_all()` 的**过滤 battery** 结果 == **单段建库**的同 battery 结果
+/// （逐位一致）。语料含两类字段：`grp`（低基数）+ `ser`（**高基数**，200 个唯一值 ⇒
+/// 尽量压到基数保护/降级的判定路径上）。
+#[test]
+fn S8_T13_合并后的字段索引与单段全量重建等价() {
+    const N: usize = 200;
+    let docs: Vec<(String, String, String)> = (0..N)
+        .map(|i| {
+            (
+                format!("字段索引语料 {i} 检索"),
+                format!("g{}", i % 3), // 低基数：3 个值
+                format!("s{i}"),       // 高基数：200 个唯一值
+            )
+        })
+        .collect();
+
+    let make = |idx: &mut SearchIndex, slice: &[(String, String, String)]| {
+        for (text, grp, ser) in slice {
+            let mut d = Document::new(text.clone());
+            d.metadata = serde_json::json!({ "grp": grp, "ser": ser });
+            idx.add(d).unwrap();
+        }
+        idx.commit().unwrap();
+    };
+
+    // 参照：**单段**建库（一次 add 全部 ⇒ 字段索引由增量维护得出）
+    let dir = tempfile::tempdir().unwrap();
+    let p_ref = dir.path().join("t13-ref.idx");
+    let mut one = bm25_builder().build();
+    make(&mut one, &docs);
+    one.save(&p_ref).unwrap();
+    let one = bm25_builder().load(&p_ref).unwrap().searcher();
+
+    // 被测：**分 4 段**写入（每 50 篇一个 delta）再 `merge_all()`
+    let mut many = bm25_builder().build();
+    for chunk in docs.chunks(50) {
+        make(&mut many, chunk);
+    }
+    let before = many
+        .searcher()
+        .search_with("检索")
+        .mode(SearchMode::Bm25)
+        .top_n(5)
+        .exec()
+        .unwrap()
+        .metrics
+        .segments;
+    assert_eq!(before, 5, "前提：main + 4 个 delta = 5 段");
+    let rep = many.merge_all().unwrap();
+    assert_eq!(rep.segments_merged, 4, "应并掉 4 个增量段");
+    let many = many.searcher();
+
+    // 过滤 battery：两个字段 × 多个值 ⇒ 覆盖「高基数」「低基数」「无命中」三类
+    let mut battery: Vec<Filter> = Vec::new();
+    for g in ["g0", "g1", "g2", "g9"] {
+        battery.push(Filter::eq("grp", g));
+    }
+    for i in [0usize, 7, 55, 199, 9999] {
+        battery.push(Filter::eq("ser", format!("s{i}")));
+    }
+    let mut nonempty = 0usize;
+    for f in &battery {
+        let a = one
+            .search_with("检索")
+            .mode(SearchMode::Bm25)
+            .filter(f)
+            .top_n(50)
+            .exec()
+            .unwrap();
+        let b = many
+            .search_with("检索")
+            .mode(SearchMode::Bm25)
+            .filter(f)
+            .top_n(50)
+            .exec()
+            .unwrap();
+        if !a.hits.is_empty() {
+            nonempty += 1;
+        }
+        assert_eq!(
+            a.metrics.allowed, b.metrics.allowed,
+            "allowed 必须一致（字段索引等价的前提量）"
+        );
+        assert_eq!(
+            format!("{:?}", a.hits),
+            format!("{:?}", b.hits),
+            "合并后的字段索引求值必须与单段建库逐位一致（`FieldIndex::rebuild` 的等价性）"
+        );
+    }
+    assert!(
+        nonempty >= 5,
+        "前提：battery 里至少有 5 条有命中（否则「空 == 空」是空转），实测 {nonempty}"
+    );
+}
+
+/// **`S8-T14`**：合并器**向量侧不丢点**（设计 §7 的 `S8-T14`）。
+///
+/// # ⚠️ 判据口径**与设计原文不同**（已单列报评审）
+///
+/// 设计 §4.9.3 判据③ 写「合并后的图与全量重建图的 top-10 重合率 **≥ 0.99**」。**spike S8-S1**
+/// 实测该阈值**结构性不可达**：`hnsw_rs` 用**无种子 `OsRng`** 分配层级 ⇒ **同一份数据重建
+/// 两次**的图（B vs B′）只有 **0.9280** 的重合率 ⇒ 任何实现都到不了 0.99。
+/// ⇒ 本条改为以 **`Brute`（精确）为参照**量 `recall@10` —— 它**不受拓扑抖动污染**，
+/// 直接回答「合并有没有丢点」这个真问题。
+///
+/// 参照库与库的被测侧用**同一个 `FakeEmbedder`** ⇒ 向量逐位相同 ⇒ 差异只来自「图」。
+#[test]
+fn S8_T14_合并后的向量侧不丢点_以精确后端为参照() {
+    let texts: Vec<String> = (0..120).map(|i| format!("向量合并语料 {i} 检索")).collect();
+
+    // 参照：`Brute` 后端 = **精确**（线性扫描）⇒ 它的 top-10 就是真值
+    let dir = tempfile::tempdir().unwrap();
+    let p_ref = dir.path().join("t14-ref.idx");
+    let mut brute = hybrid_builder().build(); // hybrid_builder 用 Brute
+    for t in &texts {
+        brute.add(Document::new(t.clone())).unwrap();
+    }
+    brute.commit().unwrap();
+    brute.save(&p_ref).unwrap();
+    let brute = hybrid_builder().load(&p_ref).unwrap().searcher();
+
+    // 被测：**Hnsw** 后端。
+    //
+    // ⚠️ **场景必须是「主段非空」**（否则测不到方案 A）：首次合并时内容**全在增量段**里，
+    //    主段图是**空图** ⇒ `hnsw_rs` 的 `file_dump` 对空图报错 ⇒ A 结构上不可用（走 B）。
+    //    真实场景里「`save` 之后又写了增量」才是常态 ⇒ 本用例按它构造。
+    let p_h = dir.path().join("t14-hnsw.idx");
+    let mut hnsw = hybrid_builder().vector_backend(VectorBackend::Hnsw).build();
+    for t in &texts[..40] {
+        hnsw.add(Document::new(t.clone())).unwrap();
+    }
+    hnsw.commit().unwrap();
+    hnsw.save(&p_h).unwrap(); // 内容折进 main（main 的图非空）
+    let mut hnsw = hybrid_builder()
+        .vector_backend(VectorBackend::Hnsw)
+        .load(&p_h)
+        .unwrap();
+    for chunk in texts[40..].chunks(40) {
+        for t in chunk {
+            hnsw.add(Document::new(t.clone())).unwrap();
+        }
+        hnsw.commit().unwrap();
+    }
+    let rep = hnsw.merge_all().unwrap();
+    assert_eq!(rep.segments_merged, 2, "应并掉 2 个增量段");
+    assert_eq!(
+        rep.vector_strategy,
+        VectorMergeStrategy::Incremental,
+        "Hnsw 有图 ⇒ 必须走方案 A（Incremental）—— 若这里是 Rebuild，说明 A 静默失败了"
+    );
+    let hnsw = hnsw.searcher();
+
+    let mut sum = 0.0f64;
+    let mut queries = 0usize;
+    for q in &texts[..20] {
+        // 用文档原文当 query：它与自己的向量最接近 ⇒ 真值里必然含它自己
+        let t = brute
+            .search_with(q)
+            .mode(SearchMode::Vector)
+            .top_n(10)
+            .exec()
+            .unwrap();
+        let g = hnsw
+            .search_with(q)
+            .mode(SearchMode::Vector)
+            .top_n(10)
+            .exec()
+            .unwrap();
+        assert!(
+            !t.hits.is_empty(),
+            "前提：精确参照必须有命中（否则 recall 无意义）"
+        );
+        let ts: std::collections::HashSet<ChunkId> = t.hits.iter().map(|h| h.chunk_id).collect();
+        let gs: std::collections::HashSet<ChunkId> = g.hits.iter().map(|h| h.chunk_id).collect();
+        sum += ts.intersection(&gs).count() as f64 / ts.len() as f64;
+        queries += 1;
+    }
+    let recall = sum / queries as f64;
+    assert!(
+        recall >= 0.9,
+        "合并后的 Hnsw 图相对精确路径的 recall@10 = {recall:.4}，应 ≥ 0.9（丢点会让它显著下滑）"
     );
 }
