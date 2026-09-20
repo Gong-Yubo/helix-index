@@ -9,6 +9,69 @@
 
 ## [Unreleased]
 
+### 新增 · V2 Step 8 PR 6 —— **分段合并器**（`S8-06`）+ spike S8-S1 的向量侧取形（2026-09-20）
+
+> ⚠️ **无 `Breaking`**（**纯加法**：新增 `MergeReport` / `VectorMergeStrategy` 两个公开类型
+> 与 `SearchIndex::merge_pending()` / `merge_all()` 两个公开方法）。
+> 门测试 = **`S8-T10`**（写/合并/读并发 + 双写端）/ **`S8-T13`**（字段索引等价）/
+> **`S8-T14`**（向量侧不丢点）。
+
+#### 新增
+
+- **`SearchIndex::merge_pending()` / `merge_all()`**（`D-S8-08`：库**不 `spawn` 线程**）：
+  宿主（CLI / `helix serve`）循环调用前者做后台合并。**严格 FIFO**（只并队首一段）——
+  跳段会破坏 §4.4.2 的基址不变式。后者是 `save()` / `compact()` 的前置（`D-S8-01` / `D-S8-12`）。
+- **`MergeReport`**（7 字段）：`segments_merged` / `chunks_merged` / `tombstones_applied` /
+  `vector_strategy` / `vector_merge_ms` / `total_ms` / `generation`。
+- **`VectorMergeStrategy`**（`None` / `Incremental` / `Rebuild`）：⚠️ `None` 是**实现期新增的取值**
+  （原设计只列两个）——「纯 BM25 装配**没有**向量侧工作」必须能如实表达（`NFR-07`：不撒谎）。
+
+#### 向量侧：**方案 A 落地**（`dump → load → 增量 insert`），失败/不支持**回落方案 B**
+
+由 **spike S8-S1** 标定（`crates/core/examples/spike_s8s1.rs`，可复跑）——
+**五条判据全 PASS**：A = **639ms** vs B = **4774ms**（**A/B = 0.134**，阈值 ≤ 0.2）+
+可行性 + 召回同量级 + 累积 RSS 增量 **0 KiB**（`Box::leak` 只漏 `HnswIo` ≈200B/次）。
+
+#### 🔴 `S8-T14` 的**判据口径就地更正**（实测逼出来的）
+
+原设计判据 = 「合并后的图与全量重建图的 top-10 重合率 **≥ 0.99**」——
+**结构性不可达**：`hnsw_rs` 用**无种子 `OsRng`** 分层 ⇒ **同一份数据重建两次**的图（B vs B′）
+只有 **0.9280** 重合。⇒ 改为**相对基线** + **以 `Brute`（精确）为参照的 `recall@10`**。
+🔑 **这是一次「对照实验推翻首跑结论」**：首跑只算 A vs B 得 0.922 ⇒ 结论会写成「回落 B」，
+**与事实相反**；补了「B vs B′ 基线」与「A vs A′ 自证」两个对照才定案。
+
+#### 测试
+
+- `S8_T10_写与合并与读的并发探针`（⚠️ **`!Sync` ⇒ 实为两线程**：写+合并一个写端、读端 `Searcher`）+ `S8_T10_双写端交替提交不得让段ID空间重叠`（钉 `I8-7` + `error.rs` 的恢复指引）。
+- `S8_T13_合并后的字段索引与单段全量重建等价`（200 篇 / 分 4 段 / 8 条过滤 battery）。
+- `S8_T14_合并后的向量侧不丢点_以精确后端为参照`。
+- `S8_06_合并原语的契约_一次一段与空段返回None` / `S8_06_纯BM25库的合并报告应为None策略`。
+
+#### 变异验证（4 组，**逐组已还原**）
+
+| 注入 | 期望命中 | 实测 |
+| --- | --- | --- |
+| 方案 A 恒不可用（强制走 B） | `S8_T14` 的 `Incremental` 断言 | ✅ **真实场景命中**（修 T14 场景前实测为 `Rebuild`） |
+| `merge_pending` 变成「并全部」 | 契约用例的 `segments_merged == 1` | ✅ 红（`left: 3 / right: 1`） |
+| 纯 BM25 库的策略记成 `Rebuild` | `None` 断言 | ✅ 红（`left: Rebuild / right: None`） |
+| `merge_from` 跳过 `field_index.rebuild` | `S8_T13` 的逐位一致 | ✅ 红（`allowed` 不一致） |
+
+⚠️ **一处踩坑如实记录**：第三组首轮报「零命中」，真因是**注入文本的行尾注释把 `)` 注释掉了
+⇒ 编译失败 ⇒ 测试根本没跑**（脚本只看 `FAILED` 会把它读成「覆盖边界」）。
+⇒ 变异脚本必须**同时判「有没有编译错误」**（`error[E` / `could not compile`）与「测试是否真的跑了」。
+
+#### 覆盖边界（不声称已守住）
+
+- **`S8-T10` 的「三线程」不可达**（`D-S8-05` 让 `SearchIndex` 保持 `!Sync`）⇒ 实为两线程；
+  **被测语义（读与写/合并重叠）未缩水**，但与设计原文的措辞不同。
+- **方案 A 的临时文件 I/O 未量化**（每次合并一次全量 dump，12K 点实测 30ms / 数十 MB）：
+  spike 只在 `/tmp`（tmpfs 或本地盘）量过，**未测慢盘/写满**的退化路径。
+- **`reclaimed_terms` 的口径仍未统一**（`D-S8-01` 后收窄）：属 `compact` 的回收统计，
+  与 `MergeReport` 是两套口径 ⇒ 登记在案、未在本 PR 处理。
+- **`merge_pending` 的「宿主调用策略」（`K=4`）未实现**：库只给原语（`D-S8-08`），
+  宿主侧循环留 Step 8 之后。
+
+
 ### 修复 · V2 Step 8 PR 5 · **第 1 轮评审响应**（#64，2026-09-20）—— P3 补 `main` 非空变体 + P4 Breaking 段补字段
 
 > 落点 = `pulls/64/reviews` **1 条**（id `5259462645`，SHA `63ad318`）+ **行内 1 条**
