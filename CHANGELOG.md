@@ -9,6 +9,92 @@
 
 ## [Unreleased]
 
+### 新增 · V2 Step 8 PR 5 · **跨段向量检索**（`S8-05`，2026-09-20）—— `S8-T5` 是它的门
+
+> ⚠️ **`Breaking`（唯一一条）**、**公开面 +1 类型 +4 方法**、**逐段谓词必须折算段内语义**。
+> 本 PR **堆叠在 PR4（#63）之上**（base = `feat/v2-step8-delta-segments`）：`S8-05` 依赖
+> `S8-03`/`S8-04` 的 delta 分段与跨段谓词，而 PR4 尚未合入 `main`（用户已确认走堆叠）。
+
+#### ⚠️ Breaking
+
+- **`VectorRoute` 新增 `Mixed` 变体**（`crates/core/src/vector/mod.rs`）：`S8-04` 起一次检索要对
+  **每段各查一次**向量，而 `prefers_exact` 是**逐段判定**的（阈值输入是该段的 `allowed_count`）
+  ⇒ 「主段走 ANN、某个小 delta 段走精确」是**常态**：只报 `Ann` / `Exact` 都会**说谎**。
+  仍按 **Q5 已结案的取形**执行 —— `VectorRoute` **未标** `#[non_exhaustive]`
+  ⇒ 下游**穷尽 `match`** 会编译失败；而补 `#[non_exhaustive]` **同样**会让它失败
+  ⇒ **两条路都 breaking，没有「零破坏」选项**（设计 §6 的核实项，本 PR 落地）。
+
+#### Added
+
+- **`SegmentedVectorRetriever`**（`crates/core/src/retriever/vector.rs`）：**逐段查 + 全局归并**
+  （段不可变 + `Box<dyn VectorIndex>` 非 `Clone` + `hnsw_rs` 无图合并 ⇒ 只能这样）。
+  归并**复用 `VectorRetriever::to_scored`**（`score = 1 − d²/2` 单调 ⇒ 距离升序 ≡ 相似度降序）
+  ⇒ 不另写一份排序口径。
+  🔑 **`Brute` 下「跨段 == 单段」逐位一致是结构性承诺**：全局 top-`k` 的任一成员在**它自己那段**
+  的排名必然 `< k` ⇒ 每段取自己的前 `k` 后归并是**无损**的（设计 §4.6.2）。
+  ⚠️ `Hnsw` 下**不承诺**（两张图 ≠ 一张图）——那是 ANN 的定义域。
+- **`VectorSegmentRef` / `SearchParts.vector_segments`**：**逐段**向量载具（FIFO）。
+  ⚠️ **刻意不复用** `SegmentSet`：本仓有「两条 lane 不得互相引用」的硬约束
+  （`retriever` 模块头注释）⇒ 载具各自一份。
+- **`union_route`**（公开纯函数）+ **`VecLane`**（编排层的两种形态）：单段 ⇒ 单索引（本地
+  `chunk_id` == 全局，**与 `S8-03` 之前逐位一致**）；跨段 ⇒ 逐段 + 并集分类。
+- **`SegmentPredicate`**（`crates/core/src/search/view.rs`）：把 `SegmentFilter` 暴露成
+  `CandidateFilter`，**段内本地 `chunk_id` 语义**，供**该段自己的**向量索引消费。
+  🔴 这层折算不可省：`VectorIndex::search_filtered` 的谓词收的是**本地** id，而跨段谓词
+  （`ViewFilter`）收的是**全局** id ⇒ 直接下推时主段（`base_chunk == 0`）**看不出问题**，
+  而 delta 段会把「本地 id」当「全局 id」判 ⇒ 过滤决策**来自别的段** ⇒ **答错**（不是少召回）。
+- **`BuiltPredicates` + `PredicateBuilder::build_all`**：**一次**过滤求值同时给出**全局**（BM25 路 /
+  单段向量路）与**逐段**（跨段向量路）两种形态 —— 分成两次构造会让逐段 `doc_bits`
+  （字段索引求值）白算一遍。默认实现只给全局（`per_segment = None`）⇒ 单段路径**逐位不变**。
+- **`ViewFilter::allowed_per_segment`**：逐段 `allowed`（**含落在该段的墓碑扣减**）的**单点实现**
+  —— 全局 `allowed`（= 其和）与逐段 `prefers_exact` 的阈值输入**同源**，否则会出现两个会漂移的口径。
+
+#### Changed
+
+- **`Metrics.vector_segments` 的语义落地**（`S8-03` 评审 P2-2 埋的信号，此前恒为 `1`）：
+  跨段时 = **参与归并的段数** ⇒ **恒等于 `Metrics.segments`**（`S8-05` 的验收项）。
+  ⚠️ 口径 = 「**参与归并**」而非「实际查到东西」：某段为空 / 无向量索引时它对归并的贡献是**空集**，
+  但它**被覆盖了**（不存在漏召回）。
+- **`Metrics.vector_route` 改为逐段判定 + 并集上报**（设计 §4.6.3 的实现落地）。
+- **`S8_02_旧API与新API结果逐位一致` 的 `vector_recalled` 断言按承诺反转**：
+  PR4 把它从「必须有向量路召回」反转为「当前不应有」，并写明「**PR5 落地后必须再反转回 `> 0`**」
+  ⇒ 本 PR 执行该反转。
+
+#### 测试
+
+- **`S8_T5_Brute后端vector模式跨段逐位一致`**（设计 §7 明写的**门测试**）：同一份语料，
+  `[单段视图]` vs `[main + 2 个 delta]` 的 `vector` 结果**逐位一致**（含 `score` / `explain`），
+  并自证 `(segments, vector_segments) == (1,1)` vs `(3,3)`（否则「两串相等」可能只是都为空）。
+- **`S8_05_逐段谓词的语义折算_带过滤的跨段向量与单段一致`**：带用户过滤（`FilterKind::Filtered`）时
+  跨段必须与单段逐位一致 —— 抓「全局谓词直接下推给 delta 段」这一**答错**类缺陷。
+- **`S8_05_union_route的并集分类`**：`None` 项忽略 / 全 `Ann` / 全 `Exact` / 混合 ⇒ `Mixed`。
+
+#### 变异验证（4 组注入，**逐个与意图相符**）
+
+| 注入 | 期望命中 | 实测 |
+| --- | --- | --- |
+| 退回「只查主段」（`if false` 让逐段分支不可达） | `S8_T5` 等 | ⚠️ 红 3 条，但**红因是我自己的 `debug_assert`（结构性兜底守卫）**⇒ 按纪律**不计数** |
+| **只查前两段**（`i > 1 ⇒ continue`，绕开守卫） | `S8_T5` 的**逐位**断言 | ✅ `S8_T5` + 谓词折算条 —— **红因正确** |
+| 逐段下推**全局**谓词（丢折算） | `S8_05_逐段谓词的语义折算` | ✅ **唯一红**（`S8_T5` 无过滤 ⇒ 保持绿，归因干净） |
+| `union_route` 恒报 `Ann` | 并集分类 + `S8_T5` 的 route 断言 | ✅ 两条 |
+| 归并不折算全局 `chunk_id` | `S8_T5` + 谓词折算条 | ✅ 两条 |
+
+🔴 **变异抓出我自己的一处夹具弱点**：谓词折算那条用例最初的语料让**两段的 tag 序列相同**
+（周期 == 分段长度）⇒ 「本地 id 当全局 id 查」**恰好得到相同结论** ⇒ 上述第 3 组注入**零命中**。
+⇒ 改成**反相**图样（`A = [keep, drop]`、`B = [drop, keep]`）后才命中，并在用例注释里写明
+「这是本判据的**夹具要害**」。（同族教训：变异「零命中」要先分清「断言弱」还是「语料不够狠」。）
+
+#### 覆盖边界（如实登记，**不声称已守住**）
+
+- **`Mixed` 没有端到端判据**：造「一段 `Exact` + 一段 `Ann`」需要某段的 `allowed` 跨过
+  `BRUTE_FALLBACK_MAX_ALLOWED`（8192 个活分片）⇒ 端到端要**万级语料**。分类规则本身是纯函数
+  ⇒ 已在单测里锁死；「逐段 route 真的被收集并归并」由 `S8_T5` 的 `vector_route` 相等断言锁
+  （`Brute` 两端都 `Exact` ⇒ 实现写死 `Ann` 就会红）。
+- **`Hnsw` 的跨段召回质量未标定**（本 PR 只交付机制）：ANN 下「分段 vs 单段」**不承诺**逐位一致，
+  召回率差异属 `S8-06` / 标定范畴。
+- **逐段 `plan` 的 `allowed` 输入只经 `allowed_per_segment` 一处**，但其正确性依赖
+  `SegmentFilter::allowed_chunks`（既有实现）⇒ 未新增独立判据。
+
 ### 修复 · V2 Step 8 PR 4 · **第 2 轮评审响应**（#63，2026-09-19）—— 2×P1（多写端 / 未发布状态的缝隙）+ P3 恢复指引 + P4 登记
 
 > 落点 = `pulls/63/reviews` **1 条**（id `5255969412`，SHA `f69fb8e`）+ **行内 4 条**；`issues/63/comments` 无新增。
