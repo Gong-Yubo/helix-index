@@ -662,19 +662,25 @@ mod tests {
     ///
     /// ⚠️ 归一发生在 `build_config`（`Config.embed_sessions >= 1` 是要守住的不变式）；
     /// 而**构造器**拿到的是**已归一**的值（见 `default_embedder` 的调用点）。
+    ///
+    /// 🔴 **必须走 `build_config_with(ok_ctor)`，不能用 `build_config()`**：后者调**真实**
+    /// 构造器 ⇒ **在 CI 里会去联网下载模型**（实测踩到：`feature isolation` 的 `charabia`
+    /// 步骤红 —— 同一用例里「一次构造失败、一次成功」⇒ 结果**不确定**）。
+    /// 本用例只关心装配出来的 `Config`，与 embedder 是怎么来的无关
+    /// ⇒ 用注入的最小 embedder（不碰 ONNX / 网络）。
     #[test]
     fn S8_08_builder的会话数默认一且零归一为一() {
-        let cfg = SearchIndexBuilder::default().build_config();
+        let cfg = SearchIndexBuilder::default().build_config_with(ok_ctor);
         assert_eq!(cfg.embed_sessions, 1, "默认 1 ⇒ 零行为变化");
 
         let cfg = SearchIndexBuilder::default()
             .embed_sessions(4)
-            .build_config();
+            .build_config_with(ok_ctor);
         assert_eq!(cfg.embed_sessions, 4, "显式值原样生效");
 
         let cfg = SearchIndexBuilder::default()
             .embed_sessions(0)
-            .build_config();
+            .build_config_with(ok_ctor);
         assert_eq!(
             cfg.embed_sessions, 1,
             "0 是无意义输入 ⇒ 归一为 1（不造空池）"
@@ -682,14 +688,24 @@ mod tests {
     }
 
     /// **`S8-08`**：会话数**不进配置指纹**（否则同一快照在 1 / 4 下会互不兼容）。
+    ///
+    /// 🔴 **同样必须注入最小 embedder**（理由见上一条）：用真实构造器时，`embedder`
+    /// 是 `None` 还是 `Some` **取决于模型能不能拿到** ⇒ 两个 `Config` 的
+    /// **唯一变量就变成了「有没有模型」而不是「会话数」** —— 那正是 CI 上这条用例首轮红的
+    /// 原因（`left: embedder_id: ""` vs `right: "bge-small-zh-v1.5"`）。
     #[test]
     fn S8_08_会话数不进配置指纹() {
         let a = SearchIndexBuilder::default()
             .embed_sessions(1)
-            .build_config();
+            .build_config_with(ok_ctor);
         let b = SearchIndexBuilder::default()
             .embed_sessions(8)
-            .build_config();
+            .build_config_with(ok_ctor);
+        // 前提（自证变量被钉住）：两侧都真的拿到了 embedder ⇒ 差异只可能来自会话数
+        assert!(
+            a.embedder.is_some() && b.embedder.is_some(),
+            "前提：注入的构造器必须成功"
+        );
         assert_eq!(
             format!("{:?}", a.fingerprint()),
             format!("{:?}", b.fingerprint()),
