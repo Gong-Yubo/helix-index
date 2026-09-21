@@ -22,6 +22,21 @@ pub use remote::RemoteEmbedder;
 
 use crate::error::Result;
 
+/// 把用户给的**会话数**规范化：**至少 1**（`S8-08` / `D-S8-11`）。
+///
+/// # 为什么放在**不带 feature gate** 的模块里
+///
+/// 它被 `search/config.rs` 的 `build_config` 消费（装配层要守住
+/// 「`Config.embed_sessions >= 1`」这条不变式）。若它跟着 `local.rs` 一起被
+/// `#[cfg(feature = "local-embed")]` 关掉，**默认构建**（`--no-default-features`）会编译失败
+/// —— 而这条规范化与「有没有本地推理能力」无关（`0` 归一为 `1` 对任何装配都成立）。
+///
+/// `0` 是**无意义输入**（既不是「不用向量」也不是「自动」）⇒ 归一为 1，而不是静默造出一个
+/// 空池（那会在第一次 `embed_query` 时才炸成除零 / 越界，错误位置离原因很远）。
+pub(crate) fn normalize_sessions(n: usize) -> usize {
+    n.max(1)
+}
+
 /// 文本向量化抽象。
 ///
 /// 两个方法分开是刻意的：查询侧与入库侧在 BGE 上语义不同。
