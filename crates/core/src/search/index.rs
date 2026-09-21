@@ -285,11 +285,17 @@ pub enum VectorMergeStrategy {
     ///
     /// 成本 `O(delta)`。spike 实测：A 合计 **639ms**（dump 30 + load 33 + insert 576）
     /// vs 全量重建 **4774ms** ⇒ **A/B = 0.134**（判据是 ≤ 1/5）。
+    ///
+    /// ⚠️ **增量段零向量时（如墓碑-only 段）仍记 `Incremental`**（`S8-06` 评审 **P2-1**）：
+    /// 那条路走的是 `dump → load` **零插入** ⇒ 保拓扑、成本一次 I/O。
+    /// 「零增量」意味着**没有向量侧工作**（主图原样正确 —— 死点由检索期的存活位图挡掉，
+    /// `Q-C1` 既有机制）⇒ 回落 **全量重建**是纯浪费，还会白付一次 `OsRng` 拓扑重随机。
     Incremental,
     /// **方案 B**：把「主段 + 增量段」的全部原始向量**全量重建**一张图。
     ///
     /// 成本 `O(N·logN)`。**它是方案 A 的兜底**：Brute 后端无图（`as_graph_persist()`
-    /// 是 `None` —— 类型事实）、增量段无原始向量、或 dump/load/insert 任一失败 ⇒ 走这条。
+    /// 是 `None` —— 类型事实）、主段为空（首次合并时内容全在增量段，主图是空图 ⇒
+    /// `file_dump` 对空图报错）、或 dump/load/insert 任一失败 ⇒ 走这条。
     /// ⚠️ 它**重写图的拓扑** ⇒ ANN 排名会漂移（既不承诺也不要求逐位一致，见设计 §4.6.2）。
     Rebuild,
 }
@@ -306,6 +312,12 @@ pub struct MergeReport {
     pub chunks_merged: usize,
     /// 本次**物理化**（真删）的跨段墓碑条数。合并后这些条目**从 `View.tombstones` 移除**
     /// ⇒ 降级谓词可回到「零谓词」（§4.7.3 / R52 的回归**可逆**）。
+    ///
+    /// ⚠️ **口径**（`S8-06` 评审 **P1-1** 的配套要求）：只计**真物理化**的条数 —— 即
+    /// **目标 `doc_id` 落在本次合并区间内**的那批（`View.tombstones.below(upper)`）。
+    /// **未合并段**里的墓碑**不计入**（它们本次既没被删、也**不许**从集合里摘掉）。
+    /// 修复前该字段报的是「全量墓碑数」⇒ 部分合并下会**谎报**
+    /// （评审实测：报 1、真物理化 0），违反 `NFR-07`。
     pub tombstones_applied: usize,
     /// 向量侧走了哪条路（见 [`VectorMergeStrategy`]）
     pub vector_strategy: VectorMergeStrategy,
@@ -420,13 +432,23 @@ impl SegmentBuilder {
     /// 该 builder 是否**空**（无内容、无墓碑）⇒ `commit()` 不追加空段（设计 §4.8.3 ③）。
     ///
     /// ⚠️ **「墓碑-only」builder 被判为非空是有意的**：跨段墓碑**只能**搭一次发布的便车进
-    /// `View.tombstones`（`commit()` 的追加路径），所以哪怕零内容也必须入列。两个次生效应
-    /// （`S8-03` 第 2 轮评审 **P4-1**，**本 PR 不修**、登记给 `S8-06` 合并器）：
-    /// ① `Metrics.segments` 被零内容段**膨胀**（删除密集型负载下持续偏大）；
-    /// ② `fold` 期 `merge_from(空 Index)` 仍走一遍 `append_from` 的 `ForwardStore::rebuild`
-    ///    + `field_index.rebuild`（各 O(N)）⇒ 每个墓碑-only 段白付一次**全量 pass**。
+    /// `View.tombstones`（`commit()` 的追加路径），所以哪怕零内容也必须入列。
+    /// `S8-03` 第 2 轮评审 **P4-1** 点名了由此产生的**两个次生效应**、并登记给 `S8-06`；
+    /// `S8-06` 第 1 轮评审 **P2-1** 又指出还有**更贵的第三条**（向量侧全量重建）。
+    /// 三条的**现状**（`S8-06` 已逐条处置，见设计 §4.9.8）：
     ///
-    /// 预期取形：零内容段不占 `deltas` 名额、墓碑直接并入 `View` 层。
+    /// ① `Metrics.segments` 被零内容段**膨胀**（删除密集型负载下持续偏大）——
+    /// 🔵 **有意保留**：入列的**理由**（墓碑搭便车）没有替代方案，「不入列」就要另开一条
+    /// 墓碑发布路径；且膨胀是**有界且自愈**的（宿主按 `deltas.len() > K` 合并 ⇒ 段数回落）；
+    /// ⚠️ 经下面的修复后，消化这类段的**代价已降到最低**。
+    ///
+    /// ② 零内容段白走一遍 `append_from` 与 `field_index.rebuild`（各 O(N)）——
+    /// ✅ **已修**（`S8-06` 第 1 轮评审 **P2-1**）：`merge_n` 对**两个槽位都为 0** 的段
+    /// **跳过 `merge_from`**（等价性论证见该处注释）。
+    ///
+    /// ③ 零向量增量的段触发向量侧**全量重建**（`O(N·logN)` + 拓扑重随机）—— ✅ **已修**：
+    /// `merge_vectors_incremental` 不再对空增量返回 `Ok(None)`，改走方案 A 的
+    /// `dump→load` **零插入**（保拓扑、成本一次 I/O）。
     fn is_empty(&self) -> bool {
         self.index.total_chunks() == 0 && self.tombstones.is_empty()
     }
@@ -1178,15 +1200,19 @@ impl SearchIndex {
         }
     }
 
-    /// 把**全部**未合并段（`deltas`）按 FIFO 合并进主段 —— `save()` / `compact()` 的**前置**。
+    /// 把**前 `take` 个**未合并段（`deltas`，FIFO）合并进主段 —— `save()` / `compact()` 的**前置**。
     ///
     /// # 它做什么（`S8-06` 起是**完整合并器**）
     ///
-    /// - **文本侧**：克隆主段 → `Index::merge_from` 追加**前 `take` 个**增量段 →
-    ///   跨段墓碑**物理化**（§4.9.2：走既有 `Index::remove` 语义 + 从 `View.tombstones` 移除）。
+    /// - **文本侧**：克隆主段 → `Index::merge_from` 追加**前 `take` 个**增量段
+    ///   （⚠️ **槽位全 0 的段跳过 `merge_from`** —— 它的末步是全量 `field_index.rebuild`，
+    ///   对零内容段是白付的一 pass，见 `S8-06` 评审 **P2-1**）→ 跨段墓碑**物理化**，
+    ///   **只物理化本次覆盖到的那批**（`View::tombstones::below(upper)`：目标 `doc_id` 落在
+    ///   本次合并区间内；区间外的**原样保留** ⇒ `S8-06` 评审 **P1-1** 的修复）。
     /// - **向量侧**：**方案 A 优先**（`merge_vectors_incremental`：`dump→load→增量 insert`，
-    ///   `O(delta)`），失败或不支持（Brute / 无原始向量 / 点数不符）**回落方案 B**（全量重建，
-    ///   `O(N·logN)`）。由 **spike S8-S1** 标定，`MergeReport.vector_strategy` 如实记录走了哪条。
+    ///   `O(delta)`；**零增量 ⇒ 零插入**，同样走 A），失败或不支持（Brute / 主段空图 /
+    ///   点数不符）**回落方案 B**（全量重建，`O(N·logN)`）。由 **spike S8-S1** 标定，
+    ///   `MergeReport.vector_strategy` 如实记录走了哪条。
     /// - **字段索引**：走 `FieldIndex::rebuild`（`Index::merge_from` 内），等价性由 `S8-T13` 钉住。
     ///
     /// # `take` 的语义
@@ -1206,9 +1232,11 @@ impl SearchIndex {
     /// （`FR-17` 的「合并期间不得阻塞读请求」在结构层面成立）。代价是一次 `O(N)` 克隆
     /// —— 与合并本身的量级相同。
     ///
-    /// # 返回
+    /// # 返回 / 错误
     ///
-    /// 本次合并掉的 delta 段数。
+    /// `Ok` = 本次合并掉的 delta 段数（读数见 [`MergeReport`]）。
+    /// `Err(Busy)` = 发布被拒（世代或前缀身份对账失败）—— **不记账、不发布、内容不丢**，
+    /// 恢复动作 = **重试本次合并**（详见 [`Self::merge_pending`] 的「返回 / 错误语义」）。
     fn merge_n(&mut self, take: usize) -> Result<MergeReport> {
         // 🔴 **顺序是硬要求**（`S8-03` 评审 P2-4）：**先记世代、后取视图快照**。
         //    反过来的话，若 `compact()` 恰好落在两次读之间，我们会拿到「旧进程内的视图 +
@@ -1256,17 +1284,54 @@ impl SearchIndex {
                     delta_raw.push((seg.base_chunk + local, v.clone()));
                 }
             }
+            // 🔴 **零内容段跳过 `merge_from`**（`S8-06` 评审 **P2-1** 的文本侧两条之一）。
+            //
+            // `Index::merge_from` 的**末步是 `field_index.rebuild(docs)`（全量 O(N)）**
+            // ⇒ 对槽位全 0 的段**白付一次全量重建 pass**（设计 v0.6 `S8-03` 评审 P4-1 点名、
+            // 指名交给 `S8-06`）。删除密集的负载下（每次 `remove` + `commit` 产生一个
+            // 墓碑-only 段）这正是每次合并最贵的那一步。
+            //
+            // **等价性**：`other` 的 doc / chunk 槽位**都为 0** ⇒ `append_from` 无内容追加、
+            // `stats` 与 `chunk_lens` 各加 0、`content_hashes` 无条目、`base_*` 不变
+            // ⇒ **跳过与调用逐位等价**，省掉的只有 `field_index.rebuild` 那一 pass。
+            // ⚠️ 判据必须**两个槽位都为 0**：只判 chunk 会漏掉「有 doc 槽位但无分片」的段
+            // （那种段仍须 append doc 槽位以保持基址对齐 —— `I8-7`）。
+            if seg.index.total_docs() == 0 && seg.index.total_chunks() == 0 {
+                continue;
+            }
             chunks_merged_now += merged.merge_from(seg.index.clone())?;
         }
         raw_all.extend_from_slice(&delta_raw);
 
-        // ② 跨段墓碑**物理化**（§4.9.2，评审 P3-1 的取形）：FIFO 保证「墓碑的目标段必已
-        //    先被合入」⇒ 直接走既有 `Index::remove` 语义（摘 postings + 清
-        //    `content_hashes` + 回滚统计量 + 同步字段索引），**然后**从集合里移除墓碑
-        //    ⇒ 热路径回到零谓词（§4.7.3，R52 的回归**可逆**）。
-        //    主段的 `base_doc` 恒 0 ⇒ 全局 `doc_id` == 本地 `doc_id`。
+        // ② 跨段墓碑**物理化**（§4.9.2）：**只处置本次真正覆盖到的那一批**。
+        //
+        // 走既有 `Index::remove` 语义（摘 postings + 清 `content_hashes` + 回滚统计量 +
+        // 同步字段索引），**然后**从集合里移除墓碑 ⇒ 热路径回到零谓词
+        // （§4.7.3，R52 的回归**可逆**）。主段的 `base_doc` 恒 0 ⇒ 全局 `doc_id` == 本地 `doc_id`。
+        //
+        // 🔴 **P1-1 的修复**（`S8-06` 第 1 轮评审）。
+        //
+        // **原来错在哪**：本处曾按 `view.tombstones.iter()` **全量** `merged.remove(doc)`，
+        // 并写下一句**错误的不变式声明**：「FIFO 保证墓碑的目标段必已先被合入」。
+        // 该前提**对部分合并（`merge_pending()`，`take < deltas.len()`）不成立** ——
+        // `SearchIndex::remove` 分支②对**任何既往段**（含**还没合并**的任意 delta）都记墓碑；
+        // 而 `Index::remove` 对**越界 `doc_id` 是静默 no-op**（`forward.rs` 的 `tombstone_doc` /
+        // `chunk_ids_of_doc` 对越界安全）⇒ 目标在未合并段的墓碑**被摘掉、却没被物理化**
+        // ⇒ 视图里再无任何东西挡它 ⇒ **已删文档复活**，继续合并还会把它**固化进主段**
+        // 并随 `save` 落盘（**删除永久丢失**）。评审给出确定性复现（纯 BM25 四步）；
+        // 回归锁 = `S8_06_部分合并不得丢弃指向未合并段的墓碑`（`step8_segments.rs`）。
+        //
+        // **判据为什么是「doc 上界」**：墓碑记**全局 `doc_id`**，而本次合并覆盖到的 doc 槽位
+        // 恰是一段前缀 `[0, upper)` —— `upper` = **物理化前** `merged` 的 doc 槽位上界
+        // （FIFO 下等于 `deltas[take].base_doc`；`I8-7` 保证槽位与段的对应唯一）。
+        // ⇒ 「目标本次已并入主段」的**充要条件**就是 `doc < upper`。
+        // 区间外的墓碑**原样保留**（物理化留给后续合并 / `merge_all`）。
+        // ⇒ 与 `S8-03` 第 2 轮 **P1-2** 的「前缀 `Arc::ptr_eq` 身份」**同一思路**：
+        //   **只处置本次真正覆盖的那部分**。
         debug_assert_eq!(view.main.base_doc, 0, "主段的 base_doc 恒为 0");
-        for doc in view.tombstones.iter() {
+        let physicalizable_upper = merged.total_docs() as DocId;
+        let physicalized = view.tombstones.below(physicalizable_upper);
+        for doc in physicalized.iter() {
             merged.remove(doc, cfg.analyzer.as_ref())?;
         }
 
@@ -1276,31 +1341,22 @@ impl SearchIndex {
         //     （既有用例 `T5b_remove在flush后raw_vectors被retain摘净` 正是钉这个）。
         raw_all.retain(|(id, _)| merged.is_live_chunk(*id));
 
-        // ③ 向量侧：**全量重建**（本 PR 暂取的保守取形，= 设计 §4.6.2 的「方案 B」）。
+        // ③ 向量侧：**方案 A 优先、失败 / 不支持回落 B**（设计 §4.9.3；spike S8-S1 标定）。
         //
-        // ⚠️ **如实陈述**（`S8-03` 评审 P2-3 更正了本文原有的自相矛盾与一个绝对命题）：
-        //
-        // - **为什么现在只能重建**：合并**拿不到**主段图的所有权 —— `main` 是
-        //   `Arc<Segment>` 共享（段不可变，`I8-2`）、`Box<dyn VectorIndex>` 也**不是
-        //   `Clone`** ⇒ 「把 delta 的点直接 add 进旧图」这条就地路径在本 PR 的取形下**走不通**。
-        // - 🔴 **但「所有权」不构成「只能重建」的证明**：`D-S8-09` 的**默认方案 A**
-        //   （dump→load→增量 insert）**根本不需要旧图所有权** —— `dump_graph` 是 `&self`
-        //   （设计 §4.9.3 已写明「对内存图也能做」），load 产出**新**图、再往新图 insert
-        //   delta 的点 ⇒ 保住旧点拓扑，成本 O(delta) 而非 O(N·logN)。
-        //   本 PR **不**实现方案 A（留给 `S8-06`），也**不**声称它不可行。
-        // - **代价（方案 B）**：每次 `save`/`compact` 只要有 delta 就 O(N·logN) 重建 +
-        //   **拓扑被重写** ⇒ ANN 排名会漂移。实测已显形：`atomic_snapshot::TI5…` 的检索手段
-        //   被迫从 hybrid 改为 bm25（`CHANGELOG` 同条目）。
-        // - ⚠️ **spike S8-S1 一条判据都还没测**（本 PR 只落地、未标定）⇒ 这个取形是
-        //   **暂定**的，不是标定结论。
-        // - `MergeReport.vector_strategy` / spike 结论 → `S8-06`。
-        //
-        // 🔑 **`S8-06` 起改为「方案 A 优先、失败/不支持回落 B」**（设计 §4.9.3；spike S8-S1 标定）：
-        //    A = 主段图 `dump` → `load`（**保住旧点拓扑**）→ 把增量段的点 `insert` 进去
-        //    ⇒ 成本 **O(delta)** 而非 O(N·logN)。spike 实测（12000 + 1200 点 / 384 维）：
-        //    A 合计 **639ms** vs B **4774ms** ⇒ **A/B = 0.134**（判据 ≤ 1/5）；A 的召回与 B
-        //    同量级（以 Brute 为参照 0.9170 vs 0.9270）。
+        // 🔑 **`S8-06` 起取形 = A**：主段图 `dump` → `load`（**保住旧点拓扑**）→ 把增量段的点
+        //    `insert` 进去 ⇒ 成本 **O(delta)** 而非 O(N·logN)。spike 实测（12000 + 1200 点 /
+        //    384 维）：A 合计 **639ms** vs B **4774ms** ⇒ **A/B = 0.134**（判据 ≤ 1/5）；
+        //    A 的召回与 B 同量级（以 Brute 为参照 0.9170 vs 0.9270）。
+        //    A 不可用（Brute 无图 / 主段为空 / dump-load-insert 失败）才走 B。
         //    `MergeReport.vector_strategy` **如实记录**本次走了哪条（不统一口径、不猜）。
+        //
+        // 📕 **历史引文（`S8-03` 期的口径，已被上面这条取代，不要照它改代码）**：
+        //    那时本处写的是「本 PR **不**实现方案 A（留给 `S8-06`），也**不**声称它不可行」，
+        //    并如实记下两条：① 「合并拿不到主段图所有权」**不构成**「只能重建」的证明
+        //    （`dump_graph` 是 `&self` ⇒ 根本不需要所有权）；② 方案 B 每合并一次就
+        //    O(N·logN) 重建 + **拓扑被重写** ⇒ ANN 排名漂移，实测已显形
+        //    （`atomic_snapshot::TI5…` 的检索手段被迫从 hybrid 改为 bm25）。
+        //    ⇒ 那两条**没有过期**（它们是取形的依据），过期的只是「本 PR 不实现 A」。
         let t_vec = std::time::Instant::now();
         let (vector_index, vector_strategy) = if !had_vectors {
             (None, VectorMergeStrategy::None)
@@ -1339,7 +1395,9 @@ impl SearchIndex {
         };
         let vector_merge_ms = t_vec.elapsed().as_millis();
 
-        // ⑤ 原子发布：`main` 吸收全部内容、`deltas` 清空、墓碑清空（已物理化）。
+        // ⑤ 原子发布：`main` 吸收本次合并的那批内容、`deltas` 只保留**未消费**的段
+        //    （窗口内新提交的**无损吸收**，见下）、墓碑**只摘掉本次真物理化的那批**
+        //    （`S8-06` 评审 P1-1）—— 指向未合并段的墓碑**必须留在集合里**继续挡。
         //    ⚠️ 合并**不改 ID** ⇒ 已用长度不变（后续段的基址继续有效）。
         let new_main = Arc::new(Segment {
             index: merged,
@@ -1370,7 +1428,9 @@ impl SearchIndex {
         //    （而 `ids.next_*` 已把它的槽位记账）。段不可变（`I8-2`）⇒ 用 `Arc::ptr_eq` 判**身份**。
         //    `Vec<Arc<_>>` 的 clone 是 O(1)（只加引用计数）。
         let snapshot_deltas: Vec<Arc<Segment>> = view.deltas.iter().take(take).cloned().collect();
-        let physicalized = (*view.tombstones).clone();
+        // ⚠️ `physicalized` **不在这里重建** —— 它就是 ② 里按 `physicalizable_upper` 过滤后的
+        //    那一批（`S8-06` 评审 **P1-1**）。这里若再 `(*view.tombstones).clone()` 一次，
+        //    就把过滤结果**又变回全量** ⇒ 修复当场失效（这正是原写法的形态）。
         // ⚠️ 必须在**下面那个闭包 move 掉它之前**取长度（闭包按值捕获）
         let physicalized_count = physicalized.len();
         let published = self.shared.commit_view(
@@ -1425,8 +1485,13 @@ impl SearchIndex {
 
     /// 向量侧**增量合并**（设计 §4.9.3 的**方案 A**）。
     ///
-    /// 返回 `Ok(None)` = **本装配走不了 A**（纯 BM25 / Brute 后端无图 / 增量段没有原始向量）
+    /// 返回 `Ok(None)` = **本装配走不了 A**（纯 BM25 无向量索引 / Brute 后端无图 /
+    /// 主段为空 —— 首次合并时主图是空图，`file_dump` 对空图报错）
     /// ⇒ 调用方**回落方案 B**（全量重建）。`Err` = A 跑到一半失败（同样回落 B，但会告警）。
+    ///
+    /// ⚠️ **「增量段没有原始向量」不再返回 `Ok(None)`**（`S8-06` 评审 **P2-1**）：
+    /// 那意味着**没有向量侧工作** ⇒ 走 A 的 `dump→load` **零插入**（保拓扑、成本一次 I/O），
+    /// 而不是白做一次 `O(N·logN)` 全量重建 + 拓扑重随机。
     ///
     /// # 它为什么可以「不用旧图的所有权」
     ///
@@ -1453,10 +1518,6 @@ impl SearchIndex {
         let Some(store) = vi.as_graph_persist() else {
             return Ok(None);
         };
-        if delta_raw.is_empty() {
-            // 没有增量 ⇒ 图就是主图本身，不必白付一次 dump/load
-            return Ok(None);
-        }
         // 🔴 **主段为空时 A 结构上不可用**（首次合并：内容**全在**增量段里）：
         //    此时主段图是**空图**，而 `hnsw_rs` 的 `file_dump` 对空图报
         //    「向量图读写失败: unexpected error」（**实测**）。
@@ -1465,6 +1526,19 @@ impl SearchIndex {
         if main.index.total_chunks() == 0 {
             return Ok(None);
         }
+        // 🔴 **`delta_raw` 为空不再是「走 B」的理由**（`S8-06` 评审 **P2-1** 的向量侧）。
+        //
+        // 修复前这里有一条 `if delta_raw.is_empty() { return Ok(None); }`，调用方随即
+        // **全量重建主图**（`O(N·logN)` + 一次 `OsRng` 拓扑重随机）。但「零向量增量」恰恰
+        // 意味着**没有向量侧工作**：主图**原样正确**（死点由检索期的存活位图挡掉 —— `Q-C1`
+        // 既有机制），这次重建是**纯浪费**；删除密集的负载下（每个墓碑-only 段都触发一次）
+        // 正是 §4.9.3 引入方案 A 要避免的那个量级。
+        //
+        // ⇒ 取形 = **走方案 A、但零插入**：`dump → load`（**保拓扑**，成本一次 I/O）后
+        //   `entries` 为空 ⇒ **不 `add_batch`** ⇒ `strategy` 如实记 `Incremental`。
+        //   ⚠️ 评审指出的边界：`Segment.vector_index` 是 `Box`（非 `Clone`）⇒ 「直接复用主图、
+        //   零 I/O」在当前类型约束下拿不到所有权；dump→load 是**最小修法**
+        //   （未来若改 `Arc<dyn VectorIndex>` 可变零成本，同评审附注）。
         let cfg = &self.shared.cfg;
 
         // 临时目标：`pid` + 进程内单调序号保证唯一（并发/多次合并不互相覆盖）
@@ -1515,7 +1589,11 @@ impl SearchIndex {
             .iter()
             .map(|(id, v)| (*id, NormalizedVector::new(v.clone())))
             .collect();
-        loaded.add_batch(&entries)?;
+        // 🔴 **零增量 ⇒ 零插入**（`S8-06` 评审 P2-1）：`dump→load` 回来的图与主图逐点一致，
+        //    拓扑原样保住 ⇒ 不白做一次 `add_batch`（也不白付一次 `OsRng` 重随机）。
+        if !entries.is_empty() {
+            loaded.add_batch(&entries)?;
+        }
         Ok(Some(Box::new(loaded) as Box<dyn VectorIndex>))
     }
 
@@ -1544,6 +1622,23 @@ impl SearchIndex {
     ///
     /// ⚠️ **严格 FIFO**：只并队首那一段 —— 这是 §4.4.2 基址不变式的要求
     /// （跳段会让后续段的 `base_*` 指向尚未并入的内容）。
+    ///
+    /// # 返回 / 错误语义（`S8-06` 评审 **P4-3**）
+    ///
+    /// - `Ok(Some(report))` = 本次真并掉了一段；`Ok(None)` = **没有未合并段**（宿主靠它判「干完了」）。
+    /// - 🔴 `Err(Busy)` = **本次发布被拒**，两种成因（`Shared::commit_view` 的两道对账）：
+    ///   ① 窗口内有另一个写端 `compact()` 过（`epoch` 变了）；② 窗口内有另一个写端 `fold` 过
+    ///   **同一个 `Arc<Shared>`** ⇒ 视图的增量段列表已不是当初那一批（前缀**身份**不符）。
+    ///   ⇒ **内容没有丢失**（增量段仍在视图里、照旧可检索），丢的只是本次合并的计算
+    ///   ⇒ **恢复动作 = 重试本次合并**（**不是**重新 `add` / `remove`；口径同 `PublishCaller::Fold`）。
+    ///
+    ///   ⚠️ 所以宿主**按「循环调用直到 `Ok(None)`」写代码时会踩**：`Err` 不是「干完了」也不是
+    ///   「坏了」，而是「**再调一次**」。建议的循环形状：
+    ///   `loop { match idx.merge_pending() { Ok(None) => break, Ok(Some(_)) => continue,
+    ///   Err(Busy(_)) => continue /* 重试 */, Err(e) => return Err(e) } }`
+    ///   —— ⚠️ `Busy` 重试是**有界**的（每一次重试都先过一遍 `commit()` 世代刷新，第二次通常即成功）；
+    ///   若要加保险，给重试次数设一个上限（如 3）并把超限当错误上报，别写成无界自旋。
+    /// - 其余 `Err` = 真错误（如 `Index::merge_from` 的 ID 空间溢出、向量侧 B 路径重建失败）。
     pub fn merge_pending(&mut self) -> Result<Option<MergeReport>> {
         if self.view().deltas.is_empty() {
             return Ok(None);

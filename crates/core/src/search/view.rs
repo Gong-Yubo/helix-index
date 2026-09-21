@@ -137,6 +137,33 @@ impl Tombstones {
         self.doc_ids.iter().copied()
     }
 
+    /// 取出**目标 `doc_id < upper`** 的那批墓碑（升序）—— 合并时**本次可物理化**的子集。
+    ///
+    /// # 判据为什么是「doc 上界」而不是「长度」或「段身份」
+    ///
+    /// 墓碑记的是**全局 `doc_id`**，而一次合并**覆盖到的 doc 槽位**恰好是一段前缀
+    /// `[0, upper)`（`upper` = 物理化前主段的 doc 槽位上界；FIFO 下等于下一个未合并段的
+    /// `base_doc`）。⇒ 「这个墓碑的目标本次已并入主段」的**充要条件**就是
+    /// `doc < upper`（`I8-7`：段 ID 空间不重叠 ⇒ 槽位与段的对应是唯一的）。
+    ///
+    /// # 它为什么必须存在（`S8-06` 评审 **P1-1**）
+    ///
+    /// `SearchIndex::remove` 对**任何既往段**都会记墓碑（含**还没合并**的增量段）。
+    /// 若合并时不做这个过滤、把**全量**墓碑都当成「已物理化」摘掉，那么目标在未合并段的
+    /// 墓碑会出现「**被摘掉但没物理化**」—— 而 `Index::remove` 对**越界 `doc_id` 是静默
+    /// no-op** ⇒ 检索期再无任何东西挡住它 ⇒ **已删文档复活**，继续合并还会把它**固化进主段**
+    /// 并随 `save` 落盘（删除永久丢失）。
+    ///
+    /// ⇒ 与 `S8-03` 第 2 轮 **P1-2** 的「前缀 `Arc::ptr_eq` 身份」**同一思路**：
+    /// **只处置本次真正覆盖到的那部分**，其余**原样保留**（物理化留给后续合并 / `merge_all`）。
+    pub(crate) fn below(&self, upper: DocId) -> Tombstones {
+        // `doc_ids` 恒升序（`add` 用 `binary_search` 插入）⇒ 前缀切分即可，保持升序不变式。
+        let n = self.doc_ids.partition_point(|d| *d < upper);
+        Tombstones {
+            doc_ids: self.doc_ids[..n].to_vec(),
+        }
+    }
+
     /// 移除一条墓碑（物理化之后调用 ⇒ 热路径可回到零谓词，见 §4.7.3）。
     pub(crate) fn remove(&mut self, doc_id: DocId) {
         if let Ok(pos) = self.doc_ids.binary_search(&doc_id) {
@@ -1233,6 +1260,40 @@ mod tests {
         assert!(carried.is_empty());
         assert!(!tomb.blocks_doc(7));
         assert!(tomb.blocks_doc(9));
+    }
+
+    /// **`S8-06` 评审 P1-1 的纯函数判据**：`Tombstones::below(upper)` 的边界必须是**严格小于**。
+    ///
+    /// 🔑 为什么值得单测（而不是只靠集成用例）：合并里「哪些墓碑**本次可物理化**」的判据就是
+    /// **一个边界**。把它写成 `<=` 会在「墓碑的目标正好是**下一个未合并段的首个** doc」
+    /// 这一格上放行 ⇒ 又变回「**摘掉但没物理化**」⇒ 已删文档复活
+    /// （`Index::remove` 对越界 `doc_id` 是静默 no-op）。
+    /// 集成用例的夹具会随场景漂移，而这个边界由本用例**逐值**钉住。
+    #[test]
+    fn S8_06_墓碑可按合并区间切分且边界是严格小于() {
+        let t = Tombstones {
+            doc_ids: vec![0, 3, 7, 11],
+        };
+
+        assert_eq!(t.below(0).len(), 0, "upper = 0 ⇒ 没有任何墓碑落在区间内");
+
+        let b = t.below(3);
+        assert_eq!(b.len(), 1, "upper = 3 ⇒ 只有 doc 0 落在 [0, 3)");
+        assert!(b.blocks_doc(0));
+        assert!(
+            !b.blocks_doc(3),
+            "🔴 边界必须是**严格小于**：`doc == upper` 的目标段**本次没被合并**\
+             ⇒ 既不许物理化、更不许把它从集合里摘掉（摘掉 = 复活）"
+        );
+
+        let all = t.below(99);
+        assert_eq!(all.len(), 4);
+        assert_eq!(
+            all.iter().collect::<Vec<_>>(),
+            vec![0, 3, 7, 11],
+            "切分必须保持**升序**（`add` 的升序去重不变式不得被动摇）"
+        );
+        assert_eq!(t.len(), 4, "`below` 是**只读**切分 ⇒ 调用方集合不得被改动");
     }
 
     /// **`S8-02` 评审 P3-2**：跨段求和必须**真的遍历 `deltas`**。
