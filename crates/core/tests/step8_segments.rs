@@ -1564,3 +1564,199 @@ fn S8_T14_合并后的向量侧不丢点_以精确后端为参照() {
         "合并后的 Hnsw 图相对精确路径的 recall@10 = {recall:.4}，应 ≥ 0.9（丢点会让它显著下滑）"
     );
 }
+
+/// **`S8-06` 评审 P1-1 的回归锁**：**部分合并**（`merge_pending()`，`take < deltas.len()`）
+/// **不得丢弃指向未合并段的跨段墓碑**。
+///
+/// # 缺陷的形状（评审给了确定性复现；本用例是它的常驻形态）
+///
+/// `SearchIndex::remove` 的**分支②**对**任何既往段**（含**还没合并**的任意增量段）都记墓碑，
+/// 而合并时若把**全量** `View.tombstones` 都当成「本次已物理化」摘掉，就会出问题：
+/// 目标在**未合并段**的墓碑「**被摘掉、却没被物理化**」——
+/// `Index::remove` 对**越界 `doc_id` 是静默 no-op** ⇒ 检索期再无任何东西挡它
+/// ⇒ **已删文档复活**；继续合并还会把它**固化进主段**并随 `save` 落盘（**删除永久丢失**）。
+///
+/// 修前实测（确定性）：`merge_pending()` 后 B 恒命中 **1**、`tombstones_applied` **谎报 1**
+/// （真物理化 0 条 —— 违反 `NFR-07`）⇒ `save`→`load` 后 B 仍可检索。
+///
+/// # 判据为什么必须含 `save`→`load` 臂
+///
+/// 前两步只证明「**视图里**还挡得住」；**落盘臂**才钉住「固化」那一层 ——
+/// 墓碑一旦在视图里丢了，主段已经把 B 的 postings 带进来了，`save` 之后**不可逆**。
+///
+/// ⚠️ **夹具的两条前提**（否则本用例会假绿）：
+/// ① `B` 必须落在**第 2 个**增量段（这样第一次 `merge_pending()` 只并 D1、D2 仍在队里）；
+/// ② 查询词与 A 的语料**无公共词** —— `MixedAnalyzer` 是单字 / 词 **OR** 语义，
+///    用带 A 语料里那些字的 query 去查会命中 A、把「B 复活」淹没掉。
+#[test]
+fn S8_06_部分合并不得丢弃指向未合并段的墓碑() {
+    let mut idx = bm25_builder().build();
+    let a = idx.add(Document::new("甲甲甲")).unwrap();
+    idx.commit().unwrap(); // D1：A 在此段
+    let b = idx.add(Document::new("乙乙乙")).unwrap();
+    idx.commit().unwrap(); // D2：B 在此段
+    assert_eq!((a.doc_id, b.doc_id), (0, 1), "前提：A / B 的全局 doc_id");
+
+    let n_hits = |idx: &SearchIndex, q: &str| -> usize {
+        idx.searcher()
+            .search_with(q)
+            .mode(SearchMode::Bm25)
+            .top_n(50)
+            .exec()
+            .unwrap()
+            .hits
+            .len()
+    };
+
+    idx.remove(b.doc_id).unwrap();
+    idx.commit().unwrap(); // 墓碑-only 提交：墓碑进视图 + 零内容段入队
+    assert_eq!(
+        n_hits(&idx, "乙乙乙"),
+        0,
+        "前提：remove + commit 后 B 不可见"
+    );
+    assert_eq!(n_hits(&idx, "甲甲甲"), 1, "前提：A 不受影响");
+
+    // ① 只并队首 D1 ⇒ B 的墓碑**指向还没合并的 D2** ⇒ 必须**留在集合里**继续挡
+    let r1 = idx.merge_pending().unwrap().expect("应并掉 D1");
+    assert_eq!(r1.segments_merged, 1, "前提：只并了一段（D1）");
+    assert_eq!(
+        n_hits(&idx, "乙乙乙"),
+        0,
+        "🔴 P1-1：部分合并后 B **复活**了 —— 指向未合并段的墓碑被静默摘掉（越界 `remove` 是 no-op）"
+    );
+    assert_eq!(
+        r1.tombstones_applied, 0,
+        "🔴 P1-1 的配套要求：本次**一条墓碑都没被真物理化**（B 的目标段 D2 还在队里）\
+         ⇒ 报「已物理化 1 条」就是**谎报**（`NFR-07`：语义偏差不得静默）"
+    );
+
+    // ② 继续并：墓碑在**其目标段**（D2）并入的那一刻才被物理化
+    let r2 = idx.merge_pending().unwrap().expect("应并掉 D2");
+    assert_eq!(r2.segments_merged, 1);
+    assert_eq!(
+        r2.tombstones_applied, 1,
+        "D2 并入后，指向 B 的墓碑才真正物理化（本次覆盖区间已包含 B 的槽位）"
+    );
+    let r3 = idx.merge_pending().unwrap().expect("应并掉零内容段 D3");
+    assert_eq!(
+        (r3.segments_merged, r3.chunks_merged, r3.tombstones_applied),
+        (1, 0, 0),
+        "前提：D3 是零内容段 ⇒ 无活分片、也无墓碑可物理化"
+    );
+    assert_eq!(
+        n_hits(&idx, "乙乙乙"),
+        0,
+        "🔴 全并完后 B 不得复活（复活会被固化进主段、此后无墓碑可挡）"
+    );
+
+    // ③ 落盘往返：钉住「固化」那一层 —— 修前这里必然红
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("p1-1.idx");
+    idx.save(&p).unwrap();
+    let reloaded = bm25_builder().load(&p).unwrap();
+    assert_eq!(
+        n_hits(&reloaded, "乙乙乙"),
+        0,
+        "🔴 P1-1：删除被固化进快照 —— `save`→`load` 后 B 仍可检索（删除**永久丢失**）"
+    );
+    assert_eq!(n_hits(&reloaded, "甲甲甲"), 1, "前提：A 必须照旧可检索");
+}
+
+/// **`S8-06` 评审 P2-1 的回归锁（向量侧）**：**墓碑-only（零向量增量）段**的合并
+/// **不得**触发向量侧**全量重建**（`Rebuild`）。
+///
+/// # 缺陷的形状
+///
+/// `merge_vectors_incremental` 曾有一条 `if delta_raw.is_empty() { return Ok(None) }`，
+/// 调用方随即**全量重建主图**（`O(N·logN)` + 一次 `OsRng` 拓扑重随机）。
+/// 但「零向量增量」恰恰意味着**没有向量侧工作**：主图**原样正确**（死点由检索期的存活位图
+/// 挡掉 —— `Q-C1` 既有机制）⇒ 这次重建是**纯浪费**。删除密集的负载下（每次 `remove` +
+/// `commit` 都产生一个墓碑-only 段）**每个这样的段**都触发一次 —— 正是 §4.9.3 引入方案 A
+/// 要避免的那个量级。
+///
+/// # 两条判据（**缺一不可**）
+///
+/// ① **策略**：零内容段的合并必须报 `Incremental`（修前实测 = `Rebuild`）；
+/// ② 🔴 **保拓扑是真的**：换策略**不得**以「图不再覆盖旧点」为代价 ——
+///    修法若写成「走 A 但返回一张空图」，只用 ① 是**看不出来**的。
+///    ⇒ 补一条**行为级**判据：合并后**向量检索仍能命中**原有内容（图还在），
+///    且被删的 doc 仍**不可见**（墓碑照样物理化 —— 换策略不等于绕开物理化）。
+///
+/// ⚠️ **场景前提**：`bootstrap` 那次合并**必须**走 `Rebuild` —— 此时主段是**空图**、
+/// 内容全在增量段里，而 `hnsw_rs` 的 `file_dump` 对空图报错 ⇒ 方案 A 结构上不可用。
+/// 本用例**显式断言**这一条，免得后人把「首次合并走 B」误当成缺陷。
+#[test]
+fn S8_06_墓碑only段的合并不触发向量全量重建() {
+    let mut idx = hybrid_builder().vector_backend(VectorBackend::Hnsw).build();
+    for i in 0..40 {
+        idx.add(Document::new(format!("重建探针 文档 {i}")))
+            .unwrap();
+    }
+    idx.commit().unwrap();
+    let boot = idx.merge_all().unwrap();
+    assert_eq!(
+        boot.vector_strategy,
+        VectorMergeStrategy::Rebuild,
+        "前提：首次合并时主段是**空图** ⇒ 方案 A 结构上不可用 —— 这是**预期**行为（不是缺陷）"
+    );
+
+    // 再写一段**带向量**的增量，然后 `remove` 造出一个「墓碑-only」段
+    for i in 40..44 {
+        idx.add(Document::new(format!("重建探针 文档 {i}")))
+            .unwrap();
+    }
+    idx.commit().unwrap(); // D2（有向量）
+    idx.remove(0).unwrap();
+    idx.commit().unwrap(); // D3（零内容：段里没有 doc / chunk，墓碑在视图里）
+
+    let r2 = idx.merge_pending().unwrap().expect("应并掉 D2");
+    assert_eq!(
+        r2.vector_strategy,
+        VectorMergeStrategy::Incremental,
+        "前提：有向量增量的段走方案 A（dump→load→增量 insert）"
+    );
+
+    let r3 = idx.merge_pending().unwrap().expect("应并掉零内容段 D3");
+    assert_eq!(
+        (r3.segments_merged, r3.chunks_merged),
+        (1, 0),
+        "前提：并的是**零内容**段（段数为 1、活分片为 0）"
+    );
+    assert_eq!(
+        r3.vector_strategy,
+        VectorMergeStrategy::Incremental,
+        "🔴 P2-1：零向量增量 ⇒ **没有向量侧工作** ⇒ 必须走 A 的 `dump→load` **零插入**\
+         （保拓扑、成本一次 I/O），而不是全量重建（`Rebuild` = `O(N·logN)` + 拓扑重随机）"
+    );
+
+    // ② 保拓扑 + 墓碑照旧物理化（换策略的替代物：**行为级**判据）
+    let v = idx
+        .searcher()
+        .search_with("重建探针")
+        .mode(SearchMode::Vector)
+        .top_n(200)
+        .exec()
+        .unwrap();
+    assert!(
+        !v.hits.is_empty(),
+        "🔴 「走 A、零插入」不得变成「图丢了」：合并后向量检索必须仍能命中内容\
+         （空图会让这里为 0 —— 这条是策略断言抓不到的）"
+    );
+    assert!(
+        v.hits.iter().all(|h| h.doc_id != 0),
+        "🔴 换策略不得绕开墓碑物理化：doc 0 已 `remove` ⇒ 必须仍不可见"
+    );
+    let b = idx
+        .searcher()
+        .search_with("重建探针")
+        .mode(SearchMode::Bm25)
+        .top_n(200)
+        .exec()
+        .unwrap();
+    assert_eq!(
+        b.hits.len(),
+        43,
+        "40（bootstrap）+ 4（D2）- 1（被删的 doc 0）= 43 —— 文本侧不得因策略变更而丢内容"
+    );
+}

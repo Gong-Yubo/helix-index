@@ -48,7 +48,7 @@ use std::time::{Duration, Instant};
 
 use helix_core::chunk::Chunker;
 use helix_core::document::Document;
-use helix_core::error::{Error, Result};
+use helix_core::error::Error;
 use helix_core::query::SearchMode;
 use helix_core::search::{MergeReport, SearchIndex, VectorBackend, VectorMergeStrategy};
 use helix_core::types::ChunkId;
@@ -232,6 +232,30 @@ fn 纯_bm25_库() -> SearchIndex {
         .build()
 }
 
+/// 「视图已发布」与「已提交上界可见」之间的**记忆序窗口**的宽限窗口（`S8-06` 评审 **P3-1**）。
+///
+/// # 窗口是怎么来的
+///
+/// 写端是 `commit()`（视图发布）**之后**才 `committed.store(i + 1)`（`:294`），而读端是
+/// 「先 `search`（取视图快照）后 `load` 上界」⇒ 若写端恰在这两条之间被抢占，读端会以
+/// `n < up` = `i < i` **误报失败**。窗口是**指令级**的。
+///
+/// # 判据为什么不能靠「它很少发生」
+///
+/// 本条是**验收标准 5 的唯一判据** ⇒ 它偶然变红会把人引向**错误方向**（去查可见性边界）。
+/// ⇒ 判失败前**宽限重读一次**：真泄漏（上界永不前进）不会消失，竞态窗口会。
+///
+/// # 实测（三臂探针，2026-09-21；把窗口人为放大到 30ms 以便打得中）
+///
+/// | 臂 | 读端判据 | 结果 |
+/// | --- | --- | --- |
+/// | ① 写端 `commit()` 后 `sleep(30ms)` | **旧**（当场判失败） | **9534 轮 / 违约 3416 次** ⇒ 窗口是真的 |
+/// | ② 同上 | **新**（本宽限） | **5793 轮 / 违约 0 次** ⇒ 宽限把它吃干净 |
+/// | ③ 写端**永不** `store`（真泄漏） | 新 | **违约** ⇒ 检测能力**没有**缩水 |
+///
+/// ⚠️ 臂 ③ 才是「不缩水」的证据 —— 只测 ② 只能证明「不误报」，不能证明「不漏报」。
+const COMMIT_BOUND_GRACE: Duration = Duration::from_millis(50);
+
 /// **`S8-T10`（主臂）**：写 / 合并 / 读**并发**。
 ///
 /// # ⚠️ 与设计原文的偏差（已单列报评审）：为什么是**两线程**而不是三线程
@@ -272,9 +296,18 @@ fn S8_T10_写与合并与读的并发探针() {
             let up = c2.load(Ordering::Relaxed);
             for h in &resp.hits {
                 if let Some(n) = 编号(&h.text) {
+                    if n < up {
+                        continue;
+                    }
+                    // 🟡 **宽限重读一次**（`S8-06` 评审 P3-1）：详见 `COMMIT_BOUND_GRACE`。
+                    // 只对「看起来违约」的那一条付这 50ms ⇒ 正常路径**零开销**。
+                    thread::sleep(COMMIT_BOUND_GRACE);
+                    let up2 = c2.load(Ordering::Relaxed);
                     assert!(
-                        n < up,
-                        "② 读端看到了**未提交**的内容（编号 {n} ≥ 已提交上界 {up}）\
+                        n < up2,
+                        "② 读端看到了**未提交**的内容（编号 {n} ≥ 已提交上界 {up2}；\
+                         宽限 {COMMIT_BOUND_GRACE:?} 后重读仍未越过 ⇒ 这**不是**记忆序窗口，\
+                         而是真的越过了可见性边界）\
                          —— 可见性边界应当是 `commit()` 之后（NFR-14 ①）"
                     );
                 }
@@ -421,5 +454,4 @@ fn S8_06_纯BM25库的合并报告应为None策略() {
         "纯 BM25 装配**没有**向量侧工作 ⇒ 必须记 None（记成 Rebuild 就是「把无说成有」）"
     );
     assert_eq!(rep.vector_merge_ms, 0, "没有向量侧工作 ⇒ 耗时口径应为 0");
-    let _: Result<()> = Ok(()); // 保持 `Result` 在作用域（与上面两个用例的 import 一致）
 }
