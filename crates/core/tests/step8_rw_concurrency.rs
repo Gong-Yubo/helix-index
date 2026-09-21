@@ -41,9 +41,17 @@
 
 #![allow(non_snake_case)]
 
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use helix_core::chunk::Chunker;
+use helix_core::document::Document;
+use helix_core::error::Error;
+use helix_core::query::SearchMode;
+use helix_core::search::{MergeReport, SearchIndex, VectorBackend, VectorMergeStrategy};
+use helix_core::types::ChunkId;
 
 /// 观测上界：**只在断言失败时**才会接近它（正常路径不应有任何可见等待）。
 const PATIENCE: Duration = Duration::from_secs(10);
@@ -201,4 +209,249 @@ fn S8_T1_反向自证_旧形状的第二次读锁会被拒() {
         "旧形状的第二次读锁（阻塞臂）在 {R34_BLOCK_WINDOW:?} 内被放行 ⇒ 同上；\
          若本臂为红而 `try_read` 臂为绿，说明两支的准入判据不一致（值得单独立项）"
     );
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// `S8-T10`：写 / 合并 / 读**并发**（验收标准 5「读不阻塞写」的**唯一**判据）
+// ══════════════════════════════════════════════════════════════════════════
+
+/// 从命中文本尾部取出编号（本文件构造的语料形如 `「并发探针 文档 12」`）。
+/// 非本文件语料（尾串不是数字）⇒ `None`，调用方按「不参与编号断言」处理。
+fn 编号(text: &str) -> Option<usize> {
+    text.rsplit(char::is_whitespace)
+        .next()
+        .and_then(|s| s.parse().ok())
+}
+
+fn 纯_bm25_库() -> SearchIndex {
+    SearchIndex::builder()
+        .embedder(None)
+        .vector_backend(VectorBackend::Brute)
+        .chunker(Chunker::new(200_000, 0))
+        .batch_size(1024)
+        .build()
+}
+
+/// 「视图已发布」与「已提交上界可见」之间的**记忆序窗口**的宽限窗口（`S8-06` 评审 **P3-1**）。
+///
+/// # 窗口是怎么来的
+///
+/// 写端是 `commit()`（视图发布）**之后**才 `committed.store(i + 1)`（`:294`），而读端是
+/// 「先 `search`（取视图快照）后 `load` 上界」⇒ 若写端恰在这两条之间被抢占，读端会以
+/// `n < up` = `i < i` **误报失败**。窗口是**指令级**的。
+///
+/// # 判据为什么不能靠「它很少发生」
+///
+/// 本条是**验收标准 5 的唯一判据** ⇒ 它偶然变红会把人引向**错误方向**（去查可见性边界）。
+/// ⇒ 判失败前**宽限重读一次**：真泄漏（上界永不前进）不会消失，竞态窗口会。
+///
+/// # 实测（三臂探针，2026-09-21；把窗口人为放大到 30ms 以便打得中）
+///
+/// | 臂 | 读端判据 | 结果 |
+/// | --- | --- | --- |
+/// | ① 写端 `commit()` 后 `sleep(30ms)` | **旧**（当场判失败） | **9534 轮 / 违约 3416 次** ⇒ 窗口是真的 |
+/// | ② 同上 | **新**（本宽限） | **5793 轮 / 违约 0 次** ⇒ 宽限把它吃干净 |
+/// | ③ 写端**永不** `store`（真泄漏） | 新 | **违约** ⇒ 检测能力**没有**缩水 |
+///
+/// ⚠️ 臂 ③ 才是「不缩水」的证据 —— 只测 ② 只能证明「不误报」，不能证明「不漏报」。
+const COMMIT_BOUND_GRACE: Duration = Duration::from_millis(50);
+
+/// **`S8-T10`（主臂）**：写 / 合并 / 读**并发**。
+///
+/// # ⚠️ 与设计原文的偏差（已单列报评审）：为什么是**两线程**而不是三线程
+///
+/// `D-S8-05` 明确规定 **`SearchIndex` 保持 `!Sync`**（`add(&mut self)` 不改），
+/// 而 `merge_pending()` **同样**要 `&mut self` ⇒ 「写」与「合并」**必须共用同一个写端**
+/// （同一时刻只有一个能持有它）。⇒ 「写线程 + 合并线程 + 读线程**三者同时跑**」在安全 Rust 下
+/// **不可达**（要 `unsafe` 才能绕过 `!Sync`），取形 = 「写 + 合并」一个线程 + 「读」一个线程
+/// （读端是 `Searcher`，它 `Send + Sync`）。
+/// **被测语义没有缩水**：读端仍与「写/合并」**重叠**进行 —— 这正是 `FR-17` 要钉的东西。
+///
+/// # 判据
+///
+/// ① **读端零 `Err`**（`FR-17`：不得以「重建索引中」为由拒绝查询）；
+/// ② **读端只看到已提交前缀**（不得出现「编号 ≥ 已提交上界」的内容）；
+/// ③ 写端 `merge_pending()` **零 `Err`**（单写端下属 `I8-7` 的合法路径）；
+/// ④ 终态**内容完整**（合并**不丢内容**）。
+#[test]
+fn S8_T10_写与合并与读的并发探针() {
+    let mut idx = 纯_bm25_库();
+    let searcher = idx.searcher();
+    // 已提交的**编号上界**（读端靠它判「看到的是不是未提交内容」）
+    let committed = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let s2 = searcher.clone();
+    let c2 = Arc::clone(&committed);
+    let st2 = Arc::clone(&stop);
+    let reader = thread::spawn(move || {
+        let mut rounds = 0usize;
+        while !st2.load(Ordering::Relaxed) {
+            let resp = s2
+                .search_with("并发探针")
+                .mode(SearchMode::Bm25)
+                .top_n(10)
+                .exec()
+                .expect("① 读端不得出错（FR-17：合并与写期间都不得拒绝查询）");
+            let up = c2.load(Ordering::Relaxed);
+            for h in &resp.hits {
+                if let Some(n) = 编号(&h.text) {
+                    if n < up {
+                        continue;
+                    }
+                    // 🟡 **宽限重读一次**（`S8-06` 评审 P3-1）：详见 `COMMIT_BOUND_GRACE`。
+                    // 只对「看起来违约」的那一条付这 50ms ⇒ 正常路径**零开销**。
+                    thread::sleep(COMMIT_BOUND_GRACE);
+                    let up2 = c2.load(Ordering::Relaxed);
+                    assert!(
+                        n < up2,
+                        "② 读端看到了**未提交**的内容（编号 {n} ≥ 已提交上界 {up2}；\
+                         宽限 {COMMIT_BOUND_GRACE:?} 后重读仍未越过 ⇒ 这**不是**记忆序窗口，\
+                         而是真的越过了可见性边界）\
+                         —— 可见性边界应当是 `commit()` 之后（NFR-14 ①）"
+                    );
+                }
+            }
+            rounds += 1;
+            thread::yield_now();
+        }
+        rounds
+    });
+
+    // 写 + 合并（**同一个写端**，交替驱动；见上方偏差说明）
+    let mut merges = 0usize;
+    for i in 0..60 {
+        idx.add(Document::new(format!("并发探针 文档 {i}")))
+            .unwrap();
+        idx.commit().unwrap();
+        committed.store(i + 1, Ordering::Relaxed);
+        if i % 5 == 4 {
+            let rep: Option<MergeReport> = idx
+                .merge_pending()
+                .expect("③ 单写端下 merge_pending 不应 Err");
+            if let Some(r) = rep {
+                assert_eq!(r.segments_merged, 1, "merge_pending 一次只并一段");
+                merges += 1;
+            }
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    let rounds = reader.join().unwrap();
+    assert!(
+        rounds > 0,
+        "前提：读端至少完整跑完一轮（否则本用例什么都没测）"
+    );
+    assert!(
+        merges > 0,
+        "前提：至少发生过一次合并（否则没测到「合并期并发读」）"
+    );
+
+    let all = idx
+        .searcher()
+        .search_with("并发探针")
+        .mode(SearchMode::Bm25)
+        .top_n(200)
+        .exec()
+        .unwrap();
+    assert_eq!(
+        all.hits.len(),
+        60,
+        "④ 合并**不丢内容**：写完的 60 篇必须全部可检索"
+    );
+}
+
+/// **`S8-T10`（双写端臂）**：两个写端（共享同一个 `Arc<Shared>`）**交替**提交 ⇒
+/// **段 ID 空间不得重叠**（`I8-7`）。
+///
+/// # 这条在钉什么
+///
+/// 两个写端各自有**独立的 `SegmentBuilder`**，而「段基址 = 创建时刻的已发布长度」。
+/// ⇒ 若两个写端都按自己的基址发布，**两段的 ID 空间会重叠**（同一 `chunk_id` 指向两个分片）
+/// ⇒ 检索结果错乱、`remove` 误伤。=>
+/// 后提交者的基址已过期 ⇒ **必须被拒**（`Err(Busy)`，`S8-03` 评审 P2-1 的那条对账）。
+///
+/// ⚠️ 两个写端**不同时**操作（`!Sync`）：「交替」正是这条对账存在的前提。
+/// ⚠️ 被拒后按 `error.rs` 的恢复指引**重做 `add`**（被拒时 builder 已被换成对齐当前基址的新的）。
+#[test]
+// ⚠️ **刻意**用已废弃的 `into_index()`：它是**唯一**能拿到「第二个写端」的公开入口，
+//    而设计 §7 的 `S8-T10` 明确要求用双写端臂钉 `I8-7`（段 ID 空间不重叠）。
+//    该入口的废弃理由是「写端不必再换回」（`S8-02` / `T7-18`）—— 与本用例**无关**。
+#[allow(deprecated)]
+fn S8_T10_双写端交替提交不得让段ID空间重叠() {
+    let mut a = 纯_bm25_库();
+    a.add(Document::new("A 端文档 0")).unwrap();
+    a.commit().unwrap();
+
+    // 第二个写端：与 `a` 共享同一个 `Arc<Shared>`（`into_index()` 总是成功）
+    let mut b = a.searcher().into_index().unwrap();
+
+    // 🔑 **交替提交下，双方的基址都会轮流过期**（谁后提交谁成功）—— 这正是被测语义：
+    //    「过期基址的提交必须被拒」。⇒ 两侧都要**按 `error.rs` 的恢复指引重做**
+    //    （被拒时内容已丢弃；`commit()` 末尾已把 builder 换成与当前基址对齐的新的）。
+    let mut rejected = 0usize;
+    fn try_commit(idx: &mut SearchIndex, text: String, rejected: &mut usize) {
+        idx.add(Document::new(text.clone())).unwrap();
+        match idx.commit() {
+            Ok(()) => {}
+            Err(Error::Busy(_)) => {
+                *rejected += 1;
+                idx.add(Document::new(text)).unwrap();
+                idx.commit()
+                    .expect("重做 `add` 后必须能提交（`error.rs` 的恢复指引）");
+            }
+            Err(e) => panic!("只应出现 Busy（暂态并发），实际是 {e}"),
+        }
+    }
+    for i in 1..8 {
+        try_commit(&mut a, format!("A 端文档 {i}"), &mut rejected);
+        try_commit(&mut b, format!("B 端文档 {i}"), &mut rejected);
+    }
+    assert!(
+        rejected > 0,
+        "基址对账**必须**在这一交替序列里生效过（否则两段的 ID 空间早就重叠了）"
+    );
+
+    // 终态：两端的全部内容都可检索，且**全局 chunk_id 无重复**（I8-7）
+    let resp = a
+        .searcher()
+        .search_with("端文档")
+        .mode(SearchMode::Bm25)
+        .top_n(200)
+        .exec()
+        .unwrap();
+    let ids: Vec<ChunkId> = resp.hits.iter().map(|h| h.chunk_id).collect();
+    let uniq: std::collections::HashSet<ChunkId> = ids.iter().copied().collect();
+    assert_eq!(
+        ids.len(),
+        uniq.len(),
+        "全局 chunk_id 不得重复 —— 重复即「段 ID 空间重叠」（I8-7 被破坏）；实测 {ids:?}"
+    );
+    assert_eq!(
+        resp.hits.len(),
+        1 + 7 + 7,
+        "终态应有 1（A 首批）+ 7（A 后续）+ 7（B 重做后提交）= 15 篇"
+    );
+}
+
+/// **`S8-06` 的落地取证**：合并器原语面对**纯 BM25 装配**时的报告口径。
+///
+/// ⚠️ 这条刻意**不**用 `#[ignore]`：它把「`MergeReport.vector_strategy` 的三个取值」
+/// 中**最容易写错的那一个**（`None` vs `Rebuild`）钉在 CI 里 —— 纯 BM25 库**没有**向量侧
+/// 工作，记成 `Rebuild` 是「把无说成有」（`NFR-07`：不撒谎）。
+#[test]
+fn S8_06_纯BM25库的合并报告应为None策略() {
+    let mut idx = 纯_bm25_库();
+    for i in 0..3 {
+        idx.add(Document::new(format!("报告口径 文档 {i}")))
+            .unwrap();
+        idx.commit().unwrap();
+    }
+    let rep: MergeReport = idx.merge_all().unwrap();
+    assert_eq!(rep.segments_merged, 3);
+    assert_eq!(
+        rep.vector_strategy,
+        VectorMergeStrategy::None,
+        "纯 BM25 装配**没有**向量侧工作 ⇒ 必须记 None（记成 Rebuild 就是「把无说成有」）"
+    );
+    assert_eq!(rep.vector_merge_ms, 0, "没有向量侧工作 ⇒ 耗时口径应为 0");
 }

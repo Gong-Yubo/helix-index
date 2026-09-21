@@ -18,6 +18,7 @@ mod view;
 
 pub use config::{required_local_embedder, GraphPersistMode, SearchIndexBuilder, VectorBackend};
 pub use index::{
-    AddOutcome, CompactionReport, GraphStatus, SearchIndex, SizeBytes, TombstoneStats,
+    AddOutcome, CompactionReport, GraphStatus, MergeReport, SearchIndex, SizeBytes, TombstoneStats,
+    VectorMergeStrategy,
 };
 pub use searcher::{SearchRequest, Searcher};
