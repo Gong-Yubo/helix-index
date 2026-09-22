@@ -94,3 +94,10 @@ required-features = ["local-embed"]
 [[example]]
 name = "bench_embed_session"
 required-features = ["local-embed"]
+
+# V2 Step 8 / S8-08：查询侧**会话池**的决策门（spike S8-S2，设计 §4.11.3）。
+# 需要本地模型 ⇒ 与 `bench_embed_session` 同 gate（默认 feature 已含 `local-embed`；
+# `--no-default-features` 构建不会尝试编译它）。
+[[example]]
+name = "spike_s8s2"
+required-features = ["local-embed"]
