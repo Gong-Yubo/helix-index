@@ -57,7 +57,9 @@ pub struct Config {
     /// - 只被**默认本地 embedder 的构造**消费（`default_embedder`）；显式 `embedder(Some(..))`
     ///   时本值被忽略；
     /// - ⚠️ **不进 `ConfigFingerprint`**（会话数不改变索引内容 ⇒ 同一快照在 1 / N 下都合法）；
-    /// - `0` 在 `build_config` 处归一为 **1**（空池不可用），故这里恒 `≥ 1`。
+    /// - `0` 在 `build_config` 处归一为 **1**（空池不可用），故这里恒 `≥ 1`；
+    /// - ⚠️ **标定结论 = 「不投」**（spike S8-S2，2026-09-21）⇒ **当前没有 >1 的推荐值**；
+    ///   字段保留是为了「结论翻转时零改动」，见设计 §4.11.4 / `eval-report.md` §8.15。
     pub embed_sessions: usize,
 }
 
@@ -163,7 +165,10 @@ impl Default for SearchIndexBuilder {
             // ⚠️ 它**只对「单次全量建图」路径生效**，见 `parallel_build()` 的文档。
             parallel_build: true,
             // `Q4`：**库侧默认不动**（1 = 零收益零风险；>1 要付 N 份 ONNX 会话的内存）。
-            // 是否给推荐值由 spike S8-S2 的三条判据决定（`D-S8-11`）。
+            // ⚠️ spike **S8-S2 已判「不投」**（2026-09-21）⇒ **当前没有 >1 的推荐值**：
+            // 判据① 数值一致性 PASS，但 ② 吞吐增益 2.10×（< 2.5×）、③ 峰值 RSS +148.4%（> 20%）
+            // ⇒ 三条合取不成立。结论与**复审触发条件**见 `v2-step8-design.md` §4.11.4 /
+            // `eval-report.md` §8.15。
             embed_sessions: 1,
         }
     }
@@ -300,6 +305,16 @@ impl SearchIndexBuilder {
     ///   ⇒ 破坏 `NFR-10` ① 的「逐位一致」前置（`Q3′` 由 spike **S8-S2** 实测）。
     ///
     /// ⇒ **默认 1**（`Q4`：库侧默认不动）；`0` 归一为 `1`（见 `LocalEmbedder`）。
+    ///
+    /// # ⚠️ 标定结论（2026-09-21，spike S8-S2）：**已判「不投」**
+    ///
+    /// ⇒ **当前没有 >1 的推荐值**：三条合取判据里 ① 数值一致性 **PASS**，但 ② 吞吐增益
+    /// **2.10× < 2.5×**、③ 峰值 RSS 增量 **+148.4% ≫ 20%** ⇒ 合取不成立 ⇒
+    /// `NFR-10` ③ 与 `R43` **保持「打开」**（如实记未达标，**不是**「只记录不判定」）。
+    ///
+    /// ⇒ 本方法**保留**（池形态已定，将来结论翻转时零改动），但**默认值 `1` 就是当前
+    /// 唯一推荐值**。完整读数、三条附加观察（含判据③ 的「结构性不可达」算术）与
+    /// **复审触发条件**见 `v2-step8-design.md` §4.11.4 与 `eval-report.md` §8.15。
     ///
     /// ⚠️ 只对**默认装配路径**生效：显式 `embedder(Some(..))` 时本值被忽略
     /// （那种情况下请自行 `LocalEmbedder::new_with_sessions(n)`）。
@@ -493,9 +508,10 @@ fn resolve_embedder(
 /// 「允许半向量」之类的放行参数。
 pub fn required_local_embedder() -> Result<Arc<dyn Embedder>> {
     // `require = true` ⇒ 必为 `Some`；用 `ok_or` 而非 `expect`，是为了不引入 panic 分支。
-    // ⚠️ CLI 侧暂**固定单会话**：`--embed-sessions` 的口径与推荐值由 spike S8-S2 的
-    //    结论决定（`Q4` 明确「库侧默认不动」，CLI 侧留待结论出来后另开），
-    //    所以这里不给它开参数；需要多会话的调用方走 `SearchIndexBuilder::embed_sessions`。
+    // ⚠️ CLI 侧**固定单会话**：spike S8-S2 **已判「不投」**（2026-09-21）⇒ CLI 侧
+    //    不加 `--embed-sessions` 开关更自洽（`Q4` 明确「库侧默认不动」）；
+    //    需要多会话的调用方走库侧两条入口：`SearchIndexBuilder::embed_sessions` /
+    //    `LocalEmbedder::new_with_sessions`。结论见设计 §4.11.4 / `eval-report.md` §8.15。
     resolve_embedder(true, local_embedder_ctor, 1)?.ok_or(crate::error::Error::NoEmbedder)
 }
 

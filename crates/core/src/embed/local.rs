@@ -43,8 +43,10 @@ fn dirs_home() -> std::path::PathBuf {
 /// - **轮转**只读一个 `AtomicUsize`（无锁）、代价为常数，且**必然**把并发请求摊到不同槽上
 ///   —— 唯一要防的是「总撞同一把锁」，轮转即可。
 ///
-/// ⚠️ 取模前先把计数器收敛（`% len` 后再加）⇒ **不会**因 `usize` 溢出而回绕到负/异常值
-/// （`fetch_add` 的返回值先 `% len`，理论上的溢出只是回绕到 0，最多让一次调度「不轮转」）。
+/// ⚠️ **计数器无界递增、靠 `usize` 回绕**：本实现是**先加后取模**（`fetch_add(1) % len`），
+/// 并没有「把计数器收敛回 `[0, len)`」这一步 —— 收敛的是**返回值**，不是计数器本身。
+/// 回绕点（`usize::MAX → 0`）只让**那一次**的取模结果不连续 ⇒ 最多一次调度「不轮转」，
+/// 语义无害（`usize` 无符号，不存在「回绕到负值」）。
 #[inline]
 fn slot_index(next: &AtomicUsize, len: usize) -> usize {
     debug_assert!(len > 0, "池至少有一个槽（构造时已规范化）");
@@ -70,7 +72,9 @@ fn slot_index(next: &AtomicUsize, len: usize) -> usize {
 /// 每个槽都是**独立的 ONNX `Session` + `Tokenizer`** ⇒ 构造耗时 **N ×**、
 /// 常驻内存 **N ×**。模型权重文件走**同一个** `default_cache_dir()`（不重复下载），
 /// 但会话各自的运行时缓冲（激活张量）会叠加 ⇒ 内存门槛由 spike **S8-S2** 实测
-/// （判据③：相对 `sessions = 1` 的峰值 RSS 增量 ≤ 20%）。
+/// （判据③：相对 `sessions = 1` 的峰值 RSS 增量 ≤ 20%）：**实测 +148.4%**
+/// （201 104 → 499 600 KiB ≈ **97 MiB / 槽**）⇒ 该门对任何 `N ≥ 2` **结构性不可达**
+/// （只加到 2 槽也约 +50%）；这是 S8-S2 **判「不投」**的两条之一（设计 §4.11.4）。
 ///
 /// # ⚠️ 槽之间必须**同构**
 ///
@@ -78,7 +82,9 @@ fn slot_index(next: &AtomicUsize, len: usize) -> usize {
 /// **Q3′ 的前置**：若给不同槽设不同 `intra_threads`，同一 query 在不同并发度下可能
 /// 拿到**不同的向量**，那会破坏 `NFR-10` ① 的「逐位一致」前置条件。
 /// ⇒ **实现上刻意不给每槽分化参数**；`intra_threads` 是否影响数值由 spike S8-S2 实测
-/// （`spike_s8s2.rs` 的判据①c，走了**非生产路径**的对照）。
+/// （`spike_s8s2.rs` 的判据①c，走了**非生产路径**的对照）：**实测不改变数值**
+/// （`intra_threads = 10` vs `2` 逐位相同）⇒ 池内**可以**按需分化，本实现仍取
+/// 「槽同构」的保守取形。⚠️ ①c 是**单观测**（一对取值 × 12 条短文本 × 1 次），不可外推。
 pub struct LocalEmbedder {
     pool: Vec<Mutex<TextEmbedding>>,
     /// 轮转游标（写端唯一共享状态；读端永不触碰索引数据）
@@ -95,7 +101,24 @@ impl LocalEmbedder {
     /// 构造 **N 会话**实例（`N = Config::embed_sessions`）。
     ///
     /// `sessions == 0` 归一为 **1**（见 `super::normalize_sessions`）。
-    /// ⚠️ 构造 N 份 ONNX 会话 ⇒ 耗时与常驻内存均 **N ×**（模型权重共享缓存目录、不重复下载）。
+    /// ⚠️ 构造 N 份 ONNX 会话 ⇒ 耗时与常驻内存均 **N ×**（模型权重共享缓存目录、不重复下载）：
+    /// spike S8-S2 实测 **≈ 97 MiB / 槽**（查询侧峰值 RSS 口径）。
+    ///
+    /// # ⚠️ 标定结论（2026-09-21）：**判「不投」**
+    ///
+    /// **默认 `1` 是当前唯一推荐值**；`>1` **无推荐值**（判据② 吞吐 2.10× < 2.5×、
+    /// 判据③ 峰值 RSS +148.4% ≫ 20%）⇒ 见设计 §4.11.4 / `eval-report.md` §8.15。
+    ///
+    /// # ⚠️ 上界（`S8-08` 评审 P4-3 的处置：**不加 cap，只写清失败模式**）
+    ///
+    /// 下界有归一（`0 → 1`），**上界没有守卫** —— 与 `batch_size` 同类（信任调用方）。
+    /// ⚠️ 实测的两级失败模式：**先撑爆的是内存**（每槽 ≈ 97 MiB，N 大即 OOM 或长时间卡在
+    /// 建会话），而不是 `Vec::with_capacity` —— 后者只在
+    /// `N × size_of::<Mutex<TextEmbedding>>() > isize::MAX` 时 panic（**本机构建**实测该尺寸
+    /// = 1232 字节 ⇒ 阈值 `N > 7.49e15`），且**是 panic（`capacity overflow`）不是 abort**
+    /// —— 用 `catch_unwind` 实测确认可捕获。
+    /// ⇒ 预期调用方给**个位数**；要设 cap 就得选一个**任意阈值**，反而会静默削掉大机器上的
+    /// 合法值（同族纪律：**入口优于检查**，而这里没有可消除的入口）。
     pub fn new_with_sessions(sessions: usize) -> Result<Self> {
         let sessions = normalize_sessions(sessions);
         let mut pool = Vec::with_capacity(sessions);
