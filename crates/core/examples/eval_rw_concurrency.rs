@@ -441,8 +441,23 @@ fn mode_latency() -> usize {
         .collect();
     let b2: Vec<u64> = samples.iter().map(|(_, us)| *us).collect();
 
+    // 🔑 **窗口「早期切片」（`#67` 第 1 轮评审 P4-1）**：`merge_pending` 是**逐段**吸收 ⇒
+    //    B1 窗口内**布局本身在渐进改善**（1 主段 + 16 增量段 → 1 段）⇒ B1 的**聚合**统计把
+    //    「合并的干扰」与「布局变好带来的提速」**混在一起**（窗口后段的样本已经受益于前几次合并）。
+    //    ⇒ 补一个**窗口前 25%** 的切片：那一小段里布局基本还是**起始形态**（第 1 次合并尚未把
+    //    后面的段并进来），是**最干净**的「同布局 + 干扰」读数。
+    //    ⚠️ 它**不是**新判据（`n` 更小 ⇒ 分位数更不稳），只作**对照列**随报告一起出。
+    let win = end_idx.saturating_sub(start_idx);
+    let early_end = start_idx + (win / 4).max(1);
+    let b1_early: Vec<u64> = samples
+        .iter()
+        .filter(|(i, _)| *i >= start_idx && *i < early_end)
+        .map(|(_, us)| *us)
+        .collect();
+
     let (_a1_50, a1_99, _) = summarize("A1_static_before", a1);
     let (_b1_50, b1_99, b1n) = summarize("B1_merge_window", b1);
+    let (_be_50, be_99, ben) = summarize("B1_early_quarter", b1_early);
     let (_b2_50, b2_99, _) = summarize("B2_all_samples", b2);
     let (_a2_50, a2_99, _) = summarize("A2_static_after", a2);
     assert!(
@@ -459,10 +474,12 @@ fn mode_latency() -> usize {
         .unwrap();
     println!(
         "{TAG} ratio p99_b1_over_a1={:.4} p99_b2_over_a1={:.4} p99_b1_over_a2={:.4} \
-a1_p99_us={a1_99} a2_p99_us={a2_99} b1_p99_us={b1_99} b2_p99_us={b2_99}",
+a1_p99_us={a1_99} a2_p99_us={a2_99} b1_p99_us={b1_99} b2_p99_us={b2_99} \
+p99_b1early_over_a1={:.4} b1early_n={ben} b1early_p99_us={be_99}",
         b1_99 as f64 / a1_99.max(1) as f64,
         b2_99 as f64 / a1_99.max(1) as f64,
-        b1_99 as f64 / a2_99.max(1) as f64
+        b1_99 as f64 / a2_99.max(1) as f64,
+        be_99 as f64 / a1_99.max(1) as f64
     );
     println!(
         "{TAG} post_merge segments={} tombstones={}",
