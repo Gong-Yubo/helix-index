@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use crate::analyze::Analyzer;
 use crate::embed::Embedder;
 use crate::error::{Error, Result};
-use crate::fusion::{FusionStrategy, LaneResults, RrfFusion};
+use crate::fusion::{FusionCtx, FusionStrategy, LaneResults, LaneStats, RrfFusion};
 use crate::index::Index;
 use crate::predicate::CandidateFilter;
 use crate::rerank::{NoOpReranker, Reranker};
@@ -100,6 +100,19 @@ pub struct SearchParts<'a> {
     /// 🔑 为什么**不复用** `segment_set`：那会把向量路与 BM25 路的类型绑在一起，而本仓
     /// 有「两条 lane 不得互相引用」的硬约束（`retriever` 模块头注释）⇒ 载具各自一份。
     pub vector_segments: Option<Vec<VectorSegmentRef<'a>>>,
+    /// **自适应融合开关**（V2 Step 9 / D-S9-03 / FR-35；**默认 `false`**）。
+    ///
+    /// - `false` ⇒ 编排层**不构造 `FusionCtx`、不调 `fuse_adaptive`**（仍走
+    ///   `parts.fusion.fuse(&lanes, candidate_k)`）⇒ S9-2 的逐位一致是**结构性的**，
+    ///   不靠「调用者记得别传」的约定；
+    /// - `true` ⇒ 构造 `FusionCtx` → 调 `fuse_adaptive(..)`；并**再调一次**
+    ///   `weights_override` / `fusion_signal` 专用于填 `Metrics`（规则 3：两者都是
+    ///   `&self` 纯函数 ⇒ 再调必然与决策同值）。
+    ///
+    /// ⚠️ 开关只决定「走不走自适应通道」；**规则本体**（信号 + θ）在策略里
+    /// （`RrfFusion::new_adaptive`）——开了开关而策略未配规则 ⇒ `weights_override`
+    /// 返回 `None` ⇒ 行为与开关关**逐位一致**（`Metrics.fusion_weights` 报 `None`）。
+    pub adaptive_fusion: bool,
 }
 
 /// 编排的唯一实现：两路召回 → 融合前过滤 → 融合 → 窗口回捞 → 精排 → 补齐 explain。
@@ -369,9 +382,36 @@ pub fn search_parts(
         lanes.push(l.clone());
     }
 
-    // 单路模式：直接用该路结果作为"融合"输出（分数即单路分数）
+    // 单路模式：直接用该路结果作为"融合"输出（分数即单路分数）。
+    // V2 Step 9（D-S9-01 / D-S9-03）：自适应只在 Hybrid 下有语义（单路没有
+    // 「两路分歧」可言）⇒ 开关只在 Hybrid 分支被消费。
     let fused: Vec<(ChunkId, Score)> = if mode == SearchMode::Hybrid {
-        parts.fusion.fuse(&lanes, candidate_k)
+        if parts.adaptive_fusion {
+            // 规则 2：构造 FusionCtx（零拷贝借用 lanes；df 探针只查词典、不回捞正文）
+            // → 走自适应通道（决策与应用都在策略内部——编排层不消费 `w`）。
+            let lane_stats: Vec<LaneStats<'_>> =
+                lanes.iter().map(|l| LaneStats::new(l.as_slice())).collect();
+            let ctx = FusionCtx {
+                lanes: &lane_stats,
+                query_terms: query_tokens.len(),
+                query_chars: query.chars().count(),
+                has_ascii: query.chars().any(|c| c.is_ascii_alphanumeric()),
+                query_df: df_coverage(parts.index, segmented, &query_tokens),
+                top_k: k,
+            };
+            let fused = parts.fusion.fuse_adaptive(&lanes, candidate_k, &ctx);
+            // 规则 3（第 3 轮评审 P4-9）：`weights_override` / `fusion_signal` 都是
+            // `&self` 纯函数 ⇒ 对同一 ctx 再调一次必然得到与决策时相同的值。
+            // （为什么不让 `fuse_adaptive` 顺路带回：那会破坏它与 `fuse` 同形的
+            // 「默认转发」、也破坏 S9-T6 的等价性判据；共享可变状态则破坏
+            // `Send + Sync` 与并发逐位一致——排除法见设计 §4.1。）
+            metrics.fusion_weights = parts.fusion.weights_override(&ctx);
+            metrics.fusion_signal = parts.fusion.fusion_signal(&ctx);
+            fused
+        } else {
+            // 规则 1：开关关 ⇒ 不构造 ctx、不调 fuse_adaptive（S9-2 结构性逐位一致）
+            parts.fusion.fuse(&lanes, candidate_k)
+        }
     } else {
         lanes.into_iter().flatten().collect()
     };
@@ -702,6 +742,39 @@ fn query_has_hits_any(
     }
 }
 
+/// query 词项的**索引侧 df 覆盖率**（V2 Step 9：s3 信号的数据源，I9-1——只查
+/// 词典、不取正文，与「融合不回捞正文」的硬约束不冲突）。
+///
+/// 口径：**去重**词项中 `df > 0` 的占比 ∈ [0, 1]（BM25 累加刻意不去重，但
+/// 「覆盖率」问的是 query 与语料的词面交集，重复词不改变事实）。跨段时对
+/// **每段**各查一次（任一段有即算覆盖——`set.segments` 含 `main`）。
+/// 空 query（0 词项）⇒ `0.0`（该情形 BM25 lane 必空，tier 1 已兜住）。
+///
+/// 成本 O(|去重词项| × 段数) 次哈希查找，与 `query_has_hits` 同族，可忽略。
+fn df_coverage(
+    index: &Index,
+    segmented: Option<&SegmentSet<'_>>,
+    query_tokens: &[crate::analyze::Token],
+) -> Score {
+    let mut seen = std::collections::HashSet::new();
+    let distinct: Vec<&str> = query_tokens
+        .iter()
+        .filter(|t| seen.insert(t.term.as_str()))
+        .map(|t| t.term.as_str())
+        .collect();
+    if distinct.is_empty() {
+        return 0.0;
+    }
+    let covered = distinct
+        .iter()
+        .filter(|t| match segmented {
+            Some(set) => set.segments.iter().any(|seg| seg.index.doc_freq(t) > 0),
+            None => index.doc_freq(t) > 0,
+        })
+        .count();
+    covered as Score / distinct.len() as Score
+}
+
 /// 向量路依赖检查：embedder 与 vector_index 必须成对出现。
 fn require_vector<'a>(
     embedder: Option<&'a dyn Embedder>,
@@ -730,6 +803,8 @@ pub struct QueryExecutor<'a> {
     reranker: Arc<dyn Reranker>,
     /// BM25 参数（P5 网格搜索从外部注入；默认 Bm25Params::default()）
     bm25_params: Bm25Params,
+    /// 自适应融合开关（V2 Step 9；**默认 `false`**——见 `SearchParts::adaptive_fusion`）
+    adaptive_fusion: bool,
 }
 
 impl<'a> QueryExecutor<'a> {
@@ -743,6 +818,7 @@ impl<'a> QueryExecutor<'a> {
             fusion: Box::new(RrfFusion::default()),
             reranker: Arc::new(NoOpReranker),
             bm25_params: Bm25Params::default(),
+            adaptive_fusion: false,
         }
     }
 
@@ -766,6 +842,17 @@ impl<'a> QueryExecutor<'a> {
     /// 覆盖融合策略（默认 `RrfFusion`）。
     pub fn with_fusion(mut self, fusion: Box<dyn FusionStrategy>) -> Self {
         self.fusion = fusion;
+        self
+    }
+
+    /// 打开自适应融合通道（V2 Step 9 / T7-14 / FR-35；默认关 ⇒ 逐位一致）。
+    ///
+    /// ⚠️ 开关只决定编排层走不走 `fuse_adaptive`；**规则本体**（信号 + θ）在
+    /// 策略里——请配套 `with_fusion(Box::new(RrfFusion::new_adaptive(..)))`。
+    /// 开了开关而策略未配规则 ⇒ 行为与关**逐位一致**（`weights_override` 返回
+    /// `None` 退回 `fuse`）。
+    pub fn with_adaptive_fusion(mut self, on: bool) -> Self {
+        self.adaptive_fusion = on;
         self
     }
 
@@ -812,6 +899,7 @@ impl<'a> QueryExecutor<'a> {
             segment_set: None,
             predicate_builder: None,
             vector_segments: None,
+            adaptive_fusion: self.adaptive_fusion,
         }
     }
 
@@ -2063,6 +2151,339 @@ mod tests {
         assert!(
             r.hits.iter().all(|h| h.chunk_id != 999),
             "陈旧条不得出现在结果里"
+        );
+    }
+    // ---- V2 Step 9 / T7-14：自适应融合（编排层判据 S9-T1/T4/T5/T7/T10 + df 探针） ----
+
+    use crate::fusion::{AdaptiveRule, AdaptiveSignal};
+    use crate::retriever::{SegmentRef, SegmentSet};
+
+    /// S9 夹具：带向量路的 Hybrid 装配（全确定性：FakeEmbedder + brute 后端）。
+    fn build_hybrid_fixture(texts: &[&str]) -> (Index, MixedAnalyzer, BruteForceIndex) {
+        let (index, analyzer) = build_index(texts);
+        let entries: Vec<(u32, crate::vector::NormalizedVector)> = index
+            .live_chunks()
+            .map(|c| {
+                (
+                    c.chunk_id,
+                    crate::vector::NormalizedVector::new(fake_vec(&c.text)),
+                )
+            })
+            .collect();
+        let mut vi = BruteForceIndex::new();
+        for (id, v) in entries {
+            vi.add(id, v).unwrap();
+        }
+        (index, analyzer, vi)
+    }
+
+    /// 武装态规则（s4：`has_ascii` 的 0/1 —— 中文 query 恒触发、ASCII query 恒不触发，
+    /// 刻意用它让「触发/不触发」在编排层**确定性可达**，不依赖语料的 df 分布）。
+    fn armed_shape_rule(theta: f32) -> AdaptiveRule {
+        AdaptiveRule {
+            signal: AdaptiveSignal::QueryShape,
+            theta,
+        }
+    }
+
+    /// 逐位比较 hits（`f32` 用 `to_bits`，与既有判据同口径）。
+    fn s9_hits_bits(r: &SearchResponse) -> Vec<(ChunkId, u32)> {
+        r.hits
+            .iter()
+            .map(|h| (h.chunk_id, h.score.to_bits()))
+            .collect()
+    }
+
+    /// **S9-T1（编排层一半）**：开关关 ⇒ 与「今天的行为」（默认 `RrfFusion` 现算，
+    /// 不硬编码期望值）**逐位一致**——哪怕策略里**配了必触发的规则**。
+    ///
+    /// 🔑 判据的牙齿：对照臂 (b) 先断言 `fusion_weights == Some(..)`（证明规则真的
+    /// 被消费了）——否则「(c) == (a)」可能是「规则根本没接线」的假一致。
+    #[test]
+    fn S9_T1_开关关时与今天逐位一致() {
+        let (index, analyzer, vi) = build_hybrid_fixture(&[
+            "BM25 是经典关键词检索算法，参数 k1 控制词频饱和",
+            "向量检索把文本编码成向量计算余弦相似度",
+            "混合检索融合关键词和向量两路结果",
+        ]);
+        let e = FakeEmbedder;
+
+        // (a) 今天的行为：默认装配（RrfFusion::default，无规则、开关关）
+        let a = QueryExecutor::new(&index, &analyzer).with_vector(&e, &vi);
+        let ra = a.search("检索", SearchMode::Hybrid, 10).unwrap();
+
+        // (b) 开关开 + 必触发规则（中文 query ⇒ s=0 < θ=0.5）⇒ 自适应真的生效
+        let b = QueryExecutor::new(&index, &analyzer)
+            .with_vector(&e, &vi)
+            .with_fusion(Box::new(RrfFusion::new_adaptive(
+                60.0,
+                vec![1.0, 1.5],
+                armed_shape_rule(0.5),
+            )))
+            .with_adaptive_fusion(true);
+        let rb = b.search("检索", SearchMode::Hybrid, 10).unwrap();
+        assert_eq!(
+            rb.metrics.fusion_weights,
+            Some(vec![0.0, 1.5]),
+            "前提自证：规则真的被消费（否则下方的『一致』是假一致）"
+        );
+
+        // (c) 同一策略、但开关**关** ⇒ 编排层根本不调 fuse_adaptive
+        let c = QueryExecutor::new(&index, &analyzer)
+            .with_vector(&e, &vi)
+            .with_fusion(Box::new(RrfFusion::new_adaptive(
+                60.0,
+                vec![1.0, 1.5],
+                armed_shape_rule(0.5),
+            )));
+        let rc = c.search("检索", SearchMode::Hybrid, 10).unwrap();
+        assert_eq!(
+            s9_hits_bits(&rc),
+            s9_hits_bits(&ra),
+            "🔴 开关关时必须与今天逐位一致（配了规则也不行，I9-3）"
+        );
+        assert!(rc.metrics.fusion_weights.is_none(), "关 ⇒ 可观测面也不写");
+    }
+
+    /// **S9-T4（I9-4）**：自适应**不改候选池口径**——开关两态对同一 query 的
+    /// `Metrics.candidates`（融合去重后候选数）与两路 lane 计数完全一致。
+    /// 用**触发态**规则（排序会变）做对照，证明「池不变」不是靠「规则没触发」。
+    #[test]
+    fn S9_T4_自适应不改候选池口径() {
+        let (index, analyzer, vi) = build_hybrid_fixture(&[
+            "BM25 是经典关键词检索算法，参数 k1 控制词频饱和",
+            "向量检索把文本编码成向量计算余弦相似度",
+            "混合检索融合关键词和向量两路结果",
+        ]);
+        let e = FakeEmbedder;
+        let off = QueryExecutor::new(&index, &analyzer).with_vector(&e, &vi);
+        let on = QueryExecutor::new(&index, &analyzer)
+            .with_vector(&e, &vi)
+            .with_fusion(Box::new(RrfFusion::new_adaptive(
+                60.0,
+                vec![1.0, 1.5],
+                armed_shape_rule(0.5),
+            )))
+            .with_adaptive_fusion(true);
+
+        let r_off = off.search("检索", SearchMode::Hybrid, 10).unwrap();
+        let r_on = on.search("检索", SearchMode::Hybrid, 10).unwrap();
+        // 前提自证：触发态（权重真的变了）
+        assert_eq!(r_on.metrics.fusion_weights, Some(vec![0.0, 1.5]));
+        assert_eq!(r_off.metrics.candidates, r_on.metrics.candidates);
+        assert_eq!(
+            r_off.metrics.bm25, r_on.metrics.bm25,
+            "BM25 lane 计数不受开关影响"
+        );
+        assert_eq!(
+            r_off.metrics.vector, r_on.metrics.vector,
+            "vector lane 计数不受开关影响"
+        );
+        assert_eq!(r_off.metrics.allowed, r_on.metrics.allowed);
+    }
+
+    /// **S9-T5（I9-6）**：融合开关与精排窗口**正交**——开关两态下，`Reranker`
+    /// 声明的窗口（这里 12 > k）与实际交接条数（`rerank_window`）一字不差。
+    #[test]
+    fn S9_T5_融合开关与精排窗口正交() {
+        // 语料必须 > 窗口（12）：否则 `take_n` 被融合条数封顶，窗口是否生效不可观测
+        // （`rerank_window` 记的是**实际交接**条数，公式值被截短时两者不相等）
+        let texts: Vec<String> = (0..14)
+            .map(|i| format!("第{i}篇：检索算法与向量混合的语料样本"))
+            .collect();
+        let texts: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        let (index, analyzer, vi) = build_hybrid_fixture(&texts);
+        let e = FakeEmbedder;
+        let mk = |adaptive: bool| {
+            QueryExecutor::new(&index, &analyzer)
+                .with_vector(&e, &vi)
+                .with_fusion(Box::new(RrfFusion::new_adaptive(
+                    60.0,
+                    vec![1.0, 1.5],
+                    armed_shape_rule(0.5),
+                )))
+                .with_adaptive_fusion(adaptive)
+                .with_reranker(Box::new(SpyReranker::new(12, false, false).0))
+        };
+        let r_off = mk(false).search("检索", SearchMode::Hybrid, 10).unwrap();
+        let r_on = mk(true).search("检索", SearchMode::Hybrid, 10).unwrap();
+        assert_eq!(
+            r_off.metrics.rerank_window, 12,
+            "前提：窗口 12 生效（off 臂）"
+        );
+        assert_eq!(
+            r_on.metrics.rerank_window, 12,
+            "🔴 自适应不得牵连精排窗口（I9-6：Reranker 一字不动）"
+        );
+        assert_eq!(
+            r_off.metrics.vector_route, r_on.metrics.vector_route,
+            "向量路分派也不受影响"
+        );
+    }
+
+    /// **S9-T7（编排层）**：BM25 lane 为空（query 词全不在词典）时，
+    /// ① `Metrics.fusion_weights == Some([0.0, w])`（tier 1 的可观测判据）；
+    /// ② 结果名次 ≡ `Vector` 单路（空 lane 零贡献 ⇒ ② 独立于 tier 1，如实两记）。
+    #[test]
+    fn S9_T7_编排层tier1可观测面() {
+        let (index, analyzer, vi) = build_hybrid_fixture(&[
+            "BM25 是经典关键词检索算法，参数 k1 控制词频饱和",
+            "向量检索把文本编码成向量计算余弦相似度",
+        ]);
+        let e = FakeEmbedder;
+        // 规则用 θ=0 的纯 tier 1（tier 2 永不触发）⇒ 观测到的 [0.0, 1.5] 只能来自 tier 1
+        let s = QueryExecutor::new(&index, &analyzer)
+            .with_vector(&e, &vi)
+            .with_fusion(Box::new(RrfFusion::new_adaptive(
+                60.0,
+                vec![1.0, 1.5],
+                AdaptiveRule {
+                    signal: AdaptiveSignal::DfCoverage,
+                    theta: 0.0,
+                },
+            )))
+            .with_adaptive_fusion(true);
+        // query 词不在中文语料词典里 ⇒ BM25 lane 空；FakeEmbedder 仍给出确定向量 ⇒ vector lane 非空
+        let r = s.search("zqxjkwv", SearchMode::Hybrid, 10).unwrap();
+        assert!(
+            !r.hits.is_empty(),
+            "前提：vector 路有结果（否则空早退路径测不到）"
+        );
+        assert_eq!(r.metrics.bm25, 0, "前提自证：BM25 lane 确实为空");
+        assert_eq!(
+            r.metrics.fusion_weights,
+            Some(vec![0.0, 1.5]),
+            "🔴 tier 1 生效的可观测证据（S9-T7 ①）"
+        );
+        // ② 名次等价于 Vector 单路（ids 序列比较——两侧 score 量纲不同，只比名次）
+        let v = QueryExecutor::new(&index, &analyzer)
+            .with_vector(&e, &vi)
+            .search("zqxjkwv", SearchMode::Vector, 10)
+            .unwrap();
+        let ids_hybrid: Vec<ChunkId> = r.hits.iter().map(|h| h.chunk_id).collect();
+        let ids_vector: Vec<ChunkId> = v.hits.iter().map(|h| h.chunk_id).collect();
+        assert_eq!(
+            ids_hybrid, ids_vector,
+            "空 BM25 路 ⇒ hybrid 名次 ≡ vector 单路"
+        );
+    }
+
+    /// **S9-T10**：`Metrics` 两个新字段的语义——关时不写、开且未配规则时不写
+    /// （「开了白开」也如实报 `None`）、开且配了规则时写对（权重原样 + 信号值）。
+    #[test]
+    fn S9_T10_Metrics两字段的写入语义() {
+        let (index, analyzer, vi) = build_hybrid_fixture(&[
+            "BM25 是经典关键词检索算法，参数 k1 控制词频饱和",
+            "向量检索把文本编码成向量计算余弦相似度",
+        ]);
+        let e = FakeEmbedder;
+
+        // ① 关 ⇒ 不写（哪怕策略里配了规则）
+        let off = QueryExecutor::new(&index, &analyzer)
+            .with_vector(&e, &vi)
+            .with_fusion(Box::new(RrfFusion::new_adaptive(
+                60.0,
+                vec![1.0, 1.5],
+                armed_shape_rule(0.5),
+            )));
+        let r = off.search("检索", SearchMode::Hybrid, 10).unwrap();
+        assert!(r.metrics.fusion_weights.is_none(), "关 ⇒ 不写");
+        assert!(r.metrics.fusion_signal.is_none(), "关 ⇒ 不写");
+
+        // ② 开 + 未配规则（默认 RrfFusion）⇒ 仍 None（「开了白开」如实可见）
+        let on_no_rule = QueryExecutor::new(&index, &analyzer)
+            .with_vector(&e, &vi)
+            .with_adaptive_fusion(true);
+        let r = on_no_rule.search("检索", SearchMode::Hybrid, 10).unwrap();
+        assert!(
+            r.metrics.fusion_weights.is_none(),
+            "策略未配规则 ⇒ 退回 fuse，报 None"
+        );
+        assert!(r.metrics.fusion_signal.is_none());
+
+        // ③ 开 + 配规则 + 不触发（θ=0.0 ⇒ s=0 不小于 0）⇒ 权重原样 + 信号值如实
+        let on_idle = QueryExecutor::new(&index, &analyzer)
+            .with_vector(&e, &vi)
+            .with_fusion(Box::new(RrfFusion::new_adaptive(
+                60.0,
+                vec![1.0, 1.5],
+                AdaptiveRule {
+                    signal: AdaptiveSignal::DfCoverage,
+                    theta: 0.0,
+                },
+            )))
+            .with_adaptive_fusion(true);
+        let r = on_idle.search("检索", SearchMode::Hybrid, 10).unwrap();
+        assert_eq!(
+            r.metrics.fusion_weights,
+            Some(vec![1.0, 1.5]),
+            "不触发 ⇒ 权重原样"
+        );
+        // 「检索」的去重词项全部在语料里 ⇒ df 覆盖率 = 1.0
+        assert_eq!(r.metrics.fusion_signal, Some(1.0), "信号值如实上报");
+
+        // ④ 单路模式（Bm25）⇒ 不写（开关只在 Hybrid 分支被消费）
+        let r = on_idle.search("检索", SearchMode::Bm25, 10).unwrap();
+        assert!(r.metrics.fusion_weights.is_none(), "单路无融合语义 ⇒ 不写");
+    }
+
+    /// `df_coverage` 探针的口径（s3 信号的数据源）：
+    /// 单段的部分覆盖、空 query、以及**跨段**（词只在 delta 段也要算覆盖）。
+    #[test]
+    fn df覆盖率探针单段与跨段口径() {
+        let (index, analyzer) = build_index(&["检索算法经典", "向量检索余弦"]);
+
+        // 部分覆盖：一个词在语料里、一个不在 ⇒ 0.5（先钉 token 前提再报数）
+        let tokens = analyzer.analyze_query("检索 xyzwq");
+        assert!(
+            tokens.iter().filter(|t| t.term == "xyzwq").count() >= 1,
+            "前提自证：未知词 xyzwq 必须成为 token（否则覆盖率的分母不对）"
+        );
+        let distinct: Vec<String> = {
+            let mut seen = std::collections::HashSet::new();
+            tokens
+                .iter()
+                .filter(|t| seen.insert(t.term.to_string()))
+                .map(|t| t.term.to_string())
+                .collect()
+        };
+        assert_eq!(
+            distinct.len(),
+            2,
+            "前提自证：恰好两个去重词项（检索 / xyzwq）"
+        );
+        let cov = df_coverage(&index, None, &tokens);
+        assert!((cov - 0.5).abs() < 1e-6, "半覆盖应为 0.5，实际 {cov}");
+
+        // 全覆盖与空 query
+        let tokens = analyzer.analyze_query("检索");
+        assert_eq!(df_coverage(&index, None, &tokens), 1.0);
+        assert_eq!(df_coverage(&index, None, &[]), 0.0, "空 query ⇒ 0.0");
+
+        // 跨段：词只在 delta 段 ⇒ 任一段有即算覆盖（main 查不到 ≠ 覆盖 0）
+        let (delta, _) = build_index(&["独此一份的稀有词汇"]);
+        let set = SegmentSet {
+            segments: vec![
+                SegmentRef {
+                    index: &index,
+                    base_doc: 0,
+                    base_chunk: 0,
+                },
+                SegmentRef {
+                    index: &delta,
+                    base_doc: 100,
+                    base_chunk: 100,
+                },
+            ],
+            n: 0, // 探针不消费段数（只查词典），口径与本测试无关
+            total_len: 0,
+            tombstones: 0,
+        };
+        let tokens = analyzer.analyze_query("检索 稀有词汇");
+        let cov = df_coverage(&index, Some(&set), &tokens);
+        assert!(
+            (cov - 1.0).abs() < 1e-6,
+            "词分布在两段 ⇒ 覆盖率应为 1.0（任一段有即算），实际 {cov}"
         );
     }
 }

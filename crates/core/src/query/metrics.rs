@@ -40,7 +40,10 @@ use std::time::Duration;
 use crate::vector::VectorRoute;
 
 /// 一次检索的指标快照。
-#[derive(Debug, Clone, Copy, Default)]
+///
+/// ⚠️ V2 Step 9 起**不再是 `Copy`**（`fusion_weights` 持有 `Vec`）⇒ 需要副本时
+/// 显式 `.clone()`（实测既有的消费面全部是字段访问/引用，无隐式拷贝依赖）。
+#[derive(Debug, Clone, Default)]
 pub struct Metrics {
     /// 总耗时（含两路召回 + 融合 + 回捞）
     pub took: Duration,
@@ -147,6 +150,19 @@ pub struct Metrics {
     /// ⇒ 计数会随 lane 数与 term 命中数虚增，读出来无法解释。「还有几条墓碑没物理化」才是
     /// 调用方真正要的那个量（`0` ⇒ 热路径已回到零谓词）。
     pub tombstoned: usize,
+    /// 本次融合**实际生效**的路权重（V2 Step 9 / S9-4；`None` = 未走自适应通道）。
+    ///
+    /// 填充路径（设计 §4.1 规则 3）：编排层在自适应开关打开时**再调一次**
+    /// `FusionStrategy::weights_override(&ctx)`（`&self` 纯函数 ⇒ 必然与决策同值）。
+    /// 关闭开关 / 策略未配规则 ⇒ `None`（不撒谎：没走就是没走）。
+    ///
+    /// ⚠️ 只在 `Hybrid` 模式下可能为 `Some`（单路无融合语义）。
+    pub fusion_weights: Option<Vec<f32>>,
+    /// 本次自适应决策所依据的**信号值** ∈ [0, 1]（V2 Step 9 / S9-4）。
+    ///
+    /// `None` = 未走自适应通道，或信号在当前 ctx 下无定义（如 s1 需要
+    /// exactly 两路候选）。填充路径与 [`Self::fusion_weights`] 相同。
+    pub fusion_signal: Option<f32>,
 }
 
 impl Metrics {
@@ -170,6 +186,8 @@ impl Metrics {
             segments = self.segments,
             vector_segments = self.vector_segments,
             tombstoned = self.tombstoned,
+            fusion_weights = ?self.fusion_weights,
+            fusion_signal = ?self.fusion_signal,
             "search"
         );
     }
@@ -207,6 +225,12 @@ mod tests {
         assert_eq!(m.segments, 0, "默认 = 草稿缓冲区（编排层入口必覆盖）");
         assert_eq!(m.vector_segments, 0, "默认 = 没走向量路");
         assert_eq!(m.tombstoned, 0, "默认 = 无跨段墓碑");
+        // V2 Step 9 的两个观测字段：默认 = 未走自适应通道（不撒谎）
+        assert!(
+            m.fusion_weights.is_none(),
+            "默认 = 未走自适应通道（S9-T10 关时不写）"
+        );
+        assert!(m.fusion_signal.is_none(), "默认 = 未走自适应通道");
     }
 
     /// `VectorRoute` **四态**齐全且 `Copy`（进 `Metrics` 后不该带来克隆成本）。
@@ -253,6 +277,8 @@ mod tests {
             segments: 3,
             vector_segments: 1,
             tombstoned: 2,
+            fusion_weights: Some(vec![0.0, 1.5]),
+            fusion_signal: Some(0.5),
         };
         full.log("满指标");
     }

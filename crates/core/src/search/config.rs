@@ -61,6 +61,15 @@ pub struct Config {
     /// - ⚠️ **标定结论 = 「不投」**（spike S8-S2，2026-09-21）⇒ **当前没有 >1 的推荐值**；
     ///   字段保留是为了「结论翻转时零改动」，见设计 §4.11.4 / `eval-report.md` §8.15。
     pub embed_sessions: usize,
+    /// **自适应融合开关**（V2 Step 9 / T7-14 / FR-35；**默认 `false`** ⇒ 零行为变化）。
+    ///
+    /// - 只被读端消费（`Searcher::parts` → `SearchParts::adaptive_fusion`）：决定编排层
+    ///   走不走 `FusionStrategy::fuse_adaptive`（开关关 ⇒ 逐位一致，I9-3）；
+    /// - ⚠️ **不进 `ConfigFingerprint`**（只改融合权重，不改索引内容 ⇒ 同一快照在
+    ///   开/关下都合法，S9-T9 钉住）；
+    /// - ⚠️ 规则本体（信号 + θ）在 `fusion` 策略里（`RrfFusion::new_adaptive`）：
+    ///   开了开关而策略未配规则 ⇒ 行为与关**逐位一致**（`weights_override` = `None`）。
+    pub adaptive_fusion: bool,
 }
 
 impl Config {
@@ -145,6 +154,8 @@ pub struct SearchIndexBuilder {
     parallel_build: bool,
     /// 查询侧会话池长度（`S8-08` / `D-S8-11`；默认 **1**）
     embed_sessions: usize,
+    /// 自适应融合开关（V2 Step 9 / T7-14；默认 **false** ⇒ 零行为变化）
+    adaptive_fusion: bool,
 }
 
 impl Default for SearchIndexBuilder {
@@ -170,6 +181,9 @@ impl Default for SearchIndexBuilder {
             // ⇒ 三条合取不成立。结论与**复审触发条件**见 `v2-step8-design.md` §4.11.4 /
             // `eval-report.md` §8.15。
             embed_sessions: 1,
+            // V2 Step 9 / D-S9-03：**默认关**（零行为变化；与 `embed_sessions` 的
+            // 「库侧默认不动」同口径——CLI 只提供显式打开，不给 CLI 默认值）。
+            adaptive_fusion: false,
         }
     }
 }
@@ -323,6 +337,32 @@ impl SearchIndexBuilder {
         self
     }
 
+    /// 打开自适应融合通道（V2 Step 9 / T7-14 / FR-35 / D-S9-03；**默认关**）。
+    ///
+    /// # 它影响什么
+    ///
+    /// 只影响**读端编排**（`SearchParts::adaptive_fusion`）：开关开 ⇒ Hybrid 检索
+    /// 走 `FusionStrategy::fuse_adaptive`（策略可按 query 侧信号覆盖本次权重，
+    /// `FusionCtx` 只含检索自身可观测的量，I9-1）。
+    ///
+    /// # 它**不**影响什么
+    ///
+    /// - **索引内容与配置指纹**：`ConfigFingerprint` **不扩**（只改融合权重 ⇒
+    ///   同一快照在开/关下都合法，S9-T9）；
+    /// - **候选池 / 截断 / 精排窗口**：`candidate_k` 与 `Reranker` 一字不动（I9-4/I9-6）；
+    /// - **单路模式**（bm25 / vector）：开关无语义。
+    ///
+    /// # ⚠️ 与规则本体的关系（两处装配，缺一退化为「开了白开」）
+    ///
+    /// 开关只决定「走不走自适应通道」；**规则**（信号 + θ）在 `fusion` 策略里：
+    /// 请配套 `fusion(Arc::new(RrfFusion::new_adaptive(k, w, rule)))`。策略未配
+    /// 规则时（如默认 `RrfFusion::default()`），开了开关 ⇒ `weights_override` 返回
+    /// `None` ⇒ 行为与关**逐位一致**（`Metrics.fusion_weights` 报 `None`）。
+    pub fn adaptive_fusion(mut self, on: bool) -> Self {
+        self.adaptive_fusion = on;
+        self
+    }
+
     /// 组装出一个空的 `SearchIndex`（消费 builder）。
     ///
     /// 这是默认装配的唯一入口：`SearchIndex::builder().build()` 零配置可用。
@@ -405,6 +445,7 @@ impl SearchIndexBuilder {
             // `0` 是无意义输入（空池会在第一次 `embed_query` 时才炸）⇒ **在装配处**归一为 1，
             // 使 `Config.embed_sessions >= 1` 成为**类型级之外的不变式**（构造点唯一 ⇒ 易守）。
             embed_sessions: crate::embed::normalize_sessions(self.embed_sessions),
+            adaptive_fusion: self.adaptive_fusion,
         };
         cfg.embedder = match &self.embedder {
             // 显式指定（含 `Some(None)` = 纯 BM25）
@@ -779,5 +820,43 @@ mod tests {
             let got = resolve_embedder(require, ok_ctor, 1).unwrap();
             assert!(got.is_some(), "require={require} 构造成功应给出 embedder");
         }
+    }
+    // ---- V2 Step 9 / T7-14：自适应开关的配置层判据（S9-T9） ----
+
+    /// **S9-T9 ①**：`adaptive_fusion` 默认 `false`（零行为变化）且显式 `true` 生效。
+    #[test]
+    fn S9_T9_自适应开关默认关且显式打开生效() {
+        let cfg = SearchIndexBuilder::default().build_config_with(ok_ctor);
+        assert!(
+            !cfg.adaptive_fusion,
+            "默认必须 false（D-S9-03：零行为变化）"
+        );
+
+        let cfg = SearchIndexBuilder::default()
+            .adaptive_fusion(true)
+            .build_config_with(ok_ctor);
+        assert!(cfg.adaptive_fusion, "显式 true 必须原样到达 Config");
+    }
+
+    /// **S9-T9 ②**：自适应开关**不进配置指纹**（只改融合权重 ⇒ 同一快照在
+    /// 开/关下都合法——照 `S8_08_会话数不进配置指纹` 的判据形态）。
+    #[test]
+    fn S9_T9_自适应开关不进配置指纹() {
+        let a = SearchIndexBuilder::default()
+            .adaptive_fusion(false)
+            .build_config_with(ok_ctor);
+        let b = SearchIndexBuilder::default()
+            .adaptive_fusion(true)
+            .build_config_with(ok_ctor);
+        // 前提（自证变量被钉住）：两侧 embedder 同源 ⇒ 差异只可能来自开关
+        assert!(
+            a.embedder.is_some() && b.embedder.is_some(),
+            "前提：注入的构造器必须成功"
+        );
+        assert_eq!(
+            format!("{:?}", a.fingerprint()),
+            format!("{:?}", b.fingerprint()),
+            "🔴 开关改变了指纹 ⇒ 同一索引在开/关下会被判为「配置不匹配」（不该发生）"
+        );
     }
 }

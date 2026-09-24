@@ -192,6 +192,8 @@ impl Searcher {
             segment_set,
             predicate_builder,
             vector_segments,
+            // V2 Step 9 / D-S9-03：自适应开关从 Config 流入编排层（默认 false）
+            adaptive_fusion: self.shared.cfg.adaptive_fusion,
         }
     }
 
@@ -480,5 +482,74 @@ mod tests {
         // 无向量侧：默认 mode 应为 Bm25（而非 Hybrid 报 NoEmbedder）
         let resp = s.search("BM25").unwrap();
         assert!(!resp.hits.is_empty());
+    }
+    /// **V2 Step 9 / S9-T1（门面段）**：`Config::adaptive_fusion` 必须真的流到编排层。
+    ///
+    /// 🔑 这是「链路每一段都有判据」的最后一环（S8-08 的教训：`embed_sessions`
+    /// 曾在 `build_config` 中间段被静默吞掉）：`SearchIndexBuilder → Config →
+    /// `Searcher::parts` → `SearchParts.adaptive_fusion`——若中间任何一段断了，
+    /// 「开了白开」的行为判据（结果照样对）看不见它，必须断言**编排层真的走了
+    /// 自适应通道**（`fusion_weights` 有值）。
+    #[test]
+    fn S9_门面adaptive_fusion真的流到编排层() {
+        use crate::fusion::{AdaptiveRule, AdaptiveSignal, RrfFusion};
+
+        let rule = AdaptiveRule {
+            signal: AdaptiveSignal::QueryShape,
+            theta: 0.5, // 中文 query ⇒ s=0 < 0.5 ⇒ 必触发
+        };
+        let cfg = super::super::config::SearchIndexBuilder::default()
+            .embedder(Some(Arc::new(FakeEmbedder)))
+            .vector_backend(crate::search::VectorBackend::Brute)
+            .fusion(Arc::new(RrfFusion::new_adaptive(
+                60.0,
+                vec![1.0, 1.5],
+                rule,
+            )))
+            .adaptive_fusion(true)
+            .build_config();
+        let mut idx =
+            SearchIndex::from_config(cfg, crate::search::VectorBackend::Brute, Default::default());
+        idx.add("BM25 是经典关键词检索算法").unwrap();
+        idx.add("向量检索把文本编码成向量").unwrap();
+        idx.commit().unwrap();
+        let s = idx.into_searcher().unwrap();
+
+        let resp = s.search("检索").unwrap();
+        assert!(!resp.hits.is_empty(), "前提：检索有结果");
+        assert_eq!(
+            resp.metrics.fusion_weights,
+            Some(vec![0.0, 1.5]),
+            "🔴 开关在门面链路里断了（编排层没走自适应通道）"
+        );
+        assert_eq!(
+            resp.metrics.fusion_signal,
+            Some(0.0),
+            "s4 信号：中文 query ⇒ 0.0"
+        );
+
+        // 对照臂：同样的 fusion 策略、开关不打开 ⇒ 通道关闭（None）
+        let cfg_off = super::super::config::SearchIndexBuilder::default()
+            .embedder(Some(Arc::new(FakeEmbedder)))
+            .vector_backend(crate::search::VectorBackend::Brute)
+            .fusion(Arc::new(RrfFusion::new_adaptive(
+                60.0,
+                vec![1.0, 1.5],
+                rule,
+            )))
+            .build_config();
+        let mut idx2 = SearchIndex::from_config(
+            cfg_off,
+            crate::search::VectorBackend::Brute,
+            Default::default(),
+        );
+        idx2.add("BM25 是经典关键词检索算法").unwrap();
+        idx2.add("向量检索把文本编码成向量").unwrap();
+        idx2.commit().unwrap();
+        let resp = idx2.into_searcher().unwrap().search("检索").unwrap();
+        assert!(
+            resp.metrics.fusion_weights.is_none(),
+            "对照：开关关 ⇒ 通道关闭"
+        );
     }
 }
