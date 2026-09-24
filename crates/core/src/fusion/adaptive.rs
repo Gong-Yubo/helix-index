@@ -35,6 +35,12 @@ use crate::types::{ChunkId, Score};
 /// `last_score == None`——**不用 `0.0` 作哨兵**：BM25 无上界、`0.0` 是合法分值，
 /// 哨兵会让「空 lane」与「非空但全零分 lane」不可区分。
 ///
+/// ⚠️ `top_score` / `last_score` 当前**无生产消费者**（评审 P4-3 如实登记）：
+/// 它们是候选信号 **s2**（BM25 路内部分布）的字段位，而 s2 **不在本 PR 的三个
+/// 候选内**（CLI 只暴露 `overlap|df|shape`）——保留是为「spike 后结论翻转、
+/// s2 上桌」时零改动（同 `embed_sessions` 的预留先例）。删掉它们须同步 `S9_T3`
+/// 白名单。
+///
 /// ⚠️ `entries` 是**整段 lane 的借用**而非 `&[ChunkId]` 切片：`LaneResults` 的
 /// 元素是 `(ChunkId, Score)` 元组，从元组切片投影不出独立的 `&[ChunkId]`（除非
 /// 拷贝）⇒ 重合率信号通过 `entries.iter().map(|(id, _)| *id)` 消费（PR9-1 定形，
@@ -67,6 +73,10 @@ impl<'a> LaneStats<'a> {
 ///
 /// 由编排层在**融合之前**构造；`query_df` 走一次词典探针（O(query 词项数)，
 /// 只查词典、不取正文——与「融合不回捞正文」的硬约束不冲突）。
+///
+/// ⚠️ `query_terms` 当前**无生产消费者**（评审 P4-3 如实登记）：它随 s1/s3 的
+/// 上下文一起入白名单，但三个已实现信号（s1/s3/s4）都不读它——保留是给
+/// 将来的 query 侧信号（含 s2 的扩展形态）留字段位；删掉须同步 `S9_T3` 白名单。
 #[derive(Debug, Clone, Copy)]
 pub struct FusionCtx<'a> {
     /// 各路候选的统计摘要（与召回结果**一一对应**，含**空 lane** 的槽位——I9-2）
@@ -243,15 +253,18 @@ mod tests {
         assert_eq!(s.entries.len(), 0);
     }
 
-    /// **S9-T3 ②（反扫）**：fusion 模块四个源文件**零命中**相关性数据标识。
+    /// **S9-T3 ②（反扫）**：fusion 模块 + **编排层构造点**的源文件**零命中**相关性数据标识。
     ///
     /// 🔴 禁词以**拼接**构造（判据源码里直接写禁词会误伤自扫描——`include_str!`
     /// 把本文件也扫进去）；并先自证检查方法有效（对照样本必须命中——否则
     /// 「零命中」可能是检查本身坏了的假阴性）。
     ///
-    /// ⚠️ 被扫的是 `adaptive.rs` / `mod.rs` / `rrf.rs` / `weighted.rs` 的**源码文本**
-    /// ⇒ fusion 模块的注释/标识符里**不许**出现这三个英文标识（中文写法不受影响，
-    /// 判据只挡「代码里真的 import/读取了这些东西」的形态）。
+    /// ⚠️ 被扫文件 = `adaptive.rs` / `mod.rs` / `rrf.rs` / `weighted.rs` +
+    /// **`query/searcher.rs`**（评审第 1 轮 P3-3：`FusionCtx` 的**唯一生产构造点**
+    /// 在那里——只扫 fusion 四文件时，把 `query_df` / `has_ascii` 换成标签派生量的
+    /// 泄漏会**静默通过**；判据范围必须 ≥ 不变式声明范围）。`query/searcher.rs`
+    /// 将来要提这三个英文标识时会红——那是**有意的**（该文件是信号的输入端，
+    /// 提相关性数据即是红灯信号；中文写法不受影响）。
     #[test]
     fn S9_T3_fusion模块源码反扫相关性标识零命中() {
         // 🔴 拼接构造：源码文本里只有 "qr"+"els" 两半，不会被自己的扫描命中
@@ -273,17 +286,22 @@ mod tests {
             );
         }
 
-        // ② 反扫（include_str! 相对本文件 ⇒ 稳定不随 cwd 漂移）
+        // ② 反扫（include_str! 相对本文件 ⇒ 稳定不随 cwd 漂移）；
+        //    第五个文件 = FusionCtx 的唯一生产构造点（评审 P3-3 扩入）
         for (file, src) in [
             ("adaptive.rs", include_str!("adaptive.rs")),
             ("mod.rs", include_str!("mod.rs")),
             ("rrf.rs", include_str!("rrf.rs")),
             ("weighted.rs", include_str!("weighted.rs")),
+            (
+                "query/searcher.rs（构造点）",
+                include_str!("../query/searcher.rs"),
+            ),
         ] {
             for w in &forbidden {
                 assert!(
                     !src.contains(w.as_str()),
-                    "🔴 fusion/{file} 出现相关性标识 {w:?}（I9-1 违约：信号只许检索自身可观测）"
+                    "🔴 {file} 出现相关性标识 {w:?}（I9-1 违约：信号只许检索自身可观测）"
                 );
             }
         }

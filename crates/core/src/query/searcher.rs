@@ -750,6 +750,12 @@ fn query_has_hits_any(
 /// **每段**各查一次（任一段有即算覆盖——`set.segments` 含 `main`）。
 /// 空 query（0 词项）⇒ `0.0`（该情形 BM25 lane 必空，tier 1 已兜住）。
 ///
+/// ⚠️ **`df > 0` 的含义是「词典收录」，不是「可召回」**（评审 P4-6）：
+/// `Index::doc_freq` = `postings[id].len()`，计数**含未物理化的墓碑条目**
+/// （物理摘除由删除路径负责）⇒ 某词若只出现在已删、未 compact 的分片里，
+/// 覆盖率会被**轻微高估**。方向上保守（信号偏高 ⇒ `s < θ` 更难成立 ⇒
+/// 更少弃 BM25 路，不会误伤该保留的路），不改实现；只在此把口径写明。
+///
 /// 成本 O(|去重词项| × 段数) 次哈希查找，与 `query_has_hits` 同族，可忽略。
 fn df_coverage(
     index: &Index,
@@ -2247,14 +2253,22 @@ mod tests {
 
     /// **S9-T4（I9-4）**：自适应**不改候选池口径**——开关两态对同一 query 的
     /// `Metrics.candidates`（融合去重后候选数）与两路 lane 计数完全一致。
-    /// 用**触发态**规则（排序会变）做对照，证明「池不变」不是靠「规则没触发」。
+    /// 用**触发态**规则做对照，证明「池不变」不是靠「规则没触发」。
+    ///
+    /// 🔑 夹具要害（评审 P4-4 补行为断言时发现——首轮夹具**两路名次恰好同序**，
+    /// 触发态名次不变，行为断言无从落地）。分歧设计（两文档，手算锚点）：
+    ///
+    /// - doc0 =「检索段落」：BM25 命中「检索」（tf=1）⇒ BM25 路 rank 1；
+    ///   向量余弦 **−0.53**（FakeEmbedder 哈希）⇒ vector 路 rank 2。
+    /// - doc1 =「段落段落」：不含「检索」⇒ BM25 路**不命中**；
+    ///   余弦 **+0.88** ⇒ vector 路 rank 1。
+    ///
+    /// 固定权重（1.0, 1.5）：doc0 = 1.0/61 + 1.5/62 ≈ **0.04059** ＞ doc1 = 1.5/61 ≈
+    /// 0.02459 ⇒ **doc0 第一**；触发态（w_bm25=0）：doc0 = 1.5/62 ≈ 0.02419 ＜ doc1
+    /// ≈ 0.02459 ⇒ **doc1 第一**——名次**必然翻转**，两态对照不是「规则没触发」的假对照。
     #[test]
     fn S9_T4_自适应不改候选池口径() {
-        let (index, analyzer, vi) = build_hybrid_fixture(&[
-            "BM25 是经典关键词检索算法，参数 k1 控制词频饱和",
-            "向量检索把文本编码成向量计算余弦相似度",
-            "混合检索融合关键词和向量两路结果",
-        ]);
+        let (index, analyzer, vi) = build_hybrid_fixture(&["检索段落", "段落段落"]);
         let e = FakeEmbedder;
         let off = QueryExecutor::new(&index, &analyzer).with_vector(&e, &vi);
         let on = QueryExecutor::new(&index, &analyzer)
@@ -2268,8 +2282,18 @@ mod tests {
 
         let r_off = off.search("检索", SearchMode::Hybrid, 10).unwrap();
         let r_on = on.search("检索", SearchMode::Hybrid, 10).unwrap();
-        // 前提自证：触发态（权重真的变了）
+        // 前提自证 ①（Metrics 面）：触发态（权重真的变了）
         assert_eq!(r_on.metrics.fusion_weights, Some(vec![0.0, 1.5]));
+        // 前提自证 ②（行为面，评审 P4-4 补）：触发态下**名次真的变了**——
+        // 若这条不成立，「池不变」的对照就是「规则没触发」的假对照。
+        // （s4 触发 ⇒ w_bm25=0 ⇒ hybrid 名次 ≡ vector 单路名次，与固定权重
+        // 的 hybrid 不同——用 chunk_id 序列断言即可，score 量纲两态不同不比。）
+        let ids_off: Vec<ChunkId> = r_off.hits.iter().map(|h| h.chunk_id).collect();
+        let ids_on: Vec<ChunkId> = r_on.hits.iter().map(|h| h.chunk_id).collect();
+        assert_ne!(
+            ids_off, ids_on,
+            "🔴 前提破裂：触发态未改变名次 ⇒ 本用例的对照退化为「规则没触发」"
+        );
         assert_eq!(r_off.metrics.candidates, r_on.metrics.candidates);
         assert_eq!(
             r_off.metrics.bm25, r_on.metrics.bm25,

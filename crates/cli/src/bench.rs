@@ -114,12 +114,21 @@ pub struct BenchArgs {
     /// CLI 硬编码，避免 bench 与 search 的"默认融合"语义分裂（V1-14）
     #[arg(long)]
     pub rrf_weights: Option<String>,
-    /// 自适应融合（V2 Step 9 / T7-14 / FR-35）。**默认 false** ⇒ 与现状逐位一致。
+    /// 自适应融合（V2 Step 9 / T7-14 / FR-35）。**默认 off** ⇒ 与现状逐位一致。
+    ///
+    /// 值形态 `on|off`（`BoolishValueParser`：`on`/`off`/`true`/`false` 都接受，
+    /// 与 `--brute-fallback off` 的开关语义同族）。
     ///
     /// ⚠️ 打开时必须同时给 `--adaptive-fusion-theta`（θ 无默认值——隐式阈值会
     /// 造成不可复现读数）。库侧默认同样不动（`Config::adaptive_fusion` 默认
     /// false），CLI 只提供显式打开（与 `embed_sessions` 的处置口径一致）。
-    #[arg(long, num_args = 1, default_value_t = false, value_name = "on|off")]
+    #[arg(
+        long,
+        num_args = 1,
+        default_value_t = false,
+        value_name = "on|off",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
     pub adaptive_fusion: bool,
     /// 自适应 tier 2 的单阈值 θ ∈ [0, 1]（预注册网格 0.00→1.00 步长 0.05，
     /// v2-step9-design §4.5；sweep 示例见该文档附录 B）。
@@ -388,7 +397,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
         match &adaptive {
             Some(rule) => format!("开启（信号 {}，θ={}）", rule.signal.name(), rule.theta),
             None =>
-                "关（默认；用 --adaptive-fusion true --adaptive-fusion-theta V 开启）".to_string(),
+                "关（默认；用 --adaptive-fusion on --adaptive-fusion-theta V 开启）".to_string(),
         }
     );
     // S5-04：A/B 开关的生效值必须显式打印——「没传」与「off」语义不同，
@@ -1009,9 +1018,19 @@ fn build_backend(
 /// 解析自适应融合规则（V2 Step 9 / T7-14；`None` = 关）。
 ///
 /// 校验三条（都按「不静默忽略」的纪律报错，NFR-07）：
-/// ① 开关关时单独给出 θ / 信号 ⇒ 报错（而不是悄悄忽略）；
+/// ① 开关关时单独给出 θ / **非默认值**信号 ⇒ 报错（而不是悄悄忽略）；
 /// ② 开关开时 θ **必填**（无默认值——隐式阈值会造成不可复现读数，设计 §4.5 预注册）；
 /// ③ θ ∈ [0, 1]、信号名 ∈ {overlap, df, shape}（与内核构造期的 assert 双保险）。
+///
+/// ⚠️ **① 的适用范围（评审 P4-5 如实登记）**：`--adaptive-fusion-signal` 有默认值
+/// `overlap` ⇒ 「显式传 `overlap`」与「没传」在本函数**不可区分**——开关关时传
+/// `overlap` **不会**报错（clap 默认值的固有局限，不是实现缺陷）。会被拒的是
+/// **非默认值**的信号。
+///
+/// ⚠️ **值形态经 clap 解析（评审 P2-1 的根因补齐）**：本函数收到的 `on: bool`
+/// 已是 `BoolishValueParser` 的产物（`on`/`off`/`true`/`false` 都接受）——
+/// 参数用例若只调本函数就**绕开了 clap**，值形态没有判据面；端到端的
+/// `on|off` 断言见 `tests::adaptive_fusion_cli值形态经clap解析`。
 fn adaptive_rule_from(args: &BenchArgs) -> Result<Option<helix_core::fusion::AdaptiveRule>> {
     adaptive_rule_of(
         args.adaptive_fusion,
@@ -1030,15 +1049,19 @@ fn adaptive_rule_of(
     use helix_core::fusion::{AdaptiveRule, AdaptiveSignal};
     if !on {
         if theta.is_some() {
-            bail!("--adaptive-fusion-theta 只在 --adaptive-fusion true 时有效（单独给出会被静默忽略）");
+            bail!(
+                "--adaptive-fusion-theta 只在 --adaptive-fusion on 时有效（单独给出会被静默忽略）"
+            );
         }
         if signal != "overlap" {
-            bail!("--adaptive-fusion-signal 只在 --adaptive-fusion true 时有效（单独给出会被静默忽略）");
+            bail!(
+                "--adaptive-fusion-signal 只在 --adaptive-fusion on 时有效（单独给出会被静默忽略）"
+            );
         }
         return Ok(None);
     }
     let theta = theta.with_context(|| {
-        "--adaptive-fusion true 需要同时给 --adaptive-fusion-theta <V>（θ 无默认值：\
+        "--adaptive-fusion on 需要同时给 --adaptive-fusion-theta <V>（θ 无默认值：\
          避免隐式阈值造成不可复现读数；预注册网格 0.00→1.00 步长 0.05）"
     })?;
     if !(0.0..=1.0).contains(&theta) {
@@ -2697,5 +2720,65 @@ mod tests {
         assert!(adaptive_rule_of(true, Some(1.0), "shape")
             .unwrap()
             .is_some());
+    }
+    /// **P2-1（评审第 1 轮）**：`--adaptive-fusion` 的值形态**必须经 clap 端到端钉住**。
+    ///
+    /// 🔴 背景：`adaptive_rule_of` 的 8 条用例全部绕开 clap（直接传 bool）⇒ 值形态
+    /// 没有任何判据面——首轮 `value_name = "on|off"` 与实际解析器（`bool`）不符，
+    /// `on` 被 clap 拒绝，而 `--help` 同时打印 `<on|off>` 与 `[possible values: true, false]`
+    /// 自相矛盾，本组用例**全绿**（覆盖假象）。
+    ///
+    /// 处置 = 采纳评审口径②：`BoolishValueParser`（`on`/`off`/`true`/`false` 都接受，
+    /// 与 `--brute-fallback off` 同族）。本用例经 `Cli::try_parse_from` 走**真实解析链**。
+    #[test]
+    fn adaptive_fusion_cli值形态经clap解析() {
+        use crate::Command;
+        use clap::Parser;
+
+        let parse_bench = |args: &[&str]| -> Result<BenchArgs, String> {
+            let mut all = vec!["helix", "bench", "--index", "/dev/null"];
+            all.extend_from_slice(args);
+            crate::Cli::try_parse_from(&all)
+                .map(|c| match c.command {
+                    Command::Bench(b) => *b,
+                    _ => unreachable!(),
+                })
+                .map_err(|e| e.to_string())
+        };
+
+        // ① `on` 被接受且解析为 true（首轮缺陷的回归锁）
+        let b = parse_bench(&["--adaptive-fusion", "on", "--adaptive-fusion-theta", "0.5"])
+            .expect("on 必须被 BoolishValueParser 接受（P2-1 回归锁）");
+        assert!(b.adaptive_fusion);
+        let rule = adaptive_rule_from(&b).unwrap().expect("规则成立");
+        assert!((rule.theta - 0.5).abs() < 1e-6);
+
+        // ② `off` / `false` / `true` 三态
+        for (v, expect) in [("off", false), ("false", false), ("true", true)] {
+            let b = parse_bench(&["--adaptive-fusion", v])
+                .unwrap_or_else(|e| panic!("{v} 必须被接受，实际 {e}"));
+            assert_eq!(b.adaptive_fusion, expect, "--adaptive-fusion {v}");
+        }
+
+        // ③ `off` 仍正确触发「关时给 θ 报错」路径（评审实测过这条）
+        let b = parse_bench(&["--adaptive-fusion", "off", "--adaptive-fusion-theta", "0.5"])
+            .expect("off 本身合法");
+        let err = adaptive_rule_from(&b).unwrap_err();
+        assert!(
+            err.to_string().contains("adaptive-fusion-theta"),
+            "实际: {err}"
+        );
+
+        // ④ 非法值被 clap 拒绝（`maybe` 不在 Boolish 词表）
+        assert!(
+            parse_bench(&["--adaptive-fusion", "maybe"]).is_err(),
+            "非法值必须被 clap 拒绝"
+        );
+
+        // ⑤ 裸旗标（无值）被拒（值形态意图：必须显式给 on/off）
+        assert!(
+            parse_bench(&["--adaptive-fusion"]).is_err(),
+            "裸旗标必须被拒（值形态）"
+        );
     }
 }
