@@ -9,6 +9,45 @@
 
 ## [Unreleased]
 
+### 功能 · V2 Step 9 **PR9-1**：自适应融合机制（`S9-02` + `S9-03`，T7-14 / FR-35）（Refs #71，2026-09-24）
+
+按 `v2-step9-design.md` **v0.3**（§8 的 PR 切分）实现——**默认关 ⇒ 零行为变化**（`S9-T1` 逐位一致判据钉住）。
+实现期定形记录见设计 **§4.10**（v0.3 → **v0.4**）。
+
+- **`fusion`**：新增 `FusionCtx` / `LaneStats`（零拷贝借用 lane 本体；字段白名单由 `S9-T3` 的
+  字面量构造 + 源码反扫钉成编译期事实）与 `AdaptiveRule` / `AdaptiveSignal`（三个候选信号
+  s1/s3/s4 都实现，**选型留给 spike S9-S1**）；`FusionStrategy` 新增**两个** provided 方法
+  `weights_override`（决策）/ `fuse_adaptive`（应用通道，P3-1）+ **一个** provided 方法
+  `fusion_signal`（信号值的上报通道，P4-9 的连锁——`Option<Vec<f32>>` 装不下信号值），
+  既有实现**一行不改**、默认逐位一致；`RrfFusion` 覆写三者（tier 1 空 lane 置 0 不删槽 +
+  tier 2 `s < θ` ⇒ BM25 路降到 0；RRF 本体抽成带权重 helper 与 `fuse` 共用，杜绝两份数学）。
+- **编排层**（`query/searcher.rs`）：`SearchParts::adaptive_fusion` 三条规则（关 ⇒ 结构性
+  不调 `fuse_adaptive`；开 ⇒ 构造 ctx 走自适应；开 ⇒ 另调一次 `weights_override` /
+  `fusion_signal` 填 `Metrics`）+ `df_coverage` 词典探针（跨段对每段各查，只查词典不回捞正文）。
+- **配置**：`Config::adaptive_fusion`（默认 `false`，**不进配置指纹**）+
+  `SearchIndexBuilder::adaptive_fusion(bool)` + `QueryExecutor::with_adaptive_fusion(bool)`
+  （bench 走 QueryExecutor 逃生舱）。
+- **可观测**（`Metrics`）：`fusion_weights: Option<Vec<f32>>` / `fusion_signal: Option<f32>`
+  （关 / 未配规则 / 单路 ⇒ `None` 不撒谎）；⚠️ `Metrics` 因此**不再是 `Copy`**
+  （既有消费面全部为字段访问，无隐式拷贝依赖——实测核对）。
+- **CLI（bench）**：`--adaptive-fusion on|off`（值形态，默认关）+ `--adaptive-fusion-theta <V>`
+  （开时**必填**，无默认值——隐式阈值不可复现）+ `--adaptive-fusion-signal overlap|df|shape`
+  （默认 overlap 为占位）；开关关时单独给 θ / 信号即报错（不静默忽略）；档位进 stdout 摘要与
+  JSON `config.adaptive_fusion`（sweep 产物自证跑的哪一档）。
+- **判据**（进 CI）：`S9-T1`（融合层 + 编排层 + 门面三段逐位一致）/ `T2`（空 lane 槽位，
+  权重 `[2.0, 1.5]` 可区分两路防串路）/ `T3`（白名单 + 反扫，禁词拼接构造防自扫描误伤）/
+  `T4`（触发态下候选池口径不变）/ `T5`（与精排窗口正交）/ `T6`（默认实现两通道等价）/
+  `T7`（tier 1 可观测面）/ `T8`（确定性 + 同分 tie-break）/ `T9`（默认关 + 不进指纹）/
+  `T10`（Metrics 两字段写入语义）+ `df_coverage` 探针口径（单段部分覆盖 / 空 query / 跨段）。
+  **变异验证 6 组全部命中**（tier1 关 / tier2 关 / tier2 降错路 / 编排开关失效 / Metrics 不填 /
+  df 恒零；M3 首次注入带行尾语法错被判无效，换合法形态后命中 3 条）。
+- **Q9-2 定论**（实现期问题收口）：BM25 累加点 `partial = idf·(tf…)` 恒 `> 0`
+  （`df ≤ n ⇒ idf = ln(1+x) > 0`；`tf ≥ 1`）⇒ **非空 BM25 lane 不可能含 0 分条目**
+  ⇒ tier 1 **不扩**「`top ≤ 0`」。
+- **覆盖边界（如实登记）**：`bench` 的 `make_searcher` 装配段（`adaptive → with_adaptive_fusion` /
+  `RrfFusion::new_adaptive`）无单测——需要真实 `Setup`（语料 + embedder）；由 PR9-2 的 spike
+  端到端覆盖。`S9-T11`（判据臂，需冻结图）按设计标 `#[ignore]`、走 `scripts/eval_s9.sh`（PR9-2）。
+
 ### 文档 · V2 Step 9 设计 **第 3 轮评审响应**（`v2-step9-design.md` v0.2 → **v0.3 ⇒ 可开工**，PR #70）（Refs #4，2026-09-24）
 
 第 3 轮评审（`pulls/70/reviews` `5303731329`，基线 `a6d87e4`）= **通过 + 3×P4（均不阻塞）**；

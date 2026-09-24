@@ -2,7 +2,7 @@
 
 | 项 | 内容 |
 | --- | --- |
-| 版本 | **v0.3（2026-09-24，第 3 轮评审响应 ⇒ 可开工）** —— v0.1（首版）→ **v0.2**（第 1~2 轮）→ **v0.3**（第 3 轮：架构行号重取 + 附录 B 的 bash 变量 + `Metrics` 填充路径）；**逐条处置见 §4.8 与 §4.9**。⚠️ **本版起 PR9-1 可直接开工**（见 §4.9 的「开工前清单」） |
+| 版本 | **v0.4（2026-09-24，PR9-1 实现期定形记录 ⇒ 见 §4.10）** —— v0.1（首版）→ v0.2（第 1~2 轮）→ v0.3（第 3 轮 ⇒ 可开工）→ **v0.4**（§4.10：ctx 字段定形 / 第三个 provided 方法 / `Metrics` 拆 `Copy` / Q9-2 定论）；**逐条处置见 §4.8 ~ §4.10** |
 | 日期 | 2026-09-23 |
 | 状态 | **已过三轮评审**（第 1 轮「通过 + 3×P4」、第 2 轮「**有条件通过 + 1×P3 + 6×P4**」、第 3 轮「**通过 + 3×P4**」）⇒ **全部逐条处置完毕**（**§4.8 / §4.9**）⇒ **本文已处于「可开工」状态**（PR9-1 可直接进入实现）。本文**纯设计、`.rs` 零改动**（体例同 `v2-step5-design.md` / `v2-step8-design.md` 的首版）。 |
 | 上游 | `plan-v2.md` **v0.25** §4 Step 9 / §4.0 **H7** / §5（**FR-35** / **NFR-15** 草案）/ §6「V2.1 门槛」/ §附-4（P0-4、P0-5、P1-10）；`requirements-spec.md` **v1.24**（§附-1：**FR-35** / **NFR-15**）；`architecture-design.md` **v1.24**（**§5.6** `FusionStrategy` / **§5.7** `Reranker` 的 provided 方法先例 / **§14.7** = 本步新增风险 R55~R58）；`eval-report.md` **§3.3**（分桶读数）/ **§3.4**（图抖动）/ **§8.15**；issue **#4**（本步入口）/ **#71**（本步跟踪，2026-09-24 建） |
@@ -463,6 +463,72 @@ pub trait FusionStrategy: Send + Sync {
 
 ⚠️ **仍留给实现期 / spike 的（设计期刻意不拍）**：`Q9-1`（tier 2 信号选型 → S9-S1）、
 `Q9-2`（BM25 是否产生 `score == 0` 的非空 lane）、`Q9-3~Q9-5`（评审拍板项）。
+
+---
+
+### 4.10 PR9-1 实现期定形记录（2026-09-24；本文 v0.3 → **v0.4**）
+
+> §4.8 的「未闭环」里写过：`fuse_adaptive` 的签名与 ctx 的**具体字段**在 PR9-1 定形时可能微调。
+> 本节记录实际定形——**机制（两方法 + 开关三规则）零改动落地**；以下为字段面与连带决策。
+> 对应实现 = PR9-1（S9-02 + S9-03 + 判据 S9-T1~T10）。
+
+#### ① `FusionCtx` / `LaneStats` 的最终字段（S9-T3 白名单即此）
+
+| 类型 | 定形字段 | 与设计原文的差异与理由 |
+| --- | --- | --- |
+| `LaneStats<'a>` | `len` / `top_score: Option<f32>` / `last_score: Option<f32>` / **`entries: &'a [(ChunkId, Score)]`** | 设计 §4.3 s1 说的是「`chunk_ids` 切片」——但 `LaneResults` 的元素是 `(ChunkId, Score)` **元组**，从元组切片投影不出独立的 `&[ChunkId]`（除非拷贝）⇒ 取**语义等价的零拷贝整段借用**（s1 对 `entries` 逐条取 `id` 消费） |
+| `FusionCtx<'a>` | `lanes` / `query_terms` / **`query_chars`** / **`has_ascii`** / **`query_df: f32`** / **`top_k: usize`** | 后四个是 §4.3 的 s1/s3/s4 落位：`query_df` = **去重**词项中 `df > 0` 的占比（跨段对每段各查、任一段有即算）；`top_k` = 判据的 `k`（s1 的 top-k 口径须与判据钉死）且 `weights_override` 签名里没有 `k` ⇒ 只能经 ctx 传入 |
+
+#### ② 第三个 provided 方法 `fusion_signal`（P4-9 的连锁缺口，实现期补闭合）
+
+§4.1 规则 3 说「编排层另调一次 `weights_override(&ctx)` 专用于填 `Metrics`（`fusion_weights` / `fusion_signal`）」——
+但 `weights_override` 的返回类型 `Option<Vec<f32>>` **装不下信号值**（设计自身的不闭合处）。
+⇒ 补 `fn fusion_signal(&self, ctx) -> Option<f32>`（provided，默认 `None`）：
+- 与 `weights_override` 同为 `&self` **纯函数** ⇒ 规则 3 的「再调一次必然同值」论证**原样成立**；
+- 不改 `weights_override` / `fuse_adaptive` 的已评审签名（P3-1 的谈判成果不动）；
+- 信号无定义（如 s1 需要 exactly 两路 / `k == 0`）⇒ `None`，tier 2 不触发。
+
+#### ③ `Metrics` 拆 `Copy`（设计未点破的连锁）
+
+`fusion_weights: Option<Vec<f32>>` 与 `#[derive(Copy)]` 互斥 ⇒ `Metrics` 自 Step 9 起
+**只有 `Clone`**。实现前实测核对：全仓 `Metrics` 消费面均为**字段访问 / 引用**（无隐式拷贝依赖）
+⇒ 拆除零影响。**此为 §6.1「按字面是破坏性」之外的又一处**，PR 正文已单列。
+
+#### ④ Q9-2 定论：tier 1 **不扩**「`top ≤ 0`」
+
+BM25 累加点（`retriever/bm25.rs` 的 TAAT 循环）：`partial = idf · tf(k1+1)/(tf+norm)`，
+其中 `idf = ln(1 + x)`、`x = (n − df + 0.5)/(df + 0.5)` —— `df ≤ n ⇒ x > 0 ⇒ idf > 0`；
+posting 条目 `tf ≥ 1` ⇒ **每个进入 lane 的条目分值恒 `> 0`**。
+⇒ 「非空但全零分的 BM25 lane」**结构性不存在**，tier 1 保持「`len == 0`」单一条件。
+
+#### ⑤ tier 2 与信号的实现取形
+
+- **降权取形 = 降到 `0`**（§4.2「单调映射降到 0」的最简形态；非缩放/档位）⇒ S9-1b 的上界
+  「结构性可达」成立（触发后该次 hybrid 的名次 ≡ vector 单路）。
+- **s4 = `has_ascii` 的 0/1 二值**（与 `t2_prep.rs:193` 的 mixed 判据同源；`query_chars` 入 ctx
+  但不进 s4——「短 query ⇒ exact 桶 ⇒ BM25 占优」与「低信号 ⇒ 弃 BM25」方向相反，掺进去
+  反而伤 exact 桶）。⚠️ 二值信号 ⇒ θ 网格上只有两个行为档，spike 如实读。
+- **s1 的短 lane 仍按 k 归一**（分母换成实际长度会把「分歧」藏起来）。
+- **三信号都可经 CLI 选择**（`--adaptive-fusion-signal overlap|df|shape`）——spike S9-S1 要
+  「各跑一遍灵敏度曲线」（§4.3），没有选择通道就跑不了对照。
+
+#### ⑥ CLI 面（附录 B 的落地口径）
+
+`--adaptive-fusion on|off`（**值形态**，默认关）+ `--adaptive-fusion-theta <V>`（开关开时
+**必填、无默认值**——隐式阈值会造成不可复现读数）+ `--adaptive-fusion-signal <NAME>`
+（默认 `overlap` 为**占位**、非定稿结论）。开关关时单独给出 θ / 信号 ⇒ **报错**（不静默忽略，
+NFR-07）。档位进 stdout 摘要与 JSON `config.adaptive_fusion`（sweep 的 21 个 θ 文件各自
+自证跑的哪一档）。
+
+#### ⑦ 覆盖边界（如实登记）
+
+- `bench` 的 `make_searcher` 装配段（`adaptive → with_adaptive_fusion` / `RrfFusion::new_adaptive`）
+  **无单测**——需要真实 `Setup`（语料 + embedder）；由 PR9-2 的 spike **端到端覆盖**
+  （跑数时 `fusion_weights` 断言先红即暴露断线）。
+- `S9-T11`（判据臂）需冻结图 + 语料，按 §7 标注走 `scripts/eval_s9.sh`（PR9-2 交付），
+  本 PR 不含。
+- 变异验证 6 组（tier1 关 / tier2 关 / tier2 降错路 / 编排开关失效 / Metrics 不填权重 /
+  df 覆盖恒零）**全部命中**，逐轮 md5 核对还原。
 
 ---
 
