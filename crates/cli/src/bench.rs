@@ -114,6 +114,23 @@ pub struct BenchArgs {
     /// CLI 硬编码，避免 bench 与 search 的"默认融合"语义分裂（V1-14）
     #[arg(long)]
     pub rrf_weights: Option<String>,
+    /// 自适应融合（V2 Step 9 / T7-14 / FR-35）。**默认 false** ⇒ 与现状逐位一致。
+    ///
+    /// ⚠️ 打开时必须同时给 `--adaptive-fusion-theta`（θ 无默认值——隐式阈值会
+    /// 造成不可复现读数）。库侧默认同样不动（`Config::adaptive_fusion` 默认
+    /// false），CLI 只提供显式打开（与 `embed_sessions` 的处置口径一致）。
+    #[arg(long, num_args = 1, default_value_t = false, value_name = "on|off")]
+    pub adaptive_fusion: bool,
+    /// 自适应 tier 2 的单阈值 θ ∈ [0, 1]（预注册网格 0.00→1.00 步长 0.05，
+    /// v2-step9-design §4.5；sweep 示例见该文档附录 B）。
+    #[arg(long, value_name = "V")]
+    pub adaptive_fusion_theta: Option<f32>,
+    /// 自适应 tier 2 的信号（overlap | df | shape）。
+    ///
+    /// 三个候选（s1/s3/s4）都实现了——**选型留给 spike S9-S1**（跑灵敏度曲线后
+    /// 按决策门 G1~G5 定夺，设计 §4.3），默认 overlap 只是占位、不是定稿结论。
+    #[arg(long, default_value = "overlap", value_name = "NAME")]
+    pub adaptive_fusion_signal: String,
     /// Recall/MRR 的相关性阈值（1 或 2；主表两列都输出）
     #[arg(long, default_value_t = 1)]
     pub rel_threshold: u8,
@@ -325,6 +342,8 @@ pub fn run(args: BenchArgs) -> Result<()> {
             rrf_weights
         );
     }
+    // V2 Step 9 / T7-14：自适应融合规则（None = 关 = 与现状逐位一致）
+    let adaptive = adaptive_rule_from(&args)?;
 
     // ---- 1. 加载 ----
     let mut setup = load_setup(&args, need_vector, reranker)?;
@@ -363,6 +382,15 @@ pub fn run(args: BenchArgs) -> Result<()> {
             None => "关（NoOp；用 --rerank-window R 开启）".to_string(),
         }
     );
+    // V2 Step 9 / T7-14：自适应档位同理由——sweep 跑错一档，θ 曲线整个作废。
+    println!(
+        "自适应融合: {}",
+        match &adaptive {
+            Some(rule) => format!("开启（信号 {}，θ={}）", rule.signal.name(), rule.theta),
+            None =>
+                "关（默认；用 --adaptive-fusion true --adaptive-fusion-theta V 开启）".to_string(),
+        }
+    );
     // S5-04：A/B 开关的生效值必须显式打印——「没传」与「off」语义不同，
     // 标定时看错一行就会把"全部退化成 ANN 基线"当成"兜底无效"。
     println!(
@@ -390,6 +418,16 @@ pub fn run(args: BenchArgs) -> Result<()> {
         );
     }
 
+    // V2 Step 9 / T7-14：自适应档位进 JSON（sweep 的每个产物文件都要能自证
+    // 跑的是哪个信号、哪个 θ——否则 21 个 θ 文件对不上号）
+    let adaptive_json = match &adaptive {
+        Some(rule) => serde_json::json!({
+            "enabled": true,
+            "signal": rule.signal.name(),
+            "theta": rule.theta,
+        }),
+        None => serde_json::json!({"enabled": false}),
+    };
     let mut json = serde_json::json!({
         "config": {
             "k": args.k, "k1": bm25_params.k1, "b": bm25_params.b, "rrf_k": rrf_k,
@@ -399,6 +437,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
             "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
             "filter": args.filter.join(" AND "),
             "oracle_depth": args.oracle_depth,
+            "adaptive_fusion": adaptive_json,
         },
         "n_queries": judgments.len(),
         "n_corpus": setup.index.num_chunks(),
@@ -449,7 +488,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
         }
         let mut results: HashMap<String, ModeResult> = HashMap::new();
         for &mode in &modes {
-            let searcher = make_searcher(&setup, bm25_params, rrf_k, &rrf_weights, mode)?;
+            let searcher = make_searcher(&setup, bm25_params, rrf_k, &rrf_weights, adaptive, mode)?;
             results.insert(
                 mode_name(mode).to_string(),
                 eval_effect(
@@ -578,7 +617,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
         }
         let mut lat_rows: Vec<(SearchMode, LatencyResult)> = Vec::new();
         for &mode in &modes {
-            let searcher = make_searcher(&setup, bm25_params, rrf_k, &rrf_weights, mode)?;
+            let searcher = make_searcher(&setup, bm25_params, rrf_k, &rrf_weights, adaptive, mode)?;
             let lat = eval_latency(
                 &searcher,
                 &judgments,
@@ -691,6 +730,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
                     bm25_params,
                     rrf_k,
                     rrf_weights: &rrf_weights,
+                    adaptive,
                 },
                 &modes,
                 &judgments,
@@ -966,14 +1006,62 @@ fn build_backend(
     }
 }
 
+/// 解析自适应融合规则（V2 Step 9 / T7-14；`None` = 关）。
+///
+/// 校验三条（都按「不静默忽略」的纪律报错，NFR-07）：
+/// ① 开关关时单独给出 θ / 信号 ⇒ 报错（而不是悄悄忽略）；
+/// ② 开关开时 θ **必填**（无默认值——隐式阈值会造成不可复现读数，设计 §4.5 预注册）；
+/// ③ θ ∈ [0, 1]、信号名 ∈ {overlap, df, shape}（与内核构造期的 assert 双保险）。
+fn adaptive_rule_from(args: &BenchArgs) -> Result<Option<helix_core::fusion::AdaptiveRule>> {
+    adaptive_rule_of(
+        args.adaptive_fusion,
+        args.adaptive_fusion_theta,
+        &args.adaptive_fusion_signal,
+    )
+}
+
+/// `adaptive_rule_from` 的实现体（拆出来只为可单测——`BenchArgs` 的全字段构造
+/// 在测试里不可行）。校验规则见 [`adaptive_rule_from`] 的文档。
+fn adaptive_rule_of(
+    on: bool,
+    theta: Option<f32>,
+    signal: &str,
+) -> Result<Option<helix_core::fusion::AdaptiveRule>> {
+    use helix_core::fusion::{AdaptiveRule, AdaptiveSignal};
+    if !on {
+        if theta.is_some() {
+            bail!("--adaptive-fusion-theta 只在 --adaptive-fusion true 时有效（单独给出会被静默忽略）");
+        }
+        if signal != "overlap" {
+            bail!("--adaptive-fusion-signal 只在 --adaptive-fusion true 时有效（单独给出会被静默忽略）");
+        }
+        return Ok(None);
+    }
+    let theta = theta.with_context(|| {
+        "--adaptive-fusion true 需要同时给 --adaptive-fusion-theta <V>（θ 无默认值：\
+         避免隐式阈值造成不可复现读数；预注册网格 0.00→1.00 步长 0.05）"
+    })?;
+    if !(0.0..=1.0).contains(&theta) {
+        bail!("--adaptive-fusion-theta 需 ∈ [0, 1]，收到 {theta}");
+    }
+    let signal = AdaptiveSignal::from_name(signal).with_context(|| {
+        format!("--adaptive-fusion-signal 需为 overlap / df / shape，收到 {signal:?}")
+    })?;
+    Ok(Some(AdaptiveRule { signal, theta }))
+}
+
 fn make_searcher<'a>(
     setup: &'a Setup,
     params: Bm25Params,
     rrf_k: f32,
     rrf_weights: &[f32],
+    adaptive: Option<helix_core::fusion::AdaptiveRule>,
     mode: SearchMode,
 ) -> Result<QueryExecutor<'a>> {
     let mut s = QueryExecutor::new(&setup.index, setup.analyzer.as_ref()).with_bm25_params(params);
+    // V2 Step 9：开关与规则成对流入（规则进策略、开关进编排层；缺一退化为
+    // 「开了白开」/「配了白配」——两处都由 `args` 的校验保证同现，见 adaptive_rule_from）
+    s = s.with_adaptive_fusion(adaptive.is_some());
     if mode != SearchMode::Bm25 {
         let e = setup
             .embedder
@@ -984,9 +1072,13 @@ fn make_searcher<'a>(
             .as_ref()
             .context("vector/hybrid 模式需要向量后端")?;
         // bench 一律覆盖 fusion（哪怕 hybrid 用默认 k）——保证 --rrf-k/--rrf-weights 生效
+        let fusion = match adaptive {
+            Some(rule) => RrfFusion::new_adaptive(rrf_k, rrf_weights.to_vec(), rule),
+            None => RrfFusion::new(rrf_k, rrf_weights.to_vec()),
+        };
         s = s
             .with_vector(e, vi.as_index())
-            .with_fusion(Box::new(RrfFusion::new(rrf_k, rrf_weights.to_vec())));
+            .with_fusion(Box::new(fusion));
     }
     // V2 Step 7 / S7-03：精排注入。`Arc::clone` ⇒ 每 mode × 每 run 装配的 4 个入口
     // （效果 / 延迟 / 并发 / 网格）共享**同一个**模型实例；未开启时保持默认 NoOp
@@ -1578,6 +1670,7 @@ struct SearchAssembly<'a> {
     bm25_params: Bm25Params,
     rrf_k: f32,
     rrf_weights: &'a [f32],
+    adaptive: Option<helix_core::fusion::AdaptiveRule>,
 }
 
 /// 跑**一档**线程数：N 个 worker 用 `&` 共享 `searcher`，各自跑**同一批 query 的同一顺序**。
@@ -1818,7 +1911,14 @@ fn run_concurrent_stage(
     let mut report = String::new();
     let mut out = serde_json::Map::new();
     for &mode in modes {
-        let searcher = make_searcher(setup, asm.bm25_params, asm.rrf_k, asm.rrf_weights, mode)?;
+        let searcher = make_searcher(
+            setup,
+            asm.bm25_params,
+            asm.rrf_k,
+            asm.rrf_weights,
+            asm.adaptive,
+            mode,
+        )?;
         let spec = BatchSpec {
             mode,
             k: args.k,
@@ -2073,6 +2173,8 @@ fn eval_grid(setup: &Setup, judgments: &[Judgment], k: usize, rrf_k: f32) -> Res
                 Bm25Params { k1, b },
                 rrf_k,
                 &[1.0, 1.0],
+                // 网格搜的是 BM25 参数（Bm25 模式不消费融合）⇒ 自适应规则不传入
+                None,
                 SearchMode::Bm25,
             )?;
             // 网格搜索只调参、不过滤：整束传 none
@@ -2535,5 +2637,65 @@ mod tests {
             "没开精排（控制组 A）⇒ 不收，**哪怕** `rerank_elapsed` 非零（NoOp 空调用）"
         );
         assert!(!should_collect_rerank(false, 0), "两条都不成立 ⇒ 不收");
+    }
+    // ---- V2 Step 9 / T7-14：自适应融合的 CLI 参数校验 ----
+
+    /// `--adaptive-fusion` 系列开关的解析：关/开/三拒绝路径。
+    #[test]
+    fn 自适应融合参数的解析与拒绝路径() {
+        use helix_core::fusion::AdaptiveSignal;
+
+        // ① 默认关 ⇒ None（与现状逐位一致）
+        assert!(adaptive_rule_of(false, None, "overlap").unwrap().is_none());
+
+        // ② 开 + θ + 默认信号 ⇒ 规则成立
+        let rule = adaptive_rule_of(true, Some(0.55), "overlap")
+            .unwrap()
+            .unwrap();
+        assert_eq!(rule.signal, AdaptiveSignal::Overlap);
+        assert!((rule.theta - 0.55).abs() < 1e-6);
+
+        // ③ 三个信号都可解析
+        for (name, expect) in [
+            ("overlap", AdaptiveSignal::Overlap),
+            ("df", AdaptiveSignal::DfCoverage),
+            ("shape", AdaptiveSignal::QueryShape),
+        ] {
+            let rule = adaptive_rule_of(true, Some(0.0), name).unwrap().unwrap();
+            assert_eq!(rule.signal, expect, "信号 {name} 必须可解析");
+        }
+
+        // ④ 拒绝路径 1：开关关时单独给 θ（不静默忽略）
+        let err = adaptive_rule_of(false, Some(0.5), "overlap").unwrap_err();
+        assert!(
+            err.to_string().contains("adaptive-fusion-theta"),
+            "实际: {err}"
+        );
+
+        // ⑤ 拒绝路径 2：开关关时单独给非默认信号
+        let err = adaptive_rule_of(false, None, "df").unwrap_err();
+        assert!(
+            err.to_string().contains("adaptive-fusion-signal"),
+            "实际: {err}"
+        );
+
+        // ⑥ 拒绝路径 3：开了开关但没给 θ（θ 无默认值——隐式阈值不可复现）
+        let err = adaptive_rule_of(true, None, "overlap").unwrap_err();
+        assert!(
+            err.to_string().contains("adaptive-fusion-theta"),
+            "实际: {err}"
+        );
+
+        // ⑦ 拒绝路径 4/5：θ 越界 / 未知信号名
+        assert!(adaptive_rule_of(true, Some(1.5), "overlap").is_err());
+        assert!(adaptive_rule_of(true, Some(0.5), "nope").is_err());
+
+        // ⑧ 边界：θ = 0.0 与 θ = 1.0 都合法（预注册网格的端点）
+        assert!(adaptive_rule_of(true, Some(0.0), "shape")
+            .unwrap()
+            .is_some());
+        assert!(adaptive_rule_of(true, Some(1.0), "shape")
+            .unwrap()
+            .is_some());
     }
 }
