@@ -127,7 +127,11 @@ pub struct BenchArgs {
         num_args = 1,
         default_value_t = false,
         value_name = "on|off",
-        value_parser = clap::builder::BoolishValueParser::new()
+        value_parser = clap::builder::BoolishValueParser::new(),
+        // 展示面（第 2 轮评审 P3-1）：BoolishValueParser::possible_values() 仍返回
+        // true/false ⇒ help 会同屏打印 `<on|off>` 与 `[possible values: true, false]`
+        // 自相矛盾。隐藏之（值名 `on|off` 保留，是实际接受集的可读子集）。
+        hide_possible_values = true
     )]
     pub adaptive_fusion: bool,
     /// 自适应 tier 2 的单阈值 θ ∈ [0, 1]（预注册网格 0.00→1.00 步长 0.05，
@@ -2779,6 +2783,28 @@ mod tests {
         assert!(
             parse_bench(&["--adaptive-fusion"]).is_err(),
             "裸旗标必须被拒（值形态）"
+        );
+
+        // ⑥ 展示面（第 2 轮评审 P3-1）：help 里**不再出现** `[possible values: true, false]`
+        //    —— 原缺陷的一半正是从渲染面漏过去的（行为对了、渲染仍自相矛盾：
+        //    `value_name = "on|off"` vs `BoolishValueParser` 的 possible_values = true/false）。
+        //    判据取 `render_help` 的**实际渲染文本**（含 `on|off`、不含 `possible values`）。
+        use clap::CommandFactory;
+        let help = crate::Cli::command()
+            .find_subcommand_mut("bench")
+            .expect("bench 子命令存在")
+            .render_help()
+            .to_string();
+        assert!(
+            help.contains("--adaptive-fusion <on|off>"),
+            "help 应含值名 on|off（实际片段：{}）",
+            help.lines()
+                .find(|l| l.contains("adaptive-fusion"))
+                .unwrap_or("<未找到>")
+        );
+        assert!(
+            !help.contains("possible values: true, false"),
+            "🔴 help 仍打印与 <on|off> 矛盾的 possible values 行（展示面未闭合）"
         );
     }
 }
