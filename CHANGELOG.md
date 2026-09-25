@@ -9,6 +9,83 @@
 
 ## [Unreleased]
 
+### 文档 · V2 Step 9 **PR9-1 第 2 轮评审响应**（设计 v0.5 → **v0.6**，PR #72）（Refs #71，2026-09-25）
+
+第 2 轮评审（`pulls/72/reviews` `5314490717`，基线 `d3ebf52`，响应验证型复审）= **✅ 通过——
+无阻塞项、达到可合并形态**；第 1 轮 10 条处置逐条独立验证为落实（含手算锚点的离线重实现复算，
+逐位吻合）。新意见 **1×P3 + 1×P4** 逐条采纳：
+
+- **P3-1**：P2-1 的**展示面残余**（`--help` 仍同屏打印 `<on\|off>` 与 `[possible values: true, false]`）
+  ⇒ 加 `hide_possible_values = true`（一行）+ **help 渲染判据**（`adaptive_fusion_cli值形态经clap解析`
+  第 ⑥ 臂：断言渲染文本含 `on\|off` 且不含 `possible values: true, false`；变异实测去掉该属性当场红；
+  实机 `--help` 核验矛盾行消失）。
+- **P4-1**：§4.11 P3-1 行「逐项加注」与实物不符（§4.9 仅形态行有注、§7 S9-T6 行未加注）⇒ 就地更正
+  （写明实际范围 + 原措辞引文保留）+ §7 S9-T6 行补注「两个 → 三个」。
+- 设计 **v0.6**（§4.12）。
+
+### 文档 · V2 Step 9 **PR9-1 第 1 轮评审响应**（设计 v0.4 → **v0.5**，PR #72）（Refs #71，2026-09-25）
+
+评审（`pulls/72/reviews` `5307035441`，基线 `d38c6b0`，独立验证型复审 + 10 条行内）=
+**有条件通过——无阻塞项（0×P1）+ 1×P2 + 3×P3 + 6×P4**，**逐条全部采纳**（P4-4 采纳了
+比建议更强的「补行为断言」形态）。机制面零改动。
+
+- 🔴 **P2-1**：`--adaptive-fusion` 值形态四处不一致（`on` 被 clap 拒、`--help` 自相矛盾）
+  ⇒ **采纳口径②**：`BoolishValueParser`（1 行）+ **值形态经 clap 端到端的判据**
+  （原 8 条参数用例全绕开 clap = 根因）+ 四处文案同步（PR9-2 的 sweep 依赖此旗标）。
+- **P3-1/P3-2**：设计状态行/日期行随 v0.5 更新；附录 A 补 `fusion_signal` 行、§6.4
+  「两个 provided 方法」改「三个」（防 PR9-4 架构回写漏第三个方法）。
+- **P3-3**：I9-1 反扫**扩到 `FusionCtx` 唯一生产构造点**（`query/searcher.rs`）——
+  判据范围必须 ≥ 不变式声明范围；变异实测构造点注入禁词当场红（两条不成串的无效注入废弃）。
+- **P4-1**：变异登记修正（M1=3 / M2=5，评审独立复算属实；根因 = 按过滤子集跑）。
+- **P4-4**：`S9-T4` 补 `assert_ne!` 行为断言 ⇒ **抓出首轮夹具两路名次同序的结构性问题**
+  ⇒ 重设计分歧夹具（「检索段落」vs「段落段落」，手算锚点名次翻转）。
+- **P4-2/3/5/6**：如实登记类（幂等不可分辨 / s2 预留 / 默认值口径 / df 词典收录口径）。
+- 设计 **v0.5**（§4.11 逐条处置 + §4.10 三处更新）。
+
+### 功能 · V2 Step 9 **PR9-1**：自适应融合机制（`S9-02` + `S9-03`，T7-14 / FR-35）（Refs #71，2026-09-24）
+
+按 `v2-step9-design.md` **v0.3**（§8 的 PR 切分）实现——**默认关 ⇒ 零行为变化**（`S9-T1` 逐位一致判据钉住）。
+实现期定形记录见设计 **§4.10**（v0.3 → **v0.4**）。
+
+- **`fusion`**：新增 `FusionCtx` / `LaneStats`（零拷贝借用 lane 本体；字段白名单由 `S9-T3` 的
+  字面量构造 + 源码反扫钉成编译期事实）与 `AdaptiveRule` / `AdaptiveSignal`（三个候选信号
+  s1/s3/s4 都实现，**选型留给 spike S9-S1**）；`FusionStrategy` 新增**两个** provided 方法
+  `weights_override`（决策）/ `fuse_adaptive`（应用通道，P3-1）+ **一个** provided 方法
+  `fusion_signal`（信号值的上报通道，P4-9 的连锁——`Option<Vec<f32>>` 装不下信号值），
+  既有实现**一行不改**、默认逐位一致；`RrfFusion` 覆写三者（tier 1 空 lane 置 0 不删槽 +
+  tier 2 `s < θ` ⇒ BM25 路降到 0；RRF 本体抽成带权重 helper 与 `fuse` 共用，杜绝两份数学）。
+- **编排层**（`query/searcher.rs`）：`SearchParts::adaptive_fusion` 三条规则（关 ⇒ 结构性
+  不调 `fuse_adaptive`；开 ⇒ 构造 ctx 走自适应；开 ⇒ 另调一次 `weights_override` /
+  `fusion_signal` 填 `Metrics`）+ `df_coverage` 词典探针（跨段对每段各查，只查词典不回捞正文）。
+- **配置**：`Config::adaptive_fusion`（默认 `false`，**不进配置指纹**）+
+  `SearchIndexBuilder::adaptive_fusion(bool)` + `QueryExecutor::with_adaptive_fusion(bool)`
+  （bench 走 QueryExecutor 逃生舱）。
+- **可观测**（`Metrics`）：`fusion_weights: Option<Vec<f32>>` / `fusion_signal: Option<f32>`
+  （关 / 未配规则 / 单路 ⇒ `None` 不撒谎）；⚠️ `Metrics` 因此**不再是 `Copy`**
+  （既有消费面全部为字段访问，无隐式拷贝依赖——实测核对）。
+- **CLI（bench）**：`--adaptive-fusion on|off`（值形态，默认 off；v0.5 起经 `BoolishValueParser`
+  解析——`on`/`off`/`true`/`false` 都接受，评审 P2-1 修正：原实现只认 `true|false`，与
+  `value_name="on|off"` 及 `--help` 自相矛盾）+ `--adaptive-fusion-theta <V>`
+  （开时**必填**，无默认值——隐式阈值不可复现）+ `--adaptive-fusion-signal overlap|df|shape`
+  （默认 overlap 为占位）；开关关时单独给 θ / **非默认值**信号即报错（不静默忽略；⚠️ 显式
+  `overlap` 与不传在 clap 默认值下不可区分，不会被拒——范围如实登记）；档位进 stdout 摘要与
+  JSON `config.adaptive_fusion`（sweep 产物自证跑的哪一档）。
+- **判据**（进 CI）：`S9-T1`（融合层 + 编排层 + 门面三段逐位一致）/ `T2`（空 lane 槽位，
+  权重 `[2.0, 1.5]` 可区分两路防串路）/ `T3`（白名单 + 反扫，禁词拼接构造防自扫描误伤）/
+  `T4`（触发态下候选池口径不变）/ `T5`（与精排窗口正交）/ `T6`（默认实现两通道等价）/
+  `T7`（tier 1 可观测面）/ `T8`（确定性 + 同分 tie-break）/ `T9`（默认关 + 不进指纹）/
+  `T10`（Metrics 两字段写入语义）+ `df_coverage` 探针口径（单段部分覆盖 / 空 query / 跨段）。
+  **变异验证 6 组全部命中**（tier1 关 / tier2 关 / tier2 降错路 / 编排开关失效 / Metrics 不填 /
+  df 恒零；M3 首次注入带行尾语法错被判无效，换合法形态后命中 3 条）。
+  ⚠️ **v0.5 更正（评审独立复算）**：M1 实为 3 条、M2 实为 5 条（首轮按过滤子集跑、漏了跨文件
+  命中）——修正版与运行范围见 `v2-step9-design.md` §4.11。
+- **Q9-2 定论**（实现期问题收口）：BM25 累加点 `partial = idf·(tf…)` 恒 `> 0`
+  （`df ≤ n ⇒ idf = ln(1+x) > 0`；`tf ≥ 1`）⇒ **非空 BM25 lane 不可能含 0 分条目**
+  ⇒ tier 1 **不扩**「`top ≤ 0`」。
+- **覆盖边界（如实登记）**：`bench` 的 `make_searcher` 装配段（`adaptive → with_adaptive_fusion` /
+  `RrfFusion::new_adaptive`）无单测——需要真实 `Setup`（语料 + embedder）；由 PR9-2 的 spike
+  端到端覆盖。`S9-T11`（判据臂，需冻结图）按设计标 `#[ignore]`、走 `scripts/eval_s9.sh`（PR9-2）。
+
 ### 文档 · V2 Step 9 设计 **第 3 轮评审响应**（`v2-step9-design.md` v0.2 → **v0.3 ⇒ 可开工**，PR #70）（Refs #4，2026-09-24）
 
 第 3 轮评审（`pulls/70/reviews` `5303731329`，基线 `a6d87e4`）= **通过 + 3×P4（均不阻塞）**；
