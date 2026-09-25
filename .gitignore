@@ -44,6 +44,18 @@
 # 运行产物（由 build 生成，可重建）
 /data/*.snapshot
 
+# ---- 评测对照资产（V2 Step 9 / T7-15，2026-09-26）----
+# 对照语料与对照快照都是**确定性派生 + 可重建**的：
+#   ./scripts/eval_s9_t7_15.sh            # 缺资产则重装（抽取 + build，约 1.5 min）
+# ⇒ 不入库（语料 10.5MB + 快照 ~38MB，纯冗余）。
+# 入库的是**读数 + 来源指纹**：data/eval/t7-15/{asset-meta.json,readings.tsv}
+#   ⇒ 它们能指认「重建出来的语料是否与本次读数同一份」（两个输入的 sha256 前 16 都在 meta 里）。
+/data/eval/*/qrels-only-corpus.jsonl
+/data/eval/*/*.snapshot
+/data/eval/*/*.hnsw.graph
+/data/eval/*/*.hnsw.data
+/data/eval/*/*.hnsw.manifest
+
 # ---- 编辑器与系统 ----
 .DS_Store
 .idea/

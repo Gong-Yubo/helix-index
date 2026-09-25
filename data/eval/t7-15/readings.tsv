@@ -1,0 +1,14 @@
+# main_index=data/t2-frozen.snapshot
+# ctrl_index=data/eval/t7-15/qrels-only.snapshot
+# queries=data/t2-queries.jsonl n_queries=320
+# n_corpus_main=12000 n_corpus_ctrl=5042
+# k=10 rrf_k=60 baseline_weights=1.0,1.5 rerank=off runs=1
+# paired_hybrid_mean_delta=+0.0031175595 median=+0.0000000000
+mode	bucket	mrr_main	mrr_ctrl	delta
+bm25	global	0.6495498512	0.6657155258	+0.0161656746
+vector	global	0.6828323413	0.6861805556	+0.0033482143
+hybrid	global	0.6941158234	0.6972333829	+0.0031175595
+hybrid	exact	0.8218750000	0.8072916667	-0.0145833333
+hybrid	natural	0.7690625000	0.7884375000	+0.0193750000
+hybrid	mixed	0.7052232143	0.6989732143	-0.0062500000
+hybrid	paraphrase	0.4803025794	0.4942311508	+0.0139285714
