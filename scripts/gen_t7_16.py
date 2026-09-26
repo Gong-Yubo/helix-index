@@ -23,8 +23,9 @@
 
     HELIX_LLM_ALLOW_EGRESS=1 python3 scripts/gen_t7_16.py --corpus … --n 80
 
-未设该变量 ⇒ **拒绝启动**，并把「将要外发什么」（条数、端点 host、单篇字符数量级）先打印出来
-让操作者过目。这样「外发」这件事在**每次**运行时都是**显式**的，不靠记忆。
+未设该变量 ⇒ **拒绝启动**，并把「将要外发什么」（**已抽样那批**的条数、每篇截断长度、
+合计字符数、端点 host）先打印出来让操作者过目。这样「外发」这件事在**每次**运行时都是**显式**的，
+不靠记忆；且打印的数字与真正送出的内容**逐项一致**（抽样在守卫之前完成，守卫吃的是同一个 `picked`）。
 
 # 生成协议（**Q9-4 定形**：多轮 + 自查，设计 §4.7）
 
@@ -82,6 +83,10 @@ DEFAULT_TEMPERATURE = 0.2
 DEFAULT_TIMEOUT_S = 120
 AGENT_TYPE = "agent"  # 自有标签：不冒充四桶（见模块文档）
 GRADES = (0, 1, 2, 3)
+# 🔑 **发送时每篇的截断长度**（唯一来源）：`run_pipeline` 构造 `docs_block` 与
+# `egress_guard` 报字节量**必须同用这一个常量**，否则守卫报的就不是真正会送出的量
+# （评审 **P4-2** 实测：原稿守卫按全文长估、发送时截断 1200 ⇒ 系统性高估）。
+EGRESS_DOC_CHARS = 1200
 
 SYS_ROUND1 = (
     "你是中文检索评测集的出题人。用户会给你若干「段落」，每段前面有 [序号] (source=编号)。\n"
@@ -313,6 +318,61 @@ def sample_docs(
     return ranked[:n]
 
 
+def load_exclude_sources(path, corpus_sources: set[str]) -> tuple[set[str], dict]:
+    """读 `--exclude-qrels` 指定的 judgment 文件 ⇒ **要排除的 source 集合** + 元信息记录。
+
+    🔑 **为什么要排除**（评审 **P4-3**）：T7-16 的价值是「**外部效度增量**」；若它的候选段落
+    与主基线 320 条 query 的 qrels 段落（5042 篇，就在**同一个 12K 语料**里）重叠，两边会命中
+    同一段落 ⇒ 对照与主基线**不独立**，那条 query 与既有 T2 query 高度相关 ⇒ 增量打折。
+    （**不是泄漏**：T7-16 只作对照，且它的弱标注来自 LLM 而非 qrels。）
+
+    排除是**默认**行为；刻意不排除要显式 `--no-exclude-qrels`（记进 `gen-meta.json`，不静默）。
+    `path=None` ⇒ 返回空集 + 「刻意不排除」的记录。
+    """
+    if path is None:
+        return set(), {"enabled": False, "note": "刻意不排除（--no-exclude-qrels）"}
+    if not path.is_file():
+        raise GenError(
+            f"--exclude-qrels 指定的文件不存在: {path}"
+            f"（刻意不排除请显式给 --no-exclude-qrels）"
+        )
+    src: set[str] = set()
+    with open(path, encoding="utf-8") as fh:
+        for lineno, line in enumerate(fh, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                j = json.loads(line)
+            except json.JSONDecodeError as e:
+                raise GenError(f"--exclude-qrels 第 {lineno} 行解析失败: {e}") from e
+            rel = j.get("relevance")
+            if not isinstance(rel, list) or not rel:
+                raise GenError(f"--exclude-qrels 第 {lineno} 行缺少非空 relevance 数组")
+            for r in rel:
+                sv = r.get("source") if isinstance(r, dict) else None
+                if sv is None:
+                    raise GenError(f"--exclude-qrels 第 {lineno} 行的 relevance 条目缺 source")
+                src.add(str(sv))
+    if not src:
+        raise GenError(f"--exclude-qrels 未解析出任何 source: {path}")
+    in_corpus = len(src & corpus_sources)
+    if in_corpus < len(src):
+        print(
+            f"  ⚠️ --exclude-qrels 的 {len(src)} 个 source 里有 {len(src) - in_corpus} 个不在语料内"
+            f"（不影响排除本身，仅作记录）",
+            file=sys.stderr,
+        )
+    note = {
+        "enabled": True,
+        "path": str(path),
+        "sha256_16": hashlib.sha256(path.read_bytes()).hexdigest()[:16],
+        "n_sources": len(src),
+        "n_in_corpus": in_corpus,
+    }
+    return src, note
+
+
 # ---------------------------------------------------------------- 传输（唯一网络缝）
 
 
@@ -375,19 +435,19 @@ class StubTransport:
 def run_pipeline(
     docs: list[tuple[str, str]],
     *,
-    n: int,
+    picked: list[tuple[str, str]],
     per_batch: int,
-    seed: int,
     qid_prefix: str,
     transport,
     meta_extra: dict,
 ) -> tuple[list[dict], dict]:
-    """抽样 → 逐批（轮 1 + 轮 2）→ 配对 → 组装。`transport(messages, ...) -> str`。
+    """逐批（轮 1 + 轮 2）→ 配对 → 组装。`transport(messages, ...) -> str`。
 
-    抽样的 **候选池 = 全部语料**；每批 `per_batch` 篇（同一批的段落互相充当**候选负例**
-    ⇒ 轮 2 才能给出 grade 0 —— 这正是弱标注的来源）。
+    `picked`（本轮要处理的段落）由调用方**先算**（`sample_docs`）—— 这样「外发守卫打印的
+    条数 / 字节量」与「真正送去模型的那批」是**同一个对象**，不会各算各的（评审 **P4-2**）。
+    每批 `per_batch` 篇（同一批的段落互相充当**候选负例** ⇒ 轮 2 才能给出 grade 0
+    —— 这正是弱标注的来源）。
     """
-    picked = sample_docs(docs, n, seed)
     corpus_sources = {d[0] for d in docs}
     all_text = dict(docs)
     rows: list[dict] = []
@@ -398,7 +458,7 @@ def run_pipeline(
     for start in range(0, len(picked), per_batch):
         batch = picked[start : start + per_batch]
         docs_block = "\n\n".join(
-            f"[{i}] (source={src})\n{all_text[src][:1200]}" for i, (src, _) in enumerate(batch)
+            f"[{i}] (source={src})\n{all_text[src][:EGRESS_DOC_CHARS]}" for i, (src, _) in enumerate(batch)
         )
         allowed = {src for src, _ in batch}
 
@@ -452,15 +512,21 @@ def write_assets(out_dir: Path, rows: list[dict], meta: dict) -> tuple[bytes, by
 # ---------------------------------------------------------------- 外发守卫（R58）
 
 
-def egress_guard(docs: list[tuple[str, str]], n: int, base_url: str, *, env: dict) -> None:
-    """**R58 的显式开关**：未设 `HELIX_LLM_ALLOW_EGRESS=1` ⇒ 拒绝启动并打印将外发什么。"""
+def egress_guard(picked: list[tuple[str, str]], base_url: str, *, env: dict) -> None:
+    """**R58 的显式开关**：未设 `HELIX_LLM_ALLOW_EGRESS=1` ⇒ 拒绝启动并打印将外发什么。
+
+    🔑 入参是**已抽样的那批**（不是「全语料的前 n 篇」）：条数与字节量因此与真正送出的内容
+    **逐项一致**（评审 **P4-2** —— 原稿按 `docs[:n]` 的**全文长**估算，既取错子集、又漏了
+    发送时的 `[:EGRESS_DOC_CHARS]` 截断 ⇒ 系统性高估）。
+    """
     if env.get("HELIX_LLM_ALLOW_EGRESS") == "1":
         return
     host = re.sub(r"^https?://", "", base_url).split("/")[0]
-    chars = sum(len(t) for _, t in docs[:n]) if n <= len(docs) else sum(len(t) for _, t in docs)
+    chars = sum(min(len(t), EGRESS_DOC_CHARS) for _, t in picked)
     raise GenError(
         "拒绝启动：语料外发未显式开启（R58）。\n"
-        f"  将外发：约 {n} 篇语料段落（合计约 {chars} 字符）→ 端点 host = {host}\n"
+        f"  将外发：{len(picked)} 篇语料段落（每篇截断至 {EGRESS_DOC_CHARS} 字 ⇒ 合计 {chars} 字符）"
+        f"→ 端点 host = {host}\n"
         "  该外发已由用户 2026-09-26 拍板批准（R58），但**每次运行都要显式确认**：\n"
         "  ⇒ HELIX_LLM_ALLOW_EGRESS=1 python3 scripts/gen_t7_16.py …\n"
         "  （只想离线验证链路请用 --self-test / --stub，两者都不发网络请求）"
@@ -483,8 +549,14 @@ def _stub_r1(docs: list[tuple[str, str]]) -> str:
 
 
 def self_test() -> int:
-    """**S9-T12**：零网络的离线桩，断言 解析 / 落盘 / 配对 三条 + 8 个负例。"""
+    """**S9-T12**：零网络的离线桩，断言 解析 / 落盘 / 配对 + 负例。
+
+    🔑 **计数由本函数自报**（结尾那行 `S9-T12 离线桩自检：N/N 通过（其中负例 M 项：…）`）——
+    文档里的数字一律照抄该行，不再手写（评审 **P4-1** 实测：docstring 写「8 个」、设计/正文写
+    「7 个」、实际 10 个 ⇒ 三处口径不一，而「负例证明拒绝真的生效」正是本 PR 的卖点）。
+    """
     checks: list[tuple[str, bool]] = []
+    neg_by_group: dict[str, int] = {}
 
     def ck(name: str, ok: bool) -> None:
         checks.append((name, ok))
@@ -494,7 +566,8 @@ def self_test() -> int:
     allowed = {s for s, _ in fake_docs}
     seed, prefix = 7, "t7-16-"
 
-    def expect_err(name: str, fn) -> None:
+    def expect_err(name: str, fn, group: str) -> None:
+        neg_by_group[group] = neg_by_group.get(group, 0) + 1
         try:
             fn()
         except GenError:
@@ -510,7 +583,8 @@ def self_test() -> int:
         json.dumps({"labels": [{"doc": "d1", "grade": 1}, {"doc": "d2", "grade": 0}, {"doc": "d3", "grade": 3}]}),
     ])
     rows, meta = run_pipeline(
-        fake_docs, n=3, per_batch=3, seed=seed, qid_prefix=prefix, transport=stub,
+        fake_docs, picked=sample_docs(fake_docs, 3, seed), per_batch=3,
+        qid_prefix=prefix, transport=stub,
         meta_extra={"llm": {"model": "stub-1", "temperature": 0.2, "seed": seed}},
     )
     ck("① 正常桩：产出 3 条自查通过", len(rows) == 3 and meta["counts"]["pass_rate"] == 1.0)
@@ -542,18 +616,22 @@ def self_test() -> int:
        extract_json("说明文字\n```json\n{\"items\":[{\"doc\":\"d1\",\"query\":\"q\"}]}\n```\n以上。")["items"][0]["doc"] == "d1")
 
     # ⑤ 负例：候选外文档 / 空 query / grade 越界 / 缺数组 / 非对象
-    expect_err("⑤ 轮 1 候选外文档 ⇒ 报错", lambda: parse_items('{"items":[{"doc":"X","query":"q"}]}', allowed))
-    expect_err("⑤ 轮 1 空 query ⇒ 报错", lambda: parse_items('{"items":[{"doc":"d1","query":"  "}]}', allowed))
-    expect_err("⑤ 轮 2 grade=4 ⇒ 报错", lambda: parse_labels('{"labels":[{"doc":"d1","grade":4}]}', allowed))
-    expect_err("⑤ 轮 2 grade 非整数 ⇒ 报错", lambda: parse_labels('{"labels":[{"doc":"d1","grade":"高"}]}', allowed))
-    expect_err("⑤ 缺 items 数组 ⇒ 报错", lambda: parse_items('{"foo":1}', allowed))
-    expect_err("⑤ 输出无 JSON ⇒ 报错", lambda: parse_items("抱歉我不能完成", allowed))
+    expect_err("⑤ 轮 1 候选外文档 ⇒ 报错",
+               lambda: parse_items('{"items":[{"doc":"X","query":"q"}]}', allowed), "解析")
+    expect_err("⑤ 轮 1 空 query ⇒ 报错",
+               lambda: parse_items('{"items":[{"doc":"d1","query":"  "}]}', allowed), "解析")
+    expect_err("⑤ 轮 2 grade=4 ⇒ 报错",
+               lambda: parse_labels('{"labels":[{"doc":"d1","grade":4}]}', allowed), "解析")
+    expect_err("⑤ 轮 2 grade 非整数 ⇒ 报错",
+               lambda: parse_labels('{"labels":[{"doc":"d1","grade":"高"}]}', allowed), "解析")
+    expect_err("⑤ 缺 items 数组 ⇒ 报错", lambda: parse_items('{"foo":1}', allowed), "解析")
+    expect_err("⑤ 输出无 JSON ⇒ 报错", lambda: parse_items("抱歉我不能完成", allowed), "解析")
     expect_err("⑤ 轮 2 漏标某候选 ⇒ 配对报错",
-               lambda: pair([{"doc": "d1", "query": "q"}], [{"doc": "d2", "grade": 1}]))
+               lambda: pair([{"doc": "d1", "query": "q"}], [{"doc": "d2", "grade": 1}]), "解析")
 
     # ⑥ 自查的牙齿：源段 grade 0 ⇒ 该条被丢（且计数如实）
     rejected_rows, rejected_meta = run_pipeline(
-        fake_docs, n=3, per_batch=3, seed=seed, qid_prefix=prefix,
+        fake_docs, picked=sample_docs(fake_docs, 3, seed), per_batch=3, qid_prefix=prefix,
         transport=StubTransport([
             _stub_r1(fake_docs),
             json.dumps({"labels": [{"doc": "d1", "grade": 0}, {"doc": "d2", "grade": 0}, {"doc": "d3", "grade": 0}]}),
@@ -568,13 +646,25 @@ def self_test() -> int:
        and rejected_rows[0]["relevance"] == [{"source": "d1", "grade": 0}, {"source": "d2", "grade": 1}, {"source": "d3", "grade": 0}])
 
     # ⑦ 外发守卫（R58）：未显式开启 ⇒ 拒绝；开启 ⇒ 放行
+    picked7 = sample_docs(fake_docs, 3, seed)
     expect_err("⑦ 未设 HELIX_LLM_ALLOW_EGRESS ⇒ 拒绝外发",
-               lambda: egress_guard(fake_docs, 3, "https://api.example.com/v1", env={}))
+               lambda: egress_guard(picked7, "https://api.example.com/v1", env={}), "外发守卫")
     try:
-        egress_guard(fake_docs, 3, "https://api.example.com/v1", env={"HELIX_LLM_ALLOW_EGRESS": "1"})
+        egress_guard(picked7, "https://api.example.com/v1", env={"HELIX_LLM_ALLOW_EGRESS": "1"})
         ck("⑦ 设 HELIX_LLM_ALLOW_EGRESS=1 ⇒ 放行", True)
     except GenError:
         ck("⑦ 设 HELIX_LLM_ALLOW_EGRESS=1 ⇒ 放行", False)
+    # 🔑 P4-2 的牙齿：守卫报的**必须**是「按 EGRESS_DOC_CHARS 截断后」的合计，而不是全文长
+    long_doc = ("dlong", "长" * (EGRESS_DOC_CHARS + 500))
+    try:
+        egress_guard([long_doc], "https://api.example.com/v1", env={})
+        ck("⑦ 守卫报字节量（应报错却通过了）", False)
+    except GenError as e:
+        full = len(long_doc[1])
+        ck(
+            f"⑦ 守卫按截断口径报字节量（{EGRESS_DOC_CHARS} 而非全文 {full}）",
+            f"合计 {EGRESS_DOC_CHARS} 字符" in str(e) and str(full) not in str(e),
+        )
 
     # ⑧ 抽样性质（**不在此处复刻哈希公式** —— 否则锁的是用例自己抄的那份实现）
     pool = [(f"d{i:03d}", "t") for i in range(200)]
@@ -592,12 +682,77 @@ def self_test() -> int:
         "⑧ exclude 生效（排除项不再出现）",
         not (set(s for s, _ in sample_docs(pool, 5, 42, exclude=set(s5))) & set(s5)),
     )
-    expect_err("⑧ 候选池不足 ⇒ 报错", lambda: sample_docs(pool, 999, 42))
+    expect_err("⑧ 候选池不足 ⇒ 报错", lambda: sample_docs(pool, 999, 42), "抽样与校验")
     expect_err("⑧ 空资产 ⇒ 组装后校验报错",
-               lambda: validate_asset([], {"d1"}))
+               lambda: validate_asset([], {"d1"}), "抽样与校验")
+
+    # ⑨ exclude 接线（评审 P4-3）：**走 `main()` 的完整离线路径**（--stub），不是只测纯函数
+    with tempfile.TemporaryDirectory() as td2:
+        td2p = Path(td2)
+        corpus_p = td2p / "corpus.jsonl"
+        corpus_p.write_text(
+            "".join(
+                json.dumps({"source": f"c{i}", "text": f"第{i}段正文"}, ensure_ascii=False) + "\n"
+                for i in range(6)
+            ),
+            encoding="utf-8",
+        )
+        excl = {"c0", "c1", "c2"}
+        q_p = td2p / "q.jsonl"
+        q_p.write_text(
+            "".join(
+                json.dumps(
+                    {"qid": f"q{i}", "query": "x", "type": "exact",
+                     "relevance": [{"source": sv, "grade": 3}]},
+                    ensure_ascii=False,
+                ) + "\n"
+                for i, sv in enumerate(sorted(excl))
+            ),
+            encoding="utf-8",
+        )
+        picked9 = sample_docs([(f"c{i}", f"第{i}段正文") for i in range(6)], 3, DEFAULT_SEED,
+                              exclude=excl)
+        stub_p = td2p / "stub.json"
+        stub_p.write_text(
+            json.dumps(
+                [_stub_r1([(sv, "") for sv, _ in picked9])]
+                + [json.dumps({"labels": [{"doc": sv, "grade": 1} for sv, _ in picked9]})
+                   for _ in picked9],
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        out9 = td2p / "out"
+        rc9 = main(["--corpus", str(corpus_p), "--stub", str(stub_p), "--out", str(out9),
+                    "--n", "3", "--exclude-qrels", str(q_p), "--qid-prefix", "t-"])
+        rows9 = [
+            json.loads(ln)
+            for ln in (out9 / "agent-queries.jsonl").read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        ]
+        got_src = {e["source"] for r in rows9 for e in r["relevance"]}
+        ck(
+            "⑨ exclude 接线（--stub 端到端）：产出的候选一律不在排除集内",
+            rc9 == 0 and len(rows9) == 3 and not (got_src & excl),
+        )
+        meta9 = json.loads((out9 / "gen-meta.json").read_text(encoding="utf-8"))
+        ck(
+            "⑨ 元信息如实记录排除（enabled / 命中语料数）",
+            meta9["sampling"]["exclude_qrels"]["enabled"] is True
+            and meta9["sampling"]["exclude_qrels"]["n_in_corpus"] == len(excl),
+        )
+        bad_p = td2p / "bad.jsonl"
+        bad_p.write_text('{"qid":"q","query":"x","type":"exact"}\n', encoding="utf-8")
+        expect_err("⑨ --exclude-qrels 行缺 relevance ⇒ 报错",
+                   lambda: load_exclude_sources(bad_p, {"c0"}), "抽样与校验")
+    expect_err("⑨ --exclude-qrels 文件不存在 ⇒ 报错",
+               lambda: load_exclude_sources(Path("/nonexistent/nope.jsonl"), {"d1"}),
+               "抽样与校验")
 
     n_ok = sum(1 for _, ok in checks if ok)
-    print(f"\nS9-T12 离线桩自检：{n_ok}/{len(checks)} 通过")
+    neg_total = sum(neg_by_group.values())
+    groups = " / ".join(f"{g} {neg_by_group[g]}" for g in sorted(neg_by_group))
+    print(f"\nS9-T12 离线桩自检：{n_ok}/{len(checks)} 通过（其中负例 {neg_total} 项：{groups}）")
     return 0 if n_ok == len(checks) else 1
 
 
@@ -631,6 +786,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--qid-prefix", default=DEFAULT_QID_PREFIX, help="qid 前缀")
     p.add_argument("--stub", type=Path, default=None,
                    help="离线桩：按序返回文件里 JSON 数组中的字符串（**不发网络**）")
+    p.add_argument("--exclude-qrels", type=Path, default=Path("data/t2-queries.jsonl"),
+                   help="候选池排除这些 judgment 的全部 relevance source（默认 data/t2-queries.jsonl"
+                        " = 主基线 320 条的 qrels 段落）⇒ T7-16 与主基线**不共用答案段落**（P4-3）")
+    p.add_argument("--no-exclude-qrels", action="store_true",
+                   help="**刻意不排除**（候选池 = 全部语料）—— 会在 gen-meta.json 里记为刻意选择")
     p.add_argument("--self-test", action="store_true",
                    help="跑 S9-T12 离线桩自检并退出（**零网络**）")
     return p.parse_args(argv)
@@ -645,15 +805,30 @@ def main(argv: list[str] | None = None) -> int:
     base_url = os.environ.get("HELIX_LLM_BASE_URL", "")
     api_key = os.environ.get("HELIX_LLM_API_KEY", "")
     model = os.environ.get("HELIX_LLM_MODEL", "")
-    if not (base_url and model):
+    # ⚠️ 通道三环境变量**只对真跑路径**是必需的：`--stub` 是纯离线验证（评审 P4-3 顺带发现的
+    #    覆盖边界 —— 原稿在这里无条件 return 2，使 `--stub` 也得伪造端点环境变量，「离线」名不副实）。
+    if args.stub is None and not (base_url and model):
         print("❌ 缺少 HELIX_LLM_BASE_URL / HELIX_LLM_MODEL（D-S9-07 的通道三环境变量）", file=sys.stderr)
         return 2
 
     docs = load_corpus(args.corpus)
     corpus_sha = hashlib.sha256(args.corpus.read_bytes()).hexdigest()[:16]
 
+    # 抽样在**外发守卫之前**做 ⇒ 守卫报的就是「真正将送出的那批」（评审 P4-2）；
+    # 同时把 `--exclude-qrels`（P4-3）接进来，接线结果进 gen-meta.json。
+    corpus_sources = {d[0] for d in docs}
+    exclude, exclude_note = load_exclude_sources(
+        None if args.no_exclude_qrels else args.exclude_qrels, corpus_sources
+    )
+    picked = sample_docs(docs, args.n, args.seed, exclude=exclude)
+    print(
+        f"抽样：候选池 {len(docs)} 篇"
+        f"（排除 qrels 段落 {exclude_note.get('n_in_corpus', 0)} 篇）"
+        f" ⇒ 取哈希秩最小 {len(picked)} 篇（种子 {args.seed}）"
+    )
+
     if args.stub is None:
-        egress_guard(docs, args.n, base_url, env=dict(os.environ))
+        egress_guard(picked, base_url, env=dict(os.environ))
         if not api_key:
             print("❌ 真实生成还需 HELIX_LLM_API_KEY（密钥不入库）", file=sys.stderr)
             return 2
@@ -676,12 +851,19 @@ def main(argv: list[str] | None = None) -> int:
                        "n_docs_to_send": 0}
 
     rows, meta = run_pipeline(
-        docs, n=args.n, per_batch=args.per_batch, seed=args.seed, qid_prefix=args.qid_prefix,
+        docs, picked=picked, per_batch=args.per_batch, qid_prefix=args.qid_prefix,
         transport=transport,
         meta_extra={
             "asset": "t7-16-agent-queries",
             "built_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "egress": egress_note,
+            "sampling": {
+                "seed": args.seed,
+                "n_requested": args.n,
+                "n_pool": len(docs),
+                "n_picked": len(picked),
+                "exclude_qrels": exclude_note,
+            },
             "llm": {"model": model or "<stub>", "temperature": args.temperature,
                     "seed": args.seed, "timeout_s": args.timeout,
                     "base_url_host": egress_note["endpoint_host"]},
@@ -702,6 +884,9 @@ def main(argv: list[str] | None = None) -> int:
           f"--queries {args.out}/agent-queries.jsonl --modes bm25,vector,hybrid --k 10 --runs 1 "
           f"--rrf-k 60 --rrf-weights 1.0,1.5 --no-latency --json <out>.json")
     print(f"   （⚠️ 四桶行恒 n=0 —— 本资产的 type 是 \"agent\"，对照取**全局行** + per_query 配对）")
+    if exclude_note.get("enabled"):
+        print(f"   （候选池已排除 {exclude_note['n_in_corpus']} 篇主基线 qrels 段落；"
+              f"口径见 gen-meta.json 的 sampling.exclude_qrels）")
     assert jsonl  # 保证产物非空（validate_asset 已断言 rows 非空）
     return 0
 

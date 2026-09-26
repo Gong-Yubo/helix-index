@@ -32,7 +32,18 @@
 #
 #   ${RUN_DIR}/json/main.json     主基线臂（`data/t2-frozen.snapshot`）
 #   ${RUN_DIR}/json/ctrl.json     对照臂（仅 qrels 语料）
-#   ${RUN_DIR}/readings.tsv       逐 (桶, 臂) 的 MRR + 配对的 Δ（头含两个语料的指纹）
+#   ${RUN_DIR}/readings.tsv       逐 (桶, 臂) 的 MRR + 配对的 Δ（头含两个语料的指纹 + 抖动提示）
+#
+# # ⚠️ 对照臂的三个附带事实（读数字前先看，第 1 轮评审 P3-1/P4-4/P4-5）
+#
+#   ① **对照图每次重建（`hnsw_rs` 无种子）** ⇒ `vector` / `hybrid` 行的 `mrr_ctrl` 与 `Δ` 的**幅度**
+#      **含建图抖动**（3 次建图实测：`mixed` 0.0062~0.0131、`paraphrase` 0.0139~0.0278、全局 0.0031~0.0068；
+#      **符号 3/3 一致**）⇒ 逐桶 Δ 是「**单次建图的实现值**」，**不可按字面复现 / 引用**；
+#      `bm25` 行（及主基线列）无图 / 冻结 ⇒ **可逐位复现**，是唯一可归因的那一列。
+#   ② `median` 取**偶数 n 的两中值均值**（n=320 ⇒ 第 159/160 个元素；本数据 280 个 0 ⇒ 两种约定同值）。
+#   ③ 入库的 `asset-meta.json` **只放确定性字段**（两个来源指纹 + 计数 + note）—— 它的价值就是
+#      「重建出来的语料是否与本次读数同一份」；`built_at` 属**本次运行**、每次重装都变，写在
+#      gitignore 覆盖的 `qrels-only-corpus.build.json`（否则每次 `REBUILD=1` 都弄脏工作树）。
 #
 # 依赖：bash / python3 / 已构建的 `target/release/helix`（脚本会自动 `cargo build --release -p helix`）。
 set -euo pipefail
@@ -133,9 +144,12 @@ if missing:
     print(f"❌ {len(missing)} 个 qrels source 不在语料里（前 5: {missing[:5]}）", file=sys.stderr)
     sys.exit(3)
 
+# 🔴 入库的 asset-meta.json **只放确定性字段**：本文件的用途是「指认重建出来的语料是否与
+#    本次读数同一份」（两个来源指纹 + 计数），而 `built_at` 是**本次运行**的属性、每次重装都变
+#    ⇒ 它一旦进库，任何一次 `REBUILD=1` 都会弄脏工作树，且若被顺手 commit，入库时间戳就漂成
+#    「最后一次重建」而非「读数对应那次装配」（评审 **P4-5**）。
 meta = {
     "asset": "t7-15-qrels-only-corpus",
-    "built_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     "source_queries": queries_p,
     "source_queries_sha256_16": sha16(queries),
     "source_corpus": corpus_p,
@@ -149,10 +163,27 @@ meta = {
 (work / "asset-meta.json").write_text(
     json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
 )
+derived_sha = sha16(out_path)
+# 运行日志（**不入库**，见 .gitignore 的 `/data/eval/*/*.build.json`）：只放每次运行会变的字段
+(work / "qrels-only-corpus.build.json").write_text(
+    json.dumps(
+        {
+            "asset": "t7-15-qrels-only-corpus",
+            "built_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "derived_sha256_16": derived_sha,
+            "note": "本次装配的运行日志（不入库）：时间戳 + 派生语料指纹",
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    + "\n",
+    encoding="utf-8",
+)
 print(
     f"  qrels 段落 {len(rel_sources)} 个 ⇒ 语料 {total} 行过滤为 {kept} 行"
-    f"（自证缺失 = 0）；指纹 sha256 前 16 = {sha16(out_path)}"
+    f"（自证缺失 = 0）；指纹 sha256 前 16 = {derived_sha}"
 )
+print(f"  装配时间戳 → {work}/qrels-only-corpus.build.json（**不入库**；asset-meta.json 只留确定性字段）")
 PY
   "$BIN" build --input "$WORK/qrels-only-corpus.jsonl" \
     --output "$CTRL_INDEX" --vectors --single-chunk 2>&1 | tail -3
@@ -243,9 +274,12 @@ m_pq, c_pq = per_query_mrr(main, "hybrid"), per_query_mrr(ctrl, "hybrid")
 assert set(m_pq) == set(c_pq), "两臂 qid 集合不一致 ⇒ 配对无效"
 deltas = sorted(c_pq[q] - m_pq[q] for q in m_pq)
 n = len(deltas)
+# 中位数：偶数 n 取**两中值均值**（`deltas[n // 2]` 是上中位 —— 评审 P4-4 的口径小疵；
+# 本数据 280 个 0 ⇒ 两种约定同值，但 TSV 里持久化的是这个数，口径要写对）
+median = deltas[n // 2] if n % 2 else (deltas[n // 2 - 1] + deltas[n // 2]) / 2.0
 print()
 print(f"=== hybrid 逐 query 配对（n={n}）===")
-print(f"  均值 {sum(deltas) / n:+.4f} | 中位 {deltas[n // 2]:+.4f} | "
+print(f"  均值 {sum(deltas) / n:+.4f} | 中位 {median:+.4f}（偶数 n 取两中值均值）| "
       f"min {deltas[0]:+.4f} | max {deltas[-1]:+.4f}")
 print(f"  变差条数 = {sum(1 for d in deltas if d < 0)} / 变好 = {sum(1 for d in deltas if d > 0)} / 不变 = "
       f"{sum(1 for d in deltas if d == 0)}")
@@ -256,7 +290,11 @@ with io.open(tsv_path, "w", encoding="utf-8") as fh:
     fh.write(f"# queries={queries_path} n_queries={main['n_queries']}\n")
     fh.write(f"# n_corpus_main={main['n_corpus']} n_corpus_ctrl={ctrl['n_corpus']}\n")
     fh.write(f"# k={k_grid} rrf_k={rrf_k} baseline_weights={base_weights} rerank=off runs=1\n")
-    fh.write(f"# paired_hybrid_mean_delta={sum(deltas) / n:+.10f} median={deltas[n // 2]:+.10f}\n")
+    # ⚠️ 下面的三行是**单行字面量**（不做隐式拼接）⇒ 入库的 readings.tsv 头部能用 grep -F 逐字核对
+    fh.write("# ⚠️ ctrl_graph=每次重建（hnsw_rs 无种子）⇒ vector/hybrid 行的 mrr_ctrl 与 delta 的幅度不可按字面引用（3 次建图：mixed 0.0062~0.0131、paraphrase 0.0139~0.0278、全局 0.0031~0.0068；符号 3 次一致）；bm25 行与主基线列可逐位复现\n")
+    fh.write("# 解读边界见 docs/devel/v2-step9-design.md §4.16.5 与 §4.17.1（三次建图全表）\n")
+    fh.write(f"# paired_hybrid_mean_delta={sum(deltas) / n:+.10f} median={median:+.10f}"
+             f"（median=偶数 n 两中值均值）\n")
     fh.write("mode\tbucket\tmrr_main\tmrr_ctrl\tdelta\n")
     for mode, bucket, m_v, c_v, d_v in rows:
         fh.write(f"{mode}\t{bucket}\t{m_v:.10f}\t{c_v:.10f}\t{d_v:+.10f}\n")
