@@ -1,6 +1,5 @@
 {
   "asset": "t7-15-qrels-only-corpus",
-  "built_at": "2026-09-25T23:33:51Z",
   "source_queries": "data/t2-queries.jsonl",
   "source_queries_sha256_16": "8e03ae62e00dcddb",
   "source_corpus": "data/t2-corpus.jsonl",
