@@ -1641,6 +1641,16 @@ min **−0.5000**｜max **+0.6667**｜变差 **17** / 变好 **23** / **不变 2
 **方法（可复算）**：`cover(q) = |2-gram(q) ∩ 2-gram(源段落)| / |2-gram(q)|`，逐 query 取其
 **正例段落**（`grade ≥ 1`）的最大值；两组用**同一函数**计算；query 长度取中位数。
 
+🔑 **载体（第 1 轮评审 P3-1 补齐）**：本诊断有**可复跑脚本** ——
+
+    python3 scripts/eval_query_cover.py \
+        --set t7-16=data/eval/t7-16/agent-queries.jsonl \
+        --set main-baseline=data/t2-queries.jsonl
+
+上表 6 个数与 `data/eval/t7-16/readings.tsv` 的 ③ 段**逐字节相同**，均由该脚本产出
+（`--self-test` = 纯逻辑自检、**零网络**，已进 CI `eval-assets` job）。⚠️ 该脚本只算**词面覆盖**：
+能排除「抄写型泄漏」，**不能排除**「生成分布与人类 query 分布不同」这一更一般的偏差。
+
 #### 8.16.9 覆盖边界与报数纪律
 
 - **降权取形只扫了「降到 0」一种**（PR9-1 的实现取形）⇒ 判「不投」**不得**读成「自适应融合整体无效」
