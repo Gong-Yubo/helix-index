@@ -1,0 +1,31 @@
+# ===== T7-16「Agent query」对照读数（**只作对照，不替换主基线**；D-S9-06 / H7）=====
+# asset=data/eval/t7-16/agent-queries.jsonl n_queries=80 type="agent" ⇒ 四桶行恒 n=0（本表不记桶）
+# index=data/t2-frozen.snapshot sha256_16=de7b3d1a8250a2d5 bytes=54844663 n_corpus=12000
+# gen=python3 scripts/gen_t7_16.py --corpus data/t2-corpus.jsonl --n 80 --out data/eval/t7-16 --exclude-qrels data/t2-queries.jsonl
+# gen_llm=model=deepseek-flash temperature=0.2 seed=1949379889 host=api.deepseek.com self_check_pass_rate=1.0
+# bench=./target/release/helix bench --index data/t2-frozen.snapshot --queries data/eval/t7-16/agent-queries.jsonl --modes bm25,vector,hybrid --k 10 --runs 1 --rrf-k 60 --rrf-weights 1.0,1.5 --no-latency
+#
+# 🔴 引用前必读（三条，缺一条都会读错）：
+# 1) **绝对读数不可与主基线对比**：本资产按构造更容易 —— 出题要求「该段落（且只有该段落）能完整
+#    回答这条 query」且 query 更长（中位 18 字 vs 主基线 12 字）⇒ 单路分数被抬高。只有**相对结论**可读。
+# 2) **未发现词面泄漏放大**（同一统计量的对照）：query 的 2-gram 出现在其源段落中的比例（逐 query
+#    取该 query 正例段落的最大值）—— T7-16 均值 0.500 / ≥0.7 占 11.2% / ≥0.9 占 0.0%；
+#    主基线（人类 query）均值 0.518 / ≥0.7 占 23.8% / ≥0.9 占 8.4% ⇒ 生成 query **不比人类 query 更贴源文**。
+# 3) 本表**不声称显著性之外的方向**：只报幅度与符号，且 80 条样本下 72 条并列（同排名次）。
+#
+# ---- ① 三路全局读数（MRR@10(1)，n=80）----
+mode	mrr_at_10_1	n
+bm25	0.9245982143	80
+vector	0.9625000000	80
+hybrid	0.9625000000	80
+#
+# ---- ② 符号检验（逐 query 配对，单侧；由 bench 产出）----
+pair	positive	negative	zero	p_one_sided
+hybrid vs bm25	7	1	72	0.0351562500
+hybrid vs vector	2	2	76	0.6875000000
+#
+# ---- ③ 泄漏诊断（同一统计量对照；2-gram 覆盖率，逐 query 取正例最大值）----
+# producer=python3 scripts/eval_query_cover.py --set t7-16=data/eval/t7-16/agent-queries.jsonl --set main-baseline=data/t2-queries.jsonl
+set	n	cover_mean	cover_median	cover_ge_0.7	cover_ge_0.9	qlen_median
+t7-16	80	0.500048	0.500000	9	0	18
+main-baseline	320	0.518043	0.500000	76	27	12

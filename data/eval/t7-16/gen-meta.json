@@ -1,0 +1,53 @@
+{
+  "asset": "t7-16-agent-queries",
+  "built_at": "2026-09-27T16:13:45Z",
+  "egress": {
+    "approved_by_user": "2026-09-26（R58）",
+    "endpoint_host": "api.deepseek.com",
+    "n_docs_to_send": 80
+  },
+  "sampling": {
+    "seed": 1949379889,
+    "n_requested": 80,
+    "n_pool": 12000,
+    "n_picked": 80,
+    "exclude_qrels": {
+      "enabled": true,
+      "path": "data/t2-queries.jsonl",
+      "sha256_16": "8e03ae62e00dcddb",
+      "n_sources": 5042,
+      "n_in_corpus": 5042
+    }
+  },
+  "llm": {
+    "model": "deepseek-flash",
+    "temperature": 0.2,
+    "seed": 1949379889,
+    "timeout_s": 120,
+    "base_url_host": "api.deepseek.com"
+  },
+  "prompts": {
+    "round1_text": "你是中文检索评测集的出题人。用户会给你若干「段落」，每段前面有 [序号] (source=编号)。\n请为**每一段**写**一条**中文检索 query，要求：\n1) 写成**用户会向检索系统提出的问题**（口语化、有真实信息需求），不要抄段落原文；\n2) 该段落（且只有该段落）应当能完整回答这条 query；\n3) 每条 query 长度 5~40 个字；\n4) **严格**只输出 JSON：{\"items\":[{\"doc\":\"<source 编号>\",\"query\":\"<query>\"}]}\n   不要输出任何解释、不要用 Markdown 代码围栏。",
+    "round1_sha256_16": "5eb45868d2022065",
+    "round2_text": "你是相关性标注员。用户会给你一条检索 query 和若干「候选段落」，每段前面有 [序号] (source=编号)。\n请对**每一段**判断它对这条 query 的相关性等级：\n  3 = 直接、完整地回答；2 = 高度相关但不完整；1 = 部分相关；0 = 不相关。\n**严格**只输出 JSON：{\"labels\":[{\"doc\":\"<source 编号>\",\"grade\":<0-3>}]}\n不要输出任何解释、不要用 Markdown 代码围栏。",
+    "round2_sha256_16": "ca2e296c9471e9d3"
+  },
+  "corpus": {
+    "path": "data/t2-corpus.jsonl",
+    "sha256_16": "568d07ca0068aa3d",
+    "n_rows": 12000
+  },
+  "schema": "与 data/t2-queries.jsonl 同构；type 固定 \"agent\"（不冒充四桶）",
+  "counts": {
+    "paired": 80,
+    "kept": 80,
+    "rejected_self_check": 0,
+    "dropped_dup_or_filtered": 0,
+    "sampled_docs": 80,
+    "pass_rate": 1.0
+  },
+  "self_check": {
+    "rule": "轮 2 给生成源段的 grade ≥ 1 才保留（否则丢弃）",
+    "pass_rate": 1.0
+  }
+}
