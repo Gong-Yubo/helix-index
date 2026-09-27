@@ -1,0 +1,12 @@
+{
+  "asset": "t7-15-qrels-only-corpus",
+  "source_queries": "data/t2-queries.jsonl",
+  "source_queries_sha256_16": "8e03ae62e00dcddb",
+  "source_corpus": "data/t2-corpus.jsonl",
+  "source_corpus_sha256_16": "568d07ca0068aa3d",
+  "n_queries": 320,
+  "n_qrels_sources": 5042,
+  "n_rows_in": 12000,
+  "n_rows_out": 5042,
+  "note": "qrels-only：随机负例段落全部剔除（grade 0 的已判定负例仍在）"
+}

@@ -26,6 +26,9 @@ name: CI
 #   效果评测需 12K 段落 embed（~230s）；性能是毫秒级 P99 口径，
 #   共享 runner 上的数字不具可引用性，反而会污染 eval-report.md。
 #   评测脚本保持本地一键可跑即可。
+#   ⚠️ **例外（V2 Step 9 / S9-06 起）**：`eval-assets` job 跑 T7-16 生成器的
+#   **离线桩自检（S9-T12）** —— 它零网络、零模型、毫秒级，守的是纯逻辑（解析/落盘/配对），
+#   不产生任何「读数」。上面那条政策的理由（重 + 数字不可引用）对它**不成立**。
 
 on:
   push:
@@ -78,6 +81,22 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: python3 scripts/check_shell_expansion.py
+
+  # ------------------------------------------------------------ 评测资产（**离线桩**）
+  #
+  # 🔑 与上面「评测脚本**故意**不进 CI」的关系（V2 Step 9 / S9-06 补）：
+  #    那条政策针对的是**读数类**评测脚本 —— 效果评测需 12K 段落 embed（≈230 s），
+  #    性能读数是毫秒级 P99 口径、共享 runner 上不可引用。
+  #    本 job 跑的是 **T7-16 生成器的离线桩自检（S9-T12）**：**零网络、零模型、毫秒级**，
+  #    断言对象是「解析 / 落盘 / 配对」这类**纯逻辑** ⇒ 正是 CI 应该守的那部分。
+  #    ⚠️ 它**不发任何外部请求**（这是 S9-T12 的字面要求）：桩响应内联在脚本里，
+  #       真实生成路径需显式 `HELIX_LLM_ALLOW_EGRESS=1` 才启动（R58 的显式开关）。
+  eval-assets:
+    name: eval assets self-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: python3 scripts/gen_t7_16.py --self-test
 
   # ------------------------------------------------------------ lint
   lint:
