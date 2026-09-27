@@ -25,6 +25,7 @@ hybrid vs bm25	7	1	72	0.0351562500
 hybrid vs vector	2	2	76	0.6875000000
 #
 # ---- ③ 泄漏诊断（同一统计量对照；2-gram 覆盖率，逐 query 取正例最大值）----
+# producer=python3 scripts/eval_query_cover.py --set t7-16=data/eval/t7-16/agent-queries.jsonl --set main-baseline=data/t2-queries.jsonl
 set	n	cover_mean	cover_median	cover_ge_0.7	cover_ge_0.9	qlen_median
 t7-16	80	0.500048	0.500000	9	0	18
 main-baseline	320	0.518043	0.500000	76	27	12
