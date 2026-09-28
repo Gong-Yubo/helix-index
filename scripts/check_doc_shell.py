@@ -13,6 +13,10 @@
 
     bash: `θ': not a valid identifier
 
+⚠️ **报错文案随形态变**（PR #78 评审的措辞 nit）：`for θ in …` 报上面这条；而**赋值形态**
+（`θ=1` / 本检查器用的 `eval "$1=1"`）报的是 `` bash: θ=1: command not found ``。
+⇒ **判据只看返回码**（两种形态都非 0）—— 脚本里**不写死**任何一条文案。
+
 而 `bash -n` **抓不到**它 —— 标识符非法是**执行期**错误，不是语法错误 ⇒ 只有**真执行**才暴露。
 
 # 判据（三条）
@@ -179,7 +183,7 @@ def scan_block(lineno: int, body: list[str]) -> list[str]:
             continue
         seen.add(ident)
         if not valid_bash_identifier(ident):
-            hits.append(f"L{lineno + i}: 非法标识符 `{ident}`（bash 拒绝：not a valid identifier）")
+            hits.append(f"L{lineno + i}: 非法标识符 `{ident}`（bash 拒绝该标识符 ⇒ 非零返回码）")
     for i, raw in enumerate(body, 1):
         for m in VAR_NONASCII.finditer(raw):
             hits.append(f"L{lineno + i}: `${m.group(1)}` 紧跟非 ASCII ⇒ 须写成 `${{{m.group(1)}}}`")
