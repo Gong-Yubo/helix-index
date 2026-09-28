@@ -152,6 +152,14 @@ impl Index {
 
     /// 摄入一个文档及其分片，返回 `(doc_id, chunk_ids)`。
     ///
+    /// ⚠️ **这是「内核直用」入口，不是常规路径**（`#5` 的命名强区分）：它收的是**已经分好片**的
+    /// `DocRecord` + `Vec<Chunk>`，调用方自己持 `Analyzer`、自己管 delta / 视图与提交时机。
+    /// 常规路径请用门面层的 [`crate::search::SearchIndex::add`]（收 `Document` 输入 DTO，
+    /// 内部自己切片 / 分词 / 维护 delta 与视图）—— 两者**同名不同层**，新读者最容易拿错。
+    ///
+    /// 按 `v2-step8-design.md` §4.12 的裁定，本入口**永久保留、不标 `#[deprecated]`**
+    /// （它是「**内核直用逃生舱**」：bench 的逐 lane 组装等场景**没有替代**）。
+    ///
     /// - **幂等 upsert（FR-15）**：`content_hash != 0` 且已存在同 hash 的存活文档
     ///   时直接跳过（返回既有 doc_id 与空 chunk 列表），不产生重复分片
     /// - 每个分片独立分词、独立维护 postings 与统计量
