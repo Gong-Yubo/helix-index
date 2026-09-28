@@ -571,11 +571,23 @@ mod tests {
     #![allow(non_snake_case)]
     use super::*;
 
+    /// ⚠️ **必须走 `build_config_with(ok_ctor)`，不能用 `build_config()`**（同下方 `S8_08_*`）：
+    /// 后者调**真实**构造器 ⇒ 在 CI 里会去联网下载模型（判据③实测：冷缓存下要 ~54 s，
+    /// 且「冷缓存 + 并发」下会取模型失败 ⇒ 断言结果**不确定**）。
+    ///
+    /// **覆盖边界**：本用例用**注入的恒成功**构造器 ⇒ 它证「零配置装配会把 embedder 装成
+    /// `Some`」，**不证**「生产入口注入的是真实构造器」（`build_config` → `local_embedder_ctor`
+    /// 那一步在无网络环境下不可断言）。
     #[test]
     fn 默认配置零配置可用() {
-        let cfg = SearchIndexBuilder::default().build_config();
+        let cfg = SearchIndexBuilder::default().build_config_with(ok_ctor);
+        // 零配置下默认 embedder **会被装出来**（原写法是 `is_some() || is_none()` 的恒真断言，
+        // 等于只测「不 panic」；换成有内容的判据：改坏「装配默认 embedder」这一步必须红）
+        assert!(
+            cfg.embedder.is_some(),
+            "零配置时必须装出默认 embedder，否则「零配置可用」不成立"
+        );
         // 分词器/融合/精排均有默认实现（不 panic）
-        assert!(cfg.embedder.is_some() || cfg.embedder.is_none()); // 有或没有均可
         assert!(!cfg.fusion.name().is_empty());
         assert_eq!(cfg.bm25_params.k1, 1.5);
         assert_eq!(cfg.bm25_params.b, 0.75);
@@ -589,16 +601,21 @@ mod tests {
     /// ⚠️ 覆盖边界：本测试只钉**配置层**的默认值与覆写。「配置 → 后端真的分派并行」这条
     /// 端到端链路**不可观测**（并行计数器 `parallel_inserts()` 只在低层 `HnswRsIndex` 上，
     /// 门面不暴露）⇒ 后端分派那一段由 `tests/graph_persist.rs` 的 **T22** 钉住。
+    ///
+    /// ⚠️ 同 `默认配置零配置可用`：走 `build_config_with(ok_ctor)` 而**不是** `build_config()`
+    /// —— 本用例只关心装配出来的 `parallel_build` 开关，与 embedder 从哪来无关。
     #[test]
     fn 并行建图默认开且可显式关闭() {
         assert!(
-            SearchIndexBuilder::default().build_config().parallel_build,
+            SearchIndexBuilder::default()
+                .build_config_with(ok_ctor)
+                .parallel_build,
             "门面默认应为 true（T7-21 / D-J11 翻转）"
         );
         assert!(
             !SearchIndexBuilder::default()
                 .parallel_build(false)
-                .build_config()
+                .build_config_with(ok_ctor)
                 .parallel_build,
             "显式 false 必须能关掉（需要可复现拓扑时用）"
         );

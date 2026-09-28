@@ -1,4 +1,4 @@
-.PHONY: all fmt lint test deny shell doc tree clean eval-quality eval-perf report
+.PHONY: all fmt lint test deny shell doc-shell doc tree clean eval-quality eval-perf report
 
 all: fmt lint test deny shell
 
@@ -34,6 +34,15 @@ deny:
 #       `LC_ALL=C` 下不触发，故本地裸跑可能漏掉，须进守门
 shell:
 	python3 scripts/check_shell_expansion.py
+	python3 scripts/check_doc_shell.py
+
+# 静态检查：docs/**/*.md 与仓库根 *.md 里 ```bash / ```sh 围栏块的形态
+# 与上面同源（文档里的 bash 块定位是「可复制的真实命令」），判据 = 语法 + **真执行**
+# 判定标识符合法（`for θ in …` 这类多字节标识符 `bash -n` 放行、执行期才报
+# `not a valid identifier`）+ `$VAR` 紧跟非 ASCII。详见 scripts/check_doc_shell.py。
+doc-shell:
+	python3 scripts/check_doc_shell.py --self-test
+	python3 scripts/check_doc_shell.py
 
 doc:
 	cargo doc --workspace --no-deps
