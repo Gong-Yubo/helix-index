@@ -71,16 +71,22 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
-  # ------------------------------------------------------------ 脚本静态检查
-  # bash 3.2（macOS 自带）在多字节 locale 下不把非 ASCII 字节当作变量名终止符：
-  # `"$VAR（"` 会被解析成一个变量名 ⇒ `set -u` 报 unbound variable 并中止脚本。
-  # `LC_ALL=C` 下不触发 ⇒ 本地裸跑可能漏掉，须由确定性守门兜住。
+  # ------------------------------------------------------------ shell / 文档 bash 块静态检查
+  # ① `check_shell_expansion.py`：bash 3.2（macOS 自带）在多字节 locale 下不把非 ASCII
+  #    字节当作变量名终止符：`"$VAR（"` 会被解析成一个变量名 ⇒ `set -u` 报 unbound variable
+  #    并中止脚本。`LC_ALL=C` 下不触发 ⇒ 本地裸跑可能漏掉，须由确定性守门兜住。
+  # ② `check_doc_shell.py`（#69 ③）：同一判据扩到**文档里的 bash 围栏块** —— 此前完全不被
+  #    检查。标识符非法（如 `for θ in …`）是**执行期**错误，`bash -n` 抓不到
+  #    （PR #70 第 3 轮评审 **P4-8** 的实测形态）⇒ 该门对标识符**真执行**判定。
+  #    `--self-test` 先跑一遍阴性对照自证判据有牙齿（含 P4-8 那类写法必须报红）。
   shell:
     name: shell expansion
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - run: python3 scripts/check_shell_expansion.py
+      - run: python3 scripts/check_doc_shell.py --self-test
+      - run: python3 scripts/check_doc_shell.py
 
   # ------------------------------------------------------------ 评测资产（**离线桩**）
   #
