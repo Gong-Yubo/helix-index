@@ -1,0 +1,583 @@
+# HelixIndex V2 · Step 10 详细设计（场景机制：命名空间 / 时间衰减 / MMR / token budget / 多 query 融合 + prefilter 判定）
+
+| 项 | 内容 |
+| --- | --- |
+| 版本 | **v0.1（2026-09-28，首版）** —— 纯设计，**`.rs` 零改动** |
+| 日期 | 2026-09-28 |
+| 状态 | **待评审**。本版交付：① 6 个任务（T7-19 / T7-20 / T7-02 / T7-03 / T7-04 / T7-27）的取形与判据；② **8 条设计期新发现**（源码级，逐条带锚点）；③ **双规模实测证据（1 万 / 10 万）**（**推翻计划里 T7-27 的判据口径**：缺口在**两个规模**恒 `0.00`，而 `filter_eval` 的**跨规模比值 9.40× ~ 14.92×** 对 10× 语料 ⇒ **未解耦**）；④ 决策 **D-S10-01 ~ D-S10-12**；⑤ 验收 **S10-1 ~ S10-7** / 测试 **S10-T1 ~ S10-T20** / 任务 **S10-01 ~ S10-09** 与 **8 段 PR 切分**；⑥ 风险 **R60 ~ R65**（→ 架构 §14.8）与未决 **Q10-1 ~ Q10-5**；⑦ 四处定义面回写草案 |
+| 上游 | `plan-v2.md` **v0.30** §4 Step 10（T7-19 / T7-20 / T7-02 / T7-03 / T7-04 / T7-27）/ §5（**FR-21 / FR-24 / FR-25 / FR-32 / FR-33 / FR-34**）/ §6「V2.1 门槛」的 **Step 10** 行 / §附-2（编号映射）/ §附-4（P0-3、P1-9）；`requirements-spec.md` **v1.27**（FR-32 / FR-33 / FR-34 行 + 范围外表）；`architecture-design.md` **v1.28**（**§5.5** Retriever / **§5.5.1** 谓词与已知短板 / **§5.6** FusionStrategy / **§5.7** Reranker 的 provided 方法先例 / **§8.3** 可观测性 / **ADR-010** 代价段 / **§14.3** R11 / R13 / R17 / R18 / **§14.5** R45 / R46 / **§14.8** = 本步新增风险 R60 ~ R65）；`eval-report.md` §8.9（Step 5 标定）；issue **#4**（本步入口） |
+| 锚点体例 | 沿用 `v2-step9-design.md` 的两条硬纪律：① 跨文档引用写「**§ 锚点 + 文档版本**」；② **本仓源码锚点用「符号 + 行号（标注时点 revision）**」，行号**只作辅助**——本仓的行号锚点已多次漂移（Step 6 / Step 7 各一次、Step 9 一次 26 行）。本文源码行号的时点 = **`c93dd5f`**（= **PR #80 的 squash 合并态**，`origin/main` 当点头；⚠️ PR #80 的**分支 head** 是 `e2155b7`、squash 后 `main` 上的提交是 `c93dd5f` —— 两者**树内容一致**（squash 不改树），但**引用须用 `main` 上的那个**，否则 `git show <sha>` 在 `main` 上找不到） |
+| 范围 | ① **T7-19** 命名空间隔离（**FR-32**）；② **T7-20** 时间衰减打分钩子（**FR-33**）；③ **T7-02** MMR 结果去重（**FR-24**）；④ **T7-03** token budget 裁剪（**FR-25**）；⑤ **T7-04** 多 query 融合（**FR-21**）；⑥ **T7-27** prefilter / 排序键索引的 **spike 与「投 / 不投」判定**（**FR-34** 草案；承接架构 **R11 / R13**）；⑦ 上述六项**共用的后处理窗口通道与观测面** |
+| 非范围 | **不做** prefilter / 排序键索引的**实现**（T7-27 只出判定 + 判据，判「投」则**另立预算与 NFR**，见 §4.7）；**不改** `FusionStrategy::fuse` 的签名（照 Step 9 的 **D-S9-01**）；**不改** Step 7 的窗口机制（`candidate_window` / `R`，**R45** 原样保留）；**不动** 精排器（`Reranker` 一字不改，仅新增**并列**的后处理 trait）；**不做**鉴权 / 多租户 / 访问控制（`requirements-spec.md` 范围外表已声明归场景层）；**不做** LLM query 改写（FR-21 只要求「留口子」，内核**不做**改写）；**不替换**主基线（评测沿用 `data/t2-queries.jsonl` + `data/synth-*`） |
+| 交付物 | ① 本文（设计）；② **判据修正**（T7-27 的判据从 `vector_shortfall` 换为「过滤求值成本的规模增长率 + 降级可观测」，见 **D-S10-06**）；③ 后处理阶段的**窗口通道**与观测面（提案，**需评审拍板是否触碰公开结构体**）；④ 8 段 PR 切分；⑤ 四处定义面回写 + CHANGELOG；⑥ 风险 **R60 ~ R65**（→ 架构 §14.8） |
+
+---
+
+## 决策速览（D-S10-01 ~ D-S10-12）
+
+| 编号 | 决策点 | 建议 | 定值来源 |
+| --- | --- | --- | --- |
+| **D-S10-01** | 后处理（时间衰减 / MMR / token budget）的**窗口通道** | **新增独立 trait**（暂名 `PostProcessor`）+ **provided** `candidate_window(k)`（默认 `k`）；编排层取 `candidate_k = max(3k, rerank_window, post_window, 10)`。**不**借用 `Reranker` 通道 | **§2.5 N6** + `Reranker::candidate_window` 先例（`rerank/mod.rs` 的 `candidate_window` 处） |
+| **D-S10-02** | 后处理的**插入位置** | **回捞之后、精排之前**（`query/searcher.rs` 的 `proto` 构造之后、`parts.reranker.rerank` 之前）。**不得**放进融合层 | **§2.5 N5**（`fusion/mod.rs` 头注释：融合**只操作 `(chunk_id, score)`、不回捞正文**） |
+| **D-S10-03** | 时间衰减**作用于哪个分**（Q-S2 / 计划明写「先定」） | 作用于**融合分这一档**，且**必须**在 `Explain` 留可观测信号（新增字段）；**不改**精排路径 | 架构 **R46** 的教训（`Hit.score` 语义随开关而变 ⇒ 必须可观测） |
+| **D-S10-04** | 命名空间的**承载形态** | **不加新检索机制**：namespace = 既有 `Filter::Eq` 用在**约定字段名**上；内核只提供**保留字段名的约定** + 便利构造（如 `Filter::namespace(ns)`） | `requirements-spec.md` §5.2 **FR-32** 行（「检索级命名空间（≠权限/多租户）」）+ 范围外表；**§2.4 N3**（全仓 0 命中 ⇒ 无现成概念） |
+| **D-S10-05** | 命名空间验收的**容差**（计划明写「容差须定义」） | **两段式**：`allowed ≤ 8192` ⇒ **容差 = 0（结构性）**；`allowed > 8192` ⇒ 容差 = **实测定值**（标「拟」）。**禁止**只写「不回退」而不给数 | **§2.5 N3** + Step 5 的 S5-04 先例（`v1.10` 落「拟」→ `v1.12` 定稿） |
+| **D-S10-06** | **T7-27 的判据**（🔴 本文**推翻**计划口径） | **主判据换为「`Metrics.filter_eval` 随语料规模的增长率」**（解耦 ⇔ 亚线性）+ 降级档位 `filter_eval` 占端到端 `took` 的比例；**辅** = 降级状态可观测面。⚠️ **`Metrics.vector_shortfall` 不得作为 T7-27 的判据**——它对「字段降级」**结构性盲**（实测：缺口恒 `0.00`） | **§2.4 N1**（本文实测，1 万级） |
+| **D-S10-07** | 字段降级的**可观测面** | 提案新增 `Metrics` 字段（如 `filter_degraded: bool` 或降级字段名列表），使「本次过滤是否整体退化为全扫」**直接可读** | **§2.5 N2**（`is_degraded` 存在但**不在** `Metrics`/`SearchResponse` 里） |
+| **D-S10-08** | MMR 的**相似度来源** | **不在设计期自选**：起步取**文本侧**（`Analyzer` 的 term 集合，零新 API）；**向量侧**（doc-doc 余弦）列为**条件项**——需先给 `VectorIndex` 加「按 `chunk_id` 取向量」能力 | **§2.5 N8**（`VectorIndex` trait 无「取向量」方法） |
+| **D-S10-09** | MMR / token budget 对 **`hits` 契约**的处置 | 二者都会改变 `hits` 的**排序依据**与**长度**，而 `Hit::score` 的 rustdoc 已声明「`hits` 恒按本字段降序」⇒ 必须：① `Explain` 留可观测信号；② **默认关**；③ 若改变默认行为则在 CHANGELOG 标 `⚠️ 破坏性` | 架构 **R46** 一族（对外可观测的破坏性变更） |
+| **D-S10-10** | token budget 的**计数口径** | 内核**不实现**目标模型的 tokenizer（仓内**没有**该抽象）；取形 = 调用方注入计数（新 trait，**默认实现 = 字符数**），并**在 rustdoc 明写「这不是 token 数」**；**禁止**把字符数当 token 数上报 | **§2.5 N4**（`token_budget` / `count_tokens` 全仓 0 命中） |
+| **D-S10-11** | 多 query 融合的**入口形态** | 新增 `Searcher::search_multi(...)`（公开方法）+ 编排层多 query 入口；⚠️ **会触碰 `FusionCtx`**（其字段是**单 query** 语义，且**字段白名单由 `S9_T3` 钉死**）⇒ 加字段**必须**同步白名单用例 | **§2.5 N4** + Step 9 的 **R55** 守线（`fusion/adaptive.rs` 的 `S9_T3`） |
+| **D-S10-12** | 「先 spike、再投」 | **T7-27 不预先承诺收益**：spike **S10-S1** 出数据再判「投 / 不投」；判「不投」则只交付**判据 + 观测面 + 结论**（同 Step 6 的 E1/E2/E3、Step 8 的 S8-S1/S8-S2、Step 9 的 S9-S1 先例） | `plan-v2.md` §4 的反模式纪律 + Step 6/8/9 先例 |
+
+---
+
+## 1. 目标与验收
+
+### 1.1 要解决的问题
+
+| 问题 | 证据（位置） | 严重度 |
+| --- | --- | --- |
+| **Q-S1** 无**命名空间 / 会话隔离**能力 | `plan-v2.md` §4 Step 10 任务表 **T7-19** 行；`requirements-spec.md` §5.2 **FR-32** 行（「检索级命名空间（≠权限/多租户）」）。⚠️ 源码侧：全仓 `crates/` 对 `namespace` / `命名空间` **0 命中**（本文实测） | 中（FR-32 优先级 = **Should**） |
+| **Q-S2** 无**时间衰减**能力，且**「作用于哪个分」未定** | `plan-v2.md` §4 Step 10 任务表 **T7-20** 行明写「⚠️ **先定「作用于哪个分」**：`Hit.score` 语义已随开关而变（融合分 → `σ(logit)`，架构 **R46**）」；`requirements-spec.md` §5.2 **FR-33** 行 | 低（FR-33 优先级 = **Could**） |
+| **Q-I1** 高基数字段过滤**收益为 0** | `architecture-design.md` §5.5.1（「**约 512 篇**就撞线」）+ **ADR-010** 代价段（「**Q-I1 对最常见的真实场景收益为 0**」）+ `index/field_index.rs` 模块文档的「⚠️ 已知短板」段。⚠️ **本文新增实测**：1 万级合成语料 `ts-range-degraded` 档 —— 旧全扫 **0.4004 ms** vs 新位图谓词 **0.3993 ms** ⇒ **加速比 1.0×**（见 §2.4 N1） | 高（`plan-v2.md` §3 需求来源的 **Q-I1**） |
+| **Q-U3** 结果**不去重** | `requirements-spec.md` §5.2 **FR-24** 行（「结果去重（MMR）」，Could）；§三「结果直接进 prompt，无翻页」的对策列点名 **FR-12 / FR-24** | 中（Agent 场景可操作性） |
+| **Q-U4** 结果**不按 token budget 裁剪** | `requirements-spec.md` §5.2 **FR-25** 行（「按 token budget 裁剪，防止撑爆上下文窗口」）；§三同一行的对应对策 | 中（同上） |
+| **Q-U5** 只支持**单 query** | `requirements-spec.md` §5.2 **FR-21** 行（「多 query 融合接口」，为 HyDE / multi-query 改写留口子）；源码侧：`search_parts(parts, query: &str, …)` 只收**一个** `&str`（`query/searcher.rs` 的 `search_parts` 签名处），全仓 `multi_query` / `search_multi` **0 命中** | 低（FR-21 优先级 = **Could**；内核**不做**改写） |
+
+### 1.2 对应需求
+
+| 需求 | 内容摘要 | 优先级 | 本文落点 |
+| --- | --- | --- | --- |
+| **FR-32** | 命名空间隔离（检索级；≠权限/多租户） | Should | §4.2（**D-S10-04 / D-S10-05**）+ 验收 **S10-1 / S10-2** |
+| **FR-33** | 时间衰减打分钩子（可插拔；**策略放场景层**） | Could | §4.3（**D-S10-03**）+ 验收 **S10-3** |
+| **FR-24** | MMR 结果去重 | Could | §4.4（**D-S10-08 / D-S10-09**）+ 验收 **S10-4** |
+| **FR-25** | token budget 裁剪 | Could | §4.5（**D-S10-09 / D-S10-10**）+ 验收 **S10-5** |
+| **FR-21** | 多 query 融合接口（内核**不做**改写） | Could | §4.6（**D-S10-11**）+ 验收 **S10-6** |
+| **FR-34** | prefilter / 排序键索引（**草案，待评审**；高基数字段） | Should | §4.7（**D-S10-06 / D-S10-07**）+ 验收 **S10-7**；⚠️ **是否投由 spike S10-S1 判定** |
+| *（无编号）* | 「命名空间低选择度过滤召回不回退（**容差须定义**）」 | — | `plan-v2.md` §6 **Step 10 门槛行** ⇒ 本文 **D-S10-05** 给出**两段式容差** |
+
+> ⚠️ **本文不新增任何 FR / NFR 编号**，也**不修订任何既有指标数值**。**FR-34 的措辞是否需要更正**（其判据句）见 **D-S10-06** 与 **§6.4**，**需评审拍板**。
+
+### 1.3 验收标准（**可证伪**，编号化）
+
+| 编号 | 判据 | 可证伪的断言（怎么算过） |
+| --- | --- | --- |
+| **S10-1** | 命名空间过滤的**召回不回退**，且容差**有定义** | ① `allowed ≤ 8192` 档：**逐 query** `metrics.vector_shortfall == 0` **且** `metrics.vector_route == Exact`（结构性，非统计）；② `allowed > 8192` 档：缺口 ≤ **实测定值**（须给数、标「拟」）—— **只写「不回退」而无数字 = 不通过** |
+| **S10-2** | 命名空间字段**降级不静默** | 构造一个必然降级的字段（如 `>=512` 篇各不相同的值），断言本次检索的观测面**显式**报告降级（`Metrics.filter_degraded == true`，或评审同意的等价形态）；**反向**断言：未降级档位为 `false` |
+| **S10-3** | 时间衰减**可插拔 + 可观测 + 关闭即逐位一致** | ① 开关关 ⇒ `hits` 的 `(chunk_id, score)` 序列与未引入该机制时**逐位一致**；② 开关开 ⇒ `Explain` 上的衰减信号 `is_some()`；③ 作用分**唯一且写进 rustdoc**（**D-S10-03**） |
+| **S10-4** | MMR 有**单测 + 示例**，且契约变化**可观测** | ① 单测：构造 `k` 条高冗余候选 ⇒ 启用后结果集的**两两相似度上界**下降，且长度 ≤ `k`；② `Explain` 能分辨「本条按多样性序选中」；③ **关闭 ⇒ 逐位一致**；④ `hits` 的排序依据变化写进 rustdoc（**D-S10-09**） |
+| **S10-5** | token budget 有**单测 + 示例**，且计数口径**不撒谎** | ① 输出的（按注入计数器计的）合计 ≤ budget；② **超预算时的行为写死**（截断 or 换条目，**二选一**，见 **Q10-3**）；③ 默认计数器 = 字符数时，**rustdoc 与 `Metrics`/`Explain` 均明写「这不是 token 数」**（**D-S10-10**） |
+| **S10-6** | 多 query 融合可用，且**单 query 路径零回归** | ① `search_multi(&[q1, q2])` 能返回融合结果；② **单 query 路径**（含 `Searcher::search`）`(chunk_id, score)` **逐位一致**；③ `FusionCtx` 若新增字段，**`S9_T3` 白名单用例同批更新**（**R55** 的守线不得失守） |
+| **S10-7** | T7-27 有**「投 / 不投」结论** + **双规模读数** | ① 1 万级与 10 万级各产出 `Metrics.filter_eval` 读数（**同一 harness**、**必标运行范围**；⚠️ **设计期已出一版双规模读数（§2.4 / 附录 C）**，spike 须**独立复跑**并补齐 **G1 ~ G4** 的判定与**阈值预注册**）；② 给出**增长率**（解耦 ⇔ 亚线性）与**决策门**的逐条对照；③ 结论为「投」则**另立预算与 NFR**（本文只给形态），为「不投」则**写明触发复审的条件** |
+
+> ⚠️ **S10-1 的写法是本设计的一个刻意选择**：把「容差」拆成**结构性为 0** 与**实测定值**两段，是为了让验收**今天就可判定**（不依赖尚未跑出的标定），同时**不掩盖**第二段的未知。
+
+---
+
+## 2. 现状与问题定位（源码级）
+
+> 本节全部锚点的时点 = **`c93dd5f`**（PR #80 的 squash 合并态，`origin/main`）。行号**只作辅助**，符号名与 `§` 锚点才是主锚点。
+
+### 2.1 检索编排只有**一个**实现，且分为**五步**
+
+`query/searcher.rs` 的 `search_parts` 是编排的唯一实现（模块内注释：「所有检索入口（`QueryExecutor::search` / 门面 `Searcher::search`）最终都到这里，不存在第二份编排逻辑」）。其步骤（按源码顺序）：
+
+| 步 | 做什么 | 关键事实（`c93dd5f`） |
+| --- | --- | --- |
+| 0 | 早退判定（索引为空） | `index_is_empty` 分支**刻意不调** `metrics.log`（D-S5-08 的注释） |
+| 1 | **候选预算 `candidate_k`** | `window = parts.reranker.candidate_window(k)` 然后 `candidate_k = k.saturating_mul(3).max(window).max(10)`；注释明写「**顺序是硬要求**：`candidate_k` 被下方两路召回与 `fuse(.., candidate_k)` 消费 ⇒ 精排窗口必须在**召回之前**问出来」 |
+| 2 | **过滤求值 → 谓词** | `predicate_builder.as_deref()`；单段回落到 `query::filter::try_build_predicate`；`metrics.filter_eval = t0.elapsed()`；`metrics.allowed = predicate.allowed_count()` |
+| 3 | **两路召回** | `bm25_f` 在**无用户过滤且无跨段墓碑**时传 `None`（热路径优化）；向量路**恒**传谓词（`hnsw_rs` 无法摘除已删向量）；Hybrid 走 `rayon::join`；`metrics.vector_shortfall = candidate_k.min(metrics.allowed).saturating_sub(l.len())` |
+| 4 | **融合** | Hybrid：`adaptive_fusion` 开 ⇒ 构造 `FusionCtx` → `fuse_adaptive(&lanes, candidate_k, &ctx)`；关 ⇒ `fuse(&lanes, candidate_k)`。单路模式：`lanes.into_iter().flatten().collect()` ⇒ **不截断** |
+| 5 | **窗口回捞 → 精排 → 补 `explain`** | `take_n = if k == 0 { 0 } else { window.max(k).min(fused.len()) }`；逐条构造 `Hit`（`metadata: doc.metadata.clone()`、`explain.fused_score`）；`handed = proto.len()`；`parts.reranker.rerank(query, proto, k)`；末段循环只补 5 个 `explain` 字段（**不碰** `rerank_score`） |
+
+**可直接读出的三个结构性事实**：
+
+1. **窗口只有一个来源**：`window` 完全由 `parts.reranker.candidate_window(k)` 决定 ⇒ 精排器是**唯一**能要求「比 `k` 更大候选池」的角色。
+2. **`candidate_k` 同时是融合输出上限**：第 4 步的 `fuse(.., candidate_k)` 用的是同一个数 ⇒ 任何后处理能看到的候选**上界**就是 `candidate_k`。
+3. **回捞之后才有 metadata**：第 5 步构造 `Hit` 时才 `doc.metadata.clone()`。
+
+### 2.2 过滤与字段索引（FR-32 / FR-34 的落点）
+
+| 事实 | 位置（`c93dd5f`） |
+| --- | --- |
+| `Filter` 只有四个变体：`Eq { field, value }` / `Range { field, gte, lte }` / `And` / `Or` | `schema.rs` 的 `enum Filter` |
+| `FieldIndex` = `field → value → doc 位图`，**doc 级**（metadata 挂 doc 上，chunk 继承判定） | `index/field_index.rs` 模块头「粒度：为什么只维护 doc 级」段 |
+| 基数保护对象 = **`terms + numbers` 合计键数**（避免「terms 受保护但 numbers 爆炸」的缝） | 同上「基数保护（内存护栏）」段；默认 `DEFAULT_MAX_VALUES_PER_FIELD = 1024` |
+| **数值字段同时登记 terms 与 numbers 两键** ⇒ 毫秒时间戳**约 512 篇**即降级（不是 1024） | 同上「⚠️ 已知短板」段 |
+| `degraded` **粘滞**（有意设计，不是 bug）：降级后即使计数回落也不复位，避免「看起来完整、实际漏键」的**假阴性**；`save`/`load` 后归零（字段索引不入快照、`import` 全量 `rebuild`） | `FieldValues::degraded` 的字段文档 |
+| 求值回退：`doc_bits` 在 `eq_bits` / `range_bits` 返回 `None` 时走 `doc_bits_scan`（**逐存活文档 JSON 全扫**） | `query/filter.rs` 的 `doc_bits` 两处 `None => doc_bits_scan(...)` |
+| **降级状态有 API**：`FieldIndex::is_degraded(&self, field) -> bool`；且 `Index::field_index()` 是 `pub` | `index/field_index.rs` 的 `is_degraded`；`index/mod.rs` 的 `pub fn field_index` |
+| **但降级状态不在 `Metrics` / `SearchResponse` 里** —— 唯一的打印点在 bench 的 `--filter-cost` 诊断路径 | `cli/src/bench.rs` 的「降级状态直接暴露」注释段 + `collect_fields` 辅助函数 |
+| 精确兜底阈值 `BRUTE_FALLBACK_MAX_ALLOWED = 8192`；路径分派由 `prefers_exact` 给出、编排层只做二选一 | `vector/hnsw_rs_index.rs` 的常量与 `prefers_exact` 实现；编排层 `let vec_route = vec_lane.route()` |
+
+### 2.3 后处理三个任务的落点（源码现状）
+
+| 任务 | 今天有没有 | 证据 |
+| --- | --- | --- |
+| **MMR** | ❌ 无 | 全仓 `crates/core/src/` 对 `mmr` / `diversity` **0 命中**（`lib.rs` 有一处历史注释提到 MMR 曾在 P6 计划里，但**不在当前范围**） |
+| **token budget** | ❌ 无 | `token_budget` / `budget` / `count_tokens` **0 命中** ⇒ **仓内没有目标模型的 tokenizer 抽象**（`Analyzer` 是 BM25 侧分词器，不是 LLM tokenizer） |
+| **多 query** | ❌ 无 | `multi_query` / `search_multi` **0 命中**；`search_parts` 的 `query: &str` 是**单选**；`FusionCtx` 的 `query_terms` / `query_chars` / `has_ascii` / `query_df` 全是**单 query** 语义 |
+| **时间衰减** | ❌ 无（只有 Step 9 留下的**近邻先例**） | `fusion/adaptive.rs` 的 `FusionCtx` + `AdaptiveRule` 是「可插拔规则 + 白名单 ctx」的**直接先例**，可照抄形态 |
+| **命名空间** | ❌ 无（但**不需要新机制**） | 全仓 `namespace` **0 命中**；`Filter::Eq` 已能表达「命名空间过滤」——争点是**约定与验收**，不是机制（**D-S10-04**） |
+
+### 2.4 🔴 设计期新发现 **N1**：T7-27 的判据与 FR-34 的第一用例**错配**（本文实测坐实）
+
+**计划写的判据**（两处，措辞一致）：
+
+- `plan-v2.md` §4 Step 10 的 T7-27 注记：「判据 = 用评测集跑出「**高基数字段过滤下 shortfall 的实际分布**」，**有数据再决定投不投**」。
+- `requirements-spec.md` §5.2 **FR-34** 行：「⚠️ **是否投由 T7-27 的 spike 判定**（判据 = `Metrics.vector_shortfall` 的分布）」。
+- 架构侧同源：`architecture-design.md` §8.3 的指标表把 `vector_shortfall` 标为「**V2.1 是否引入 prefilter 结构的判据**」。
+
+**但 FR-34 的第一用例是「高基数字段的**过滤成本**与语料规模解耦」**，其病根在**过滤求值侧**（字段索引降级 ⇒ `doc_bits_scan` O(N) 全扫），与 `vector_shortfall` 度量的**向量路召回缺口**是两个正交的量。
+
+**实测（本文）** —— **双规模**合成语料（`data/synth-{10000,100000}-corpus.jsonl`；`--modes bm25,vector,hybrid`；`--reps 5`；`k=10`；release；快照由 `helix build --vectors --single-chunk` **现建**）。⚠️ **两规模的 query 数不同**（1 万 = **60**、10 万 = **100**，随 fixture 自带）⇒ **只比较同一规模内的相对关系与跨规模的比值**，**不比较绝对值**。
+
+| 规模 | 档位 | 过滤条件 | `allowed` | 内核缺口 `vector_shortfall` | `vector_route` 精确占比 | `mean_filter_eval_us`（bm25 / vector / hybrid） |
+| --- | --- | --- | --- | --- | --- | --- |
+| **1 万** | `none` | 无过滤 | — | **0.00 / 0.00 / 0.00** | 0.000 / 0.000 / 0.000 | **0.017 / 0.043 / 0.062** |
+| **1 万** | `ts-range-degraded` | `ts_ms>=1700000000000,ts_ms<1700000010000` | **14**（选择度 0.0014） | **0.00 / 0.00 / 0.00** | — / **1.000** / **1.000** | **375.07 / 613.24 / 496.77** |
+| **10 万** | `none` | 无过滤 | — | **0.00 / 0.00 / 0.00** | 0.000 / 0.000 / 0.000 | **0.019 / 0.032 / 0.031** |
+| **10 万** | `ts-range-degraded` | 同上 | **115**（选择度 0.00115） | **0.00 / 0.00 / 0.00** | — / **1.000** / **1.000** | **5594.71 / 5762.52 / 6137.16** |
+
+**跨规模增长率（10 万 ÷ 1 万，同档同 mode；语料比 = 10×）**：
+
+| 档位 | bm25 | vector | hybrid |
+| --- | --- | --- | --- |
+| `none` | 1.12× | 0.73× | 0.50×（**平坦** —— 无过滤时求值几乎免费、与规模无关） |
+| `ts-range-degraded` | **14.92×** | **9.40×** | **12.35×**（≈ 线性 ⇒ **未解耦**） |
+
+**同档「降级 ÷ 无过滤」的比值**（即设计 §4.7 的 **G4** 用的量）：1 万 **8035× ~ 21597×**、10 万 **182404× ~ 288120×** ⇒ 降级档的求值成本不是「稍贵」，而是**换了量级**。
+
+同批 `--filter-cost` 的 T13 对照（仅求值，不含检索）：
+
+| 规模 | `allowed_chunks`（旧·全扫 HashSet） | `doc_bits + 惰性谓词`（新） | `doc_bits_scan`（降级字段实际路径） | 加速比（旧 ÷ 新） |
+| --- | --- | --- | --- | --- |
+| 1 万 | **0.4004 ms** | **0.3993 ms** | **0.4028 ms** | **1.0×** |
+| 10 万 | **3.8426 ms** | **5.2301 ms** | **3.9168 ms** | **0.7×** ⚠️ |
+
+⚠️ **10 万级那一行是本轮新增的一个更硬的读数**：在**降级字段**上「新路径」（`doc_bits + 惰性谓词`）**比旧的全扫 HashSet 还慢 1.36×** —— 机理是 `doc_bits` 在该字段上**回落**到 `doc_bits_scan`（逐存活文档 JSON 全扫），却又额外付了谓词包装 / 位图构造的成本。这**不是新缺陷**（架构 §5.5.1 与 **ADR-010** 代价段早已写「**Q-I1 对它收益为 0**」），而是把「**收益为 0**」这句**从定性变成定量**：**10 万级上是负收益**。bench 同时打印：`降级字段: ["ts_ms", "ts_ms"] → 该字段退化为全扫（Q-I1 对它收益为 0）`。
+
+**三条结论**：
+
+1. **`vector_shortfall` 对「字段降级」结构性盲 —— 且该盲在两个规模上一致**。机理可从源码推出：缺口定义为 `candidate_k.min(allowed) − vector_lane.len()`；降级只影响**过滤求值怎么算**，不影响 `allowed` 的**取值**（全扫同样算得对）；而当 `allowed ≤ BRUTE_FALLBACK_MAX_ALLOWED (8192)` 时向量路走 `Exact`、返回 `min(k, allowed)` 条 ⇒ **缺口恒 0**。**实测在 1 万（`allowed = 14`）与 10 万（`allowed = 115`）两个规模上都是 `0.00`** ⇒ 「缺口恒 0 只是小规模假象」这一**可能的反驳被两个规模同时排除**；而同一批读数里 `filter_eval` 已从 375~613 µs 涨到 5595~6137 µs。
+2. **真信号在 `Metrics.filter_eval`，且它给出的正是判据要的那个量**。该量的**跨规模比值**（**9.40× ~ 14.92×** 对 10× 语料）直接回答「**成本是否与规模解耦**」—— 本轮读数说**没有**（≈ 线性）。且 `architecture-design.md` §8.3 的指标表本来就把 `filter_eval` 标为「**定位 Q-I1 未覆盖到的降级字段全扫**」——**架构文档里 `filter_eval` 与 `vector_shortfall` 的定位本就不冲突，冲突的是计划把两者当成同一个判据**。
+3. **按计划字面执行会得到假阴性**：spike 会读到「缺口处处为 0」（**两个规模都是**）⇒ 顺理成章判「不投」，而**真需求（高基数字段解耦）从未被测量**。这正是本项目反复记录的「**判据错 ⇒ 结论错、而代码没错**」一类（同族：Step 7 的 `R48`）。
+
+⇒ 处置见 **D-S10-06**（换判据）+ **D-S10-07**（补观测面）+ **§4.7**（spike 与决策门）+ 风险 **R60**。
+
+> ⚠️ **本节只给读数，不预先给「投 / 不投」结论**：决策门 **G1 ~ G4**（§4.7）的判定属 **spike S10-S1（`S10-01`）**，且**阈值必须在出数前预注册**（Step 9 的 G4 教训）。⚠️ **延迟类读数不具跨机可引用性**；本节只用**同机同批**的相对关系（降级档 vs 无过滤档、10 万 vs 1 万、旧路径 vs 新路径）。运行范围见 **附录 C**。
+
+> ⚠️ **本文不主张 `vector_shortfall` 无用**。它对 **R11 / R13 / R17 / R18**（filtered-ANN 的**召回缺口**、`allowed > 8192` 的中高选择度档位）仍是正确的信号——**它只是不能回答 FR-34 问的那个问题**。这一点必须写清，否则会从「用错判据」滑到「废掉一个正确指标」。
+
+### 2.5 设计期新发现 **N2 ~ N8**
+
+| 编号 | 发现 | 证据（`c93dd5f`） | 设计后果 |
+| --- | --- | --- | --- |
+| **N2** | 字段**降级状态在生产侧不可直接观测** | `FieldIndex::is_degraded` 存在且 `Index::field_index()` 为 `pub`，但**均不在** `Metrics` / `SearchResponse` 里；唯一打印点在 bench 的 `--filter-cost` 诊断路径（`cli/src/bench.rs` 的「降级状态直接暴露」段） | ⇒ 生产调用方只能从「`filter_eval` 变慢」**间接**察觉，无法回答「我的 namespace 字段是否已降级」⇒ **D-S10-07** |
+| **N3** | 「命名空间」在代码里**零现成概念**；但**不需要新机制** | 全仓 `crates/` 对 `namespace` / `命名空间` **0 命中**；`Filter::Eq` 已能表达该过滤；`requirements-spec.md` 范围外表明写「内核只提供**命名空间过滤机制**（FR-32），鉴权/策略归场景层」 | ⇒ 争点是**约定 + 验收容差**，不是机制 ⇒ **D-S10-04 / D-S10-05** |
+| **N3b** | 命名空间的容差可以**从源码结构性派生**（本设计的**具体答案**） | `allowed ≤ BRUTE_FALLBACK_MAX_ALLOWED (8192)` ⇒ `prefers_exact` 为真 ⇒ 走精确路径 ⇒ 返回 `min(k, allowed)` ⇒ **缺口 = 0 是结构性结论、不是统计结论**。实测佐证：本档 `allowed = 14`、`mean_hits = 10.00`、精确占比 `1.000`、缺口 `0.00` | ⇒ 容差**两段式**：`≤ 8192` ⇒ **0**；`> 8192` ⇒ 走 ANN ⇒ 容差 = `R17` 的固有近似误差 + 图覆盖偏差，**须实测** ⇒ **D-S10-05 / S10-1** |
+| **N4** | MMR / token budget / 多 query **三项全为绿地**，且各有一个**结构性缺口** | ① `mmr` / `diversity` 0 命中；② `token_budget` / `count_tokens` 0 命中 ⇒ **仓内无 LLM tokenizer 抽象**；③ `multi_query` / `search_multi` 0 命中，`search_parts` 收单个 `&str`，`FusionCtx` 字段为单 query 语义（且**白名单由 `S9_T3` 钉死**） | ⇒ **D-S10-10**（计数口径由调用方注入）/ **D-S10-11**（多 query 触碰白名单须同步用例） |
+| **N5** | 后处理的插入位置**被源码限死**：只能在「回捞之后、精排之前」 | `fusion/mod.rs` 模块头明写「本模块**不回捞正文**——融合只操作 `(chunk_id, score)`」⇒ 融合层**物理上**读不到时间 / 正文；`Hit` 的 `metadata` 在 `query/searcher.rs` 第 5 步才被 `clone` 进来 | ⇒ **D-S10-02**（位置唯一）。⚠️ 这条**排除**了「把时间衰减做成 `FusionStrategy` 的一个方法」这一看似自然的取形 |
+| **N6** | 任何「需要比 `k` 更大候选池」的后处理都会撞 **`candidate_k` 的静默封顶**（**R45 同族**） | `candidate_k = max(3k, window, 10)` 且**同时**是融合输出上限（`fuse(.., candidate_k)`）；后处理能看到的量 = `take_n = min(max(k, window), 融合条数)`，而 `window` **只由** `Reranker::candidate_window` 给出 | ⇒ 三个取形（A 借用 `Reranker` 通道 / **B 新增独立 trait + 自己的窗口** / C 只在 `k` 内工作）；**取 B**，理由见 §4.1 ⇒ **D-S10-01 / R61** |
+| **N7** | `hits` 的「恒按 `score` 降序」是**已文档化的对外契约**，MMR 会破坏它 | `query/response.rs` 的 `Hit::score` rustdoc：「**当前排序依据**（`hits` 恒按本字段降序；同分按 `chunk_id` 升序，NFR-06）」 | ⇒ MMR / token budget 必须在 `Explain` 留可观测信号 + 默认关 + 必要时标 `⚠️ 破坏性` ⇒ **D-S10-09 / R62** |
+| **N8** | **MMR 拿不到「候选自己的向量」** | `vector/mod.rs` 的 `VectorIndex` trait 只有 `add` / `add_batch` / `search` / `search_filtered` / `search_exact_filtered` / `prefers_exact` / `len` / `as_graph_persist` —— **没有**「按 `chunk_id` 取向量」；`index/mod.rs` 也没有对应的 `pub fn`；`Explain.vector_score` 是 **query↔doc** 余弦，**不是 doc↔doc** | ⇒ MMR 的相似度来源**必须显式拍板**：文本侧（零新 API）/ 向量侧（需给 `VectorIndex` 加能力）/ 查询期重 embed（有语义漂移与成本）⇒ **D-S10-08 / Q10-2** |
+
+---
+
+## 3. 设计约束（既有事实，本文不重新论证）
+
+1. **`Metrics` / `SearchResponse` / `Explain` / `Hit` 字段全 `pub`** ⇒ 加字段是**破坏性**（下游字面量构造会编译失败）。本项目 0.x 阶段接受，但**必须在 CHANGELOG 标 `⚠️ 破坏性`**（先例：D-S5-05 / D-S7-05）。
+2. **`Metrics` 的值必须「不撒谎」**：`Metrics::default()` 是草稿缓冲区，**每条返回路径**都必须显式填好（单测 `默认值不撒谎` 钉住）。
+3. **`fusion` 模块不回捞正文**（模块头硬约束）⇒ 融合只操作 `(chunk_id, score)`。
+4. **`FusionCtx` / `LaneStats` 的字段白名单由 `S9_T3` 钉死**（结构体字面量逐字段构造）⇒ **加字段而不改用例 ⇒ 编译失败**（这是 R55 的守线，**不得绕过**）。
+5. **I7 口径自洽**：`metrics.took == took`、`metrics.candidates == total_candidates`。
+6. **NFR-06（确定性）**：相同 query → 完全相同结果；`hits` 恒按 `score` 降序、同分按 `chunk_id` 升序。
+7. **精排窗口三条不变式**（Step 7 / `query/searcher.rs` 的模块级注释）：`window ≤ candidate_k`、`metrics.rerank_window ≤ k` ⟺ 本次没有额外候选、默认实现下与精排引入前逐位一致。
+8. **`hnsw_rs` 建图无 seed** ⇒ 任何「跨两张图逐位一致」的断言必然 flaky ⇒ 效果类对比必须在**同一冻结图**上做（`--index` + 固定快照）。
+9. **评测数据固定**：主基线 = `data/t2-queries.jsonl`（320 query）；选择性档位 = `data/synth-{10000,100000}-filters.json`（**已物化**，含 `ts-range-degraded` 档）。⇒ **T7-27 的 spike 不需要新造资产**。
+10. **`deny.toml`** 的许可白名单与 MIT 单许可**不动**；本 Step 不引入新依赖（文本侧 MMR / 字符计数为 0 依赖取形；向量侧 MMR 需另议）。
+
+---
+
+## 4. 详细设计
+
+### 4.1 后处理阶段与窗口通道（**D-S10-01 / D-S10-02**）
+
+**结论**：在「回捞之后、精排之前」插入一个**可选**的后处理阶段，其窗口由**后处理器自己**（provided 方法）给出，并参与 `candidate_k` 的 `max`。
+
+```text
+window        = Reranker::candidate_window(k)          // Step 7 现状，不动
+post_window   = PostProcessor::candidate_window(k)     // 新增，provided，默认 k
+candidate_k   = max(3k, window, post_window, 10)       // ← post_window 必须参与，否则静默封顶（R61）
+steps:
+  ① 召回（bm25 / vector）
+  ② 融合           → fused: Vec<(ChunkId, Score)>      （长度 ≤ candidate_k）
+  ③ 窗口回捞       → proto: Vec<Hit>                    （长度 = min(max(k, window), fused.len()) 内可回捞的）
+  ④ 后处理【新】   → post: Vec<Hit>                     （时间衰减 / MMR / token budget）
+  ⑤ 精排           → hits: Vec<Hit>                     （可能再变序 / 变长）
+  ⑥ 补 explain
+```
+
+**为什么取「新增独立 trait」而不是「借用 `Reranker` 通道」（N6 的三选一）**：
+
+| 取形 | 代价 | 判断 |
+| --- | --- | --- |
+| **A. 把后处理实现为 `Reranker`** | 零新机制；但 ① **语义借用**（「精排」装 MMR 会让 `Metrics.rerank_*` / `Explain.rerank_score` 的语义失真）；② `Searcher` 只有**一个** `reranker` ⇒ **MMR 与真精排不能并存**（而 FR-24/25 与 FR-18 是独立需求） | ❌ 否决 |
+| **B. 新增 `PostProcessor` trait（**采纳**）** | 新公开 trait（纯加法）+ `SearchParts` 新字段 + `SearchIndexBuilder` 新 setter；需与精排**串行**而非并存（同一个「后处理」位） | ✅ **采纳** |
+| **C. 只在 `k` 条内工作** | 零机制改动；但 MMR 无候选可换 ⇒ 多样性上限 = 已选 `k` 条内重排；token budget 无法「换更小条目」；时间衰减无法把窗口外的条目提上来 | ❌ 否决（会重演 Step 9 `R59` 的「取形过糙」教训） |
+
+⚠️ **B 的一个诚实边界**：`PostProcessor` 与 `Reranker` 谁先谁后是**固定的**（后处理 → 精排）。若要「精排后再 MMR」需另立阶段；本设计**不做**，并把它登记为 **Q10-5**（未决）。
+
+⚠️ **默认装配为空**（`post: None`）⇒ **零行为变化**，与 `NoOpReranker` 的处置口径一致（D-S7-04 先例）。
+
+### 4.2 命名空间（**D-S10-04 / D-S10-05**）
+
+**D-S10-04 的实质**：FR-32 要的是「检索级命名空间过滤**机制**」，而 `Filter::Eq` **已经是**该机制。内核**不加**第二套过滤路径。本文只定两件事：
+
+1. **约定**：命名空间用**元数据字段**承载，字段名由使用方约定（本文**不**保留一个魔法字段名——保留名会与用户元数据冲突，且一旦保留就进了「内核语义」，而 FR-32 明确是「检索级」）。
+2. **便利构造**（可选，纯加法）：`Filter::namespace(ns)` ⇒ 展开为 `Filter::Eq { field: <约定字段>, value: ns }`。⚠️ **便利构造不得引入默认字段名以外的语义**；若评审认为「约定字段名」本身就多余，可只保留文档约定、不加 API。
+
+**D-S10-05 的容差（两段式，本设计的具体交付）**：
+
+| 档 | 条件 | 召回缺口容差 | 依据 |
+| --- | --- | --- | --- |
+| **A** | `allowed ≤ BRUTE_FALLBACK_MAX_ALLOWED (8192)` | **0（结构性）** | `prefers_exact` 为真 ⇒ 精确路径 ⇒ 返回 `min(k, allowed)` 条 ⇒ 缺口恒 0。**实测佐证**：1 万级 `ts-range-degraded`（`allowed = 14`）下缺口 `0.00`、`mean_hits = 10.00`、精确占比 `1.000` |
+| **B** | `allowed > 8192` | **待实测**（标「拟」） | 走 ANN ⇒ 缺口 = `R17` 的固有近似误差 + 图覆盖偏差（`R17` 已记「20 点图 200 次采样：191 次满 / 8 次少 1 / 1 次少 2」）⇒ **不可写死**，须按 `S5-04` 先例（先「拟」后定稿） |
+
+⚠️ **公开的使用建议要写清**：命名空间字段若是**每会话一个**（高基数）⇒ 必然降级（**§2.2**：数值字段约 512 篇、字符串字段约 1024 篇即撞线）⇒ 隔离仍在、但**该字段上的过滤退化为 O(N) 全扫**。这既是 **R64**，也是 T7-27 的真实动因之一。
+
+### 4.3 时间衰减打分钩子（**D-S10-03**）
+
+**作用分**（计划明写「先定」的那个问题）：**作用于融合分这一档**，理由是它与 `Explain.fused_score` 同一层，可观测面现成；作用于精排输出后的 `σ(logit)` 会把「衰减」与「精排」两把尺子混在一起（**R46** 的教训）。
+
+**形态**（照 `fusion/adaptive.rs` 的 `AdaptiveRule` + `FusionCtx` 先例）：
+
+- 新增 `PostProcessor` 的一个实现（暂名 `TimeDecay`），持「权重 + 时间字段名 + 时钟基准」三个显式参数（**全部显式、无默认魔数**——Step 9 的教训是「隐式阈值造成不可复现读数」）。
+- 触发面：`Config::time_decay`（**默认 `None` = 不做**）+ `SearchIndexBuilder` setter ⇒ **零行为变化**。
+- 可观测：`Explain` 新增字段（如 `decay_factor: Option<Score>`）；`is_some()` ⟺ 该条被衰减改写。
+- ⚠️ **⚠️**：`hits` 的排序依据随之变化 ⇒ 必须同时满足 **D-S10-09** 的三条处置（可观测 / 默认关 / 必要时标破坏性）。
+
+**时钟与字段的两个未决**：① 内核**不持时钟**（衰减基准必须由调用方给，否则测试不可复现）；② 时间字段名由调用方指定（内核不猜 `ts_ms` / `created_at`）。⇒ **Q10-1**。
+
+### 4.4 MMR 结果去重（**D-S10-08 / D-S10-09**）
+
+**MMR 的经典式**需要 `(query↔候选)` 相关度与 `(候选↔候选)` 相似度。前者**现成**（融合分 / `explain.fused_score`）；后者**拿不到**（**N8**）。三条路：
+
+| 相似度来源 | 可行性 | 代价 |
+| --- | --- | --- |
+| **文本侧**（`Analyzer::analyze_doc` 的 term 集合，Jaccard / 重合度） | ✅ **今天就能做**（`Analyzer` 已在 `SearchParts` 里） | 粗糙（词面 ≠ 语义）；且**要 `analyze_doc` 候选正文**，成本随窗口线性增长（同 Step 7 D-S7-06 的 `matched_terms` 教训） |
+| **向量侧**（doc↔doc 余弦） | ⚠️ **需先给 `VectorIndex` 加「按 `chunk_id` 取向量」**（provided 默认 `None` ⇒ 既有实现零改动） | 触碰公开 trait（纯加法）；且**向量路未开启时不可用**（`SearchMode::Bm25` 下无向量） |
+| **查询期重 embed 候选正文** | ✅ 不碰 trait | ❌ **语义漂移**：查询期重算的向量与入库向量不保证逐位一致（且成本 = 窗口 × 编码，`R44` 同族） |
+
+⇒ **D-S10-08**：起步取**文本侧**（零新 API、对 `mode` 无偏），向量侧列为**条件项**（若 spike/实现期证明文本侧不够，再评估加 trait 能力）。**设计中不承诺**用哪种——**Q10-2**。
+
+**FR-24 的另一个读法**（「MMR **或**同文档相邻 chunk 合并」）：本设计**只承接 MMR 一支**；「相邻 chunk 合并」不属 MMR，须另立项（登记 **Q10-2** 的第二问）。
+
+### 4.5 token budget 裁剪（**D-S10-09 / D-S10-10**）
+
+**计数口径是本条的全部难点**：内核**没有**目标模型的 tokenizer（**N4**）。取形：
+
+- 新增 trait（暂名 `TokenCounter`）：`fn count(&self, text: &str) -> usize`；
+- **provided 默认实现 = 字符数**，并在 rustdoc 明写「**这不是目标模型的 token 数**，只是保守上界的一种」；
+- 调用方注入（`Config::token_counter`，默认 = 字符数实现）；
+- 输出侧：新增可观测（如 `Metrics.token_total: Option<usize>` 或 `Explain` 上的计数），**并标注单位**（chars vs tokens）。
+
+⚠️ **两条禁止**：① 不得把字符数当 token 数**上报**（字段名 / 文档必须区分）；② 不得**静默**截断——超预算时是「截断」还是「换更小的条目」是**产品决策**，须写死（**Q10-3**）。
+
+**与 `k` 的关系**：token budget 生效时 `hits.len()` **不再由 `k` 决定** ⇒ 必须与 `k` 的关系写清（建议：`k` 仍为候选上界，budget 是**第二道**截断），并满足 **D-S10-09**。
+
+### 4.6 多 query 融合（**D-S10-11**）
+
+**入口**：`Searcher::search_multi(&[&str])`（新公开方法）+ 编排层多 query 入口。链路：
+
+```text
+for q in queries:  analyze(q) → (lane_bm25_q, lane_vector_q)
+lanes = [bm25@q1, vector@q1, bm25@q2, vector@q2, …]   // 或「先 per-query 融合再跨 query 融合」
+fuse(lanes, candidate_k)                                // 复用既有 FusionStrategy
+```
+
+**两个必须显式拍板的点**（**Q10-4**）：
+
+1. **`k` 的语义**：是「每 query 各取 `k`」还是「全局合并后取 `k`」？影响 `candidate_k` 的算式（若每 query `k` ⇒ 候选池是否 ×N）。
+2. **融合层次**：「N×2 条 lane 一次融合」vs「每 query 先融合、再对 N 个结果跨 query 融合」——前者复用现成 `fuse`，后者语义更接近 HyDE 的原意。
+
+⚠️ **`FusionCtx` 的连锁**：其字段（`query_terms` / `query_chars` / `has_ascii` / `query_df` / `top_k`）全带**单 query** 语义。多 query 若要用自适应融合，必须扩展 —— 而**白名单由 `S9_T3` 钉死**（**R55** 的守线）⇒ **加字段必须同批更新用例**，且**新增字段仍须满足 I9-1「只含检索自身可观测的量」**（多 query 场景下仍**禁止**引入标注）。
+
+⚠️ **内核不做改写**（FR-21 原话：「内核不做改写，只做承载」）⇒ `search_multi` 只**承载**调用方给的多个 query，不做 HyDE / 改写 / 扩展。
+
+### 4.7 T7-27 的判据与 spike（**D-S10-06 / D-S10-07 / D-S10-12**）
+
+**判据（换后）**：
+
+| 序 | 判据 | 口径 | 今天能否算 |
+| --- | --- | --- | --- |
+| **主** | `Metrics.filter_eval` 的**规模增长率** | 同 harness、同档位（`ts-range-degraded`）、1 万 vs 10 万 ⇒ 比值。解耦 ⇔ **亚线性**（比值 ≪ 语料比 10×） | ✅ 能（`bench` 已采 `mean_filter_eval_us`） |
+| **主** | 降级档位 `filter_eval` **占端到端 `took`** 的比例 | `mean_filter_eval_us / (took P50)` | ✅ 能 |
+| **辅** | **降级状态可观测**（**D-S10-07**） | `Metrics.filter_degraded`（提案） | ⚠️ 需先实现（或退化为「bench `--filter-cost` 的人工判读」） |
+| **参考** | `vector_shortfall` / `vector_route` | **不用于本判定**；只用于说明「向量路缺口与字段降级正交」（**N1**） | ✅ 能 |
+
+**spike S10-S1 的决策门（合取；全部满足才判「投」）**：
+
+| 门 | 判据 | 阈值 |
+| --- | --- | --- |
+| **G1** | 降级档位 `filter_eval` 显著非零 | `mean_filter_eval_us` ≥ **1000 µs**（1 万级）/ ≥ **5000 µs**（10 万级）—— ⚠️ **阈值标「拟」**，须按 S5-04 先例在本 spike 内定稿 |
+| **G2** | 成本**随规模增长**（说明未解耦） | `filter_eval(10万) / filter_eval(1万)` ≥ **3×**（语料比 10×） |
+| **G3** | 端到端**可见** | 降级档位 `filter_eval` 占 `took` P50 ≥ **10%** |
+| **G4** | **不是**「已经便宜」（防误判） | `mean_filter_eval_us`（降级档） / `mean_filter_eval_us`（无过滤档） ≥ **100×** |
+
+⚠️ **G1 / G3 的阈值是「拟」值**，且**必须在出数前预注册**（Step 9 的 `G4` 教训：θ 网格预注册是判「不投」能站住的前提）。⚠️ **判「不投」也必须写「什么时候复审」**（Step 9 的 `R59` 教训：结论若不写复审触发条件，会把「本轮没投」读成「永远不投」）。
+
+**为什么先做 T7-27**：它的结论会影响 **T7-19 的取形**（若判「投」，命名空间的字段降级问题有另外的解法；若判「不投」，则命名空间必须**明确禁止**用高基数字段，并把这一限制写进文档）。⇒ **PR 切分把 T7-27 放在第 1 段实现 PR**（§8）。
+
+### 4.8 不变式清单（写入 rustdoc 的三条以内 + 内部约束）
+
+**写进 rustdoc 的（≤3 条）**：
+
+1. `PostProcessor` 在**回捞之后、精排之前**执行；其 `candidate_window(k)` 会参与 `candidate_k = max(3k, rerank_window, post_window, 10)` ⇒ **不会被候选池静默封顶**（否则后处理是空转）。
+2. 后处理 / MMR / token budget 若改变 `hits` 的**排序依据**或**长度**，**必须**在 `Explain` 留可观测信号；`None` / 关闭时不改变任何行为。
+3. token budget 的计数单位**由注入的 `TokenCounter` 决定**，内核默认实现是**字符数**，**不是**目标模型的 token 数。
+
+**内部约束（不写进公开 rustdoc）**：
+
+- I10-1：`post_window` 恒 ≥ 1（与 `window` 的 `max(k)` 兜底同族）。
+- I10-2：后处理**不得**读取相关性标注（同 **I9-1**，多 query 场景同样适用）。
+- I10-3：`FusionCtx` 加字段必须同批更新 `S9_T3` 白名单用例。
+- I10-4：`Metrics` 新增字段必须在**每条返回路径**（含三条早退）填真值，不得依赖 `Default`。
+
+---
+
+## 5. 决策记录（D-S10-01 ~ D-S10-12）
+
+见文首「决策速览」表。**需评审拍板的四条**：
+
+1. **D-S10-06（换判据）** —— 这是本文最重的一条：**是否同意把 T7-27 的判据从 `vector_shortfall` 换成「过滤求值成本的规模增长率 + 降级可观测面」**？若不同意，请给出「`vector_shortfall` 如何能测到字段降级」的机理（本文断言它对字段降级**结构性盲**，并给了实测）。
+2. **D-S10-07（新增 `Metrics` 字段）** —— 触碰公开结构体（纯加法，先例充分），**是否同意**？
+3. **D-S10-01（新增 `PostProcessor` trait）** —— 是否同意「不借用 `Reranker` 通道」？（A/C 两案已在 §4.1 逐条给出否决理由）
+4. **D-S10-08（MMR 相似度来源不自选）** —— 是否同意「起步取文本侧、向量侧列为条件项」？若要求向量侧，需一并拍板「给 `VectorIndex` 加按 id 取向量的能力」。
+
+---
+
+## 6. 影响面与兼容性
+
+### 6.1 兼容性
+
+| 变更 | 是否破坏性 | 说明 |
+| --- | --- | --- |
+| 新增 `PostProcessor` trait | **否**（纯加法） | 新 trait，既有实现不受影响 |
+| `SearchParts` 新增字段（`post`） | **否**（`pub(crate)` 结构体） | `SearchParts` 非公开面（供编排内核使用） |
+| `Config` 新增字段 | **否**（纯加法） | 先例：`adaptive_fusion` / `embed_sessions` |
+| `Searcher::search_multi` | **否**（新方法） | — |
+| `Metrics` 新增字段（`filter_degraded` 等） | ⚠️ **是**（公开结构体、字段全 `pub`） | 需 CHANGELOG 标 `⚠️ 破坏性`（D-S5-05 / D-S7-05 先例） |
+| `Explain` 新增字段（衰减信号 / MMR 标记） | ⚠️ **是** | 同上 |
+| `VectorIndex` 新增「按 id 取向量」 | **否**（若取 provided + 默认 `None`） | **条件项**（D-S10-08 / Q10-2） |
+| `FusionCtx` 新增字段 | ⚠️ **是**（若做） | 且**必须**同批更新 `S9_T3` 白名单用例 |
+| `Hit` / `SearchResponse` 结构 | **否**（本设计不改其字段） | ⚠️ 但**行为契约**可能变（排序依据 / 长度）⇒ D-S10-09 |
+
+### 6.2 全部新机制**默认关**（零行为变化）
+
+| 机制 | 默认值 | 依据 |
+| --- | --- | --- |
+| 后处理阶段 | `None`（不执行） | 照 `NoOpReranker`（D-S7-04） |
+| 时间衰减 | 不启用 | 照 `adaptive_fusion`（D-S9-03） |
+| MMR | 不启用 | — |
+| token budget | 不启用 | — |
+| 多 query | 只有显式调用 `search_multi` 才走 | 单 query 路径**逐位一致**（S10-6） |
+
+### 6.3 需回写的**计划文档漂移**（🔴 本文提出，需评审同意）
+
+| 位置 | 现写 | 建议改为 |
+| --- | --- | --- |
+| `plan-v2.md` §4 Step 10 的 T7-27 注记 | 「判据 = 用评测集跑出「高基数字段过滤下 shortfall 的实际分布」」 | 「判据 = **`Metrics.filter_eval` 随语料规模的增长率** + 降级可观测面（`vector_shortfall` 对字段降级**结构性盲**，留作向量路缺口的信号）」 |
+| `requirements-spec.md` §5.2 **FR-34** 行 | 「判据 = `Metrics.vector_shortfall` 的分布」 | 同上（**只改判据句，不改需求本身**） |
+| `architecture-design.md` §8.3 指标表 | `vector_shortfall` 标为「**V2.1 是否引入 prefilter 结构的判据**」 | 补一句：本判据**只针对向量路召回缺口**；**字段索引降级**的判据是 `filter_eval`（**两者正交**） |
+
+⚠️ **保留原措辞为引文**（本项目纪律：被推翻的结论不静默删除）。
+
+### 6.4 未触碰的面
+
+**不改**任何既有 trait 签名（`FusionStrategy` 的三个 provided 方法与 Step 9 一致、`Reranker` 一字不动）；**不改** `FORMAT_VERSION`（无快照格式变更）；**不改** `deny.toml`；**不新增依赖**（文本侧 MMR / 字符计数为 0 依赖）。
+
+---
+
+## 7. 测试计划（S10-T1 ~ S10-T20）
+
+| 编号 | 目标 | 进 CI | 备注 |
+| --- | --- | --- | --- |
+| **S10-T1** | `PostProcessor` 默认（`None`）⇒ `hits` 的 `(chunk_id, score)` 与未引入时**逐位一致** | ✅ | 零回归的**结构性**证明 |
+| **S10-T2** | `post_window` 参与 `candidate_k` 的 `max`：用**间谍向量后端**断言「后端收到的 `k` ≥ `post_window`」 | ✅ | 照 `S7_T3` 先例；**R61** 的绊线 |
+| **S10-T3** | 后处理发生在**回捞之后**：断言传入后处理的 `Vec<Hit>` 已带 `metadata` / `text` | ✅ | 钉住 **D-S10-02** |
+| **S10-T4** | 命名空间 `allowed ≤ 8192` 档：逐 query `vector_shortfall == 0` **且** `vector_route == Exact` | ✅ | **S10-1** 的结构性一半 |
+| **S10-T5** | 命名空间字段降级 ⇒ 观测面显式为真；未降级 ⇒ 为假 | ✅ | **S10-2**；反向断言必须在 |
+| **S10-T6** | 时间衰减关闭 ⇒ 逐位一致；开启 ⇒ `Explain` 信号 `is_some()` | ✅ | **S10-3** |
+| **S10-T7** | 时间衰减的**单调性**：同一批候选、时间权重增大 ⇒ 新条目的名次不变差 | ✅ | 性质测试（避免把实现写死） |
+| **S10-T8** | MMR：构造高冗余候选 ⇒ 启用后结果集两两相似度上界下降、长度 ≤ `k` | ✅ | **S10-4** |
+| **S10-T9** | MMR 关闭 ⇒ 逐位一致 | ✅ | — |
+| **S10-T10** | token budget：注入**确定性**计数器 ⇒ 输出合计 ≤ budget | ✅ | **S10-5** |
+| **S10-T11** | token budget 默认计数器 = 字符数，且**单位标注**在文档与可观测面一致 | ✅ | 防「字符数当 token 数」**R63** |
+| **S10-T12** | `search_multi` 可用 + **单 query 路径逐位一致** | ✅ | **S10-6** |
+| **S10-T13** | `FusionCtx` 白名单：新增字段后 `S9_T3` 用例**同批更新**（结构体字面量逐字段构造） | ✅ | **I10-3 / R65** |
+| **S10-T14** | 后处理与精排的**次序**：后处理先、精排后（用可观测的顺序证据） | ✅ | 钉住 §4.1 的固定次序 |
+| **S10-T15** | `Metrics` 新字段在**三条早退路径**上也是真值（不是 `Default`） | ✅ | **I10-4** |
+| **S10-T16** | MMR 的相似度来源可替换（文本侧默认 + 注入桩） | ✅ | 为 Q10-2 留缝 |
+| **S10-T17** | 多 query 的 `k` 语义按拍板结果断言 | ✅ | 依赖 **Q10-4** 的裁定 |
+| **S10-T18** | 端到端示例（`examples/`）：命名空间过滤 + MMR + token budget 各一条可跑示例 | ⚠️ 不进 CI | 文档可用性 |
+| **S10-T19** | spike S10-S1 的读数载体：`scripts/eval_step10_filter.sh`（复用 `eval_filter.sh`）双规模跑 | ⚠️ 不进 CI | 延迟类读数不具 CI 可引用性 |
+| **S10-T20** | 变异验证：删掉「`post_window` 参与 `candidate_k`」⇒ `S10-T2` 必须**精确变红** | ⚠️ 人工 | 证明绊线**承重**（照 #54 / #54 评审的变异先例） |
+
+---
+
+## 8. 实施任务拆分（S10-01 ~ S10-09）与 PR 切分
+
+| 任务 | 内容 | 依赖 | 量级 |
+| --- | --- | --- | --- |
+| **S10-01** | **T7-27 spike**：判据修正后跑双规模（1 万 / 10 万），出 G1~G4 对照 + 「投 / 不投」结论；**补** `Metrics` 降级观测面（D-S10-07）作为 spike 的读数载体 | — | M |
+| **S10-02** | **T7-19 命名空间**：约定 + 便利构造（可选）+ 容差文档 + 降级告警；按 S10-01 的结论决定是否**禁止**高基数字段 | S10-01（结论影响取形） | S |
+| **S10-03** | **后处理公共机制**：`PostProcessor` trait + `post_window` 参与 `candidate_k` + `SearchParts`/`Config` 接通 + 观测面 | — | M |
+| **S10-04** | **T7-20 时间衰减钩子**：`TimeDecay` 实现 + `Explain` 信号 + 单测 | S10-03 | S |
+| **S10-05** | **T7-02 MMR**：文本侧相似度 + 实现 + `Explain` 标记 + 单测/示例 | S10-03 | M |
+| **S10-06** | **T7-03 token budget**：`TokenCounter` trait + 默认字符数 + 超预算行为 + 单测/示例 | S10-03 | M |
+| **S10-07** | **T7-04 多 query 融合**：`search_multi` + 编排层多 query + `FusionCtx` 白名单同步 | S10-03 | M |
+| **S10-08** | 文档：`docs/README.md` 索引、`user-guide.md` 使用面、CHANGELOG | 全部 | S |
+| **S10-09** | 收尾：四处定义面定稿 + 风险回填 + spike 读数落 `eval-report.md` 新节 | 全部 | S |
+
+**PR 切分建议 = 8 段**：
+
+| 段 | 内容 | 说明 |
+| --- | --- | --- |
+| `PR10-0` | **本设计 + 四处回写** | ✅ **本 PR**（纯文档、`.rs` 零改动） |
+| `PR10-1` | **S10-01 + S10-02**（T7-27 spike + T7-19） | ⚠️ **建议先合** —— spike 的结论决定 T7-19 的取形（是否禁止高基数字段） |
+| `PR10-2` | **S10-03**（后处理公共机制） | 后三个任务的共同前置 |
+| `PR10-3` | **S10-04**（时间衰减） | 依赖 PR10-2 |
+| `PR10-4` | **S10-05**（MMR） | 依赖 PR10-2 |
+| `PR10-5` | **S10-06**（token budget） | 依赖 PR10-2 |
+| `PR10-6` | **S10-07**（多 query） | 依赖 PR10-2；⚠️ 触碰 `S9_T3` 白名单 |
+| `PR10-7` | **S10-08 + S10-09**（收尾） | 四处定义面 + 读数落点 |
+
+> ⚠️ **PR10-1 内含 spike，故「结论 = 不投」也必须可合并**（Step 9 的 `NFR-15` 处置先例：收窄 + 另立 + 保持打开 + 写明复审触发条件）。
+
+---
+
+## 9. 风险与未决问题
+
+### 9.1 新增风险（**R60 ~ R65**，→ 架构 **§14.8**）
+
+| # | 风险 | 影响 | 应对 | 残余 |
+| --- | --- | --- | --- | --- |
+| **R60** | **判据错配**：计划把 T7-27 的判据写成 `Metrics.vector_shortfall`，而它对**字段索引降级结构性盲**（缺口定义只含 `allowed` 与向量路条数；降级只改变「怎么算 `allowed`」，不改变其**取值**；且 `allowed ≤ 8192` 时走精确路径 ⇒ 缺口恒 0） | 按计划字面执行 ⇒ spike 读到「缺口处处 0」⇒ **误判「不投」**（假阴性），而 FR-34 的真需求**从未被测量**。这属「**结论错、而代码没错**」一类（同族：Step 7 的 `R48`） | ① **换判据**（**D-S10-06**）：主 = `filter_eval` 的规模增长率；辅 = 降级可观测面；② **本文已给双规模实测读数**（缺口**两规模皆 `0.00`**；`filter_eval` **375~613 µs → 5595~6137 µs**，跨规模 **9.40× ~ 14.92×**；T13 加速比 **1.0× → 0.7×**）；③ **回写三处**（`plan-v2` §4 / `requirements-spec` FR-34 行 / 架构 §8.3 的指标定位），**保留原措辞为引文** | 🟡 **未消解**（属**判据 / 评测诚信**类：靠「换判据 + 回写 + 评审红线」守，**没有「修完就关」的时点**） |
+| **R61** | **后处理窗口被 `candidate_k` 静默封顶**（**R45 同族**，但这次是**多通道叠加**）：`candidate_k = max(3k, window, 10)` 今天只含**精排**窗口；后处理的窗口若不参与 ⇒ 后处理看到的是 `≤ 3k` 条，MMR / token budget / 衰减全部**空转** | 「机制已交付」的结论建立在**空转**上（与 Step 7 `R45` 的陷阱**同型**） | ① **`post_window` 必须参与 `candidate_k` 的 `max`**（**D-S10-01**）；② 写进 rustdoc 不变式；③ **S10-T2** 用间谍后端钉「后端收到的 `k` ≥ `post_window`」；④ **S10-T20** 变异验证绊线**承重** | ⚠️ **保持开放**（属**结构性**类：靠断言 + 评审守） |
+| **R62** | **MMR / token budget 改变 `hits` 的排序依据与长度**，而 `Hit::score` 的 rustdoc 已声明「`hits` 恒按本字段降序、同分按 `chunk_id` 升序（NFR-06）」 | 下游若用 `score` 设阈值 / 跨配置比较 / 缓存排序结果 ⇒ **静默失准**（**R46 一族**） | ① `Explain` 留可观测信号（**D-S10-09**）；② **默认关**；③ 若改默认行为 ⇒ CHANGELOG 标 `⚠️ 破坏性`；④ `Hit::score` 的 rustdoc 重写、写明三档语义（对齐 R46 的处置） | ⚠️ **识别成本仍在用户侧**（内核只能说清「这次 `score` 是什么」） |
+| **R63** | **token budget 的计数 ≠ 目标模型的 token 数**：内核**没有** LLM tokenizer（**N4**），默认实现只能是**字符数** | 调用方把「字符数」当「token 数」用 ⇒ 预算**静默失准**（中文场景下字符数与 token 数**不成固定比例**） | ① **字段名 / 文档 / 可观测面三处都标注单位**（**D-S10-10**）；② **禁止**把字符数当 token 数上报；③ 提供注入通道（`TokenCounter`）让调用方能给真值；④ **S10-T11** 钉住标注 | ⚠️ **保持开放**（内核**不可能**内置所有模型的 tokenizer ⇒ 属**固有边界**类） |
+| **R64** | **命名空间字段的「天然降级」**：若命名空间是**每会话一个**（高基数），字段索引必然降级（数值字段约 **512** 篇 / 字符串约 **1024** 篇撞线，`degraded` **粘滞**、除 `rebuild` 外不可逆）⇒ 「隔离」仍然正确，但该字段上的过滤退化为 **O(N) 全扫** | 「命名空间隔离」在小规模下表现良好、**随规模静默劣化**（无告警）——正是 **Q-I1** 的翻版 | ① **降级可观测**（**D-S10-07**）+ **S10-2** 的显式断言；② **文档明写**「高基数字段 = 命名空间」的代价与上限（**§4.2** 的使用建议）；③ 结论依赖 **T7-27** 的判定（判「投」则另有解法；判「不投」则**明确禁止**该用法） | 🟡 **保持开放**（与 **R60** 同源：T7-27 的结论未出前不消解） |
+| **R65** | **多 query 触碰 `FusionCtx` 白名单**（**R55** 的守线）：多 query 场景下 `query_terms` / `query_df` / `has_ascii` 的语义需扩展，而白名单由 **`S9_T3`** 的「结构体字面量逐字段构造」钉死 ⇒ 加字段**必须**同批更新用例，否则白名单**静默失守** | R55（标签泄漏）的**唯一绊线**失效 ⇒ 自适应融合可能读到不该读的量 | ① **I10-3**（加字段同批更新用例）；② **S10-T13** 进 CI；③ 新增字段**仍须**满足 **I9-1**（只含检索自身可观测的量） | ⚠️ **保持开放**（属**设计约束**类：同 R55，**没有关闭时点**） |
+
+> ⚠️ **R60 / R64 同源**（都指向 T7-27 的结论），**R61 / R62 / R65** 是**结构性 / 契约**类，**R63** 是**固有边界**类。⇒ 六条里**没有一条**能靠「一次修复关闭」——这是本 Step 的性质（场景机制 + 判定），与 Step 9 的 `R55~R59` 同类。
+
+### 9.2 未决问题（Q10-1 ~ Q10-5）
+
+| 编号 | 问题 | 为什么现在不能定 | 建议的裁定时点 |
+| --- | --- | --- | --- |
+| **Q10-1** | 时间衰减的**时钟基准**与**时间字段名**从哪来 | 内核**不持时钟**（否则测试不可复现）；字段名由调用方约定（内核不猜 `ts_ms` / `created_at`） | 实现 `S10-04` 时定（**建议**：二者都做成显式参数、无默认） |
+| **Q10-2** | MMR 的相似度来源（文本 vs 向量）与「FR-24 的另一读法（相邻 chunk 合并）」 | 向量侧需先给 `VectorIndex` 加「按 id 取向量」；相邻 chunk 合并不属 MMR | 实现 `S10-05` 时定（本文**只给三选一的代价**） |
+| **Q10-3** | token budget **超预算时**的行为（截断 or 换更小条目）与 budget 的单位 | 属**产品决策**，本文不代拍 | 实现 `S10-06` 时定（**建议**：先「截断」——语义最简、可证伪） |
+| **Q10-4** | 多 query 的 **`k` 语义**（每 query 各 `k` vs 全局 `k`）与**融合层次**（N×2 lane 一次融合 vs 两级融合） | 影响 `candidate_k` 算式与结果语义；两案各有先例（RRF 原论文是「多列表一次融合」） | 实现 `S10-07` 时定 |
+| **Q10-5** | 后处理与精排的**次序**是否要可配（后处理 → 精排 vs 精排 → 后处理） | 本文**固定**为「后处理 → 精排」（§4.1），可配会引入组合爆炸与两套契约 | 若使用侧出现真实需求 ⇒ **另立** |
+
+---
+
+## 附录 A：新增 / 变更 API 一览 + 不变式
+
+| 项 | 形态 | 兼容性 |
+| --- | --- | --- |
+| `PostProcessor`（新 trait） | `name()` / `candidate_window(k) -> usize`（provided，默认 `k`）/ `process(hits: Vec<Hit>, k, ctx) -> Vec<Hit>` | 纯加法 |
+| `SearchParts.post` | `Option<&'a dyn PostProcessor>`（`pub(crate)`） | 非公开面 |
+| `Config.post` / `SearchIndexBuilder::post(...)` | 默认 `None` | 纯加法 |
+| `Config::time_decay` / `SearchIndexBuilder::time_decay(...)` | 默认**不启用** | 纯加法 |
+| `Config::mmr` / `SearchIndexBuilder::mmr(...)` | 默认**不启用** | 纯加法 |
+| `Config::token_budget` + `Config::token_counter` | 默认**不启用** / 默认 = 字符数计数 | 纯加法 |
+| `Searcher::search_multi(&[&str])` | 新公开方法 | 纯加法 |
+| `Metrics.filter_degraded`（**提案**） | `bool`（或降级字段名集合） | ⚠️ **破坏性**（公开结构体加字段） |
+| `Metrics.token_total`（**提案**） | `Option<usize>` + **单位标注** | ⚠️ 同上 |
+| `Explain.decay_factor`（**提案**） | `Option<Score>`；`is_some()` ⟺ 被衰减改写 | ⚠️ 同上 |
+| `Explain.mmr_selected`（**提案**） | `Option<...>`；可辨「按多样性序选中」 | ⚠️ 同上 |
+| `Filter::namespace(ns)`（**可选**） | 便利构造 | 纯加法 |
+| `VectorIndex` 的「按 id 取向量」（**条件项**） | provided，默认 `None` | 纯加法 |
+
+**不变式（三条，写进 rustdoc）**：见 §4.8。
+
+## 附录 B：执行命令（可复制的真实命令）
+
+```bash
+# ① T7-27 判据修正后的 spike（双规模；复用既有 fixture 与脚本先例）
+#    ⚠️ 快照现建（本仓未缓存 synth 快照）⇒ 1 万约 50s、10 万约 6~10min（embed 主导）
+./target/release/helix build --input data/synth-10000-corpus.jsonl  \
+    --output /tmp/helix-s10-10000.snapshot  --vectors --single-chunk
+./target/release/helix build --input data/synth-100000-corpus.jsonl \
+    --output /tmp/helix-s10-100000.snapshot --vectors --single-chunk
+
+# ② 两档对照：无过滤（基线）与降级字段 Range（第一用例）
+#    ⚠️ 循环变量必须是 ASCII（Step 9 的 P4-8 教训：多字节变量名在 bash 3.2/5.x 下非法）
+for n in 10000 100000; do
+  for spec in "" "ts_ms>=1700000000000,ts_ms<1700000010000"; do
+    tag=$( [ -z "$spec" ] && echo none || echo degraded )
+    ./target/release/helix bench --index "/tmp/helix-s10-${n}.snapshot" \
+        --queries "data/synth-${n}-queries.jsonl" --modes bm25,vector,hybrid \
+        --reps 5 --filter "$spec" --filter-cost --json "/tmp/helix-s10-${n}-${tag}.json"
+  done
+done
+
+# ③ 读判据（主 = filter_eval 的规模增长率；辅 = 降级可观测面）
+python3 - <<'PY'
+import json
+for n in (10000, 100000):
+    for tag in ("none", "degraded"):
+        d = json.load(open(f"/tmp/helix-s10-{n}-{tag}.json"))
+        L = d["latency"]["hybrid"]
+        print(f"{n:>7} {tag:>8}  filter_eval={L['mean_filter_eval_us']:>10.2f} us  "
+              f"shortfall_kernel={L['vector_shortfall_kernel']:.2f}  "
+              f"exact_ratio={L['vector_route_exact_ratio']:.3f}  p50={L['p50_ms']:.3f} ms")
+PY
+```
+
+> ⚠️ **报数纪律**：延迟类读数**不具跨机可引用性** —— 报数**必标运行范围**（核数 / 是否插电 / 是否在 CI）。本文 §2.4 的读数运行范围见附录 C。
+>
+> ✅ **本节的命令已实跑（2026-09-28，设计期）**，读数即 §2.4 的表；两档产物 = `/tmp/step10-{none,degraded}.json`（1 万）与 `/tmp/step10-100k-{none,degraded}.json`（10 万）。⚠️ 实跑时快照命名为 `/tmp/helix-step10-{n}.snapshot`（与上文示例的 `helix-s10-` 前缀**仅命名不同**，命令行其余部分一致）。⚠️ **spike S10-S1 须独立复跑** —— 本节只是**设计期的可行性验证**，**不替代** `S10-01` 的出数义务，也**不预先给** `G1 ~ G4` 的判定。
+
+## 附录 C：源码 / 实测核实记录
+
+| # | 主张 | 核实方式 | 结论 |
+| --- | --- | --- | --- |
+| C1 | 全仓无 `namespace` / 命名空间 | `crates/` 全量 grep | **0 命中** ✅（负事实） |
+| C2 | 全仓无 `token_budget` / `count_tokens` | `crates/core/src/` grep | **0 命中** ✅ |
+| C3 | 全仓无 `mmr` / `diversity` 机制 | `crates/core/src/` grep | 仅 `lib.rs` 一处**历史注释**（P6 计划），**无实现** ✅ |
+| C4 | 全仓无 `multi_query` / `search_multi` | `crates/core/src/` grep | **0 命中** ✅ |
+| C5 | `VectorIndex` 无「按 id 取向量」 | 读 `vector/mod.rs` 的 trait 方法表 | ✅（N8） |
+| C6 | 融合层不回捞正文 | 读 `fusion/mod.rs` 模块头 | ✅（N5） |
+| C7 | `candidate_k` 同时是融合输出上限 | 读 `query/searcher.rs` 的 `candidate_k` / `fuse` 调用点 | ✅（N6） |
+| C8 | `vector_shortfall` 的定义 | 读 `query/searcher.rs` 的赋值处 + `query/metrics.rs` 的字段文档 | ✅（N1 的机理） |
+| C9 | `degraded` 粘滞 + 约 512 篇撞线 | 读 `index/field_index.rs` 的 `FieldValues::degraded` 与模块文档 | ✅ |
+| C10 | **双规模实测（1 万 / 10 万）**（本文 §2.4 的表） | 现建快照 + `helix bench`（**同一批 flags**），见附录 B 的 ①② | ✅ **实测**（缺口**两规模皆 `0.00`**；`filter_eval` 跨规模 **9.40× ~ 14.92×**） |
+| C11 | T13 加速比：1 万 **1.0×** / 10 万 **0.7×**（降级字段上**负收益**） | 同批 `--filter-cost` 的 stdout | ✅ **实测**（1 万 0.4004 / 0.3993 / 0.4028 ms；**10 万 3.8426 / 5.2301 / 3.9168 ms**） |
+| C12 | `grep "A\|B"` 在 macOS BSD grep 下静默返回空 | **本文踩到并自证**（对照样本 `grep -cE "candidate_k"` = 25 命中） | ✅ 已知坑，改用 `grep -E` |
+
+**C10 / C11 的运行范围**：macOS（darwin）/ release profile / 单机本地 / 合成语料 **10000 篇（60 query）与 100000 篇（100 query）**（`--single-chunk`，含向量；快照**现建** —— 10 万级 `helix build --vectors --single-chunk` 实测 embed **455.4 s**、落盘 **27.4 s**、总 **594.2 s**，图 sidecar `100000` 点 / **253.0 MB**）/ `--reps 5` / warmup 3 / `k=10` / `vector_index=hnsw` / `brute_fallback=kernel-default (8192)` / **非 CI** / 两次 bench 之间**无其它重负载**（10 万级 bench 全程 **3 m 38 s**）。⚠️ **延迟绝对值不具跨机可引用性**；本节只用**同机同批**的相对关系（降级档 vs 无过滤档、10 万 vs 1 万、旧路径 vs 新路径）。⚠️ **两规模的 query 数不同** ⇒ 跨规模**只比比值**、不比绝对值。
+
+## 附录 D：本文引用的项目内证据
+
+| 主张 | 位置 |
+| --- | --- |
+| Step 10 的 6 个任务与依赖 | `plan-v2.md` **v0.30** §4 Step 10 小节（任务表 + 两条 ⚠️ 注记 + 「设计已出」块） |
+| T7-27 的判据（**本文推翻**） | `plan-v2.md` §4 Step 10 的 T7-27 注记；`requirements-spec.md` §5.2 **FR-34** 行 |
+| Step 10 的门槛（含「容差须定义」） | `plan-v2.md` §6「V2.1 门槛」的 **Step 10** 行 |
+| 「现 Step 10 = 原 Step 9」 | `plan-v2.md` §附-2 的步骤编号映射表 |
+| `vector_shortfall` 的定位 | `architecture-design.md` §8.3 指标表；`query/metrics.rs` 的字段文档 |
+| `filter_eval` 的定位 | `architecture-design.md` §8.3 指标表；`query/metrics.rs` 的字段文档 |
+| 字段索引的基数保护与已知短板 | `architecture-design.md` §5.5.1；**ADR-010** 代价段；`index/field_index.rs` 模块文档 |
+| R45 / R46（窗口封顶 / `score` 语义） | `architecture-design.md` §14.5 |
+| R11 / R13 / R17 / R18（filtered-ANN） | `architecture-design.md` §14 的 R11 / R13 行与 §14 导读的两条纪律 |
+| `candidate_window` 先例 | `architecture-design.md` §5.7；`rerank/mod.rs` |
+| 谓词化与 `doc_bits_scan` 回退 | `architecture-design.md` §5.5 / §5.5.1；`query/filter.rs` |
+| `S9_T3` 白名单守线（R55） | `fusion/adaptive.rs` 模块文档；`architecture-design.md` §14.7 |
+| 选择性档位 fixture（含降级档） | `data/synth-10000-filters.json` / `data/synth-100000-filters.json`；生成器 `scripts/gen_synth_corpus.py`；载体 `scripts/eval_filter.sh` |
+| S5-04 的「拟 → 定稿」标定先例 | `plan-v2.md` §8 的 Step 5 回写条目；`eval-report.md` §8.9 |
