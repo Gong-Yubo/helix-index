@@ -6,6 +6,9 @@
 | 日期      | 2026-09-02（v1.0）/ 2026-09-03（v1.1）                                            |
 | 状态      | **已采纳并回写**；**P0 已执行验证**（2026-09-02），执行中发现的 5 处修正见第 4 章各节与 `p0-design.md` 第 12 章 |
 | v1.1 变更 | 2026-09-03：5.2 新增非 crate 资产 **T2Ranking 数据集**（Apache-2.0，P5 评测数据源，选型见 `p5-design.md` 第 3 章） |
+| 上游文档    | `docs/devel/requirements-spec.md`、`docs/devel/architecture-design.md`、`docs/devel/plan.md`    |
+| 数据来源    | crates.io API、docs.rs、HuggingFace API 实测拉取（非记忆），见附录 A                |
+| 核查时点    | Rust stable 1.98.0（2026-08-20 发布）                                      |
 
 **P0 执行后的 5 处修正**
 
@@ -16,9 +19,6 @@
 | 3 | `fastembed` 必须 `default-features = false`（移除 NCSA 依赖链）        | 本文档 4.3、架构文档 9.1、plan.md 附录 B        |
 | 4 | 模型实际来源为 `Xenova` 而非 `Qdrant`，且**未声明 License**                 | 本文档 4.3/5.2、需求文档 8.3（新增 P5）、p0-design.md |
 | 5 | 依赖白名单需补充 `CDLA-Permissive-2.0` / `MPL-2.0` / `Unicode-3.0`   | `deny.toml`、p0-design.md 12.6         |
-| 上游文档    | `docs/devel/requirements-spec.md`、`docs/devel/architecture-design.md`、`docs/devel/plan.md`    |
-| 数据来源    | crates.io API、docs.rs、HuggingFace API 实测拉取（非记忆），见附录 A                |
-| 核查时点    | Rust stable 1.98.0（2026-08-20 发布）                                      |
 
 ---
 
