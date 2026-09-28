@@ -45,7 +45,7 @@
 ## 1.2 build 参数
 
 ```
-helix build --input <语料> [--output <快照>] [--vectors] [--single-chunk] [--no-graph-persist]
+helix build --input <语料> [--output <快照>] [--vectors] [--single-chunk] [--no-graph-persist] [--no-parallel-build]
 ```
 
 | 参数 | 默认 | 说明 |
@@ -55,6 +55,7 @@ helix build --input <语料> [--output <快照>] [--vectors] [--single-chunk] [-
 | `--vectors` | 关 | 同时 embed 并保存向量，**vector/hybrid 检索必需**；首次运行会下载模型（约 91MB） |
 | `--single-chunk` | 关 | 每段落强制单 chunk。评测口径专用——段落级标注时会防"同一 passage 的多个 chunk 各占位次"的双计 |
 | `--no-graph-persist` | 关 | 只写快照、**不写图 sidecar**。**磁盘总占用 1.6× → 1.0×**（12K：≈84MB → 52.3MB，即省下约 0.6× 快照体积），代价是下次冷启动要重建图（≈10s）。磁盘紧张或排查图问题时用 |
+| `--no-parallel-build` | 关 | **串行建图**（建图可复现性逃生舱）。并行插入时**插入顺序不确定** ⇒ 两次建库的图拓扑会不同；开了它就去掉这一路不确定源。⚠️ **不保证逐位可复现** —— `hnsw_rs` 的分层随机源无 seed（`R-P5-13` / `C8`），串行下拓扑仍可能变；它固定的是「建库基准的顺序变量」。⚠️ 它**不在配置指纹里** ⇒ 追加（`--index`）不会因此报配置不匹配。做跨进程建库基准 / 复现图相关问题时用 |
 
 输出示例：
 
@@ -337,6 +338,19 @@ analyzer 没活到最后 → 分词器不一致）。现在这些全部由库保
 | `FusionStrategy` | `RrfFusion`（k=60 / weights 1:1.5） | `.fusion(Arc::new(..))` | 换融合算法 |
 | `Reranker` | `NoOpReranker` | `.reranker(Arc::new(..))` | 接 rerank 模型（P7） |
 | `BM25 参数` | `Bm25Params`（k1=1.5 / b=0.75） | `.bm25_params(..)` | 网格搜索 |
+
+**旧 API 与「逃生舱」的状态**（裁定见 `v2-step8-design.md` §4.12）：门面之下的一切都**永久保留**，
+但其中**两个**已标 `#[deprecated]`：
+
+| 项 | 状态 | 迁移 / 说明 |
+| --- | --- | --- |
+| `SearchIndex::into_searcher(self)` | ⚠️ **已废弃** | 改用 `SearchIndex::searcher(&self)`（不消耗写端）+ **显式** `commit()`。原方法保留为薄封装 ⇒ 既有调用点零改动 |
+| `Searcher::into_index()` | ⚠️ **已废弃** | 它的动机（写端「换回来」）已消失；用 `SearchIndex::searcher()` 让读写**并存**即可 |
+| `Index` 的 `pub` 面（`add` / `remove` / `export` / `import` / `compacted` …） | ✅ **永久保留、不废弃** | **内核直用逃生舱**（收**已切片**的 `DocRecord` + `Vec<Chunk>`，调用方自持 `Analyzer`）且**无替代**。⚠️ 它与门面层 `SearchIndex::add`（收 `Document` DTO）**同名不同层**，最容易拿错 |
+| `QueryExecutor<'a>`、六个 trait、`HnswRsIndex::*`、`SearchIndex::add/commit/flush/save/remove/compact*`、`Searcher::search*` | ✅ **永久保留、不废弃** | bench 的逐 lane 组装等场景依赖它们（`p6-design` 7.3「底层永远可达」） |
+
+⚠️ **`into_searcher` → `searcher()` 不是纯改名**：前者**隐含 `flush`**、后者**不隐含**
+⇒ 迁移时必须**显式** `commit()`，否则写缓冲 / 向量的写入**看不见**。
 
 **底层永远可达（逃生舱）**：需要逐 lane 自定义组装时，借用型
 `QueryExecutor<'a>`（原 `Searcher`）与六个 trait 原样可用——

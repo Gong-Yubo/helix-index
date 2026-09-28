@@ -87,6 +87,21 @@ struct BuildArgs {
     /// 省约 1.6× 磁盘，代价是下次冷启动重建图 —— 磁盘紧张 / 排查图问题用）
     #[arg(long)]
     no_graph_persist: bool,
+    /// 串行建图（建图可复现性逃生舱）：并行插入时插入顺序不确定，两次建库的图拓扑会不同；
+    /// 本开关把「插入顺序」这一路不确定源去掉。
+    ///
+    /// 注意：不保证逐位可复现 —— 分层随机源无 seed，串行下拓扑仍可能变。它固定的是
+    /// 「建库基准的顺序变量」，不是「同一份字节」的保证。
+    ///
+    /// 不走它时沿用门面默认（并行开）。它不在配置指纹里，故追加（--index）不会因此报
+    /// 配置不匹配。与 --brute-fallback 一类「查询侧」逃生舱无关：本开关只影响建图。
+    //
+    // 内部理由（不进 help）：`#50`；`hnsw_rs` 的分层随机源 = 无 seed 的 `StdRng::from_os_rng()`
+    // （R-P5-13 / `C8`）；`fingerprint()` 只覆盖 analyzer / embedder / dim / chunker
+    // ⇒ 本开关**不在** `ConfigFingerprint` 里（评审 #49 已核实）。
+    // ⚠️ `///` 会被 clap **原样**当用户可见帮助文本（本项目既有坑）⇒ 上面刻意不用 `**` / 反引号。
+    #[arg(long)]
+    no_parallel_build: bool,
 }
 
 #[derive(clap::Args)]
@@ -443,7 +458,7 @@ pub(crate) fn embed_chunks(
         .collect())
 }
 
-/// 按 `--vectors` / `--single-chunk` / `--no-graph-persist` 装配门面层 builder。
+/// 按 `--vectors` / `--single-chunk` / `--no-graph-persist` / `--no-parallel-build` 装配门面层 builder。
 ///
 /// `--vectors` 走**显式请求**语义（S6-09 / D-S6-05 方案 A）：要向量就必须给向量，
 /// 拿不到本地 embedder 直接报错。不给时显式装 `embedder(None)`（纯 BM25）——
@@ -466,6 +481,11 @@ fn configured_builder(args: &BuildArgs) -> Result<SearchIndexBuilder> {
     // V2 Step 2：图持久化逃生舱（磁盘紧张 / 排查图问题时不落图）
     if args.no_graph_persist {
         builder = builder.without_graph_persist();
+    }
+    // `#50`：可复现拓扑逃生舱 —— **只在显式要求串行时**才盖默认值，其余一律沿用门面默认
+    // （并行开，T7-21 / D-J11），避免 CLI 与 API 的默认值漂移。
+    if args.no_parallel_build {
+        builder = builder.parallel_build(false);
     }
     Ok(builder)
 }

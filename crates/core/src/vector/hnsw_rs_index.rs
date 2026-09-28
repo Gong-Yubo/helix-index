@@ -265,6 +265,10 @@ impl VectorIndex for HnswRsIndex {
     /// 只 `retain` 不 return），且堆未满时距离剪枝全程关闭 ⇒ 低选择度下退化为整图遍历。
     /// 这是 `hnsw_rs` 的结构性行为，调参治不了；我们用 `EF_FILTER_MAX` 限制最坏延迟，
     /// 召回缺口由 `Metrics::vector_shortfall` 暴露。
+    ///
+    /// ⚠️ **`EF_FILTER_MAX` 只夹得住 `ef`，夹不住 `k`**：`hnsw_rs` 内部还会做
+    /// `let ef = ef_arg.max(knbn)`（`hnsw.rs:1519`）⇒ 失控 `k` 会把它拉回去
+    /// ⇒ 入口另有 `k.min(self.len())` 兜底（**#54**，理由见入口处的注释）。
     fn search_filtered(
         &self,
         query: &NormalizedVector,
@@ -274,6 +278,15 @@ impl VectorIndex for HnswRsIndex {
         if k == 0 {
             return Ok(Vec::new());
         }
+
+        // 🔴 **失控 `k` 的入口钳制**（#54 / PR #53 评审 P3-3）：「候选不可能超过语料规模」是
+        // **后端自己知道的不变式**，对一切合理输入是**恒等变换**（路径 A 早已这样夹、路径 B 的
+        // `out.truncate(k)` 同理）⇒ 放在**统一入口**，两条路径不必各修一遍。
+        // 不夹的后果（#54 的决定性实验）：`hnsw_rs` 内部自己做 `let ef = ef_arg.max(knbn)`
+        // ⇒ 我们的 `.min(EF_FILTER_MAX)` 被**抵消**，失控 `k` 会一路走到
+        // `BinaryHeap::with_capacity(usize::MAX)`；且路径 B 的 `k * EF_FILTER_FACTOR`
+        // 在 debug 下先 `attempt to multiply with overflow` panic。
+        let k = k.min(self.len());
 
         // 路径分派用 `match` 而非「bool 判据 + Option 形参」：路径 B 只在**确实存在
         // 用户过滤谓词**时被选中，写成 match 后「走了下推却没谓词」在类型层面即不可达，
@@ -435,7 +448,10 @@ impl HnswRsIndex {
             Some(f) => f.allowed_count() as f64 / self.len().max(1) as f64,
         };
         // 期望需要 k/ratio 个候选才能凑出 k 个存活项，再加 k 的余量吸收方差
-        let knbn = ((k as f64 / alive_ratio.max(0.01)).ceil() as usize + k)
+        // ⚠️ `.saturating_add` 是**纵深防御**（入口已把 k 钳到 len）：万一钳制被绕过，
+        // 这里也不会在 debug 下 `attempt to add with overflow` panic（#54）。
+        let knbn = ((k as f64 / alive_ratio.max(0.01)).ceil() as usize)
+            .saturating_add(k)
             .min(self.len())
             .min(PHYSICAL_OVERSAMPLE_CAP)
             .max(k.min(self.len()));
@@ -464,7 +480,8 @@ impl HnswRsIndex {
         filter: &dyn CandidateFilter,
     ) -> Vec<(ChunkId, f32)> {
         // knbn 是输出条数旋钮，ef 只是搜索宽度（§3.3 结论 4）
-        let ef = (k * EF_FILTER_FACTOR).max(k).min(EF_FILTER_MAX);
+        // ⚠️ `.saturating_mul` 同理（#54）：入口钳制是主防线，这行是纵深防御。
+        let ef = k.saturating_mul(EF_FILTER_FACTOR).max(k).min(EF_FILTER_MAX);
         // `FilterT` 对 `Fn(&usize) -> bool` 有 blanket impl，闭包即可适配
         let adapt = |id: &usize| filter.contains(*id as ChunkId);
         self.hnsw
@@ -1027,6 +1044,40 @@ mod tests {
                 always.search_filtered(&q, 10, None).unwrap(),
                 "None 谓词下 search() 与 search_filtered(None) 必须等价"
             );
+        }
+    }
+
+    /// **#54 回归**：失控 `k` 必须**不 panic**，且返回条数 ≤ 语料规模。
+    ///
+    /// 为什么需要它（#54 的决定性实验）：`hnsw_rs` 内部自己做 `let ef = ef_arg.max(knbn)`
+    /// （`hnsw.rs:1519`）⇒ 本文件 `search_path_b` 里的 `.min(EF_FILTER_MAX)` **被抵消**，
+    /// 失控 `k` 会一路走到 `BinaryHeap::with_capacity(usize::MAX)`；且两条路径的
+    /// `k * EF_FILTER_FACTOR` / `… + k` 在 **debug** 下会先 overflow panic。
+    ///
+    /// 两个臂分别打**两条路径**（`None` ⇒ 路径 A；带 `Filtered` 谓词 ⇒ 路径 B）。
+    /// ⚠️ 断言的是「**不 panic** + 条数 ≤ 语料规模」而**不是**具体名次 ——
+    /// 失控 `k` 下名次无从谈起（钳制后等价于「返回全部候选」）。
+    #[test]
+    fn 失控k不panic且条数不超语料规模() {
+        let mut seed = 41u64;
+        let n = 40usize;
+        let (idx, entries) = build_index(n, &mut seed);
+        let q = entries[3].1.clone();
+
+        // 路径 A（`None`）：原式 `… + k` 会 add-overflow
+        let a = idx.search_filtered(&q, usize::MAX, None).unwrap();
+        assert!(!a.is_empty(), "钳制后仍应返回候选");
+        assert!(a.len() <= n, "路径 A 返回 {} 条 > 语料规模 {n}", a.len());
+
+        // 路径 B（`Filtered`）：原式 `k * EF_FILTER_FACTOR` 会 mul-overflow
+        let predicate = EvenChunks { count: n / 2 };
+        let b = idx
+            .search_filtered(&q, usize::MAX, Some(&predicate))
+            .unwrap();
+        assert!(!b.is_empty(), "钳制后仍应返回候选");
+        assert!(b.len() <= n, "路径 B 返回 {} 条 > 语料规模 {n}", b.len());
+        for (id, _) in &b {
+            assert!(predicate.contains(*id), "路径 B 返回了谓词外候选 {id}");
         }
     }
 }

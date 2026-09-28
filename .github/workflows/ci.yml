@@ -264,6 +264,19 @@ jobs:
         run: |
           ./target/release/helix build --input data/corpus.jsonl --output /tmp/smoke.snapshot
           ./target/release/helix search --index /tmp/smoke.snapshot --mode bm25 "向量检索"
+      # `#50`：`--no-parallel-build` 逃生舱的**参数面**覆盖（BM25、无模型 ⇒ 秒级）。
+      # ⚠️ **覆盖边界**：它只证明「参数被接受 + 建库成功」。**「建图真的串行」在库外不可观测** ——
+      #    `SearchIndexBuilder` 的 `parallel_build` 库外不可读（`build_config_with` 是 `pub(crate)`），
+      #    而图侧因分层随机源**无 seed**（`R-P5-13`）⇒ **不可逐位比较**。
+      #    ⇒ 别据此认为「串行建图已被 CI 守住」。接线正确性靠那 3 行直读 + 类型检查。
+      #    另：本步不带 `--vectors` ⇒ 没有图 ⇒ 该开关在 BM25 下**无作用**，本步纯验参数面。
+      #  ⚠️ 日志里 `文档数 = 0` 是**既有的打印错位**（不是本步坏了）：全新构建路径在
+      #     `commit()` **之前**打印计数 ⇒ 恒报 0；`--index` 加载路径报的是真值（实测 30/30）。
+      #     已另立跟踪（见 PR 正文「不在范围」一节），别据此判断本步失败。
+      - name: build --no-parallel-build
+        run: |
+          ./target/release/helix build --input data/corpus.jsonl \
+            --output /tmp/smoke-nopar.snapshot --no-parallel-build
       - name: metadata filter
         run: |
           ./target/release/helix search --input data/corpus.jsonl --mode bm25 \
