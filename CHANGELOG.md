@@ -9,6 +9,17 @@
 
 ## [Unreleased]
 
+### 文档 · V2 Step 10 设计第 1 轮评审响应（设计 v0.1 → v0.2）（2026-09-28/29）
+
+**评审**（`pulls/81/reviews` = 1 条 `COMMENTED` + 2 条行内；基线 `903a42d`）= **⚠️ 有条件通过、0×P1；1×P2 + 1×P3，另 2×P4**。两条实质意见作者**独立复核后均判「属实」**，本版**逐条采纳**。**纯文档、`.rs` 零改动**。
+
+- 🔴 **O1（P2，采纳）**：`post_window` 参与 `candidate_k` 的 `max`**不够** —— 回捞 `take_n = window.max(k).min(fused.len())`（`query/searcher.rs:469-475`）**不含** `post_window` ⇒ **R61 的静默封顶在回捞层重现**（后处理仍只拿到默认 `k` 条）。口径补为 `take_n = max(k, window, post_window).min(fused.len())`，并把「**两处参与**」写进**不变式 / 测试 / 风险应对**：`S10-T2` 拆**两条**断言、`S10-T20` **两处各变异一次**、架构 §14.8 的 **R61 应对**补第二处封顶点。
+- 🔴 **O2（P3，采纳）**：`SearchParts` 实为**公开**类型 —— `query/searcher.rs:70` `pub struct SearchParts` + `lib.rs:55` `pub mod query` / `query/mod.rs:17` `pub mod searcher` / `:21` `pub use searcher::{…, SearchParts}` ⇒ 外部可经 `helix_core::query::SearchParts` 触达；设计原写「`pub(crate)` 结构体 / 非公开面」**与代码不符** ⇒ §6.1 兼容性定级改为「⚠️ **是**（类型技术上公开；**实际风险低**）」、附录 A 与 §4.1 表 B 同步（**原措辞保留为引文**）。
+- **O3 / O4（P4，采纳）**：§4.7 点明「设计期 1 万级读数（**375~613 µs**）**落在 G1 阈值（≥1000 µs）之下**」、并重申**判定权在 `S10-S1`**（G2 / G4 由同批读数支撑）；§8 补注 `PR10-1`（spike + T7-19 捆一段）**可能二次评审**与**拆分选项**。
+- **与 Step 7 不变式的关系已交代**：`Metrics.rerank_window` 的语义**不变**，但「本次**有无额外候选**」的判据**不再由 `rerank_window ≤ k` 单独表达**（`post_window > k` ⇒ `take_n > k`）⇒ 实现期须同步 `query/searcher.rs:123-134` 的注释，已记入 **`S10-03`**。
+- **四处定义面同步**：设计 **v0.2**（另**新增 §10 第 1 轮评审响应**）/ 架构 **v1.29**（§14.8 **R61 应对** + §14 导读）/ `plan-v2` **v0.31**（§4 / §8 回写计划）/ `docs/README.md` 索引行。⚠️ **`requirements-spec.md` 内容未变 ⇒ 不升版**（**对偶检查**：上一轮已回写，本轮无新内容）。
+- ⚠️ **本 PR 仍零生产代码改动**（`git diff origin/main --name-only -- '*.rs'` = 0）；⚠️ **§5.7 的 Step 7 三条不变式一字未改**（那是**当前**实现的真实状态，Step 10 落地时同步）；**`R60` / `R62 ~ R65` 一字未改**、**`R1 ~ R59` 一字未改**。
+
 ### 文档 · V2 Step 10（场景机制）详细设计 + 四处定义面回写（2026-09-28）
 
 **V2.1 的第四步**（Step 10 = 场景机制；`plan-v2.md` §附-2 的编号映射：**现 Step 10 = 原 Step 9**）。
