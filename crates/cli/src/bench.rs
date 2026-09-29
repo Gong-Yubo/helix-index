@@ -687,6 +687,8 @@ pub fn run(args: BenchArgs) -> Result<()> {
                     "mean_shortfall": lat.mean_shortfall,
                     "vector_shortfall_kernel": lat.mean_shortfall_kernel,
                     "vector_route_exact_ratio": lat.exact_ratio,
+                    // V2 Step 10 / D-S10-07：与 mean_filter_eval_us 构成因果对
+                    "filter_degraded_ratio": lat.filter_degraded_ratio,
                     "mean_filter_eval_us": lat.mean_filter_eval_us,
                     "mean_bm25_ms": lat.mean_bm25_ms,
                     "mean_vector_ms": lat.mean_vector_ms,
@@ -711,26 +713,29 @@ pub fn run(args: BenchArgs) -> Result<()> {
                 "\n内核耗时分解（per-lane；Hybrid 下两路走 rayon::join，**区间重叠不可相加**）："
             );
             println!(
-                "{:<8} {:>16} {:>12} {:>12} {:>12}",
-                "mode", "filter_eval(ms)", "bm25(ms)", "vector(ms)", "n(metrics)"
+                "{:<8} {:>16} {:>12} {:>12} {:>12} {:>10}",
+                "mode", "filter_eval(ms)", "bm25(ms)", "vector(ms)", "n(metrics)", "degraded%"
             );
             for (mode, lat) in &lat_rows {
                 println!(
-                    "{:<8} {:>16.4} {:>12.4} {:>12.4} {:>12}",
+                    "{:<8} {:>16.4} {:>12.4} {:>12.4} {:>12} {:>10.1}",
                     mode_name(*mode),
                     lat.mean_filter_eval_us / 1000.0,
                     lat.mean_bm25_ms,
                     lat.mean_vector_ms,
-                    lat.n_metrics
+                    lat.n_metrics,
+                    lat.filter_degraded_ratio * 100.0
                 );
             }
             println!(
                 "  精确占比 = `Metrics.vector_route == Exact` 的响应占比（0 = 一次没兜底，\
-                 1 = 每次都兜底）；\n  缺口(内核) 与 缺口(bench) 的分母不同（候选池 vs K），\
-                 两者并列是为了让差异可见；\n  ⚠️ 精确路径下 缺口(内核) 通常为 0，但那不是恒等式：\
-                 \n  allowed 来自 Index、扫描枚举的是图中的点，图滞后于索引时该值仍 > 0\
-                 \n  —— 那时它反过来是「图未覆盖全部 allowed」的诊断信号。两种读数都必须\
-                 \n  连看「精确占比 / route」，不能单看缺口。"
+                 1 = 每次都兜底）；\n  degraded% = `Metrics.filter_degraded` 为真的响应占比\
+                 （100% ⇒ 本档位的过滤求值**全部**走了 O(N) 全扫，\n  此时 filter_eval 的规模\
+                 增长率才是「字段降级成本」的干净读数）；\n  缺口(内核) 与 缺口(bench) 的分母\
+                 不同（候选池 vs K），两者并列是为了让差异可见；\n  ⚠️ 精确路径下 缺口(内核) 通常\
+                 为 0，但那不是恒等式：\n  allowed 来自 Index、扫描枚举的是图中的点，\
+                 图滞后于索引时该值仍 > 0\n  —— 那时它反过来是「图未覆盖全部 allowed」的诊断信号。\
+                 两种读数都必须\n  连看「精确占比 / route」，不能单看缺口。"
             );
         }
         json["latency"] = latency.into();
@@ -1416,6 +1421,14 @@ struct LatencyResult {
     /// T7-22 的 A/B 判据：0.0 = 一次都没兜底（阈值没生效），
     /// 1.0 = 每次都兜底（该档位选择度确实 ≤ 阈值）。
     exact_ratio: f64,
+    /// 走**降级全扫**的响应占比（`metrics.filter_degraded`，V2 Step 10 / D-S10-07）。
+    ///
+    /// `0.0` = 该档位的过滤**全部**由字段索引驱动；`1.0` = 每次都回落 O(N) 全扫。
+    /// 🔑 它与 [`Self::mean_filter_eval_us`] 构成**因果对**：本字段说「**为什么**贵」，
+    /// 后者说「**贵多少**」。⚠️ **只有本字段为 `1.0` 时，`filter_eval` 的规模增长率
+    /// 才是「字段降级成本」的干净读数** —— 否则样本里混着「索引路径」与「全扫路径」
+    /// 两种成本，比值不可解释（V2 Step 10 的 T7-27 spike 判据前提）。
+    filter_degraded_ratio: f64,
     /// 平均过滤求值耗时（µs，内核口径）——兜底没生效与"过滤求值本身贵"靠它区分
     /// （D-S5-04：降级字段档位上 `doc_bits_scan` 就要 ~8ms）。
     mean_filter_eval_us: f64,
@@ -1508,6 +1521,8 @@ fn eval_latency(
     // ↓ V2 Step 5 / S5-07：内核口径采集（断链 4 的修复点）
     let mut shortfall_kernel_sum = 0usize;
     let mut exact_count = 0usize;
+    // ↓ V2 Step 10 / D-S10-07：降级全扫的响应数（与 `filter_eval` 构成因果对）
+    let mut degraded_count = 0usize;
     let mut filter_eval_us_sum = 0f64;
     let mut bm25_ms_sum = 0f64;
     let mut vector_ms_sum = 0f64;
@@ -1533,6 +1548,9 @@ fn eval_latency(
                 shortfall_kernel_sum += m.vector_shortfall;
                 if m.vector_route == VectorRoute::Exact {
                     exact_count += 1;
+                }
+                if m.filter_degraded {
+                    degraded_count += 1;
                 }
                 filter_eval_us_sum += m.filter_eval.as_secs_f64() * 1e6;
                 bm25_ms_sum += m.bm25_elapsed.as_secs_f64() * 1000.0;
@@ -1563,6 +1581,7 @@ fn eval_latency(
         mean_shortfall: shortfall_sum as f64 / denom,
         mean_shortfall_kernel: shortfall_kernel_sum as f64 / kdenom,
         exact_ratio: exact_count as f64 / kdenom,
+        filter_degraded_ratio: degraded_count as f64 / kdenom,
         mean_filter_eval_us: filter_eval_us_sum / kdenom,
         mean_bm25_ms: bm25_ms_sum / kdenom,
         mean_vector_ms: vector_ms_sum / kdenom,
