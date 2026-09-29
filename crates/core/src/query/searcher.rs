@@ -154,6 +154,18 @@ pub fn search_parts(
     //    （可能是空的）—— 「没有 delta」与「没有段」是两件事。
     metrics.segments = segmented.map_or(1, |set| set.segments.len());
     metrics.tombstoned = segmented.map_or(0, |set| set.tombstones);
+    // V2 Step 10 / D-S10-07（T7-27 的读数载体；架构 `R64` / 设计 §2.5 N2）：
+    // 本 query 传入的过滤条件里，是否**至少有一个叶子字段已降级**（降级 ⇒ 该字段上的
+    // 求值回落 O(N) 全扫、成本随语料规模线性增长）。
+    //
+    // ⚠️ **必须放在三条早退之前**（设计 §4.8 **I10-4**）：本量是 `(filter, 索引)` 的**纯函数**，
+    //    与「本 query 能不能跑出结果」无关；放在早退之后就只剩 `Default` 的 `false`
+    //    ——那会让「**过滤排空**」这条最需要看降级的路径反而报 `false`，属于撒谎。
+    // ⚠️ 成本 **O(叶子数)**、与语料规模无关（只做判定、不构造位图，见
+    //    `filter_hits_degraded_field`）。
+    // ⚠️ 覆盖边界：只看 `parts.index`（单段装配 = 全部内容；跨段装配 = **主段**）。
+    metrics.filter_degraded =
+        filter.is_some_and(|f| super::filter::filter_hits_degraded_field(f, parts.index));
     // 空库判定：跨段时看**全局** N（`main` 空但有 delta 时库不是空的）
     let index_is_empty = match segmented {
         Some(set) => set.n == 0,
