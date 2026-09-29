@@ -1,0 +1,5 @@
+n	tag	mode	mean_filter_eval_us	shortfall_kernel	exact_ratio	degraded_ratio	p50_ms	p99_ms	mean_hits
+10000	none	hybrid	0.02	0.00	0.000	0.000	2.1778	3.0321	10.00
+10000	degraded	hybrid	498.69	0.00	1.000	1.000	2.3581	3.0586	10.00
+100000	none	hybrid	0.05	0.00	0.000	0.000	2.3962	3.6551	10.00
+100000	degraded	hybrid	7002.34	0.00	1.000	1.000	9.6255	17.9879	10.00
