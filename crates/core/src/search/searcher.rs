@@ -188,6 +188,8 @@ impl Searcher {
             vector_index: view.main.vector_index.as_ref().map(|vi| vi.as_ref()),
             fusion: self.shared.cfg.fusion.as_ref(),
             reranker: self.shared.cfg.reranker.as_ref(),
+            // V2 Step 10 / D-S10-01：后处理策略从 `Config` 流入编排层（默认 `None` ⇒ 逐位一致）。
+            post: self.shared.cfg.post.as_deref(),
             bm25_params: self.shared.cfg.bm25_params,
             segment_set,
             predicate_builder,

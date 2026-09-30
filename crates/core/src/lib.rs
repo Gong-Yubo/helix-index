@@ -51,6 +51,7 @@ pub mod embed;
 pub mod error;
 pub mod fusion;
 pub mod index;
+pub mod post;
 pub mod predicate;
 pub mod query;
 pub mod rerank;

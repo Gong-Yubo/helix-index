@@ -21,6 +21,7 @@ use crate::embed::Embedder;
 use crate::error::{Error, Result};
 use crate::fusion::{FusionCtx, FusionStrategy, LaneResults, LaneStats, RrfFusion};
 use crate::index::Index;
+use crate::post::PostProcessor;
 use crate::predicate::CandidateFilter;
 use crate::rerank::{NoOpReranker, Reranker};
 use crate::retriever::{
@@ -80,6 +81,12 @@ pub struct SearchParts<'a> {
     pub fusion: &'a dyn FusionStrategy,
     /// 重排策略
     pub reranker: &'a dyn Reranker,
+    /// **后处理策略**（V2 Step 10 / D-S10-01；`None` = 本阶段不执行 ⇒ 逐位一致）。
+    ///
+    /// ⚠️ 位置**固定**为「回捞之后、精排之前」（D-S10-02），理由见 [`crate::post`] 模块文档。
+    /// ⚠️ `SearchParts` 是**公开类型**（第 1 轮评审 **O2** 勘误），故本字段按公开口径登记；
+    /// 实际风险低（半内部类型）。
+    pub post: Option<&'a dyn PostProcessor>,
     /// BM25 参数（P5 定稿 k1=1.5 / b=0.75）
     pub bm25_params: Bm25Params,
     /// **跨段**检索输入（`S8-04`）：`Some` ⇒ 走 `main + deltas` 的跨段路径；
@@ -115,26 +122,31 @@ pub struct SearchParts<'a> {
     pub adaptive_fusion: bool,
 }
 
-/// 编排的唯一实现：两路召回 → 融合前过滤 → 融合 → 窗口回捞 → 精排 → 补齐 explain。
+/// 编排的唯一实现：两路召回 → 融合前过滤 → 融合 → 窗口回捞 → 后处理 → 精排 → 补齐 explain。
 ///
 /// 所有检索入口（`QueryExecutor::search` / 门面 `Searcher::search`）最终都到这里，
 /// 不存在第二份编排逻辑。
 ///
-/// # 精排窗口的三条不变式（V2 Step 7 / D-S7-01~03，设计 §4.2.3）
+/// # 窗口的两条通道与其不变式（V2 Step 7 `D-S7-01~03` + V2 Step 10 `D-S10-01/02`）
 ///
 /// ```text
 /// window            = Reranker::candidate_window(k)      // trait provided，默认 k
-/// candidate_k       = max(3k, window, 10)                // 恒 ≥ window
-/// take_n            = k == 0 ? 0 : min(max(k, window), 融合条数)
+/// post_window       = PostProcessor::candidate_window(k) // V2 Step 10；无后处理器时 = k
+/// candidate_k       = max(3k, window, post_window, 10)   // 恒 ≥ 两者
+/// take_n            = k == 0 ? 0 : min(max(k, window, post_window), 融合条数)
 /// handed            = 窗口内**可回捞**的条数（≤ take_n；陈旧 chunk_id 会让它更小）
 /// metrics.rerank_window = handed                         // ⚠️ 记**实际交接**值，非公式值
 /// ```
 ///
-/// 1. `window ≤ candidate_k`（否则窗口被候选池**静默封顶**）；
+/// 1. `window ≤ candidate_k` **且** `post_window ≤ candidate_k`（否则对应窗口被候选池**静默封顶**）；
 /// 2. `metrics.rerank_window ≤ k` ⟺ 本次**没有**可用的额外候选（放开失效）；
-/// 3. 默认实现下 `window == k` ⇒ `handed == take_n == k`、`candidate_k == max(3k, 10)`
-///    ⇒ 与精排引入前**逐位一致**；
-/// 4. `k == 0` 时**一条都不交给精排**（退化输入的浪费护栏，见下文注释）。
+///    ⚠️ **V2 Step 10 起这条判据要重新读**：`rerank_window` 的**语义不变**（仍只反映
+///    `Reranker` 的**实际交接**条数），但「本次没有额外候选」**不再由 `rerank_window ≤ k`
+///    单独表达** —— `post_window > k` 时 `take_n > k`，后处理会拿到更多条（即便精排窗口
+///    未放开）。⇒ **两者要分开判**：后处理窗口看 `post_window`，精排窗口看 `rerank_window`。
+/// 3. 默认实现下 `window == post_window == k` ⇒ `handed == take_n == k`、
+///    `candidate_k == max(3k, 10)` ⇒ 与**两阶段引入前**都**逐位一致**；
+/// 4. `k == 0` 时**一条都不交给**后处理 / 精排（退化输入的浪费护栏，见下文注释）。
 pub fn search_parts(
     parts: &SearchParts<'_>,
     query: &str,
@@ -206,7 +218,15 @@ pub fn search_parts(
     //
     // ⚠️ 默认 `R = k` ⇒ 本行是**恒等变换**，与精排引入前逐位一致（`S7_T1`）。
     let window = parts.reranker.candidate_window(k);
-    let candidate_k = k.saturating_mul(3).max(window).max(10);
+    // V2 Step 10 / D-S10-01（架构 `R61`）：后处理窗口与精排窗口**同权重**参与候选池。
+    //
+    // ⚠️ **只把截断改成窗口 `post_window` 而候选池不动 ⇒ 窗口被 `candidate_k` 静默封顶**
+    //    （`post_window = 100, k = 10` ⇒ 融合只出 30 条 ⇒ 后处理最多看到 30 条）。这是
+    //    **第一个**封顶点，与精排那条（`S7_T3` 钉住的）同族。
+    // ⚠️ **默认 `post_window = k`**（trait provided）⇒ 本行也是**恒等变换**、
+    //    未装后处理器时全链路逐位一致（`S10-T1`）。
+    let post_window = parts.post.map_or(k, |p| p.candidate_window(k));
+    let candidate_k = k.saturating_mul(3).max(window).max(post_window).max(10);
 
     // 1. 过滤求值 → 候选谓词（**下推的数据源**，只求值一次；空集直接短路）
     let t0 = Instant::now();
@@ -478,10 +498,15 @@ pub fn search_parts(
     // ⇒ 近零成本。本 PR 若不挡，会**无意放大这个退化输入的成本**。
     // 可达性：`helix search --k 0`（`k: usize` 无下界，`SearchRequest::top_n` 也不钳制）。
     // ⚠️ `window == 0`（trait 契约没写「必须 ≥ 1」）**不需要**额外处理：`max(k)` 已兜底。
+    //
+    // V2 Step 10 / D-S10-01：后处理窗口**必须同时**参与回捞（**第二个**封顶点，第 1 轮评审 **O1**）。
+    // ⚠️ 只做 `candidate_k` 那一处不够：候选池虽然放大了，但回捞仍只取
+    //    `max(k, window)` 条 ⇒ **后处理看到的候选数与没装它时一样多** ⇒ 机制空转、
+    //    而 `Metrics.rerank_window`（它记的是回捞后的实得条数）也**看不出**差别。
     let take_n = if k == 0 {
         0
     } else {
-        window.max(k).min(fused.len())
+        window.max(post_window).max(k).min(fused.len())
     };
     let mut proto: Vec<Hit> = Vec::with_capacity(take_n);
     for (chunk_id, fused_score) in fused.into_iter().take(take_n) {
@@ -527,7 +552,23 @@ pub fn search_parts(
         });
     }
 
-    // 4. 精排（V2 Step 7）。入参是**候选窗口**（可能 > `k`），出参应 ≤ `k` 条。
+    // 4. 后处理（V2 Step 10 / D-S10-01 / D-S10-02）。入参是**窗口内可回捞**的候选
+    //    （可能 > `k`），已带 `text` / `metadata`（第 3 步回捞的产物）。
+    //
+    // ⚠️ **位置固定**为「回捞之后、精排之前」，理由 = `fusion` 模块**不回捞正文**
+    //    （模块头硬约束）⇒ 时间衰减读时间字段 / MMR 读正文 / token budget 数正文
+    //    这三件事**结构上**不能在融合层做（设计 §2.5 **N5**）。
+    // ⚠️ `None`（默认）⇒ **整个阶段不执行**，`proto` 原样进精排 ⇒ 全链路与引入前
+    //    **逐位一致**（`S10-T1`；同 `NoOpReranker` 的 D-S7-04 先例）。
+    // ⚠️ 后处理**变更 `hits` 的长度是允许的**（token budget 就是第二道截断，
+    //    设计 §4.5）⇒ 这里**不**设「不得超 `k`」的安全网（那是 `Reranker` 的契约）。
+    //    但实现**必须**把长度 / 排序依据的变化经 `Explain` / `Metrics` 暴露（D-S10-09 / NFR-07）。
+    let proto = match parts.post {
+        None => proto,
+        Some(p) => p.process(proto, k)?,
+    };
+
+    // 5. 精排（V2 Step 7）。入参是**候选窗口**（可能 > `k`），出参应 ≤ `k` 条。
     //
     // `NoOpReranker`（默认，D-S7-04）= 原样 `take(k)`，且此时 `take_n == k`
     // ⇒ 全链路零回归。真精排器（`LocalReranker`）在此返回 `σ(logit)` 并把原始分
@@ -819,6 +860,11 @@ pub struct QueryExecutor<'a> {
     /// 架构 R44），而 `bench` 会对「每 mode × 每 run」各装配一次 searcher
     /// ⇒ 必须能**共享同一实例**，否则会重复加载模型（秒级 × N，且内存峰值叠加）。
     reranker: Arc<dyn Reranker>,
+    /// 后处理策略（**默认 `None`** ⇒ 本阶段不执行 ⇒ 逐位一致）。
+    ///
+    /// ⚠️ 与 `reranker` 同为 **`Arc`**（理由同：`bench` 会「每 mode × 每 run」各装配一次
+    /// `QueryExecutor` ⇒ 有状态的后处理器必须能**共享同一实例**，避免重复构造）。
+    post: Option<Arc<dyn PostProcessor>>,
     /// BM25 参数（P5 网格搜索从外部注入；默认 Bm25Params::default()）
     bm25_params: Bm25Params,
     /// 自适应融合开关（V2 Step 9；**默认 `false`**——见 `SearchParts::adaptive_fusion`）
@@ -835,6 +881,7 @@ impl<'a> QueryExecutor<'a> {
             vector_index: None,
             fusion: Box::new(RrfFusion::default()),
             reranker: Arc::new(NoOpReranker),
+            post: None,
             bm25_params: Bm25Params::default(),
             adaptive_fusion: false,
         }
@@ -902,6 +949,16 @@ impl<'a> QueryExecutor<'a> {
         self
     }
 
+    /// 装配**后处理策略**（V2 Step 10 / D-S10-01；默认不装 ⇒ 本阶段不执行）。
+    ///
+    /// ⚠️ 这是**逃生舱**入口（逐 lane 自定义组装）。一般用途请用门面层
+    /// `SearchIndexBuilder::post`（`Config::post`）—— 两条路径最终都汇到
+    /// [`search_parts`] 的同一个阶段。
+    pub fn with_post(mut self, post: Arc<dyn PostProcessor>) -> Self {
+        self.post = Some(post);
+        self
+    }
+
     /// 把自身状态投影成借用型 `SearchParts`（编排内核的输入）。
     fn parts(&self) -> SearchParts<'_> {
         SearchParts {
@@ -911,6 +968,8 @@ impl<'a> QueryExecutor<'a> {
             vector_index: self.vector_index,
             fusion: self.fusion.as_ref(),
             reranker: self.reranker.as_ref(),
+            // V2 Step 10 / D-S10-01：后处理策略（默认 `None`）。
+            post: self.post.as_deref(),
             bm25_params: self.bm25_params,
             // ⚠️ `QueryExecutor` 是**单段逃生舱**（它持 `&Index`，不认识 `View` / 分段）
             // ⇒ 两个跨段字段恒为空 ⇒ 走的还是 `S8-03` 之前那条单段路径（逐位不变）。
