@@ -9,6 +9,18 @@
 
 ## [Unreleased]
 
+### 功能 · V2 Step 10 `PR10-2`：后处理公共机制（`PostProcessor` trait + 窗口**两处**联动）（2026-09-30）
+
+**V2.1 第四步的第二段**：`plan-v2.md` §4 Step 10 的 **`PR10-2`** = **`S10-03`**（后处理公共机制）—— 时间衰减（`S10-04`）/ MMR（`S10-05`）/ token budget（`S10-06`）三个任务的**共同前置**。前置 `PR10-1`（#82）已合并 = `a949c05`。
+
+- **新增 `PostProcessor` trait**（新模块 `helix_core::post`，与 `rerank` 并列）：`name()` / `candidate_window(k)`（**provided，默认 `k`**）/ `process(hits, k) -> Result<Vec<Hit>>`。位置**固定**为「窗口回捞之后、精排之前」（`D-S10-02`）—— 因为 `fusion` 模块**不回捞正文**，「时间衰减读时间字段 / MMR 读正文 / token budget 数正文」这三件事在融合层**结构上做不到**。
+- 🔴 **`post_window` 同时参与两处**（架构 `R61` 的**两个**封顶点）：① 候选池 `candidate_k = max(3k, rerank_window, post_window, 10)`；② 回捞 `take_n = max(k, rerank_window, post_window).min(fused.len())`。⚠️ **只做 ①** 时候选池够大而回捞仍只取 `max(k, window)` 条 ⇒ **后处理看到的候选数没变、机制空转**（第 1 轮评审 **O1** 的形态）。`post == None` 时两处都是**恒等变换** ⇒ 零行为变化。
+- **观测面（`§15 I-14`）**：**不新增** `Metrics` / `Explain` 字段（加公开字段是破坏性的，且附录 A 的提案清单里没有 `post_window`）；复用既有 **`Metrics.rerank_window`** —— 其口径**精化**为「**后处理输出** = 实际交给精排的条数」（`§15 I-15`）。⚠️ **零回归**：`post == None` 时取值与引入前**恒等**。
+- **接通面**：`Config.post`（默认 `None`）+ `SearchIndexBuilder::post(...)` + **`QueryExecutor::with_post(...)`**（`§15 I-13`，与 `with_reranker` 对称；不给它则逃生舱在新阶段出现缺口）。
+- 🔴 **接口形态偏差（`§15 I-11`，已报评审）**：设计附录 A 写的是 `process(hits, k, ctx) -> Vec<Hit>`，实际为 `process(hits, k) -> Result<Vec<Hit>>` —— **去掉 `ctx`**（它在设计全文只出现一次、**从未定义**，且四个计划实现**没有一个需要它** ⇒ 加了就是**永久公开 API 债**）、**返回 `Result`**（NFR-07：不得静默降级）。
+- ⚠️ **本段默认关**（`post: None`）⇒ **零行为变化**；`S10-04` ~ `S10-07` 四个任务**不因本 PR 改变默认行为**，它们各自仍需自己的开关与 `Explain` 信号（`D-S10-09`）。
+- **对外面**：新 trait + 新模块 + `SearchParts` 新字段（**保持 `pub`**，`§15 I-12` 说明为何不收窄）+ `Config` 新字段 + 2 个 setter。**不改**任何既有 trait 签名、**不新增依赖**、**不动 `deny.toml`**、**不改 `FORMAT_VERSION`**。
+
 ### 文档 · V2 Step 10 `PR10-1` 第 2 轮（响应验证型）评审留痕（设计 v0.5 → v0.6）（2026-09-30）
 
 **评审**（`pulls/82/reviews` = **1 条 `COMMENTED`**，`5353774436`，基线 `4f20ff8`；**行内 = 0**；`issues/82/comments` 无新增）= **✅ 通过、无阻塞项：0×P1 / 0×P2 / 0×P3 / 0×P4，达到可合并形态**。本轮是**响应验证型**（评审明说未重新通读全 PR）⇒ **0 项需处置**；本版**纯留痕，零 `.rs` 改动**。
