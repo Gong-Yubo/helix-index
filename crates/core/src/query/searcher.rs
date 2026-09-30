@@ -21,6 +21,7 @@ use crate::embed::Embedder;
 use crate::error::{Error, Result};
 use crate::fusion::{FusionCtx, FusionStrategy, LaneResults, LaneStats, RrfFusion};
 use crate::index::Index;
+use crate::post::PostProcessor;
 use crate::predicate::CandidateFilter;
 use crate::rerank::{NoOpReranker, Reranker};
 use crate::retriever::{
@@ -80,6 +81,12 @@ pub struct SearchParts<'a> {
     pub fusion: &'a dyn FusionStrategy,
     /// 重排策略
     pub reranker: &'a dyn Reranker,
+    /// **后处理策略**（V2 Step 10 / D-S10-01；`None` = 本阶段不执行 ⇒ 逐位一致）。
+    ///
+    /// ⚠️ 位置**固定**为「回捞之后、精排之前」（D-S10-02），理由见 [`crate::post`] 模块文档。
+    /// ⚠️ `SearchParts` 是**公开类型**（第 1 轮评审 **O2** 勘误），故本字段按公开口径登记；
+    /// 实际风险低（半内部类型）。
+    pub post: Option<&'a dyn PostProcessor>,
     /// BM25 参数（P5 定稿 k1=1.5 / b=0.75）
     pub bm25_params: Bm25Params,
     /// **跨段**检索输入（`S8-04`）：`Some` ⇒ 走 `main + deltas` 的跨段路径；
@@ -115,26 +122,31 @@ pub struct SearchParts<'a> {
     pub adaptive_fusion: bool,
 }
 
-/// 编排的唯一实现：两路召回 → 融合前过滤 → 融合 → 窗口回捞 → 精排 → 补齐 explain。
+/// 编排的唯一实现：两路召回 → 融合前过滤 → 融合 → 窗口回捞 → 后处理 → 精排 → 补齐 explain。
 ///
 /// 所有检索入口（`QueryExecutor::search` / 门面 `Searcher::search`）最终都到这里，
 /// 不存在第二份编排逻辑。
 ///
-/// # 精排窗口的三条不变式（V2 Step 7 / D-S7-01~03，设计 §4.2.3）
+/// # 窗口的两条通道与其不变式（V2 Step 7 `D-S7-01~03` + V2 Step 10 `D-S10-01/02`）
 ///
 /// ```text
 /// window            = Reranker::candidate_window(k)      // trait provided，默认 k
-/// candidate_k       = max(3k, window, 10)                // 恒 ≥ window
-/// take_n            = k == 0 ? 0 : min(max(k, window), 融合条数)
+/// post_window       = PostProcessor::candidate_window(k) // V2 Step 10；无后处理器时 = k
+/// candidate_k       = max(3k, window, post_window, 10)   // 恒 ≥ 两者
+/// take_n            = k == 0 ? 0 : min(max(k, window, post_window), 融合条数)
 /// handed            = 窗口内**可回捞**的条数（≤ take_n；陈旧 chunk_id 会让它更小）
 /// metrics.rerank_window = handed                         // ⚠️ 记**实际交接**值，非公式值
 /// ```
 ///
-/// 1. `window ≤ candidate_k`（否则窗口被候选池**静默封顶**）；
+/// 1. `window ≤ candidate_k` **且** `post_window ≤ candidate_k`（否则对应窗口被候选池**静默封顶**）；
 /// 2. `metrics.rerank_window ≤ k` ⟺ 本次**没有**可用的额外候选（放开失效）；
-/// 3. 默认实现下 `window == k` ⇒ `handed == take_n == k`、`candidate_k == max(3k, 10)`
-///    ⇒ 与精排引入前**逐位一致**；
-/// 4. `k == 0` 时**一条都不交给精排**（退化输入的浪费护栏，见下文注释）。
+///    ⚠️ **V2 Step 10 起这条判据要重新读**：`rerank_window` 的**语义不变**（仍只反映
+///    `Reranker` 的**实际交接**条数），但「本次没有额外候选」**不再由 `rerank_window ≤ k`
+///    单独表达** —— `post_window > k` 时 `take_n > k`，后处理会拿到更多条（即便精排窗口
+///    未放开）。⇒ **两者要分开判**：后处理窗口看 `post_window`，精排窗口看 `rerank_window`。
+/// 3. 默认实现下 `window == post_window == k` ⇒ `handed == take_n == k`、
+///    `candidate_k == max(3k, 10)` ⇒ 与**两阶段引入前**都**逐位一致**；
+/// 4. `k == 0` 时**一条都不交给**后处理 / 精排（退化输入的浪费护栏，见下文注释）。
 pub fn search_parts(
     parts: &SearchParts<'_>,
     query: &str,
@@ -206,7 +218,15 @@ pub fn search_parts(
     //
     // ⚠️ 默认 `R = k` ⇒ 本行是**恒等变换**，与精排引入前逐位一致（`S7_T1`）。
     let window = parts.reranker.candidate_window(k);
-    let candidate_k = k.saturating_mul(3).max(window).max(10);
+    // V2 Step 10 / D-S10-01（架构 `R61`）：后处理窗口与精排窗口**同权重**参与候选池。
+    //
+    // ⚠️ **只把截断改成窗口 `post_window` 而候选池不动 ⇒ 窗口被 `candidate_k` 静默封顶**
+    //    （`post_window = 100, k = 10` ⇒ 融合只出 30 条 ⇒ 后处理最多看到 30 条）。这是
+    //    **第一个**封顶点，与精排那条（`S7_T3` 钉住的）同族。
+    // ⚠️ **默认 `post_window = k`**（trait provided）⇒ 本行也是**恒等变换**、
+    //    未装后处理器时全链路逐位一致（`S10-T1`）。
+    let post_window = parts.post.map_or(k, |p| p.candidate_window(k));
+    let candidate_k = k.saturating_mul(3).max(window).max(post_window).max(10);
 
     // 1. 过滤求值 → 候选谓词（**下推的数据源**，只求值一次；空集直接短路）
     let t0 = Instant::now();
@@ -478,10 +498,15 @@ pub fn search_parts(
     // ⇒ 近零成本。本 PR 若不挡，会**无意放大这个退化输入的成本**。
     // 可达性：`helix search --k 0`（`k: usize` 无下界，`SearchRequest::top_n` 也不钳制）。
     // ⚠️ `window == 0`（trait 契约没写「必须 ≥ 1」）**不需要**额外处理：`max(k)` 已兜底。
+    //
+    // V2 Step 10 / D-S10-01：后处理窗口**必须同时**参与回捞（**第二个**封顶点，第 1 轮评审 **O1**）。
+    // ⚠️ 只做 `candidate_k` 那一处不够：候选池虽然放大了，但回捞仍只取
+    //    `max(k, window)` 条 ⇒ **后处理看到的候选数与没装它时一样多** ⇒ 机制空转、
+    //    而 `Metrics.rerank_window`（它记的是回捞后的实得条数）也**看不出**差别。
     let take_n = if k == 0 {
         0
     } else {
-        window.max(k).min(fused.len())
+        window.max(post_window).max(k).min(fused.len())
     };
     let mut proto: Vec<Hit> = Vec::with_capacity(take_n);
     for (chunk_id, fused_score) in fused.into_iter().take(take_n) {
@@ -527,7 +552,23 @@ pub fn search_parts(
         });
     }
 
-    // 4. 精排（V2 Step 7）。入参是**候选窗口**（可能 > `k`），出参应 ≤ `k` 条。
+    // 4. 后处理（V2 Step 10 / D-S10-01 / D-S10-02）。入参是**窗口内可回捞**的候选
+    //    （可能 > `k`），已带 `text` / `metadata`（第 3 步回捞的产物）。
+    //
+    // ⚠️ **位置固定**为「回捞之后、精排之前」，理由 = `fusion` 模块**不回捞正文**
+    //    （模块头硬约束）⇒ 时间衰减读时间字段 / MMR 读正文 / token budget 数正文
+    //    这三件事**结构上**不能在融合层做（设计 §2.5 **N5**）。
+    // ⚠️ `None`（默认）⇒ **整个阶段不执行**，`proto` 原样进精排 ⇒ 全链路与引入前
+    //    **逐位一致**（`S10-T1`；同 `NoOpReranker` 的 D-S7-04 先例）。
+    // ⚠️ 后处理**变更 `hits` 的长度是允许的**（token budget 就是第二道截断，
+    //    设计 §4.5）⇒ 这里**不**设「不得超 `k`」的安全网（那是 `Reranker` 的契约）。
+    //    但实现**必须**把长度 / 排序依据的变化经 `Explain` / `Metrics` 暴露（D-S10-09 / NFR-07）。
+    let proto = match parts.post {
+        None => proto,
+        Some(p) => p.process(proto, k)?,
+    };
+
+    // 5. 精排（V2 Step 7）。入参是**候选窗口**（可能 > `k`），出参应 ≤ `k` 条。
     //
     // `NoOpReranker`（默认，D-S7-04）= 原样 `take(k)`，且此时 `take_n == k`
     // ⇒ 全链路零回归。真精排器（`LocalReranker`）在此返回 `σ(logit)` 并把原始分
@@ -819,6 +860,11 @@ pub struct QueryExecutor<'a> {
     /// 架构 R44），而 `bench` 会对「每 mode × 每 run」各装配一次 searcher
     /// ⇒ 必须能**共享同一实例**，否则会重复加载模型（秒级 × N，且内存峰值叠加）。
     reranker: Arc<dyn Reranker>,
+    /// 后处理策略（**默认 `None`** ⇒ 本阶段不执行 ⇒ 逐位一致）。
+    ///
+    /// ⚠️ 与 `reranker` 同为 **`Arc`**（理由同：`bench` 会「每 mode × 每 run」各装配一次
+    /// `QueryExecutor` ⇒ 有状态的后处理器必须能**共享同一实例**，避免重复构造）。
+    post: Option<Arc<dyn PostProcessor>>,
     /// BM25 参数（P5 网格搜索从外部注入；默认 Bm25Params::default()）
     bm25_params: Bm25Params,
     /// 自适应融合开关（V2 Step 9；**默认 `false`**——见 `SearchParts::adaptive_fusion`）
@@ -835,6 +881,7 @@ impl<'a> QueryExecutor<'a> {
             vector_index: None,
             fusion: Box::new(RrfFusion::default()),
             reranker: Arc::new(NoOpReranker),
+            post: None,
             bm25_params: Bm25Params::default(),
             adaptive_fusion: false,
         }
@@ -902,6 +949,16 @@ impl<'a> QueryExecutor<'a> {
         self
     }
 
+    /// 装配**后处理策略**（V2 Step 10 / D-S10-01；默认不装 ⇒ 本阶段不执行）。
+    ///
+    /// ⚠️ 这是**逃生舱**入口（逐 lane 自定义组装）。一般用途请用门面层
+    /// `SearchIndexBuilder::post`（`Config::post`）—— 两条路径最终都汇到
+    /// [`search_parts`] 的同一个阶段。
+    pub fn with_post(mut self, post: Arc<dyn PostProcessor>) -> Self {
+        self.post = Some(post);
+        self
+    }
+
     /// 把自身状态投影成借用型 `SearchParts`（编排内核的输入）。
     fn parts(&self) -> SearchParts<'_> {
         SearchParts {
@@ -911,6 +968,8 @@ impl<'a> QueryExecutor<'a> {
             vector_index: self.vector_index,
             fusion: self.fusion.as_ref(),
             reranker: self.reranker.as_ref(),
+            // V2 Step 10 / D-S10-01：后处理策略（默认 `None`）。
+            post: self.post.as_deref(),
             bm25_params: self.bm25_params,
             // ⚠️ `QueryExecutor` 是**单段逃生舱**（它持 `&Index`，不认识 `View` / 分段）
             // ⇒ 两个跨段字段恒为空 ⇒ 走的还是 `S8-03` 之前那条单段路径（逐位不变）。
@@ -2759,5 +2818,275 @@ mod tests {
             r.metrics.filter_degraded,
             "③ 空原因由 query 侧信号决定，但本字段描述的是**过滤求值**走了哪条路径 ⇒ 仍为 true"
         );
+    }
+    // ══════════════════════════════════════════════════════════════════════════
+    // V2 Step 10 / PR10-2（S10-03）：后处理公共机制 —— 窗口**两处**参与（R61）
+    // ══════════════════════════════════════════════════════════════════════════
+    //
+    // 架构 `R61` 说后处理窗口有**两个**封顶点：候选池 `candidate_k` 与回捞 `take_n`。
+    // ⇒ 判据必须**分别**钉住两处（设计 `S10-T2` 的两条断言），且变异要**两处各验一次**
+    //    （设计 `S10-T20`）—— 因为**只做其中一处**时另一处会`静默封顶`，而这一点在
+    //    「结果对不对」的行为判据上**看不见**（两个窗口都只是让后处理多吃几条候选）。
+
+    /// 建「带向量的 `QueryExecutor`」，可选装后处理器。
+    ///
+    /// ⚠️ 走**真实**的 [`QueryExecutor::with_post`]（生产同一入口），不另开 `SearchParts`
+    /// 直构造的口子 —— 后者的中间那条传递（`QueryExecutor` → `SearchParts.post`）
+    /// 就会**没有判据**（同 `S8-08` 的 `embed_sessions` 教训）。
+    fn make_executor_with_post<'a>(
+        index: &'a Index,
+        analyzer: &'a dyn Analyzer,
+        e: &'a dyn Embedder,
+        vi: &'a dyn VectorIndex,
+        spy: Arc<dyn crate::post::PostProcessor>,
+    ) -> QueryExecutor<'a> {
+        QueryExecutor::new(index, analyzer)
+            .with_vector(e, vi)
+            .with_post(spy)
+    }
+
+    /// 间谍后处理器：记录入参，并按开关施加**可预测**的变换。
+    ///
+    /// ⚠️ 与 `SpyReranker` 分开写（不复用）：后处理要看的是「拿到了几条」与
+    /// 「正文 / 元数据在不在」——那正是「位置在回捞之后」的证据。
+    struct SpyPost {
+        /// `candidate_window` 的返回值（`post_window`）
+        window: usize,
+        /// `Some(n)` ⇒ 把候选截到前 `n` 条（模拟 token budget 那类**缩短** `hits` 的实现）
+        keep: Option<usize>,
+        obs: SpyPostObs,
+    }
+
+    /// 观测窗（`Arc` 共享 ⇒ 装进 `Box<dyn PostProcessor>` 移走后仍可读）。
+    #[derive(Clone, Default)]
+    struct SpyPostObs {
+        /// 最近一次 `process` 收到的条数
+        seen_len: Arc<AtomicUsize>,
+        /// 最近一次 `process` 入参里 `text` **非空** 的条数（钉 D-S10-02 的「回捞之后」）
+        seen_with_text: Arc<AtomicUsize>,
+        /// 最近一次 `process` 入参里 `metadata` **非空** 的条数（同上）
+        seen_with_meta: Arc<AtomicUsize>,
+        /// 调用次数（钉「`None` ⇒ 一次都不调」）
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl SpyPostObs {
+        fn seen_len(&self) -> usize {
+            self.seen_len.load(AtomicOrdering::SeqCst)
+        }
+        fn seen_with_text(&self) -> usize {
+            self.seen_with_text.load(AtomicOrdering::SeqCst)
+        }
+        fn seen_with_meta(&self) -> usize {
+            self.seen_with_meta.load(AtomicOrdering::SeqCst)
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    impl SpyPost {
+        fn new(window: usize) -> (Self, SpyPostObs) {
+            Self::with_keep(window, None)
+        }
+
+        /// `keep = Some(n)` ⇒ 变换后只剩前 `n` 条（**改变长度**的实现，如 token budget）。
+        fn with_keep(window: usize, keep: Option<usize>) -> (Self, SpyPostObs) {
+            let obs = SpyPostObs::default();
+            (
+                Self {
+                    window,
+                    keep,
+                    obs: obs.clone(),
+                },
+                obs,
+            )
+        }
+    }
+
+    impl crate::post::PostProcessor for SpyPost {
+        fn name(&self) -> &'static str {
+            "spy-post"
+        }
+
+        fn candidate_window(&self, _k: usize) -> usize {
+            self.window
+        }
+
+        fn process(&self, hits: Vec<Hit>, _k: usize) -> Result<Vec<Hit>> {
+            self.obs.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.obs.seen_len.store(hits.len(), AtomicOrdering::SeqCst);
+            self.obs.seen_with_text.store(
+                hits.iter().filter(|h| !h.text.is_empty()).count(),
+                AtomicOrdering::SeqCst,
+            );
+            self.obs.seen_with_meta.store(
+                hits.iter()
+                    .filter(|h| h.metadata != serde_json::Value::Null)
+                    .count(),
+                AtomicOrdering::SeqCst,
+            );
+            // 原样返回（本阶段不做任何变换 ⇒ 「机制接通」与「变换语义」分开验）
+            let mut hits = hits;
+            if let Some(n) = self.keep {
+                hits.truncate(n);
+            }
+            Ok(hits)
+        }
+    }
+
+    /// **S10-T2 ①（架构 `R61` 的候选池封顶点）**：`post_window` 必须参与 `candidate_k`。
+    ///
+    /// 用**四档** `post_window` 读**向量后端实际收到的 `k`**（照 `S7_T3` 先例）：
+    /// 只改截断而 `candidate_k` 不联动时，后两档立刻暴露（后端仍收到 30 ⇒ 被静默封顶）。
+    #[test]
+    fn S10_T2a_后处理窗口必须参与候选池() {
+        let (index, analyzer, _) = build_window_fixture();
+        let e = FakeEmbedder;
+        const K: usize = 10;
+
+        for (post_window, expected_k, label) in [
+            (10usize, 30usize, "post_window <= 3k：候选池由 3k 兜底"),
+            (30, 30, "post_window == 3k：正好对齐"),
+            (
+                100,
+                100,
+                "post_window > 3k：必须由它决定（否则 R61 候选池封顶）",
+            ),
+            (200, 200, "post_window >> 3k"),
+        ] {
+            let ids: Vec<ChunkId> = (0..12).collect();
+            let vi = SpyVectorIndex::new(false, ids.clone(), ids);
+            let (spy, _obs) = SpyPost::new(post_window);
+            let s = make_executor_with_post(&index, &analyzer, &e, &vi, Arc::new(spy));
+            let _r = s.search("检索", SearchMode::Vector, K).unwrap();
+
+            assert_eq!(vi.max_k(), expected_k, "{label}：后端收到的 k 参数");
+            assert!(
+                vi.max_k() >= post_window,
+                "{label}：不变式 `post_window <= candidate_k` 必须成立"
+            );
+        }
+    }
+
+    /// **S10-T2 ②（架构 `R61` 的回捞封顶点，第 1 轮评审 O1）**：`post_window` 必须参与 `take_n`。
+    ///
+    /// 🔑 **这一条与上一条不可互相替代**：`candidate_k` 只决定「融合池有多大」，
+    /// 而回捞 `take_n` 决定「后处理**实得**几条」。只做 ① 时 `vi.max_k()` 会是对的
+    /// （所以 ① 绿），但 `obs.seen_len()` 仍是 `max(k, window)` ⇒ **后处理空转**。
+    #[test]
+    fn S10_T2b_后处理窗口必须参与回捞() {
+        let (index, analyzer, _) = build_window_fixture();
+        let e = FakeEmbedder;
+        const K: usize = 10;
+
+        // 四档：与 ① 同一组阈值，但这次的判据是**后处理实得条数**
+        for (post_window, expected_seen, label) in [
+            (
+                10usize,
+                10usize,
+                "post_window == k ⇒ 后处理只拿 k 条（零变化）",
+            ),
+            (12, 12, "post_window == 融合条数 ⇒ 拿满"),
+            (100, 12, "post_window > 融合条数 ⇒ 上界是融合条数 12"),
+        ] {
+            let ids: Vec<ChunkId> = (0..12).collect();
+            let vi = SpyVectorIndex::new(false, ids.clone(), ids);
+            let (spy, obs) = SpyPost::new(post_window);
+            let s = make_executor_with_post(&index, &analyzer, &e, &vi, Arc::new(spy));
+            let _r = s.search("检索", SearchMode::Vector, K).unwrap();
+
+            assert_eq!(
+                obs.seen_len(),
+                expected_seen,
+                "{label}：后处理**实得**条数（= take_n 的上界）"
+            );
+        }
+    }
+
+    /// **S10-T2 ③（`metrics.rerank_window` 口径在新链路下仍是「实际交接」）**：
+    /// 后处理**缩短**候选时，`rerank_window` 记的是**后处理输出**条数，不是 `take_n`。
+    ///
+    /// 🔑 为什么单列：`handed` 在 V2 Step 10 前 = 回捞后条数；插入后处理之后它必须
+    /// 取**交给精排的那一批**（= 后处理输出）。若沿用「回捞后」的值，token budget
+    /// 那类实现在 `rerank_window` 上会**高报**（自称交给精排 12 条、实际 3 条）。
+    /// ⇒ 这条与 `S10-T2 ①②` 三者互补：① 候选池够大、② 回捞够多、③ 记账如实。
+    #[test]
+    fn S10_T2c_缩短候选时rerank_window记后处理输出() {
+        let (index, analyzer, _) = build_window_fixture();
+        let e = FakeEmbedder;
+        let ids: Vec<ChunkId> = (0..12).collect();
+        let vi = SpyVectorIndex::new(false, ids.clone(), ids);
+        // 窗口 100 ⇒ take_n = 12（融合条数上限）；后处理再截到 3 条
+        let (spy, obs) = SpyPost::with_keep(100, Some(3));
+        let s = make_executor_with_post(&index, &analyzer, &e, &vi, Arc::new(spy));
+        let r = s.search("检索", SearchMode::Vector, 10).unwrap();
+
+        assert_eq!(
+            obs.seen_len(),
+            12,
+            "后处理实得 12 条（回捞上界 = 融合条数）"
+        );
+        assert_eq!(
+            r.metrics.rerank_window, 3,
+            "🔴 必须记「后处理输出」= 实际交给精排的条数，而不是 take_n = 12"
+        );
+        assert_eq!(r.hits.len(), 3, "精排拿到 3 条 ⇒ 出口也只有 3 条");
+    }
+
+    /// **S10-T3（D-S10-02）**：后处理发生在**窗口回捞之后** ⇒ 入参 `Hit` 已带 `text` / `metadata`。
+    ///
+    /// 钉住「位置固定为回捞之后、精排之前」：若哪天有人把它挪到融合层（那里**不回捞正文**），
+    /// 本用例立刻红 —— 不是「断言变了」，而是**位置上做不到了**。
+    #[test]
+    fn S10_T3_后处理入参已回捞正文() {
+        let (index, analyzer, _) = build_window_fixture();
+        let e = FakeEmbedder;
+        let ids: Vec<ChunkId> = (0..12).collect();
+        let vi = SpyVectorIndex::new(false, ids.clone(), ids);
+        let (spy, obs) = SpyPost::new(100);
+        let s = make_executor_with_post(&index, &analyzer, &e, &vi, Arc::new(spy));
+        let _r = s.search("检索", SearchMode::Vector, 10).unwrap();
+
+        assert_eq!(obs.calls(), 1, "装了后处理器 ⇒ 恰好调一次");
+        let n = obs.seen_len();
+        assert!(n > 0, "前提：后处理确实拿到了候选");
+        assert_eq!(
+            obs.seen_with_text(),
+            n,
+            "🔴 每条候选都必须已回捞 `text`（D-S10-02：位置在回捞之后）"
+        );
+        assert_eq!(
+            obs.seen_with_meta(),
+            n,
+            "🔴 每条候选都必须已回捞 `metadata`（时间衰减 / token budget 依赖它）"
+        );
+    }
+
+    /// **S10-T1（编排层零回归）**：不装后处理器 ⇒ 后处理阶段**一次都不执行**，
+    /// 且 `hits` 与「窗口 = k 的精排」路径**逐位一致**。
+    #[test]
+    fn S10_T1_默认不装后处理器时零变化() {
+        let (index, analyzer, vi) = build_window_fixture();
+        let e = FakeEmbedder;
+
+        let base = QueryExecutor::new(&index, &analyzer)
+            .with_vector(&e, &vi)
+            .search("检索", SearchMode::Vector, 10)
+            .unwrap();
+
+        // 对照：装一个**恒等**后处理器、且窗口 = k（= 默认值）
+        let ids: Vec<ChunkId> = (0..12).collect();
+        let vi2 = SpyVectorIndex::new(false, ids.clone(), ids);
+        let (spy, obs) = SpyPost::new(10);
+        let s = make_executor_with_post(&index, &analyzer, &e, &vi2, Arc::new(spy));
+        let r = s.search("检索", SearchMode::Vector, 10).unwrap();
+
+        assert_eq!(obs.calls(), 1, "装了就要被调用（证明通道真的接通）");
+        assert_eq!(ids_of(&base), ids_of(&r), "hits 顺序必须不变");
+        for (a, b) in base.hits.iter().zip(&r.hits) {
+            assert_eq!(a.score.to_bits(), b.score.to_bits(), "分数必须逐位一致");
+            assert_eq!(explain_snapshot(a), explain_snapshot(b));
+        }
     }
 }
