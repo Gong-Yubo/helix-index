@@ -154,6 +154,18 @@ pub fn search_parts(
     //    （可能是空的）—— 「没有 delta」与「没有段」是两件事。
     metrics.segments = segmented.map_or(1, |set| set.segments.len());
     metrics.tombstoned = segmented.map_or(0, |set| set.tombstones);
+    // V2 Step 10 / D-S10-07（T7-27 的读数载体；架构 `R64` / 设计 §2.5 N2）：
+    // 本 query 传入的过滤条件里，是否**至少有一个叶子字段已降级**（降级 ⇒ 该字段上的
+    // 求值回落 O(N) 全扫、成本随语料规模线性增长）。
+    //
+    // ⚠️ **必须放在三条早退之前**（设计 §4.8 **I10-4**）：本量是 `(filter, 索引)` 的**纯函数**，
+    //    与「本 query 能不能跑出结果」无关；放在早退之后就只剩 `Default` 的 `false`
+    //    ——那会让「**过滤排空**」这条最需要看降级的路径反而报 `false`，属于撒谎。
+    // ⚠️ 成本 **O(叶子数)**、与语料规模无关（只做判定、不构造位图，见
+    //    `filter_hits_degraded_field`）。
+    // ⚠️ 覆盖边界：只看 `parts.index`（单段装配 = 全部内容；跨段装配 = **主段**）。
+    metrics.filter_degraded =
+        filter.is_some_and(|f| super::filter::filter_hits_degraded_field(f, parts.index));
     // 空库判定：跨段时看**全局** N（`main` 空但有 delta 时库不是空的）
     let index_is_empty = match segmented {
         Some(set) => set.n == 0,
@@ -2508,6 +2520,244 @@ mod tests {
         assert!(
             (cov - 1.0).abs() < 1e-6,
             "词分布在两段 ⇒ 覆盖率应为 1.0（任一段有即算），实际 {cov}"
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // V2 Step 10 / PR10-1 —— S10-T4（命名空间过滤结构性不缺口）
+    //                        + S10-T5（字段降级可观测，含 I10-4 三条早退路径）
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// 逐篇 metadata 互异的语料：`ns`（命名空间，字符串）+ `ts`（高基数常用形状，数值）。
+    ///
+    /// ⚠️ `max_values_per_field` **显式参数化** ⇒ 传一个小值即可**廉价**造出「必然降级」：
+    /// 降级判据是 `value_count >= max`（`field_index.rs` 的 `insert`），**与语料规模无关**
+    /// ⇒ 不必真堆 `>= 512` 篇（数值字段同时登记 terms 与 numbers、两者**合计**计入限额，
+    /// 所以毫秒时间戳约 512 篇就撞线）。
+    fn build_ns_index(n: usize, max_values_per_field: usize) -> (Index, MixedAnalyzer) {
+        let analyzer = MixedAnalyzer::new();
+        let chunker = Chunker::default();
+        let mut index = Index::with_max_values_per_field(max_values_per_field);
+        for i in 0..n {
+            let doc = DocRecord {
+                doc_id: 0,
+                source: format!("doc-{i}"),
+                metadata: serde_json::json!({
+                    "ns": format!("ns-{i}"),
+                    "ts": 1_700_000_000_000u64 + i as u64,
+                }),
+                content_hash: 0,
+            };
+            index
+                .add(
+                    doc,
+                    chunker.chunk(0, &format!("检索 文档编号 {i}")),
+                    &analyzer,
+                )
+                .unwrap();
+        }
+        (index, analyzer)
+    }
+
+    /// 把某索引的存活 chunk 全量灌进 HNSW（`brute_fallback` 可配 ⇒ 能**切换策略**）。
+    fn hnsw_of(index: &Index, brute_fallback: Option<usize>) -> crate::vector::HnswRsIndex {
+        let mut vi =
+            crate::vector::HnswRsIndex::with_capacity(1024).with_brute_fallback(brute_fallback);
+        for c in index.live_chunks() {
+            vi.add(
+                c.chunk_id,
+                crate::vector::NormalizedVector::new(fake_vec(&c.text)),
+            )
+            .unwrap();
+        }
+        vi
+    }
+
+    /// 某字段取某值的**存活 chunk** 集合（判据的独立参照，不经检索路径）。
+    fn chunks_with(index: &Index, field: &str, value: &str) -> Vec<ChunkId> {
+        index
+            .live_chunks()
+            .filter(|c| {
+                index
+                    .doc(c.doc_id)
+                    .is_some_and(|d| d.metadata.get(field).and_then(|v| v.as_str()) == Some(value))
+            })
+            .map(|c| c.chunk_id)
+            .collect()
+    }
+
+    /// **S10-T4 / 设计 §1.3 的 S10-1 ①**：命名空间过滤在 `allowed ≤ 8192` 档
+    /// **结构性不缺口** —— 逐 query `vector_shortfall == 0` **且** `vector_route == Exact`。
+    ///
+    /// - **臂 A**（默认兜底阈值 `8192`）：先断言**前提** `allowed ≤ 8192`，再断言两条结构性结论；
+    /// - **臂 B**（把兜底阈值压成 `0`）：断言 `route` **翻成 `Ann`**。
+    ///
+    /// 🔑 **臂 B 是本用例的牙齿**：没有它，「`route == Exact`」可能只是「后端恒 `Exact`」
+    /// 的结果（`BruteForceIndex::prefers_exact` 就是恒 `true`）⇒ 判据退化成恒真断言。
+    ///
+    /// ⚠️ 本用例**不复跑** `S5_T7` / `S5_T13` 的通用结构性证明，只钉「**命名空间这条路径**」
+    /// 满足同一性质（新增的 `Filter::namespace` 必须真的建出 `Filtered` 谓词）。
+    #[test]
+    fn S10_T4_命名空间过滤低选择度档结构性不缺口() {
+        use crate::schema::Filter;
+
+        let (index, analyzer) = build_ns_index(12, 1024);
+        let e = FakeEmbedder;
+        let f = Filter::namespace("ns", "ns-3");
+        let expect = chunks_with(&index, "ns", "ns-3");
+        assert_eq!(expect.len(), 1, "夹具前提：ns-3 恰有 1 个存活 chunk");
+
+        // ── 臂 A：默认兜底阈值 ⇒ 低选择度 ⇒ 精确路径 ⇒ 缺口 0 ──
+        let hnsw = hnsw_of(&index, Some(8192));
+        let s = QueryExecutor::new(&index, &analyzer).with_vector(&e, &hnsw);
+        let r = s
+            .search_filtered("检索", SearchMode::Hybrid, 10, Some(&f))
+            .unwrap();
+        assert!(
+            r.metrics.allowed <= 8192,
+            "臂 A 前提：allowed ≤ 8192，实际 {}",
+            r.metrics.allowed
+        );
+        assert_eq!(
+            r.metrics.allowed,
+            expect.len(),
+            "allowed 必须等于该命名空间的存活 chunk 数"
+        );
+        assert_eq!(
+            r.metrics.vector_route,
+            VectorRoute::Exact,
+            "S10-1 ①：低选择度档必须走精确路径"
+        );
+        assert_eq!(
+            r.metrics.vector_shortfall, 0,
+            "S10-1 ①：精确路径 ⇒ 结构性不缺口"
+        );
+        assert!(
+            r.hits.iter().all(|h| expect.contains(&h.chunk_id)),
+            "命名空间过滤必须**真的**生效（结果全部落在该命名空间内）"
+        );
+
+        // ── 臂 B：兜底阈值压成 0（`allowed > 0` ⇒ 策略为假）⇒ 必须回到 ANN ──
+        let hnsw_ann = hnsw_of(&index, Some(0));
+        let s_ann = QueryExecutor::new(&index, &analyzer).with_vector(&e, &hnsw_ann);
+        let r_ann = s_ann
+            .search_filtered("检索", SearchMode::Hybrid, 10, Some(&f))
+            .unwrap();
+        assert_eq!(
+            r_ann.metrics.vector_route,
+            VectorRoute::Ann,
+            "臂 B：兜底阈值压到 0 必须让 route 翻成 Ann（否则臂 A 的 Exact 是恒真断言）"
+        );
+    }
+
+    /// **S10-T5 / 设计 §1.3 的 S10-2**：命名空间字段降级 ⇒ 观测面**显式为真**；
+    /// 未降级 ⇒ **为假**。⚠️ **反向断言必须在** —— 只写正向时「恒 `true`」的实现也能过。
+    ///
+    /// | 臂 | 索引 | 期望 `filter_degraded` |
+    /// | --- | --- | --- |
+    /// | ① 未降级 | `max_values_per_field = 1024`、12 篇 | `false` |
+    /// | ② 已降级 | `max_values_per_field = 2`、12 篇 | `true` |
+    ///
+    /// ⚠️ 本字段是**成本面**的信号、**不是**正确性面：臂 ② 的**结果必须与臂 ① 逐位一致**
+    /// （降级只让求值慢 O(N)，不让它答错 —— 见 `field_index.rs` 的基数保护节）。
+    #[test]
+    fn S10_T5_降级档观测面属实且未降级档为假() {
+        use crate::schema::Filter;
+
+        let f = Filter::namespace("ns", "ns-3");
+
+        // ① 未降级
+        let (ok_index, analyzer) = build_ns_index(12, 1024);
+        assert!(
+            !ok_index.field_index().is_degraded("ns"),
+            "臂①前提：不得降级"
+        );
+        let s_ok = QueryExecutor::new(&ok_index, &analyzer);
+        let r_ok = s_ok
+            .search_filtered("检索", SearchMode::Bm25, 10, Some(&f))
+            .unwrap();
+        assert!(!r_ok.metrics.filter_degraded, "臂①：未降级必须为 false");
+
+        // ② 已降级（上限 2 + 逐篇互异的值 ⇒ 必然撞线；降级粘滞、不可逆）
+        let (bad_index, analyzer) = build_ns_index(12, 2);
+        assert!(
+            bad_index.field_index().is_degraded("ns"),
+            "臂②前提：必须降级"
+        );
+        assert!(
+            bad_index.field_index().is_degraded("ts"),
+            "臂②前提：数值字段同样降级"
+        );
+        let s_bad = QueryExecutor::new(&bad_index, &analyzer);
+        let r_bad = s_bad
+            .search_filtered("检索", SearchMode::Bm25, 10, Some(&f))
+            .unwrap();
+        assert!(r_bad.metrics.filter_degraded, "臂②：降级必须为 true");
+        assert_eq!(
+            r_bad.metrics.allowed, 1,
+            "臂②：降级只是慢，命中仍恰好是该命名空间的 1 个 chunk"
+        );
+        assert_eq!(
+            r_bad.hits.iter().map(|h| h.chunk_id).collect::<Vec<_>>(),
+            r_ok.hits.iter().map(|h| h.chunk_id).collect::<Vec<_>>(),
+            "两臂结果必须逐位一致（降级只影响成本、不影响正确性）"
+        );
+
+        // ③ 本 query **没给**过滤条件 ⇒ 无「过滤降级」可言（与索引是否降级无关）
+        let r_none = s_bad.search("检索", SearchMode::Bm25, 10).unwrap();
+        assert!(!r_none.metrics.filter_degraded, "无过滤条件 ⇒ false");
+    }
+
+    /// **S10-T5 配套 / 设计 §4.8 I10-4**：`filter_degraded` 在**三条早退路径**上也必须是
+    /// **真值**，**不是** `Default` 的 `false`。
+    ///
+    /// 最尖锐的是「**过滤排空**」：本 query 确实**给了**过滤条件、字段确实**已降级**，
+    /// 只是没有任何文档通过 ⇒ 若把赋值放到早退之后，这条路径会报 `false` —— 那是**撒谎**，
+    /// 而它恰恰是最需要看降级的路径（「我的过滤为什么这么慢」）。
+    #[test]
+    fn S10_T5_早退路径的filter_degraded也是真值() {
+        use crate::query::response::EmptyReason;
+        use crate::schema::Filter;
+
+        // ① 索引为空：字段索引里什么都没有 ⇒ 无降级可言（但**必须是填过的值**）
+        let analyzer = MixedAnalyzer::new();
+        let empty = Index::new();
+        let r = QueryExecutor::new(&empty, &analyzer)
+            .search("x", SearchMode::Bm25, 10)
+            .unwrap();
+        assert_eq!(r.empty_reason, Some(EmptyReason::NoDocuments));
+        assert!(!r.metrics.filter_degraded, "① 空索引：无字段 ⇒ false");
+
+        // ② 过滤排空 **且** 字段已降级 ⇒ 必须 true（本用例的牙齿）
+        let (index, analyzer) = build_ns_index(12, 2);
+        assert!(
+            index.field_index().is_degraded("ns"),
+            "前提：字段必须已降级"
+        );
+        let s = QueryExecutor::new(&index, &analyzer);
+        let miss = Filter::namespace("ns", "不存在的命名空间");
+        let r = s
+            .search_filtered("检索", SearchMode::Bm25, 10, Some(&miss))
+            .unwrap();
+        assert_eq!(
+            r.empty_reason,
+            Some(EmptyReason::FilteredOut),
+            "本臂必须命中「过滤排空」早退"
+        );
+        assert!(
+            r.metrics.filter_degraded,
+            "② 过滤排空且字段降级 ⇒ 必须 true（I10-4：不得留 Default 的 false）"
+        );
+
+        // ③ 融合为空（query 词不在词典）+ 给了过滤条件 + 字段已降级 ⇒ 仍必须 true
+        let some = Filter::namespace("ns", "ns-1");
+        let r = s
+            .search_filtered("zzz_not_in_dict", SearchMode::Bm25, 10, Some(&some))
+            .unwrap();
+        assert_eq!(r.empty_reason, Some(EmptyReason::AllTermsUnmatched));
+        assert!(
+            r.metrics.filter_degraded,
+            "③ 空原因由 query 侧信号决定，但本字段描述的是**过滤求值**走了哪条路径 ⇒ 仍为 true"
         );
     }
 }

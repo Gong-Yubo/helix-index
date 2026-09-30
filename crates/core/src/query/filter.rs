@@ -101,6 +101,36 @@ pub fn doc_bits(filter: &Filter, index: &Index) -> DocBits {
     }
 }
 
+/// 本次过滤的求值路径里，是否**至少有一个叶子字段**因降级而必须回落 O(N) 全扫。
+///
+/// 这是 [`Metrics::filter_degraded`](crate::query::Metrics::filter_degraded) 的判据，
+/// 也是 [`doc_bits`] 的**同一判据的另一面**：
+///
+/// - [`doc_bits`] 的叶子分支在 [`FieldIndex::eq_bits`](crate::index::FieldIndex::eq_bits) /
+///   [`range_bits`](crate::index::FieldIndex::range_bits) 返回 `None` 时改走 [`doc_bits_scan`]；
+/// - 而这两者返回 `None` 的**唯一**条件就是该字段已降级
+///   （字段**不存在**时返回的是 `Some(空集)`，**不是** `None`）。
+///
+/// ⇒ 「`FieldIndex::is_degraded(field)` 为真」⟺「该叶子走了全扫」。
+/// 本函数只做**判定**、**不构造位图**，成本 **O(叶子数)**、与语料规模无关。
+///
+/// ⚠️ 这份等价关系的绊线是 `field_index` 侧的**两条**契约用例：
+/// `超过基数上限后该字段降级并退化为全扫` / `基数保护对数值键同样生效`（钉「降级 ⇒ 必然 `None`」）
+/// 与 `契约_字段不存在或值未命中都返回Some而不是None`（钉「非降级 ⇒ 恒 `Some`」）。
+/// 若将来 `None` 被挪去表达**别的**语义，后一条会先红。
+///
+/// ⚠️ **不公开**：它只服务编排层的观测面（`Metrics.filter_degraded`），
+/// 不构成新的公开 API。
+pub(crate) fn filter_hits_degraded_field(filter: &Filter, index: &Index) -> bool {
+    let fi = index.field_index();
+    match filter {
+        Filter::Eq { field, .. } | Filter::Range { field, .. } => fi.is_degraded(field),
+        Filter::And(list) | Filter::Or(list) => {
+            list.iter().any(|f| filter_hits_degraded_field(f, index))
+        }
+    }
+}
+
 /// 兜底 / 对照实现：逐文档用 [`matches()`] 判定（与字段索引互为 oracle）。
 ///
 /// 遍历**存活文档**（不是 chunk）——字段索引按 doc 级维护，兜底必须同粒度，

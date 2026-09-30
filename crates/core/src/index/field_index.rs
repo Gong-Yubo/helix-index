@@ -535,6 +535,40 @@ mod tests {
         assert!(fi.range_bits("ts", 0.0, 10.0).is_none());
     }
 
+    /// **契约（V2 Step 10 / PR10-1）**：`eq_bits` / `range_bits` 返回 `None` 的
+    /// **唯一**情形是「该字段已降级」—— 与上两条用例合起来构成**双向**契约
+    /// （上两条钉「降级 ⇒ `None`」，本条钉「非降级 ⇒ 恒 `Some`」）。
+    ///
+    /// 🔑 **为什么必须钉住「另一半」**：编排层的
+    /// [`Metrics::filter_degraded`](crate::query::Metrics::filter_degraded) 由
+    /// [`crate::query::filter::filter_hits_degraded_field`] 直接读 `is_degraded` 算出，
+    /// 而它成立的**前提**正是「[`crate::query::filter::doc_bits`] 走全扫 ⟺ `is_degraded` 为真」。
+    /// 若将来把 `None` 挪去表达**别的**语义（如「字段未索引」），
+    /// `filter_degraded` 会**静默少报**（漏掉那些真走了全扫的 query）⇒ 本用例先红。
+    #[test]
+    fn 契约_字段不存在或值未命中都返回Some而不是None() {
+        let mut fi = FieldIndex::new();
+        // ① 字段**从未出现过** ⇒ `Some(空集)`（由 `doc_bits` 正常消费），**不是**全扫信号
+        assert!(
+            fi.eq_bits("从不存在", "x").is_some(),
+            "字段不存在 ⇒ Some(空集)；若改成 None，filter_degraded 会把它误报成降级"
+        );
+        assert!(fi.range_bits("从不存在", 0.0, 10.0).is_some());
+
+        // ② 字段存在、但该 value 不在索引里 ⇒ 同样 `Some(空集)`
+        fi.insert(0, &serde_json::json!({"tag": "rust"}));
+        assert!(fi.eq_bits("tag", "从未出现过的值").is_some());
+        // ③ 该字段没有任何数值键 ⇒ 也 `Some(空集)`
+        assert!(
+            fi.range_bits("tag", 0.0, 10.0).is_some(),
+            "无 numbers 键 ⇒ Some(空集)（range_bits 的 `numbers.is_empty()` 分支）"
+        );
+
+        // ④ 未降级字段恒 `Some`
+        assert!(!fi.is_degraded("tag"));
+        assert!(fi.eq_bits("tag", "rust").is_some());
+    }
+
     #[test]
     fn 非object的metadata不panic() {
         let mut fi = FieldIndex::new();

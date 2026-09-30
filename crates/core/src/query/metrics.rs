@@ -59,6 +59,27 @@ pub struct Metrics {
     pub filter_eval: Duration,
     /// 通过过滤的候选总数（`CandidateFilter::allowed_count`；无过滤时为存活 chunk 数）
     pub allowed: usize,
+    /// 本次过滤求值是否**至少有一个叶子字段**因降级而回落 O(N) 全扫（V2 Step 10 / D-S10-07）。
+    ///
+    /// `true` ⇒ 该字段不再由字段索引驱动，而是逐文档 [`matches()`](crate::query::filter::matches)
+    /// （[`doc_bits_scan`](crate::query::filter::doc_bits_scan)）⇒ 过滤成本 **O(N)**、
+    /// **随语料规模线性增长**（架构 §5.5.1 / ADR-010 代价段 / 风险 `R64`）。
+    /// `false` ⇒ 全部叶子字段都走字段索引，**或**本 query 根本没给过滤条件。
+    ///
+    /// 🔑 **为什么必须有它**：`degraded` 是**建库期**由基数超限留下的**粘滞**标记
+    /// （[`crate::index::FieldIndex`] 的 `is_degraded`；数值字段约 512 篇、字符串约 1024 篇撞线，
+    /// 除 `rebuild` 外**不可逆**），而在此之前它**只在 `helix bench --filter-cost` 的诊断打印里可见**
+    /// （设计 §2.5 **N2**）⇒ 生产调用方只能从「`filter_eval` 变慢」**间接**察觉，
+    /// 无法回答「**我的**命名空间字段是不是已经降级了」。
+    ///
+    /// ⚠️ **口径 = 「至少一个叶子字段降级」**（`And` / `Or` 递归**任一为真**即真），
+    /// **不是**「整个过滤条件全部退化」：混合过滤里只要有一个叶子降级，本次求值就已经付了 O(N)。
+    /// ⚠️ **与 [`Self::filter_eval`] 连看**：本字段回答「**为什么**慢」，`filter_eval` 回答「**多**慢」。
+    /// ⚠️ **三条早退路径也填真值**（设计 §4.8 **I10-4**）：语义恒为「**本 query 传入的过滤条件**里
+    /// 有没有降级字段」，**不是** `Default` 的 `false` 草稿值。
+    /// ⚠️ **覆盖边界**：只反映编排层索引（`SearchParts::index`）—— 单段装配下即全部内容；
+    /// 跨段装配下是**主段**（`deltas` 各自的字段索引不在公开面上，不可达）。
+    pub filter_degraded: bool,
     /// 向量路「本该拿到 `min(candidate_k, allowed)` 条、实得 n 条」的缺口。
     ///
     /// 归一到 `allowed`（通过过滤的候选总数）而非裸 `candidate_k`：候选池本身不足
@@ -177,6 +198,7 @@ impl Metrics {
             fused = self.fused,
             filter_eval_us = self.filter_eval.as_micros() as u64,
             allowed = self.allowed,
+            filter_degraded = self.filter_degraded,
             vector_shortfall = self.vector_shortfall,
             vector_route = ?self.vector_route,
             bm25_ms = self.bm25_elapsed.as_secs_f64() * 1000.0,
@@ -268,6 +290,7 @@ mod tests {
             fused: 10,
             filter_eval: Duration::from_micros(430),
             allowed: 1000,
+            filter_degraded: true,
             vector_shortfall: 0,
             vector_route: VectorRoute::Exact,
             bm25_elapsed: Duration::from_micros(1400),

@@ -216,6 +216,46 @@ helix search --input data/corpus.jsonl --mode bm25 --filter topic=vector "向量
 helix search --input data/corpus.jsonl --filter topic=vector --filter lang=zh "检索"
 ```
 
+### 命名空间（检索级隔离）
+
+「命名空间」是**检索级**的隔离约定：内核**不加**第二套过滤路径 —— 它就是一次元数据等值过滤，
+**字段名由使用方约定**（内核**不保留**魔法字段名：保留名会与你的元数据冲突，
+且一旦保留就进了「内核语义」，而这条需求明确是检索级的）。
+
+```bash
+# 约定一个字段（如 ns / tenant / workspace），建库时写进 metadata
+helix search --index /tmp/demo.snapshot --filter ns=tenant-a "如何加快检索速度"
+```
+
+库内用便利构造（**显式传字段名**，语义恒等于 `Filter::eq`）：
+
+```rust
+use helix_core::schema::Filter;
+const NS_FIELD: &str = "ns";                     // 约定在**调用侧**，内核不猜
+let f = Filter::namespace(NS_FIELD, "tenant-a"); // == Filter::eq(NS_FIELD, "tenant-a")
+```
+
+⚠️ **代价与上限（必读）**：命名空间字段若是**每会话一个**（高基数，如 uuid / 毫秒时间戳），
+建库期**必然降级** —— 数值字段约 **512 篇**、字符串约 **1024 篇**各不相同的值就撞线
+（两类键**合计**计数），降级**粘滞**、除**重建索引**外**不可逆**。
+降级后隔离仍然**正确**，但该字段上的过滤退化为 **O(N) 全扫**、成本随语料规模**线性增长**。
+
+- **怎么发现**：`SearchResponse.metrics.filter_degraded == true` 就是「本次过滤走了全扫」的
+  **直接**信号（V2 Step 10 新增）；配合 `metrics.filter_eval`（**慢了多少**）一起读 ——
+  前者回答「**为什么**慢」，后者回答「**多**慢」。
+- **怎么取舍**：低基数命名空间（团队 / 租户 / 工作区，几十 ~ 几百个值）**没有**这个问题；
+  若必须用高基数，可调高 `Index::with_max_values_per_field`（代价：内存随基数线性增长），
+  或接受 O(N)。
+- 🔴 **高基数字段不要用作命名空间**：本 Step 的 spike 实测给出了判据与结论，
+  见 `data/eval/t7-27/README.md`（含双规模读数与决策门逐条对照）。
+
+**召回容差是两段式的（可判定，不写「不回退」这种空话）**：
+
+| 档 | 条件 | 召回缺口容差 | 依据 |
+| --- | --- | --- | --- |
+| **A** | `allowed ≤ 8192`（`BRUTE_FALLBACK_MAX_ALLOWED`） | **0（结构性）** | 走精确扫描 ⇒ 返回 `min(k, allowed)` 条 ⇒ 缺口**恒 0**，不是统计结论 |
+| **B** | `allowed > 8192` | **待实测**（标「拟」） | 走 ANN ⇒ 缺口 = 图覆盖偏差 + 固有近似误差，**不可写死** |
+
 ### 可解释性（Agent 自查检索质量）
 
 ```bash
@@ -271,6 +311,7 @@ make eval-quality
 | 加载快照后首次检索仍要等 ~10s | 图 sidecar **未命中**（文件被删 / 没一起拷贝 / 快照被重写过 / 跨平台搬运） | 看 stderr 的 `[向量图加载：⚠️ 降级重建（原因：…）]`；四文件一起带、或干脆只带 `foo.idx` 让它重建 |
 | `vector`/`hybrid` 模式首次运行很久 | 首次下载 bge-small-zh-v1.5（约 91MB） | 缓存在 `~/.cache/helix-index/models`，仅首次 |
 | 同一 query 两次跑分数略有不同 | 只在**重建图**时发生：两次**建库** / 降级重建 / `bench --runs` 的重建轮——HNSW 拓扑跨进程本就不同（R-P5-13） | 图持久化后**同一快照两次加载已逐位一致**；要观察抖动用 `--runs`（它刻意跳过图），要稳定结果就带齐四个文件走快路径 |
+| 命名空间「隔离了、但检索明显变慢」 | 高基数字段（uuid / 毫秒时间戳 / 每会话一个的值）建库期**必然降级** ⇒ 该字段上的过滤退化为 **O(N) 全扫**、随语料规模线性增长（架构 §5.5.1 / ADR-010） | 读 `metrics.filter_degraded`（`true` ⇒ 本次走了全扫）与 `metrics.filter_eval`（慢了多少）；见 [命名空间（检索级隔离）](#命名空间检索级隔离)。低基数字段不受影响，或调高 `Index::with_max_values_per_field` |
 
 ---
 
