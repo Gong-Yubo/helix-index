@@ -99,3 +99,35 @@ pub trait PostProcessor: Send + Sync {
     /// `k` 是调用方请求的 `top_n`（= 最终要的条数），不是入参长度。
     fn process(&self, hits: Vec<Hit>, k: usize) -> Result<Vec<Hit>>;
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(non_snake_case)] // 中文测试名含英文缩写（S10_T1）
+
+    use super::*;
+
+    /// 空实现（只为验默认方法，不构成可用实现）。
+    struct Null;
+
+    impl PostProcessor for Null {
+        fn name(&self) -> &'static str {
+            "null"
+        }
+        fn process(&self, hits: Vec<Hit>, _k: usize) -> Result<Vec<Hit>> {
+            Ok(hits)
+        }
+    }
+
+    /// **S10-T1（trait 侧零回归）**：`candidate_window` 的**默认实现必须等于 `k`**。
+    ///
+    /// 这是「未装后处理器 ⇒ 全链路逐位一致」的**唯一**依据：只要默认值不是 `k`，
+    /// 编排层的 `candidate_k` / `take_n` 就会跟着变。
+    #[test]
+    fn S10_T1_默认窗口等于k() {
+        let p = Null;
+        for k in [1usize, 10, 100] {
+            assert_eq!(p.candidate_window(k), k, "默认实现不得改变候选池与回捞窗口");
+        }
+        assert_eq!(p.name(), "null");
+    }
+}

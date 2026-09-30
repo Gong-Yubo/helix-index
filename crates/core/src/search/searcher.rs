@@ -554,4 +554,106 @@ mod tests {
             "对照：开关关 ⇒ 通道关闭"
         );
     }
+
+    /// **V2 Step 10 / `S10-T2`（门面段）**：`Config::post` 必须真的流到编排层。
+    ///
+    /// 🔑 这是「链路每一段都有判据」的最后一环（`S8-08` 的教训：`embed_sessions` 曾在
+    /// `build_config` 中间段被静默吞掉）：`SearchIndexBuilder → Config → Searcher::parts
+    /// → SearchParts.post → 编排层` —— 若中间任何一段断了，「装了白装」的行为判据
+    /// （结果照样对）**看不见它**，必须断言**编排层真的调用了后处理器**、且**它声明的窗口
+    /// 真的放大了候选池**（架构 `R61` 的两个封顶点）。
+    ///
+    /// ⚠️ 用**大窗口 + 小语料**是刻意的：语料只有 3 篇 ⇒ `take_n` 上界 = 3；
+    /// 真正可判的是「后处理器**被调用过**」与「它看到的条数 = 语料规模」（而不是 `k`）。
+    #[test]
+    fn S10_门面post真的流到编排层() {
+        use crate::post::PostProcessor;
+
+        #[derive(Default)]
+        struct Obs {
+            calls: std::sync::atomic::AtomicUsize,
+            seen: std::sync::atomic::AtomicUsize,
+        }
+        struct SpyPost(Arc<Obs>);
+        impl PostProcessor for SpyPost {
+            fn name(&self) -> &'static str {
+                "facade-spy"
+            }
+            fn candidate_window(&self, _k: usize) -> usize {
+                // 声明一个远大于 k 的窗口 ⇒ 若链路里任何一段把它吃掉，
+                // 编排层只会给后处理 `k` 条（下面的 seen 断言报红）。
+                100
+            }
+            fn process(
+                &self,
+                hits: Vec<crate::query::Hit>,
+                _k: usize,
+            ) -> crate::error::Result<Vec<crate::query::Hit>> {
+                self.0
+                    .calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.0
+                    .seen
+                    .store(hits.len(), std::sync::atomic::Ordering::SeqCst);
+                Ok(hits)
+            }
+        }
+
+        let obs = Arc::new(Obs::default());
+        let cfg = super::super::config::SearchIndexBuilder::default()
+            .embedder(Some(Arc::new(FakeEmbedder)))
+            .vector_backend(crate::search::VectorBackend::Brute)
+            .post(Arc::new(SpyPost(obs.clone())))
+            .build_config();
+        assert!(cfg.post.is_some(), "① builder → Config 这一段");
+        let mut idx =
+            SearchIndex::from_config(cfg, crate::search::VectorBackend::Brute, Default::default());
+        idx.add("BM25 是经典关键词检索算法").unwrap();
+        idx.add("向量检索把文本编码成向量").unwrap();
+        idx.add("融合把两路结果合并").unwrap();
+        idx.commit().unwrap();
+        let s = idx.into_searcher().unwrap();
+
+        let resp = s.search_with("检索").top_n(2).exec().unwrap();
+        assert!(!resp.hits.is_empty(), "前提：检索有结果");
+        assert_eq!(
+            obs.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "🔴 后处理器**一次都没被调用**（门面链路里断了：builder / Config / parts 任一段）"
+        );
+        assert_eq!(
+            obs.seen.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "🔴 `post_window = 100` 必须真的放大回捞窗口（k = 2 时若只给 2 条 ⇒ R61 回捞封顶）"
+        );
+
+        // 对照臂：同装配但不装后处理器 ⇒ 一次都不调（证明判据的区分度）
+        let cfg_off = super::super::config::SearchIndexBuilder::default()
+            .embedder(Some(Arc::new(FakeEmbedder)))
+            .vector_backend(crate::search::VectorBackend::Brute)
+            .build_config();
+        assert!(cfg_off.post.is_none(), "默认不装（零行为变化）");
+        let mut idx2 = SearchIndex::from_config(
+            cfg_off,
+            crate::search::VectorBackend::Brute,
+            Default::default(),
+        );
+        idx2.add("BM25 是经典关键词检索算法").unwrap();
+        idx2.add("向量检索把文本编码成向量").unwrap();
+        idx2.add("融合把两路结果合并").unwrap();
+        idx2.commit().unwrap();
+        let resp2 = idx2
+            .into_searcher()
+            .unwrap()
+            .search_with("检索")
+            .top_n(2)
+            .exec()
+            .unwrap();
+        assert_eq!(
+            obs.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "对照臂不得再调一次后处理器"
+        );
+        assert_eq!(resp2.hits.len(), 2, "无后处理 ⇒ 出口条数仍由 k 决定");
+    }
 }
