@@ -9,6 +9,16 @@
 
 ## [Unreleased]
 
+### 文档 · V2 Step 10 `PR10-4` 实现期定值与偏差（设计 v0.10 → v0.11）（2026-10-08）
+
+- 新增 **§19 实现期定值与偏差**（`PR10-4` / `S10-05` MMR），登记 `I-26 ~ I-35`。
+- **🔴 用户拍板两条（2026-10-08）**：**① `D-S10-08` 相似度来源 = 文本侧**（`Analyzer` 的 term 集合 Jaccard；向量侧仍为条件项、`Q10-2` 未消解）；**② 信号形态 = `Explain.mmr_selected: Option<u32>`**（0-based 多样性序位次 —— `Some(i)` 与输出位置一一对应）。
+- **⚠️ 破坏性（第二次在 `Explain` 上加字段）**：`Explain` 新增 **`mmr_selected: Option<u32>`**（公开结构体、字段全 `pub` ⇒ 外部字面量构造会断；先例 `rerank_score` / `decay_factor`）。库内构造点（`rerank/noop.rs`）已同步。`SearchIndexBuilder::mmr` 与 `post::Mmr` 均为**纯加法**，且**默认关**（不调用即零行为变化）。
+- **⚠️ 行为契约变化（`D-S10-09` / 架构 `R62`）**：MMR 生效时 **`hits` 不再按 `score` 降序**（改按多样性序）⇒ `Hit::score` 的 rustdoc 已新增**三档语义表**（精排关 / 精排开 / 后处理），并写明「看 `Explain.mmr_selected` 的 `is_some()` 才知道次序被打破」。
+- **窗口取形与时间衰减相反**：MMR **必须放大窗口**（`candidate_window(k) = pool.max(k)`）—— 否则窗口里只有 `k` 条、多样性无从发生（`R61` 同族的静默空转）。
+- **顺带落地上游 `PR10-3` 评审的 `P4-1`**：`TimeDecay::now_ms` ⇒ `pub(crate)`、`field()` ⇒ **删除**（无外部消费者；本仓红线 = 删掉而非 `#[allow]`，S8-05 先例）。
+- 同批：`docs/README.md` 索引行 + 头部（版本 / 日期 / 状态 / 交付物 ⑰）。
+
 ### 功能 · V2 Step 10 `PR10-3`：T7-20 时间衰减钩子（`TimeDecay` + `Explain.decay_factor`）（2026-10-08）
 
 **V2.1 第四步的第三段**：`plan-v2.md` §4 Step 10 的 **`PR10-3`** = **`S10-04`**（`T7-20` 时间衰减钩子 / **FR-33**）—— `PR10-2`（后处理公共机制）合并后的**第一个实现**。前置 `PR10-2`（#84）已合并 = `ca0ebae`。
