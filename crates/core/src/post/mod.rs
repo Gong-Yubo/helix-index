@@ -31,9 +31,16 @@
 //! - [`TimeDecay`]（**时间衰减**，`S10-04` / `FR-33`）—— 语义、公式与三条定值（时钟源 / 缺字段上抛 /
 //!   改写后重排）见 [`time_decay`]。⚠️ 它**不改窗口**（用 [`PostProcessor::candidate_window`] 的
 //!   **provided 默认** = `k`）：衰减只重加权已有候选，不需要额外候选。
+//! - [`Mmr`]（**结果去重**，`S10-05` / `FR-24`）—— 语义、公式与相似度来源见 [`mmr`]。
+//!   ⚠️ 与 `TimeDecay` **相反**：它**必须放大窗口**（要从比 `k` 多的候选里挑多样的一组，
+//!   否则多样性无从发生）⇒ 显式覆盖 [`PostProcessor::candidate_window`]。⚠️ 它还**改变
+//!   `hits` 的排序依据**（输出按 MMR 选择顺序，不再是 `score` 降序）⇒ 属 `D-S10-09` /
+//!   架构 `R62` 明文处置的一档。
 
+pub mod mmr;
 pub mod time_decay;
 
+pub use mmr::Mmr;
 pub use time_decay::TimeDecay;
 
 use crate::error::Result;

@@ -274,6 +274,33 @@ impl SearchIndexBuilder {
         self
     }
 
+    /// 启用 **MMR 结果去重**（V2 Step 10 / `S10-05` / `FR-24`；`D-S10-08` / `D-S10-09`）。
+    ///
+    /// - `lambda` = 相关度权重 ∈ `[0, 1]`：`1.0` ⇒ 纯按分数（**退化为「原样取前 k」**）；
+    ///   越小越强调多样性。⚠️ 越界（非有限 / 不在 `[0, 1]`）会在**检索时**上抛 `Err`（NFR-07）。
+    /// - `pool` = **候选池大小** ⇒ `candidate_window(k) = pool.max(k)`。**建议 `> k`**
+    ///   （如 `4 * k`），否则窗口里只有 `k` 条、多样性无从发生（架构 `R61` 同族的「空转」）。
+    ///
+    /// 用 `builder().analyzer(..)` 指定的分词器做**文本侧相似度**（term 集合 Jaccard）；
+    /// 未指定 `analyzer` 时用默认 `MixedAnalyzer` —— 与建库口径一致才能复用 term 语义。
+    ///
+    /// ⚠️ **MMR 会改变 `hits` 的排序依据**（输出按多样性序，不再按 `score` 降序）⇒
+    /// 属 `D-S10-09` 明文处置的一档：① 可观测信号 [`crate::query::Explain::mmr_selected`]；
+    /// ② **默认关**（不调用本方法即零行为变化）；③ `Hit::score` 的 rustdoc 已写明该语义。
+    /// 细节（公式 / tie-break / 相似度来源 / 为什么必须放大窗口）见 [`crate::post::Mmr`]。
+    ///
+    /// ⚠️ **与 [`Self::post`] / [`Self::time_decay`] 是同一个槽位**（后处理只有一个位置）
+    /// ⇒ **后设置者生效**。需要串联多个后处理器时，请自己实现一个
+    /// [`crate::post::PostProcessor`] 来组合它们。
+    pub fn mmr(mut self, lambda: f64, pool: usize) -> Self {
+        let analyzer = self
+            .analyzer
+            .clone()
+            .unwrap_or_else(|| Arc::new(MixedAnalyzer::new()));
+        self.post = Some(Arc::new(crate::post::Mmr::new(lambda, analyzer, pool)));
+        self
+    }
+
     /// 覆盖 BM25 参数（逃生舱：BM25 网格搜索）。
     pub fn bm25_params(mut self, params: Bm25Params) -> Self {
         self.bm25_params = Some(params);
