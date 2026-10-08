@@ -39,6 +39,9 @@ mod tests {
                 // 这里刻意**显式列出**而不是 `..Default::default()`：让「加字段 = 下游
                 // 字面量构造会断」这件事在 diff 里一眼可见（CHANGELOG 的破坏性段引用它）。
                 rerank_score: None,
+                // V2 Step 10 / S10-04：`Explain` **又**新增一个字段（同样破坏性）⇒ 库内构造点再次同步。
+                // 同上，仍**显式列出**：让「加字段 = 下游字面量构造会断」在 diff 里继续可见。
+                decay_factor: None,
             },
         }
     }

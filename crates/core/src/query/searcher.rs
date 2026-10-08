@@ -1664,7 +1664,8 @@ mod tests {
     }
 
     /// `explain` 的**五字段**快照（D-S7-06 的回归护栏：推迟只改时机、不改结果）。
-    /// `rerank_score` 单列（它是新增的第六个字段，语义不同类）。
+    /// `rerank_score`（V2 Step 7）与 `decay_factor`（V2 Step 10 / `S10-04`）**单列** ——
+    /// 二者都是**语义不同类**的新增字段，各有各的用例，**本快照不含它们**。
     type ExplainSnapshot = (
         Vec<String>,
         Option<Score>,
@@ -3087,6 +3088,94 @@ mod tests {
         for (a, b) in base.hits.iter().zip(&r.hits) {
             assert_eq!(a.score.to_bits(), b.score.to_bits(), "分数必须逐位一致");
             assert_eq!(explain_snapshot(a), explain_snapshot(b));
+        }
+    }
+
+    /// 时间衰减夹具用的固定「现在」（`S10-04`）。
+    const TS_NOW: i64 = 1_700_000_000_000;
+
+    /// 时间衰减夹具：第 `i` 篇的 `ts_ms = TS_NOW − ages_hours[i] 小时`
+    /// ⇒ **越靠后越新**（刻意与 `chunk_id` 升序**错位**：否则「衰减有没有生效」看不出来）。
+    fn build_ts_index(ages_hours: &[i64]) -> (Index, MixedAnalyzer) {
+        let analyzer = MixedAnalyzer::new();
+        let chunker = Chunker::default();
+        let mut index = Index::new();
+        for (i, h) in ages_hours.iter().enumerate() {
+            let text = format!("检索 文档 {i}");
+            let doc = DocRecord {
+                doc_id: 0,
+                source: format!("doc-{i}"),
+                metadata: serde_json::json!({ "ts_ms": TS_NOW - h * 3_600_000 }),
+                content_hash: 0,
+            };
+            index.add(doc, chunker.chunk(0, &text), &analyzer).unwrap();
+        }
+        (index, analyzer)
+    }
+
+    /// **S10-T6（`S10-3` 的验收 ①②）**：时间衰减**关闭 ⇒ 无信号**；**开启 ⇒ 被改写条目出信号**。
+    ///
+    /// 三臂**互补**（缺一不可）：
+    /// - **A 不装**（机制关闭）⇒ `decay_factor` 恒 `None`；
+    /// - **B 装但 `weight == 0`**（开了但无事发生）⇒ 与 A **逐位一致**（含 `to_bits`）；
+    /// - **C 装且 `weight > 0`** ⇒ 至少一条 `is_some()`，且**名次与 A 不同**（真的改写了次序）。
+    ///
+    /// ⚠️ 夹具把**最新的文档放在最后**（`chunk_id = 3`）⇒ 衰减不生效时输出顺序看不出差别；
+    /// 生效则它必须冒到**最前**（这条断言是「排序真的变了」的牙齿）。
+    #[test]
+    fn S10_T6_时间衰减关闭无信号开启后被改写条目出信号() {
+        use crate::post::TimeDecay;
+
+        let (index, analyzer) = build_ts_index(&[24, 2, 1, 0]);
+        let clock: Arc<dyn Fn() -> i64 + Send + Sync> = Arc::new(move || TS_NOW);
+
+        // A：不装后处理器（= 机制关闭）
+        let a = QueryExecutor::new(&index, &analyzer)
+            .search("检索", SearchMode::Bm25, 4)
+            .unwrap();
+        assert!(!a.hits.is_empty(), "前提：检索有结果");
+        assert!(
+            a.hits.iter().all(|h| h.explain.decay_factor.is_none()),
+            "关闭 ⇒ `Explain.decay_factor` 必须恒 None"
+        );
+
+        // B：装了但 weight == 0 ⇒ 「开了但无事发生」仍必须逐位一致
+        let b = QueryExecutor::new(&index, &analyzer)
+            .with_post(Arc::new(TimeDecay::new(0.0, "ts_ms", clock.clone())))
+            .search("检索", SearchMode::Bm25, 4)
+            .unwrap();
+        assert_eq!(ids_of(&a), ids_of(&b), "weight == 0 ⇒ 顺序逐位一致");
+        for (x, y) in a.hits.iter().zip(&b.hits) {
+            assert_eq!(x.score.to_bits(), y.score.to_bits(), "分数逐位一致");
+            assert_eq!(explain_snapshot(x), explain_snapshot(y));
+        }
+        assert!(
+            b.hits.iter().all(|h| h.explain.decay_factor.is_none()),
+            "无改写 ⇒ 信号仍恒 None"
+        );
+
+        // C：weight > 0 ⇒ 真的改写，且名次真的变了
+        let c = QueryExecutor::new(&index, &analyzer)
+            .with_post(Arc::new(TimeDecay::new(1e-3, "ts_ms", clock)))
+            .search("检索", SearchMode::Bm25, 4)
+            .unwrap();
+        assert!(
+            c.hits.iter().any(|h| h.explain.decay_factor.is_some()),
+            "🔴 开启后**一条信号都没有** —— 后处理要么没跑、要么没改写"
+        );
+        assert_eq!(
+            c.hits[0].chunk_id, 3,
+            "最新文档（chunk_id=3、输入排在最后）必须被衰减抬到最前"
+        );
+        assert_ne!(ids_of(&a), ids_of(&c), "衰减必须真的改变名次");
+        for h in &c.hits {
+            if let Some(f) = h.explain.decay_factor {
+                assert!(
+                    (h.score - h.explain.fused_score * f).abs() < f32::EPSILON * 8.0,
+                    "口径：`score == fused_score × factor`（chunk_id={}）",
+                    h.chunk_id
+                );
+            }
         }
     }
 }
