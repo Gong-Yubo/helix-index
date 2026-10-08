@@ -9,6 +9,20 @@
 
 ## [Unreleased]
 
+### 功能 · V2 Step 10 `PR10-3`：T7-20 时间衰减钩子（`TimeDecay` + `Explain.decay_factor`）（2026-10-08）
+
+**V2.1 第四步的第三段**：`plan-v2.md` §4 Step 10 的 **`PR10-3`** = **`S10-04`**（`T7-20` 时间衰减钩子 / **FR-33**）—— `PR10-2`（后处理公共机制）合并后的**第一个实现**。前置 `PR10-2`（#84）已合并 = `ca0ebae`。
+
+- **新增 `post::TimeDecay`**（新子模块 `crates/core/src/post/time_decay.rs`）：`PostProcessor` 的**第一个实现**。三个**显式**参数（`Q10-1` 的裁定）= `weight`（**指数衰减率 λ，单位 1/秒**）/ `field`（元数据里的时间字段名，unix 毫秒）/ **`clock`（时钟源，不是固定基准）**。
+- **作用分 = 融合分这一档**（`D-S10-03`）：`age = max(0, now − t) / 1000`、`factor = exp(−λ · age)`、`hit.score = fused_score × factor`；**不改**精排路径。
+- 🔑 **时钟取形 = 时钟源**（`§18 I-19`）：后处理**没有** per-query 入参通道（`§15 I-11`）⇒ 基准只能持在实现字段里；**固定基准会把衰减冻结在构造时刻**。测试注入恒返回定值的闭包即可**可复现**。
+- **缺字段 / 非整数 / 非有限 `weight` ⇒ `Err`**（`§18 I-21`；NFR-07 + `process` 的入参契约）；⚠️ **复用既有 `Error::InvalidInput`**、**不新增公开枚举变体**（那会破坏下游穷尽 `match`）。消息带**字段名 + `chunk_id`**。
+- **改写后重排**（`§18 I-22`）：`score` 降序 + 同分 `chunk_id` 升序 —— 守住 `Hit::score` 的既有契约；⚠️ **只在真的发生改写时才重排** ⇒ 「开了但无事发生」与「没开」仍**逐位一致**。
+- ⚠️ **破坏性**：`Explain` 新增 **`decay_factor: Option<Score>`**（`§18 I-23`）—— `Explain` 字段全 `pub` ⇒ 下游以**字面量**构造它的代码会编译失败（先例 = `rerank_score`（S7-02）/ `Metrics.filter_degraded`（`D-S10-07`））。语义 = **`is_some()` ⟺ 该条被衰减改写**（`factor == 1.0` ⇒ `None`）。
+- **接通面**：**`SearchIndexBuilder::time_decay(weight, field, clock)`**（`§18 I-18`）—— 构造 `TimeDecay` 写进 `PR10-2` 的**单槽** `post`；⚠️ **不新增 `Config::time_decay` 字段**（避免「两处表达同一件事」的重复面）；**冲突规则 = 后设置者生效**（两处 rustdoc 写明 + 用例钉两方向）。**窗口不变**（`I-24`：`candidate_window` 用 provided 默认 = `k`）。
+- ⚠️ **本段默认关**（不调用 `time_decay`）⇒ **零行为变化**；`S10-05` ~ `S10-07` 三个任务**不因本 PR 而改变默认行为**。
+- **不改**任何既有 trait 签名、**不新增依赖**、**不动 `deny.toml`**、**不改 `FORMAT_VERSION`**。
+
 ### 文档 · V2 Step 10 `PR10-2` 第 2 轮（**响应验证型**）评审响应 + **作者自查修复**（设计 v0.8 → v0.9）（2026-10-08）
 
 **评审**（`pulls/84/reviews` 第 **2** 条 = **`5444174749`**，基线 `343a84d` → 新 head `6fae2ce`；**行内 = 0**；`issues/84/comments` 无新增）= **✅ 通过：0×P1 / 0×P2 / 0×P3；1×P4（引用精度，非阻塞）**。本版**零 `.rs` 改动**。
