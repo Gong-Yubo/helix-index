@@ -18,6 +18,7 @@ use crate::chunk::Chunker;
 use crate::embed::Embedder;
 use crate::error::Result;
 use crate::fusion::{FusionStrategy, RrfFusion};
+use crate::post::PostProcessor;
 use crate::rerank::{NoOpReranker, Reranker};
 use crate::retriever::Bm25Params;
 
@@ -43,6 +44,14 @@ pub struct Config {
     pub fusion: Arc<dyn FusionStrategy>,
     /// 重排策略
     pub reranker: Arc<dyn Reranker>,
+    /// **后处理策略**（V2 Step 10 / D-S10-01；**默认 `None`** ⇒ 后处理阶段不执行、零行为变化）。
+    ///
+    /// 时间衰减 / MMR / token budget 三个任务（`S10-04` / `S10-05` / `S10-06`）的**共同通道**；
+    /// 位置固定为「窗口回捞之后、精排之前」（D-S10-02），理由见 [`crate::post`] 模块文档。
+    ///
+    /// ⚠️ **不进 `ConfigFingerprint`**（后处理只改排序 / 截断，不改索引内容 ⇒ 同一快照在
+    /// 装 / 不装后处理器下都合法，同 `adaptive_fusion` 的口径）。
+    pub post: Option<Arc<dyn PostProcessor>>,
     /// BM25 参数（P5 定稿）
     pub bm25_params: Bm25Params,
     /// 写缓冲批量 embed 阈值
@@ -156,6 +165,8 @@ pub struct SearchIndexBuilder {
     embed_sessions: usize,
     /// 自适应融合开关（V2 Step 9 / T7-14；默认 **false** ⇒ 零行为变化）
     adaptive_fusion: bool,
+    /// 后处理策略（V2 Step 10 / D-S10-01；默认 **`None`** ⇒ 后处理阶段不执行）
+    post: Option<Arc<dyn PostProcessor>>,
 }
 
 impl Default for SearchIndexBuilder {
@@ -184,6 +195,9 @@ impl Default for SearchIndexBuilder {
             // V2 Step 9 / D-S9-03：**默认关**（零行为变化；与 `embed_sessions` 的
             // 「库侧默认不动」同口径——CLI 只提供显式打开，不给 CLI 默认值）。
             adaptive_fusion: false,
+            // V2 Step 10 / D-S10-01：**默认不装后处理器**（零行为变化；与 `adaptive_fusion`
+            // 的「库侧默认不动」同口径 —— 调用方显式注入才生效）。
+            post: None,
         }
     }
 }
@@ -216,6 +230,21 @@ impl SearchIndexBuilder {
     /// 覆盖精排策略（默认 `NoOpReranker`）。
     pub fn reranker(mut self, reranker: Arc<dyn Reranker>) -> Self {
         self.reranker = Some(reranker);
+        self
+    }
+
+    /// **装配后处理策略**（V2 Step 10 / D-S10-01；默认**不装** ⇒ 后处理阶段不执行）。
+    ///
+    /// 后处理在「窗口回捞之后、精排之前」执行，是时间衰减 / MMR / token budget 的**共同通道**
+    /// （三个实现分别落 `S10-04` / `S10-05` / `S10-06`）。理由与边界见 [`crate::post`]。
+    ///
+    /// ⚠️ 传入的实现若让 [`crate::post::PostProcessor::candidate_window`] 返回 `> 3k`，
+    /// **候选池与回捞窗口都会随之放大**（否则本阶段被静默封顶，架构 `R61`）——
+    /// 代价是召回与回捞的成本同比例上升。
+    ///
+    /// ⚠️ 本方法**只装通道**：机制**默认关**（不调用即零行为变化），与 `adaptive_fusion` 同口径。
+    pub fn post(mut self, post: Arc<dyn PostProcessor>) -> Self {
+        self.post = Some(post);
         self
     }
 
@@ -446,6 +475,8 @@ impl SearchIndexBuilder {
             // 使 `Config.embed_sessions >= 1` 成为**类型级之外的不变式**（构造点唯一 ⇒ 易守）。
             embed_sessions: crate::embed::normalize_sessions(self.embed_sessions),
             adaptive_fusion: self.adaptive_fusion,
+            // V2 Step 10 / D-S10-01：后处理策略装配（默认 `None`）。
+            post: self.post.clone(),
         };
         cfg.embedder = match &self.embedder {
             // 显式指定（含 `Some(None)` = 纯 BM25）
