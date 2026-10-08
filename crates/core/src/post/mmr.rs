@@ -244,3 +244,225 @@ fn jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f32 {
         inter / union
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(non_snake_case)] // 中文测试名含英文缩写（S10_T8）
+
+    use super::*;
+    use crate::analyze::MixedAnalyzer;
+    use crate::query::response::Explain;
+
+    /// 用「真分词器」构造默认来源（term 集合 Jaccard）。
+    fn default_mmr(lambda: f64, pool: usize) -> Mmr {
+        Mmr::new(lambda, Arc::new(MixedAnalyzer::new()), pool)
+    }
+
+    fn hit(chunk_id: u32, score: f32, text: &str) -> Hit {
+        Hit {
+            chunk_id,
+            doc_id: chunk_id,
+            score,
+            text: text.to_string(),
+            source: format!("doc-{chunk_id}"),
+            metadata: serde_json::json!({}),
+            explain: Explain {
+                fused_score: score,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn ids(hits: &[Hit]) -> Vec<u32> {
+        hits.iter().map(|h| h.chunk_id).collect()
+    }
+
+    /// 两两 Jaccard 的**上界**（用默认识别器；只算输出内部两两）。
+    fn max_pairwise_jaccard(mmr: &Mmr, hits: &[Hit]) -> f32 {
+        let mut mx = 0.0f32;
+        for i in 0..hits.len() {
+            for j in (i + 1)..hits.len() {
+                let s = (mmr.similarity)(&hits[i].text, &hits[j].text);
+                if s > mx {
+                    mx = s;
+                }
+            }
+        }
+        mx
+    }
+
+    /// **S10-T8（S10-4 验收 ①②）**：高冗余候选 ⇒ 启用 MMR 后
+    /// **结果集的两两相似度上界下降**，且长度 ≤ `k`；信号能分辨「按多样性序选中」。
+    ///
+    /// ⚠️ 构造：`3` 条**近重复**高分（同一句微改）+ `1` 条**不同主题**低分，取 `k = 2`。
+    /// **`k` 必须留出「换掉冗余项」的空间**：纯分数序会取 `[近重复 A, 近重复 B]`（上界高），
+    /// 而 MMR 应当把第 2 位**换成**那条异主题的（上界骤降）。若取 `k = 3`，三条近重复会
+    /// 全被选进来 ⇒ 上界**不会**下降，断言就失去鉴别力（本用例刻意取 `k = 2`）。
+    #[test]
+    fn S10_T8_高冗余候选启用后相似度上界下降且长度不超k() {
+        // 近重复的三条：只差末尾一个字（term 集合几乎全同）+ 一条异主题
+        let dup_texts = [
+            "向量检索使用近似最近邻算法计算余弦相似度并返回结果甲",
+            "向量检索使用近似最近邻算法计算余弦相似度并返回结果乙",
+            "向量检索使用近似最近邻算法计算余弦相似度并返回结果丙",
+        ];
+        let mut hits: Vec<Hit> = dup_texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| hit(i as u32, 1.0 - i as f32 * 0.01, t))
+            .collect();
+        hits.push(hit(99, 0.5, "中文分词与倒排索引是检索系统的另一条主线"));
+
+        let k = 2;
+        // 纯分数序（λ = 1 等价于「原样取前 k」）作为对照基线
+        let score_order = default_mmr(1.0, 100).process(hits.clone(), k).unwrap();
+        let undup = max_pairwise_jaccard(&default_mmr(1.0, 100), &score_order);
+        assert_eq!(
+            ids(&score_order),
+            vec![0, 1],
+            "前提：纯分数序取的是两条近重复"
+        );
+
+        let mmr = default_mmr(0.5, 100);
+        let out = mmr.process(hits.clone(), k).unwrap();
+        assert!(out.len() <= k, "长度必须 ≤ k（S10-4 验收①）");
+        assert_eq!(out.len(), k, "候选足够 ⇒ 应当凑满 k");
+        let dedup = max_pairwise_jaccard(&mmr, &out);
+
+        println!(
+            "纯分数序={:?}（上界 {undup:.4}）⇒ MMR 后={:?}（上界 {dedup:.4}）",
+            ids(&score_order),
+            ids(&out)
+        );
+        assert!(
+            dedup < undup,
+            "🔴 启用 MMR 后两两相似度上界**没有下降**：{undup:.4} → {dedup:.4}（S10-4 验收①）"
+        );
+        assert!(
+            out.iter().any(|h| h.chunk_id == 99),
+            "🔴 那条异主题候选应当被多样性选进来（否则机制没起作用）"
+        );
+        // 信号：`Some(i)` 且 `i` 与位置一致（hits[i].mmr_selected == Some(i)）
+        for (i, h) in out.iter().enumerate() {
+            assert_eq!(
+                h.explain.mmr_selected,
+                Some(i as u32),
+                "🔴 位置 {i} 的信号应当是 Some({i})（S10-4 验收②）"
+            );
+        }
+    }
+
+    /// **S10-T9（S10-4 验收③）**：MMR **不启用**（`post: None`）时全链路逐位一致。
+    ///
+    /// 这条在编排层另有一份（`S10_T9_关闭时逐位一致`）；此处钉的是**本模块的等价形态**：
+    /// `λ = 1.0` ⇒ 纯按分数 ⇒ 输出顺序与「按 `score` 降序 + `chunk_id` 升序」**完全一致**。
+    #[test]
+    fn S10_T9_lambda为1时退化为纯分数序() {
+        let hits = vec![
+            hit(3, 0.9, "甲 乙 丙 丁"),
+            hit(1, 0.9, "戊 己 庚 辛"),
+            hit(2, 0.5, "壬 癸 子 丑"),
+        ];
+        let out = default_mmr(1.0, 100).process(hits, 3).unwrap();
+        println!("λ=1 ⇒ {:?}", ids(&out));
+        assert_eq!(
+            ids(&out),
+            vec![1, 3, 2],
+            "🔴 λ=1 ⇒ 必须退化为「按 score 降序 + 同分 chunk_id 升序」（NFR-06 口径）"
+        );
+    }
+
+    /// **S10-T15（边界）**：空候选 / `k == 0` ⇒ 返回空（不 panic、不 Err）。
+    #[test]
+    fn S10_T15_空输入与k为零返回空() {
+        let mmr = default_mmr(0.5, 100);
+        assert!(
+            mmr.process(vec![], 10).unwrap().is_empty(),
+            "空入参 ⇒ 空出参"
+        );
+        let hits = vec![hit(1, 1.0, "甲 乙"), hit(2, 0.9, "丙 丁")];
+        assert!(
+            mmr.process(hits, 0).unwrap().is_empty(),
+            "k == 0 ⇒ 一条都不要（退化输入护栏）"
+        );
+    }
+
+    /// **S10-T16（S10-3 验收 / Q10-2 留缝）**：相似度来源**可替换**（注入桩）。
+    ///
+    /// 注入一个「按 `chunk_id` 奇偶判相似」的桩 ⇒ 断言 MMR 真的用了**注入的**来源，
+    /// 而不是内置的文本侧 Jaccard。
+    #[test]
+    fn S10_T16_相似度来源可注入() {
+        let calls = Arc::new(Mutex::new(0usize));
+        let calls2 = Arc::clone(&calls);
+        let src: SimilaritySource = Arc::new(move |a: &str, b: &str| {
+            *calls2.lock().unwrap() += 1;
+            // 桩：正文里含「甲」的两条视为完全相似（与 Jaccard 不同）
+            if a.contains('甲') && b.contains('甲') {
+                1.0
+            } else {
+                0.0
+            }
+        });
+        let mmr = Mmr::with_similarity(0.5, src, 100);
+        // 三条互不相同正文，但两条含「甲」
+        let hits = vec![
+            hit(0, 1.0, "甲 完全 不同 内容 一"),
+            hit(1, 0.9, "甲 完全 不同 内容 二"),
+            hit(2, 0.8, "乙 完全 不同 内容 三"),
+        ];
+        let out = mmr.process(hits, 3).unwrap();
+        println!("注入桩 ⇒ {:?}", ids(&out));
+        assert!(*calls.lock().unwrap() > 0, "🔴 注入的来源必须被真的调用");
+        assert_eq!(
+            out[1].chunk_id, 2,
+            "🔴 桩把 id 0/1 判为相似 ⇒ 第 2 位应当是 id 2（异组那条）"
+        );
+    }
+
+    /// **相似度夹取**：契约外的返回（`NaN` / 越界）被**夹到 `[0, 1]`**，不上抛。
+    #[test]
+    fn S10_T17_相似度越界被夹取() {
+        let src: SimilaritySource = Arc::new(|_a: &str, _b: &str| f32::NAN);
+        let mmr = Mmr::with_similarity(0.5, src, 100);
+        let hits = vec![hit(0, 1.0, "甲"), hit(1, 0.5, "乙")];
+        let out = mmr.process(hits, 2).unwrap();
+        assert_eq!(out.len(), 2, "NaN 不得导致 panic / Err（视作 0 相似）");
+        assert_eq!(ids(&out), vec![0, 1], "NaN ⇒ sim 视作 0 ⇒ 仍按分数序");
+    }
+
+    /// **λ 非法 ⇒ `Err`**（NFR-07：不得静默降级）。
+    #[test]
+    fn S10_T18_非法lambda上抛Err() {
+        for bad in [f64::NAN, f64::INFINITY, -0.1, 1.1] {
+            let mmr = default_mmr(bad, 100);
+            let err = mmr
+                .process(vec![hit(0, 1.0, "甲")], 1)
+                .expect_err("非法 λ 必须上抛 Err");
+            println!("λ={bad} ⇒ {err}");
+        }
+    }
+
+    /// **窗口必须放大**（架构 `R61` 同族）：`candidate_window(k) = pool.max(k)`。
+    /// 与 `TimeDecay`（用 provided 默认 = `k`）**相反** —— 这条是二者的语义分野。
+    #[test]
+    fn S10_T19_窗口取pool与k的较大者() {
+        let mmr = default_mmr(0.5, 40);
+        assert_eq!(mmr.name(), "mmr");
+        assert_eq!(mmr.candidate_window(10), 40, "pool > k ⇒ 取 pool");
+        assert_eq!(mmr.candidate_window(100), 100, "k > pool ⇒ 取 k");
+        let zero = default_mmr(0.5, 0);
+        assert_eq!(zero.candidate_window(7), 7, "pool=0 ⇒ 退化为 k（不报错）");
+    }
+
+    /// **Jaccard 边界**：任一侧为空 ⇒ `0.0`（**不是** `1.0`）。
+    /// 取 `1.0` 会让 K 条空正文互相「完全相似」、把整组判断带偏。
+    #[test]
+    fn S10_T20_空词集相似度为零() {
+        let empty: HashSet<String> = HashSet::new();
+        let some: HashSet<String> = ["甲".to_string()].into_iter().collect();
+        assert_eq!(jaccard(&empty, &some), 0.0);
+        assert_eq!(jaccard(&empty, &empty), 0.0);
+        assert_eq!(jaccard(&some, &some), 1.0, "自身相似度仍须 1.0");
+    }
+}

@@ -3178,4 +3178,155 @@ mod tests {
             }
         }
     }
+
+    /// 造「**近重复**语料 + 一条异主题」的索引（MMR 用例专用）。
+    ///
+    /// 3 条近重复（同一句只差末字）+ 1 条异主题 ⇒ `k = 2` 时纯分数序会取两条近重复，
+    /// 而 MMR 应当**换掉**其中一条。
+    ///
+    /// ⚠️ 那条异主题正文**也必须命中 query**（含「向量检索」）—— 否则它压根不在候选里，
+    /// 「MMR 改变次序」的断言就成了空转（本用例踩过：最初第 4 条不含 query 词 ⇒ 断言恒假）。
+    fn build_redundant_index() -> (Index, MixedAnalyzer) {
+        let texts = [
+            "向量检索使用近似最近邻算法计算余弦相似度并返回结果甲",
+            "向量检索使用近似最近邻算法计算余弦相似度并返回结果乙",
+            "向量检索使用近似最近邻算法计算余弦相似度并返回结果丙",
+            "向量检索的另一条主线是中文分词与倒排索引的工程取舍",
+        ];
+        let mut index = Index::new();
+        let analyzer = MixedAnalyzer::new();
+        let chunker = Chunker::default();
+        for (i, text) in texts.iter().enumerate() {
+            let doc = DocRecord {
+                doc_id: i as ChunkId,
+                source: format!("doc-{i}"),
+                metadata: serde_json::json!({}),
+                content_hash: 0,
+            };
+            index
+                .add(doc, chunker.chunk(i as ChunkId, text), &analyzer)
+                .unwrap();
+        }
+        (index, analyzer)
+    }
+
+    /// **S10-T9（`S10-4` 验收③）**：MMR **关闭 ⇒ 逐位一致**。
+    ///
+    /// 三臂：
+    /// - **A 不装**（机制关闭）⇒ `mmr_selected` 恒 `None`；
+    /// - **B 装但 `λ == 1.0`**（纯按分数 ⇒ 「开了但退化为同一序」）⇒ 与 A **逐位一致**；
+    /// - **C 装且 `λ < 1`** ⇒ 信号出现、且**次序真的变了**（与 A 不同）。
+    ///
+    /// ⚠️ 夹具把**冗余候选排在前面** ⇒ 纯分数序（A / B）会先取它们；`λ < 1` 时 MMR
+    /// 必须把异主题那条提前 ⇒ 「次序真的变了」有牙齿。
+    #[test]
+    fn S10_T9_MMR关闭逐位一致开启后信号出现且次序改变() {
+        use crate::post::Mmr;
+
+        let (index, analyzer) = build_redundant_index();
+
+        // A：不装（关闭）
+        let a = QueryExecutor::new(&index, &analyzer)
+            .search("向量检索 余弦相似度", SearchMode::Bm25, 2)
+            .unwrap();
+        assert_eq!(a.hits.len(), 2, "前提：有 2 条结果");
+        assert!(
+            a.hits.iter().all(|h| h.explain.mmr_selected.is_none()),
+            "关闭 ⇒ `Explain.mmr_selected` 必须恒 None"
+        );
+
+        // B：装了但 λ == 1 ⇒ 退化为纯分数序 ⇒ 与 A 逐位一致
+        let b = QueryExecutor::new(&index, &analyzer)
+            .with_post(Arc::new(Mmr::new(1.0, Arc::new(MixedAnalyzer::new()), 100)))
+            .search("向量检索 余弦相似度", SearchMode::Bm25, 2)
+            .unwrap();
+        assert_eq!(ids_of(&a), ids_of(&b), "λ == 1 ⇒ 顺序逐位一致");
+        for (x, y) in a.hits.iter().zip(&b.hits) {
+            assert_eq!(x.score.to_bits(), y.score.to_bits(), "分数逐位一致");
+            assert_eq!(explain_snapshot(x), explain_snapshot(y));
+        }
+
+        // C：λ < 1 ⇒ 信号出现 + 次序真的变了
+        //
+        // ⚠️ **query 必须让冗余组的分显著更高**：BM25 的长度归一化让**短**的异主题正文
+        //    在单词 query 下反而得分更高（实测 `向量检索`：异主题 0.233 > 近重复 0.204
+        //    ⇒ λ = 0.5 也翻不动）。加长 query 命中冗余组独有的词（余弦相似度）后，
+        //    冗余组 1.241 才显著高于异主题 0.233 ⇒ λ = 0.3 可翻（λ 越小越强调多样性）。
+        let c = QueryExecutor::new(&index, &analyzer)
+            .with_post(Arc::new(Mmr::new(0.3, Arc::new(MixedAnalyzer::new()), 100)))
+            .search("向量检索 余弦相似度", SearchMode::Bm25, 2)
+            .unwrap();
+        assert!(
+            c.hits.iter().all(|h| h.explain.mmr_selected.is_some()),
+            "🔴 开启后**一条信号都没有** —— 后处理要么没跑、要么没标记"
+        );
+        assert_eq!(
+            c.hits
+                .iter()
+                .map(|h| h.explain.mmr_selected.unwrap())
+                .collect::<Vec<_>>(),
+            vec![0, 1],
+            "信号须与位置一致（0-based 序位）"
+        );
+        assert_ne!(
+            ids_of(&a),
+            ids_of(&c),
+            "🔴 MMR 必须真的改变次序（否则这条断言没验到东西）"
+        );
+        // ⚠️ 判据要写成「与本条的 `fused_score` 相等」而**不是**「与 A 里同 id 的那条相等」：
+        //    MMR 的输出条目集合与 A 的 top-k 集合**本就不必相同**（这正是它的作用）
+        //    ⇒ 拿 A 去查会因「找不到」而假报（本用例踩过）。MMR **不改 `score`** ⇒ 与 `fused_score` 相等。
+        assert!(
+            c.hits
+                .iter()
+                .all(|h| h.score.to_bits() == h.explain.fused_score.to_bits()),
+            "MMR **不改** `Hit::score`（与时间衰减的分野；见 `Hit::score` 的三档表）"
+        );
+    }
+
+    /// **S10-T10（`R61` 同族 / 窗口放大）**：MMR 的 `candidate_window` 必须**真的放大**
+    /// 候选池与回捞 —— 否则窗口里只有 `k` 条、多样性无从发生（机制空转）。
+    ///
+    /// 证据：`SpyVectorIndex.max_k()`（后端收到的召回 `k`）在装 MMR 后**必须 > 不装时**。
+    #[test]
+    fn S10_T10_MMR的窗口放大真的传到召回与回捞() {
+        use crate::post::Mmr;
+
+        let (index, analyzer, vi_base) = build_window_fixture();
+        let e = FakeEmbedder;
+
+        let base = make_executor_with_post(
+            &index,
+            &analyzer,
+            &e,
+            &vi_base,
+            Arc::new(SpyPost::new(10).0),
+        );
+        let k_base = {
+            let _ = base.search("检索", SearchMode::Vector, 10).unwrap();
+            vi_base.max_k()
+        };
+
+        let ids: Vec<ChunkId> = (0..12).collect();
+        let vi = SpyVectorIndex::new(false, ids.clone(), ids);
+        let executor = make_executor_with_post(
+            &index,
+            &analyzer,
+            &e,
+            &vi,
+            Arc::new(Mmr::new(0.5, Arc::new(MixedAnalyzer::new()), 40)),
+        );
+        let _ = executor.search("检索", SearchMode::Vector, 10).unwrap();
+        let k_mmr = vi.max_k();
+
+        println!("不装 post ⇒ 后端收到 k={k_base}；装 MMR(pool=40) ⇒ k={k_mmr}");
+        assert!(
+            k_mmr >= 40,
+            "🔴 MMR 的 `pool = 40` 必须传到召回层（后端收到 {k_mmr}）—— 否则窗口被静默封顶（R61）"
+        );
+        assert!(
+            k_mmr > k_base,
+            "🔴 装 MMR 后后端收到的 k 必须**严格更大**（{k_base} → {k_mmr}），否则放大没发生"
+        );
+    }
 }

@@ -738,4 +738,93 @@ mod tests {
             "后设的 `time_decay` 必须覆盖先设的 `post`"
         );
     }
+
+    /// **V2 Step 10 / `S10-05`（门面段）**：`SearchIndexBuilder::mmr` 必须真的流到编排层，
+    /// 且它**与 `post` / `time_decay` 共用同一槽位**（**后设置者生效**）。
+    ///
+    /// ⚠️ 这里额外钉一条**只有门面能验证**的事：`mmr(...)` 用的是 **builder 自己配的
+    /// `analyzer`**（而不是另起一个默认分词器）—— 否则「建库分词器」与「去重分词器」
+    /// 会用两套 term 口径（`R4` 同族）。
+    #[test]
+    fn S10_门面mmr真的流到编排层且沿用builder的分词器() {
+        use crate::post::PostProcessor;
+
+        // ① builder → Config：`mmr` 写进**已合并的单槽** `post`，且装的就是 `Mmr`
+        let cfg = super::super::config::SearchIndexBuilder::default()
+            .embedder(Some(Arc::new(FakeEmbedder)))
+            .vector_backend(crate::search::VectorBackend::Brute)
+            .mmr(0.5, 100)
+            .build_config();
+        assert_eq!(
+            cfg.post.as_ref().expect("① builder → Config 这一段").name(),
+            "mmr",
+            "🔴 `mmr(...)` 没有写进 `post` 槽（门面链路第一段就断了）"
+        );
+
+        // ② 端到端：3 条近重复 + 1 条异主题 ⇒ 编排层真的按多样性序输出（`Explain` 出信号）
+        let mut idx =
+            SearchIndex::from_config(cfg, crate::search::VectorBackend::Brute, Default::default());
+        for text in [
+            "向量检索使用近似最近邻算法计算余弦相似度并返回结果甲",
+            "向量检索使用近似最近邻算法计算余弦相似度并返回结果乙",
+            "向量检索使用近似最近邻算法计算余弦相似度并返回结果丙",
+            "向量检索的另一条主线是中文分词与倒排索引的工程取舍",
+        ] {
+            idx.add(crate::document::Document::new(text)).unwrap();
+        }
+        idx.commit().unwrap();
+        let resp = idx
+            .into_searcher()
+            .unwrap()
+            .search_with("向量检索 余弦相似度")
+            .top_n(2)
+            .exec()
+            .unwrap();
+        assert!(!resp.hits.is_empty(), "前提：检索有结果");
+        assert!(
+            resp.hits.iter().all(|h| h.explain.mmr_selected.is_some()),
+            "🔴 门面链路走完仍无信号 ⇒ 中间某段把 Mmr 吞了（同 S8-08 的教训）"
+        );
+        assert_eq!(
+            resp.hits
+                .iter()
+                .map(|h| h.explain.mmr_selected.unwrap())
+                .collect::<Vec<_>>(),
+            vec![0, 1],
+            "信号须与位置一致（0-based 序位）"
+        );
+
+        // ③ 槽位规则（**后设置者生效**）：两个方向都钉住
+        struct AnyPost;
+        impl PostProcessor for AnyPost {
+            fn name(&self) -> &'static str {
+                "any-post"
+            }
+            fn process(
+                &self,
+                hits: Vec<crate::query::Hit>,
+                _k: usize,
+            ) -> crate::error::Result<Vec<crate::query::Hit>> {
+                Ok(hits)
+            }
+        }
+        let after = super::super::config::SearchIndexBuilder::default()
+            .mmr(0.5, 100)
+            .post(Arc::new(AnyPost))
+            .build_config();
+        assert_eq!(
+            after.post.as_ref().unwrap().name(),
+            "any-post",
+            "后设的 `post` 必须覆盖先设的 `mmr`"
+        );
+        let after2 = super::super::config::SearchIndexBuilder::default()
+            .post(Arc::new(AnyPost))
+            .mmr(0.5, 100)
+            .build_config();
+        assert_eq!(
+            after2.post.as_ref().unwrap().name(),
+            "mmr",
+            "后设的 `mmr` 必须覆盖先设的 `post`"
+        );
+    }
 }
