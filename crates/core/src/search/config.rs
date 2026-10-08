@@ -18,7 +18,7 @@ use crate::chunk::Chunker;
 use crate::embed::Embedder;
 use crate::error::Result;
 use crate::fusion::{FusionStrategy, RrfFusion};
-use crate::post::PostProcessor;
+use crate::post::{PostProcessor, TimeDecay};
 use crate::rerank::{NoOpReranker, Reranker};
 use crate::retriever::Bm25Params;
 
@@ -243,8 +243,34 @@ impl SearchIndexBuilder {
     /// 代价是召回与回捞的成本同比例上升。
     ///
     /// ⚠️ 本方法**只装通道**：机制**默认关**（不调用即零行为变化），与 `adaptive_fusion` 同口径。
+    ///
+    /// ⚠️ **与 [`Self::time_decay`] 是同一个槽位**（后处理阶段只有**一个**位置，`D-S10-01`）——
+    /// 两者**后设置者生效**。要串联多个后处理器，请自己实现一个 [`PostProcessor`] 组合它们。
     pub fn post(mut self, post: Arc<dyn PostProcessor>) -> Self {
         self.post = Some(post);
+        self
+    }
+
+    /// 启用**时间衰减**（V2 Step 10 / `S10-04` / `T7-20`；默认**不启用** ⇒ 零行为变化）。
+    ///
+    /// - `weight` = 指数衰减率 λ（**1/秒**，建议 `≥ 0`）；
+    /// - `field` = [`crate::query::response::Hit::metadata`] 里的时间字段名（unix **毫秒**；
+    ///   内核**不猜** `ts_ms` / `created_at`）；
+    /// - `clock` = **时钟源**（返回 unix 毫秒）—— 内核**不持时钟**；测试注入恒返回定值的闭包即可
+    ///   得到**可复现**读数。
+    ///
+    /// 公式、作用分（**融合分这一档**，`D-S10-03`）、「缺字段 ⇒ `Err`」（NFR-07）与「改写后重排」
+    /// （守住 `Hit::score` 的降序契约）见 [`crate::post::TimeDecay`]。
+    ///
+    /// ⚠️ **与 [`Self::post`] 是同一个槽位**（后处理只有一个位置）⇒ **后设置者生效**。
+    /// 需要多个后处理器串联时，请自己实现一个 [`PostProcessor`] 来组合它们。
+    pub fn time_decay(
+        mut self,
+        weight: f64,
+        field: impl Into<String>,
+        clock: Arc<dyn Fn() -> i64 + Send + Sync>,
+    ) -> Self {
+        self.post = Some(Arc::new(TimeDecay::new(weight, field, clock)));
         self
     }
 

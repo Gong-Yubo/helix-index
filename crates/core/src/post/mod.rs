@@ -25,6 +25,16 @@
 //!
 //! 编排层的 `SearchParts::post` 默认 `None` ⇒ **本阶段整个不执行**，全链路与引入前**逐位一致**
 //! （同 `NoOpReranker` 的处置口径，D-S7-04 先例）。
+//!
+//! # 已有实现（V2 Step 10）
+//!
+//! - [`TimeDecay`]（**时间衰减**，`S10-04` / `FR-33`）—— 语义、公式与三条定值（时钟源 / 缺字段上抛 /
+//!   改写后重排）见 [`time_decay`]。⚠️ 它**不改窗口**（用 [`PostProcessor::candidate_window`] 的
+//!   **provided 默认** = `k`）：衰减只重加权已有候选，不需要额外候选。
+
+pub mod time_decay;
+
+pub use time_decay::TimeDecay;
 
 use crate::error::Result;
 use crate::query::response::Hit;

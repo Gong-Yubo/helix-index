@@ -91,6 +91,23 @@ pub struct Explain {
     /// ⚠️ 本字段是**加在公开结构体上的新字段**（`Explain` 字段全 `pub`）⇒ 下游以字面量
     /// 构造 `Explain` 的代码会编译失败（破坏性，见 CHANGELOG）。库内构造点已同步。
     pub rerank_score: Option<Score>,
+    /// 时间衰减的**改写系数**（V2 Step 10 / `S10-04`；`Some(f)` ⟺ 该条**被衰减改写**）。
+    ///
+    /// 语义：后处理阶段把 `hit.score` 乘上 `f = exp(−λ · age_secs)`（λ = 调用方给的衰减率、
+    /// `age_secs` = 「现在 − 文档时间戳」，**向下钳到 0**）⇒ 于是
+    /// `hit.score == fused_score × f`。**`lambda`/`age`/`f` 的完整定义与三条实现期定值
+    /// 见 [`crate::post::TimeDecay`]**。
+    ///
+    /// ⚠️ `f == 1.0`（`age == 0` 或 `λ == 0`）时**分数逐位不变** ⇒ 本字段保持 `None`
+    /// （即「`is_some()` ⟺ 真的被改写」）—— 与 [`Self::rerank_score`] 的口径同款。
+    ///
+    /// ⚠️ `None` 有**三种**来源，必须**连看配置**才能区分：
+    /// ① **未启用**时间衰减（默认 ⇒ 恒 `None`）；② 启用但本条 `f == 1.0`（没被改写）；
+    /// ③ 该条**没走到**后处理阶段（三条早退 / 过滤清空）。
+    ///
+    /// ⚠️ 本字段是**加在公开结构体上的新字段**（`Explain` 字段全 `pub`）⇒ 下游以字面量
+    /// 构造 `Explain` 的代码会编译失败（破坏性，见 CHANGELOG）。
+    pub decay_factor: Option<Score>,
 }
 
 /// 检索响应。
