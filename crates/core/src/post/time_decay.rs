@@ -162,3 +162,245 @@ impl PostProcessor for TimeDecay {
         Ok(hits)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(non_snake_case)] // 中文测试名含英文缩写（S10_T7）
+
+    use super::*;
+    use crate::query::response::Explain;
+
+    /// 固定时钟的读数（**可复现的关键**：内核不持时钟 ⇒ 测试注入恒返回定值的闭包）。
+    const NOW: i64 = 1_700_000_000_000;
+
+    fn fixed_clock(now: i64) -> Arc<dyn Fn() -> i64 + Send + Sync> {
+        Arc::new(move || now)
+    }
+
+    /// `ts_ms: None` ⇒ metadata 里**没有**该字段（用于缺字段臂）。
+    fn hit(chunk_id: u32, score: f32, ts_ms: Option<i64>) -> Hit {
+        let metadata = match ts_ms {
+            Some(t) => serde_json::json!({ "ts_ms": t }),
+            None => serde_json::json!({}),
+        };
+        Hit {
+            chunk_id,
+            doc_id: chunk_id,
+            score,
+            text: format!("正文 {chunk_id}"),
+            source: format!("doc-{chunk_id}"),
+            metadata,
+            explain: Explain {
+                fused_score: score,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn ids(hits: &[Hit]) -> Vec<u32> {
+        hits.iter().map(|h| h.chunk_id).collect()
+    }
+
+    /// **S10-T7（性质测试）**：同一批候选、**时间权重增大 ⇒ 新条目的名次不变差**。
+    ///
+    /// ⚠️ **刻意让输入顺序 ≠ 期望顺序**：输入是「老 → 新」（`[3, 2, 1]`，越靠后越新），
+    /// 而 `weight == 0` 时输出**逐位保持输入顺序**（id=1 排最后 ⇒ 名次 = 2）。
+    /// 若输入本身就按期望顺序排，这条断言会「看着过了其实什么都没验」。
+    #[test]
+    fn S10_T7_权重增大时新条目名次不变差() {
+        let ages_ms = [86_400_000i64, 3_600_000, 0]; // 24h / 1h / 0
+        let mut prev_rank: Option<usize> = None;
+        for w in [0.0f64, 1e-5, 1e-3] {
+            let hits: Vec<Hit> = ages_ms
+                .iter()
+                .enumerate()
+                .map(|(i, age)| hit(3 - i as u32, 1.0, Some(NOW - age)))
+                .collect();
+            assert_eq!(
+                ids(&hits),
+                vec![3, 2, 1],
+                "前提：输入顺序 = 老→新（**不是**期望顺序）"
+            );
+            let td = TimeDecay::new(w, "ts_ms", fixed_clock(NOW));
+            let out = td.process(hits, 10).unwrap();
+            let rank = out
+                .iter()
+                .position(|h| h.chunk_id == 1)
+                .expect("最新条目必须在输出里");
+            println!("weight={w} ⇒ 输出={:?}，最新条目名次={rank}", ids(&out));
+            if let Some(p) = prev_rank {
+                assert!(
+                    rank <= p,
+                    "🔴 权重增大后**最新条目的名次变差**了：{p} → {rank}（weight={w}）"
+                );
+            }
+            prev_rank = Some(rank);
+        }
+        assert_eq!(prev_rank, Some(0), "大权重下最新条目必须排第一");
+    }
+
+    /// **缺字段 / 非整数 ⇒ `Err`**（NFR-07：不得静默降级）+ 消息必须**可定位**。
+    #[test]
+    fn S10_T8_时间字段缺失或非整数上抛Err() {
+        let td = TimeDecay::new(1e-3, "ts_ms", fixed_clock(NOW));
+
+        // ① 缺字段
+        let e = td.process(vec![hit(7, 1.0, None)], 10).unwrap_err();
+        let msg = e.to_string();
+        assert!(
+            msg.contains("ts_ms") && msg.contains('7'),
+            "🔴 报错消息必须带**字段名 + chunk_id**（否则调用方分不清「字段名写错」与「个别文档缺数据」）：{msg}"
+        );
+
+        // ② 浮点（非整数毫秒）
+        let mut h = hit(8, 1.0, None);
+        h.metadata = serde_json::json!({ "ts_ms": 1.5 });
+        let e = td.process(vec![h], 10).unwrap_err();
+        assert!(e.to_string().contains("不是整数"), "实得：{e}");
+
+        // ③ 字符串
+        let mut h2 = hit(9, 1.0, None);
+        h2.metadata = serde_json::json!({ "ts_ms": "2026-10-08" });
+        assert!(td.process(vec![h2], 10).is_err(), "字符串时间戳必须报错");
+
+        // 对照臂：**合法输入不得报错** —— 否则上面三条可能只是「任何输入都 Err」的空断言
+        assert!(
+            td.process(vec![hit(1, 1.0, Some(NOW))], 10).is_ok(),
+            "对照臂：合法输入必须成功"
+        );
+    }
+
+    /// **边界：没有真的改写时 ⇒ 信号 `None`、顺序逐位保持**（设计 §4.3 的 `is_some() ⟺ 被改写`）。
+    #[test]
+    fn S10_T10_未改写时信号为None且顺序逐位保持() {
+        // arm A：`weight == 0`（开了但无事发生）
+        let hits = vec![
+            hit(3, 0.5, Some(NOW - 1000)),
+            hit(1, 0.5, Some(NOW - 2000)),
+            hit(2, 0.5, Some(NOW)),
+        ];
+        let base = ids(&hits);
+        let out0 = TimeDecay::new(0.0, "ts_ms", fixed_clock(NOW))
+            .process(hits.clone(), 10)
+            .unwrap();
+        assert_eq!(
+            ids(&out0),
+            base,
+            "weight == 0 ⇒ 一条都不改写 ⇒ 顺序逐位保持"
+        );
+        assert!(
+            out0.iter().all(|h| h.explain.decay_factor.is_none()),
+            "无改写 ⇒ 信号恒 None"
+        );
+
+        // arm B：`age == 0`（时间戳正好等于时钟）
+        let out1 = TimeDecay::new(1e-3, "ts_ms", fixed_clock(NOW))
+            .process(vec![hit(1, 1.0, Some(NOW))], 10)
+            .unwrap();
+        assert_eq!(
+            out1[0].score, 1.0,
+            "age == 0 ⇒ factor == 1.0 ⇒ 分数逐位不变"
+        );
+        assert!(
+            out1[0].explain.decay_factor.is_none(),
+            "未被改写 ⇒ 信号为 None（口径：is_some() ⟺ 被改写）"
+        );
+    }
+
+    /// **改写后必须重排**：输出按 `score` 降序、同分按 `chunk_id` 升序（NFR-06 的既有契约）。
+    ///
+    /// ⚠️ 刻意让**输入顺序 ≠ 期望顺序**（输入 `[9, 4, 1]`、期望 `[4, 9, 1]`）。
+    #[test]
+    fn S10_T9_改写后按分数降序且同分按chunk_id升序() {
+        let hits = vec![
+            hit(9, 1.0, Some(NOW - 1000)),
+            hit(4, 1.0, Some(NOW - 1000)), // 与 9 同 age ⇒ 改写后**同分**
+            hit(1, 1.0, Some(NOW - 86_400_000)), // 最老 ⇒ 被压到最后
+        ];
+        let out = TimeDecay::new(1e-3, "ts_ms", fixed_clock(NOW))
+            .process(hits, 10)
+            .unwrap();
+        assert_eq!(
+            ids(&out),
+            vec![4, 9, 1],
+            "🔴 契约：分数降序 + 同分按 chunk_id 升序（不是「同分保持输入相对顺序」）"
+        );
+        for w in out.windows(2) {
+            assert!(w[0].score >= w[1].score, "必须降序");
+            if w[0].score == w[1].score {
+                assert!(w[0].chunk_id < w[1].chunk_id, "同分必须 chunk_id 升序");
+            }
+        }
+        for h in &out {
+            let f = h.explain.decay_factor.expect("被改写的条目必须有信号");
+            assert!(
+                (h.score - h.explain.fused_score * f).abs() < f32::EPSILON * 8.0,
+                "口径：`score == fused_score × factor`（chunk_id={}）",
+                h.chunk_id
+            );
+        }
+    }
+
+    /// **非有限权重 ⇒ `Err`**（而不是悄悄产出 NaN 分数污染排序）。
+    #[test]
+    fn S10_T11_非有限权重上抛Err() {
+        for w in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let td = TimeDecay::new(w, "ts_ms", fixed_clock(NOW));
+            let e = td
+                .process(vec![hit(1, 1.0, Some(NOW - 1000))], 10)
+                .unwrap_err();
+            assert!(e.to_string().contains("有限数"), "weight={w} 实得：{e}");
+        }
+    }
+
+    /// **负权重**（调用方自担）：越**新**的条目分越**高** ⇒ 信号可以 `> 1`。
+    #[test]
+    fn S10_T13_负权重时越新越高且信号可大于一() {
+        let hits = vec![
+            hit(1, 1.0, Some(NOW - 86_400_000)), // 老
+            hit(2, 1.0, Some(NOW)),              // 新（age == 0 ⇒ 不改写）
+        ];
+        let out = TimeDecay::new(-1e-5, "ts_ms", fixed_clock(NOW))
+            .process(hits, 10)
+            .unwrap();
+        assert_eq!(
+            ids(&out),
+            vec![1, 2],
+            "负权重 ⇒ 老条目 factor > 1 ⇒ 反而靠前"
+        );
+        let f = out[0].explain.decay_factor.expect("老条目必须被改写");
+        assert!(f > 1.0, "负权重下信号允许 > 1（实得 {f}）");
+    }
+
+    /// **边界：未来时间戳** ⇒ `age` 必须钳到 0 ⇒ `factor == 1.0` ⇒ **不改写、不放大**。
+    ///
+    /// 若去掉 `.max(0)`，未来时间戳会得到 `factor > 1`（**凭空加分**）—— 这条就是那个钳位的牙齿。
+    #[test]
+    fn S10_T14_未来时间戳被钳为零龄() {
+        let td = TimeDecay::new(1e-3, "ts_ms", fixed_clock(NOW));
+        let out = td
+            .process(vec![hit(1, 1.0, Some(NOW + 3_600_000))], 10)
+            .unwrap();
+        assert_eq!(out[0].score, 1.0, "未来时间戳不得被放大（age 必须钳到 0）");
+        assert!(
+            out[0].explain.decay_factor.is_none(),
+            "未被改写 ⇒ 信号 None"
+        );
+    }
+
+    /// **名字与「默认窗口」**：衰减**不需要额外候选** ⇒ 必须走 provided 默认（`k`）。
+    #[test]
+    fn S10_T12_名字与默认窗口() {
+        let td = TimeDecay::new(1e-3, "ts_ms", fixed_clock(NOW));
+        assert_eq!(td.name(), "time-decay");
+        for k in [1usize, 10, 100] {
+            assert_eq!(
+                td.candidate_window(k),
+                k,
+                "🔴 时间衰减只重加权、不需要额外候选 ⇒ 不得覆盖 provided 默认（否则白付召回与回捞成本）"
+            );
+        }
+        assert_eq!(td.field(), "ts_ms");
+        assert_eq!(td.now_ms(), NOW);
+    }
+}

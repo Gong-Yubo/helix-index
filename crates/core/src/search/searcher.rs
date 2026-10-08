@@ -656,4 +656,86 @@ mod tests {
         );
         assert_eq!(resp2.hits.len(), 2, "无后处理 ⇒ 出口条数仍由 k 决定");
     }
+
+    /// **V2 Step 10 / `S10-04`（门面段）**：`SearchIndexBuilder::time_decay` 必须真的流到编排层，
+    /// 且它**与 `post` 共用同一槽位**（**后设置者生效** —— 两处 rustdoc 都写明了这条承诺）。
+    #[test]
+    fn S10_门面time_decay真的流到编排层() {
+        use crate::post::PostProcessor;
+
+        const NOW: i64 = 1_700_000_000_000;
+        let clock: Arc<dyn Fn() -> i64 + Send + Sync> = Arc::new(move || NOW);
+
+        // ① builder → Config：`time_decay` 写进**已合并的单槽** `post`，且装的就是 `TimeDecay`
+        let cfg = super::super::config::SearchIndexBuilder::default()
+            .embedder(Some(Arc::new(FakeEmbedder)))
+            .vector_backend(crate::search::VectorBackend::Brute)
+            .time_decay(1e-3, "ts_ms", clock.clone())
+            .build_config();
+        assert_eq!(
+            cfg.post.as_ref().expect("① builder → Config 这一段").name(),
+            "time-decay",
+            "🔴 `time_decay(...)` 没有写进 `post` 槽（门面链路第一段就断了）"
+        );
+
+        // ② 端到端：文档带 `ts_ms` ⇒ 编排层真的改写（`Explain` 出信号）
+        let mut idx =
+            SearchIndex::from_config(cfg, crate::search::VectorBackend::Brute, Default::default());
+        idx.add(
+            crate::document::Document::new("BM25 是经典关键词检索算法")
+                .with_metadata(serde_json::json!({ "ts_ms": NOW - 86_400_000 })),
+        )
+        .unwrap();
+        idx.add(
+            crate::document::Document::new("向量检索把文本编码成向量")
+                .with_metadata(serde_json::json!({ "ts_ms": NOW })),
+        )
+        .unwrap();
+        idx.commit().unwrap();
+        let resp = idx
+            .into_searcher()
+            .unwrap()
+            .search_with("检索")
+            .top_n(2)
+            .exec()
+            .unwrap();
+        assert!(!resp.hits.is_empty(), "前提：检索有结果");
+        assert!(
+            resp.hits.iter().any(|h| h.explain.decay_factor.is_some()),
+            "🔴 门面链路走完仍无信号 ⇒ 中间某段把 TimeDecay 吞了（同 S8-08 的教训）"
+        );
+
+        // ③ 槽位规则（**后设置者生效**）：两个方向都钉住 —— 否则那两处 rustdoc 的承诺无人守
+        struct AnyPost;
+        impl PostProcessor for AnyPost {
+            fn name(&self) -> &'static str {
+                "any-post"
+            }
+            fn process(
+                &self,
+                hits: Vec<crate::query::Hit>,
+                _k: usize,
+            ) -> crate::error::Result<Vec<crate::query::Hit>> {
+                Ok(hits)
+            }
+        }
+        let after = super::super::config::SearchIndexBuilder::default()
+            .time_decay(1e-3, "ts_ms", clock.clone())
+            .post(Arc::new(AnyPost))
+            .build_config();
+        assert_eq!(
+            after.post.as_ref().unwrap().name(),
+            "any-post",
+            "后设的 `post` 必须覆盖先设的 `time_decay`"
+        );
+        let after2 = super::super::config::SearchIndexBuilder::default()
+            .post(Arc::new(AnyPost))
+            .time_decay(1e-3, "ts_ms", clock)
+            .build_config();
+        assert_eq!(
+            after2.post.as_ref().unwrap().name(),
+            "time-decay",
+            "后设的 `time_decay` 必须覆盖先设的 `post`"
+        );
+    }
 }
