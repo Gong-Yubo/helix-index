@@ -86,7 +86,10 @@ impl Mmr {
     /// - `lambda` = 相关度权重 ∈ `[0, 1]`（`1.0` ⇒ 纯按分数）；
     /// - `analyzer` = 分词器（与建库时**同一实现**才保证 term 口径一致）；
     /// - `pool` = **候选池大小**（[`PostProcessor::candidate_window`] 返回 `pool.max(k)`）。
-    ///   建议取 `k` 的若干倍（如 `4 * k`）；传 `0` 时退化为「窗口 = `k`」（不报错，但多样性空间为零）。
+    ///   ⚠️ **可判定建议：`pool ≥ 4 * k`**（且**必须 `> k`**）—— 窗口里只有 `k` 条时 MMR
+    ///   会退化成**纯分数序**（一条冗余都换不掉 = 静默空转，`R61` 同族）。
+    ///   传 `0`（或任意 `≤ k`）**不报错**、只退化 ⇒ 这条约束**只能靠文档与调用方**守
+    ///   （第 1 轮评审 **P4-2**）。
     ///
     /// ⚠️ **构造期不校验** `lambda`（有限性 / 区间在 [`PostProcessor::process`] 里上抛 `Err`）
     /// —— 与 [`super::TimeDecay::new`] 同口径：校验放到真正消费它的那一刻。
@@ -299,7 +302,7 @@ mod tests {
     /// 而 MMR 应当把第 2 位**换成**那条异主题的（上界骤降）。若取 `k = 3`，三条近重复会
     /// 全被选进来 ⇒ 上界**不会**下降，断言就失去鉴别力（本用例刻意取 `k = 2`）。
     #[test]
-    fn S10_T8_高冗余候选启用后相似度上界下降且长度不超k() {
+    fn S10_T21_高冗余候选启用后相似度上界下降且长度不超k() {
         // 近重复的三条：只差末尾一个字（term 集合几乎全同）+ 一条异主题
         let dup_texts = [
             "向量检索使用近似最近邻算法计算余弦相似度并返回结果甲",
@@ -325,8 +328,13 @@ mod tests {
 
         let mmr = default_mmr(0.5, 100);
         let out = mmr.process(hits.clone(), k).unwrap();
-        assert!(out.len() <= k, "长度必须 ≤ k（S10-4 验收①）");
-        assert_eq!(out.len(), k, "候选足够 ⇒ 应当凑满 k");
+        // ⚠️ 只留 `== k` 这一条：`<= k` 在它**之前**恒真（无鉴别力，第 1 轮评审 P3-2 指出）。
+        //    长度**上界**这条由 `S10_T15`（空入参 / `k == 0`）与「候选不足」的隐含路径覆盖。
+        assert_eq!(
+            out.len(),
+            k,
+            "候选足够 ⇒ 应当凑满 k（S10-4 验收①：长度 ≤ k）"
+        );
         let dedup = max_pairwise_jaccard(&mmr, &out);
 
         println!(
@@ -342,7 +350,17 @@ mod tests {
             out.iter().any(|h| h.chunk_id == 99),
             "🔴 那条异主题候选应当被多样性选进来（否则机制没起作用）"
         );
-        // 信号：`Some(i)` 且 `i` 与位置一致（hits[i].mmr_selected == Some(i)）
+        // 🔴 **身份级**判据（第 1 轮评审 P3-2 补）：钉住「**按什么次序**输出」——
+        //    上面两条（上界 / `any(==99)`）只约束「**选谁**」，对「仅换序」的实现**不敏感**：
+        //    实测把输出改回 `score` 降序（选择集不变）时，本文件只有 `S10_T16` 会红。
+        //    真值 = 近重复 A 在前、那条异主题 99 **插到第 2 位**（这正是多样性序与分数序的分野）。
+        assert_eq!(
+            ids(&out),
+            vec![0, 99],
+            "🔴 MMR 的输出次序必须**按多样性序**（不是 `score` 降序）；\
+             这条会在「选择集不变、仅换序」的实现下精确变红（P3-2）"
+        );
+        // 信号：`Some(i)` 且 `i` 与位置一致（`NoOpReranker` 下精排不改次序 ⇒ 恒等成立）
         for (i, h) in out.iter().enumerate() {
             assert_eq!(
                 h.explain.mmr_selected,
@@ -357,7 +375,7 @@ mod tests {
     /// 这条在编排层另有一份（`S10_T9_关闭时逐位一致`）；此处钉的是**本模块的等价形态**：
     /// `λ = 1.0` ⇒ 纯按分数 ⇒ 输出顺序与「按 `score` 降序 + `chunk_id` 升序」**完全一致**。
     #[test]
-    fn S10_T9_lambda为1时退化为纯分数序() {
+    fn S10_T22_lambda为1时退化为纯分数序() {
         let hits = vec![
             hit(3, 0.9, "甲 乙 丙 丁"),
             hit(1, 0.9, "戊 己 庚 辛"),
@@ -374,7 +392,7 @@ mod tests {
 
     /// **S10-T15（边界）**：空候选 / `k == 0` ⇒ 返回空（不 panic、不 Err）。
     #[test]
-    fn S10_T15_空输入与k为零返回空() {
+    fn S10_T23_空输入与k为零返回空() {
         let mmr = default_mmr(0.5, 100);
         assert!(
             mmr.process(vec![], 10).unwrap().is_empty(),
@@ -392,7 +410,7 @@ mod tests {
     /// 注入一个「按 `chunk_id` 奇偶判相似」的桩 ⇒ 断言 MMR 真的用了**注入的**来源，
     /// 而不是内置的文本侧 Jaccard。
     #[test]
-    fn S10_T16_相似度来源可注入() {
+    fn S10_T24_相似度来源可注入() {
         let calls = Arc::new(Mutex::new(0usize));
         let calls2 = Arc::clone(&calls);
         let src: SimilaritySource = Arc::new(move |a: &str, b: &str| {
@@ -420,20 +438,80 @@ mod tests {
         );
     }
 
-    /// **相似度夹取**：契约外的返回（`NaN` / 越界）被**夹到 `[0, 1]`**，不上抛。
+    /// **相似度契约外返回的处置**：`NaN` ⇒ 视作 `0`；**越上界**（`> 1`）⇒ **夹到 `1.0`**。
+    ///
+    /// ⚠️ 第 1 轮评审 **P4-1** 指出：原用例只注了 `NaN` ⇒ 走 `is_nan()` 分支，
+    /// **删掉 `clamp(0.0, 1.0)` 也照样全绿** ⇒ 「越界 ⇒ 夹到 `1.0`」（`I-30`）这一半**没有牙齿**。
+    ///
+    /// ⚠️ 补的上界臂**必须构造得让夹取真的改变结果**：只在「同一对候选」上比 `1.5` 与 `1.0`
+    /// 是**验不出**的 —— 夹取是**单调非降**的，永远不翻转**一对**候选的相对序。真正会翻的是
+    /// 「**在已选集合的相似度惩罚**」上：`1.5` 让冗余候选的罚分**更重**，于是它可能被一条
+    /// **不冗余的低分候选**挤掉。
+    ///
+    /// 构造（`λ = 0.5`、`k = 2`）：`A`(1.0) / `B`(1.0，与 `A` 高度相似) / `C`(0.0，与谁都不像)。
+    /// 第 1 步并列取 `A`（`chunk_id` 升序）；第 2 步：
+    /// - **夹取后**：`B = 0.5·1.0 − 0.5·1.0 = 0` > `C = −0.5·0.2 = −0.1` ⇒ 选 `B` ⇒ `[A, B]`；
+    /// - **不夹取**：`B = 0.5 − 0.5·1.5 = −0.25` < `C = −0.1` ⇒ 选 `C` ⇒ `[A, C]`（**结果不同**）。
     #[test]
-    fn S10_T17_相似度越界被夹取() {
-        let src: SimilaritySource = Arc::new(|_a: &str, _b: &str| f32::NAN);
-        let mmr = Mmr::with_similarity(0.5, src, 100);
+    fn S10_T25_相似度契约外返回的处置() {
+        // ① `NaN` ⇒ 视作 0（不上抛、不 panic）
+        let nan: SimilaritySource = Arc::new(|_a: &str, _b: &str| f32::NAN);
+        let mmr = Mmr::with_similarity(0.5, nan, 100);
         let hits = vec![hit(0, 1.0, "甲"), hit(1, 0.5, "乙")];
         let out = mmr.process(hits, 2).unwrap();
-        assert_eq!(out.len(), 2, "NaN 不得导致 panic / Err（视作 0 相似）");
+        assert_eq!(out.len(), 2, "NaN 不得导致 panic / Err");
         assert_eq!(ids(&out), vec![0, 1], "NaN ⇒ sim 视作 0 ⇒ 仍按分数序");
+
+        // ② **越上界** ⇒ 夹到 `1.0`（本臂是 `P4-1` 补的那一半，删 `clamp` 即红）
+        let over: SimilaritySource = Arc::new(|a: &str, b: &str| {
+            let pair = (a, b);
+            let is_ab = matches!(pair, ("甲", "乙")) || matches!(pair, ("乙", "甲"));
+            if is_ab {
+                1.5 // 越界（契约是 ≤ 1.0）
+            } else {
+                0.2
+            }
+        });
+        let at_one: SimilaritySource = Arc::new(|a: &str, b: &str| {
+            let pair = (a, b);
+            if matches!(pair, ("甲", "乙")) || matches!(pair, ("乙", "甲")) {
+                1.0
+            } else {
+                0.2
+            }
+        });
+        let hits = vec![
+            hit(0, 1.0, "甲"),
+            hit(1, 1.0, "乙"), // 与 甲 高度相似 ⇒ 罚分重
+            hit(2, 0.0, "丙"), // 低分但不冗余
+        ];
+        let over_out = Mmr::with_similarity(0.5, over, 100)
+            .process(hits.clone(), 2)
+            .unwrap();
+        let one_out = Mmr::with_similarity(0.5, at_one, 100)
+            .process(hits.clone(), 2)
+            .unwrap();
+        println!(
+            "越界桩 ⇒ {:?}；1.0 桩 ⇒ {:?}",
+            ids(&over_out),
+            ids(&one_out)
+        );
+        assert_eq!(
+            ids(&over_out),
+            vec![0, 1],
+            "🔴 越界（1.5）必须被**夹到 1.0**：不夹取时会误选不冗余的 `丙`（`[0, 2]`）——\
+             本断言就是 `clamp(0.0, 1.0)` 的牙齿（P4-1）"
+        );
+        assert_eq!(
+            ids(&over_out),
+            ids(&one_out),
+            "口径：`1.5` 与 `1.0` **等价**（同为上界）"
+        );
     }
 
     /// **λ 非法 ⇒ `Err`**（NFR-07：不得静默降级）。
     #[test]
-    fn S10_T18_非法lambda上抛Err() {
+    fn S10_T26_非法lambda上抛Err() {
         for bad in [f64::NAN, f64::INFINITY, -0.1, 1.1] {
             let mmr = default_mmr(bad, 100);
             let err = mmr
@@ -446,7 +524,7 @@ mod tests {
     /// **窗口必须放大**（架构 `R61` 同族）：`candidate_window(k) = pool.max(k)`。
     /// 与 `TimeDecay`（用 provided 默认 = `k`）**相反** —— 这条是二者的语义分野。
     #[test]
-    fn S10_T19_窗口取pool与k的较大者() {
+    fn S10_T27_窗口取pool与k的较大者() {
         let mmr = default_mmr(0.5, 40);
         assert_eq!(mmr.name(), "mmr");
         assert_eq!(mmr.candidate_window(10), 40, "pool > k ⇒ 取 pool");
@@ -458,11 +536,81 @@ mod tests {
     /// **Jaccard 边界**：任一侧为空 ⇒ `0.0`（**不是** `1.0`）。
     /// 取 `1.0` 会让 K 条空正文互相「完全相似」、把整组判断带偏。
     #[test]
-    fn S10_T20_空词集相似度为零() {
+    fn S10_T28_空词集相似度为零() {
         let empty: HashSet<String> = HashSet::new();
         let some: HashSet<String> = ["甲".to_string()].into_iter().collect();
         assert_eq!(jaccard(&empty, &some), 0.0);
         assert_eq!(jaccard(&empty, &empty), 0.0);
         assert_eq!(jaccard(&some, &some), 1.0, "自身相似度仍须 1.0");
+    }
+
+    /// **`S10_T29`（`S10-4` 验收①/② 的**次序**面；第 1 轮评审 P3-2 补）**：
+    /// 钉住「**输出次序 = 多样性序**」这条被打破的契约本体。
+    ///
+    /// ⚠️ **为什么必须单独一条、且夹具要专门设计**：P3-2 指出现有判据对
+    /// 「**选择集不变、仅换序**」的实现（即「只去重、不改次序」）**结构性不敏感**。
+    /// 我实测复核属实 —— 但**评审**建议的那条具体断言（拿 `S10_T21` 的 `ids == [0, 99]`）
+    /// **同样没有牙齿**：该夹具里 `0`(1.0) 的分数本就高于 `99`(0.5)，**按 `score` 降序排出来
+    /// 也是 `[0, 99]`** ⇒ 注入变异后它照样绿。要让它变红，夹具必须满足
+    /// 「**选择序 ≠ 分数序**」——`k=3` 且**第 2 位被选中的那条分数低于第 3 位**。
+    ///
+    /// 构造（注入相似度桩 ⇒ 完全确定）：`A`=1.0 / `B`=0.95 / `C`=0.50 / `D`=0.05，
+    /// `sim(A,B) = 1.0`（`B` 是 `A` 的近重复）、`sim(C,D) = 1.0`、其余为 `0`、`λ = 0.5`、`k = 3`：
+    ///
+    /// | 步 | `B` | `C` | `D` | 选中 |
+    /// | --- | --- | --- | --- | --- |
+    /// | 1（`selected` 空） | — | — | — | **`A`**（`rel` 最高） |
+    /// | 2 | `0.5·0.95 − 0.5·1.0 = −0.025` | `0.5·0.5 = 0.25` | `0.025` | **`C`** |
+    /// | 3 | `−0.025` | — | `0.5·0.05 − 0.5·1.0 = −0.475` | **`B`** |
+    ///
+    /// ⇒ 输出 `[A, C, B]`，而 **`score` 降序是 `[A, B, C]`** —— 两者**不同**。
+    /// 若实现被改成「选择集不变、按 `score` 降序输出」，本条**精确变红**（`S10_T21` 则不会）。
+    #[test]
+    fn S10_T29_输出次序按多样性序而非分数序() {
+        // 桩：只让 (A,B) 与 (C,D) 相似，其余为 0 ⇒ 上表可逐位复算
+        let src: SimilaritySource = Arc::new(|a: &str, b: &str| {
+            let p = (a, b);
+            match p {
+                ("A", "B") | ("B", "A") | ("C", "D") | ("D", "C") => 1.0,
+                _ => 0.0,
+            }
+        });
+        let hits = vec![
+            hit(0, 1.00, "A"),
+            hit(1, 0.95, "B"),
+            hit(2, 0.50, "C"),
+            hit(3, 0.05, "D"),
+        ];
+        let out = Mmr::with_similarity(0.5, src, 100)
+            .process(hits, 3)
+            .unwrap();
+        let out_ids = ids(&out);
+        // 「按分数降序」的对照（= 被打破的那条契约本体会给出的次序）
+        let score_order: Vec<u32> = {
+            let mut v = out_ids.clone();
+            v.sort_by(|&x, &y| {
+                // 分数与 id 的对应见上表
+                let sx = [1.00f32, 0.95, 0.50, 0.05][x as usize];
+                let sy = [1.00f32, 0.95, 0.50, 0.05][y as usize];
+                sy.total_cmp(&sx).then(x.cmp(&y))
+            });
+            v
+        };
+        println!("多样性序 = {out_ids:?}；分数序对照 = {score_order:?}");
+        assert_eq!(
+            score_order,
+            vec![0, 1, 2],
+            "前提自证：对照的分数序**不是**多样性序（否则本用例没有鉴别力）"
+        );
+        assert_eq!(
+            out_ids,
+            vec![0, 2, 1],
+            "🔴 MMR 输出必须**按多样性序**（`[A, C, B]`）；若实现改成「选择集不变、\
+             按 score 降序输出」⇒ 本断言精确变红（这正是 `D-S10-09` / `R62` 打破的那条契约）"
+        );
+        // 信号与位置一致（后处理刚结束时）
+        for (i, h) in out.iter().enumerate() {
+            assert_eq!(h.explain.mmr_selected, Some(i as u32), "信号 = 多样性序位");
+        }
     }
 }

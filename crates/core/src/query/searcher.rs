@@ -3220,7 +3220,7 @@ mod tests {
     /// ⚠️ 夹具把**冗余候选排在前面** ⇒ 纯分数序（A / B）会先取它们；`λ < 1` 时 MMR
     /// 必须把异主题那条提前 ⇒ 「次序真的变了」有牙齿。
     #[test]
-    fn S10_T9_MMR关闭逐位一致开启后信号出现且次序改变() {
+    fn S10_T30_MMR关闭逐位一致开启后信号出现且次序改变() {
         use crate::post::Mmr;
 
         let (index, analyzer) = build_redundant_index();
@@ -3289,7 +3289,7 @@ mod tests {
     ///
     /// 证据：`SpyVectorIndex.max_k()`（后端收到的召回 `k`）在装 MMR 后**必须 > 不装时**。
     #[test]
-    fn S10_T10_MMR的窗口放大真的传到召回与回捞() {
+    fn S10_T31_MMR的窗口放大真的传到召回与回捞() {
         use crate::post::Mmr;
 
         let (index, analyzer, vi_base) = build_window_fixture();
@@ -3327,6 +3327,71 @@ mod tests {
         assert!(
             k_mmr > k_base,
             "🔴 装 MMR 后后端收到的 k 必须**严格更大**（{k_base} → {k_mmr}），否则放大没发生"
+        );
+    }
+
+    /// **`S10_T32`（第 1 轮评审 **P2-1** 补）**：`mmr_selected` 记的是**精排前**的多样性序位 ⇒
+    /// 接了**会重排的精排器**之后，序位与 `hits` 下标**错开**，而这不是缺陷、是既定口径
+    /// （`D-S10-02` 把后处理固定在精排之前）。
+    ///
+    /// ⚠️ 本用例是那条 rustdoc 承诺的**牙齿**：若有人把「`hits[i].mmr_selected == Some(i)`
+    /// 对每条都成立」当成普适不变式去实现（例如在精排后按新位置**重写**信号），本条会红。
+    ///
+    /// 证据链：MMR 输出 `[0(Some(0)), 99(Some(1))]` ⇒ `SpyReranker{promote_tail}`
+    /// 按「输入位置越靠后 logit 越大」给分并**按分数重排**（`D-S7-07`）⇒ 输出 `[99, 0]`，
+    /// 但两条的 `mmr_selected` 仍是 `Some(1)` / `Some(0)` ⇒ **位置与序位错开**。
+    #[test]
+    fn S10_T32_MMR的序位在精排重排后与位置错开且信号仍可信() {
+        use crate::post::Mmr;
+
+        let (index, analyzer) = build_redundant_index();
+        let e = FakeEmbedder;
+        let ids: Vec<ChunkId> = (0..4).collect();
+        let vi = SpyVectorIndex::new(false, ids.clone(), ids);
+
+        // `promote_tail = true` ⇒ 精排会用「输入位置越靠后 logit 越大」并**按分数重排**
+        let (reranker, _obs) = SpyReranker::new(100, true, false);
+        let executor = QueryExecutor::new(&index, &analyzer)
+            .with_vector(&e, &vi)
+            .with_post(Arc::new(Mmr::new(0.3, Arc::new(MixedAnalyzer::new()), 100)))
+            .with_reranker(Box::new(reranker));
+
+        let r = executor
+            .search("向量检索 余弦相似度", SearchMode::Bm25, 2)
+            .unwrap();
+        let pairs: Vec<(ChunkId, Option<u32>)> = r
+            .hits
+            .iter()
+            .map(|h| (h.chunk_id, h.explain.mmr_selected))
+            .collect();
+        println!("精排后 (chunk_id, mmr_selected) = {pairs:?}");
+
+        assert_eq!(r.hits.len(), 2, "前提：出 2 条");
+        assert!(
+            r.hits.iter().all(|h| h.explain.mmr_selected.is_some()),
+            "🔴 信号必须保留 —— 它是「本条由 MMR 按多样性序选中」的**唯一**证据（P2-1 的处置：\
+             错位时**不**把信号改写为 `None`，否则把这条信息也丢了）"
+        );
+        // 错位：位置与序位**不再**一一对应（这正是 rustdoc 现在写明的口径）
+        assert!(
+            r.hits
+                .iter()
+                .enumerate()
+                .any(|(i, h)| h.explain.mmr_selected != Some(i as u32)),
+            "🔴 接了会重排的精排器后，`mmr_selected` 与位置**必须错开** —— \
+             若本条失败，说明「位置恒等」被当成了普适不变式（那是 P2-1 的原始缺陷）"
+        );
+        // 序位集合仍是 `{0, 1}`（只是顺序被打乱）⇒ 信号**内容**未被破坏
+        let mut seq: Vec<u32> = r
+            .hits
+            .iter()
+            .filter_map(|h| h.explain.mmr_selected)
+            .collect();
+        seq.sort_unstable();
+        assert_eq!(
+            seq,
+            vec![0, 1],
+            "两条的序位集合仍是 {{0, 1}}（错开的只是**位置**）"
         );
     }
 }
