@@ -9,6 +9,14 @@
 
 ## [Unreleased]
 
+### 文档 · V2 Step 10 `PR10-5` 第 1 轮评审响应（设计 v0.14 → v0.15）（2026-10-10）
+
+- 评审落点 = `pulls/87/reviews`（`5478333149`，`COMMENTED`）+ **行内 2 条**（`post/token_budget.rs:150` / `query/metrics.rs:199`）；`issues/87/comments` **无新增**（唯一一条是本 PR 自己的 CI 确认评论；**行内 2 条 ⇒ 2 个线程需逐条回帖**）。**结论：1×P3（建议本 PR 内处置）+ 2×P4，无 P1 / P2；三条全部处置**。
+- **`P3-1`（唯一实质项，已改）**：`used += units` 在 `budget == usize::MAX` 下溢出 —— debug `panic` / release **回绕 ⇒ 静默放行**超预算条目。**先独立复现**（哨兵计数器恒返回 `usize::MAX` + `budget = usize::MAX` + 2 条 hit；与评审读数逐字一致）⇒ 判据与累加改由**同一个 `checked_add`** 闭合（`None ⇒ break`）。⚠️ **不是**「只把累加换 `saturating_add`」—— 那只治 panic、**不治误放行**。**新增绊线 `S10_T46`**（debug / release 双 profile），两个变异（**原缺陷** / **错修法**）**各自变红**；`I-45` 同步（原措辞保留为引文）。
+- **`P4-1`（已改）**：`Metrics.budget_units` 的 `Some(0) ⟺ 截到 0 条` 不精确 ⇒ `⟺` 降为 `⇐` + 列出 `Some(0)` 的**两种来源**（① 截到 0 条 / ② **输出非空但全 0 单位** —— 后者见 `S10_T38` 的推论）。⚠️ **顺手扫同族载体**：`query/searcher.rs` 的同处注释有**同一假断言**（评审未点）⇒ 一并改。
+- **`P4-2`（已登记）**：builder 名 `token_budget` **跟随任务名**（T7-03 / FR-25）、而默认单位是**字符** ⇒ 在 `I-40` 补「**属有意保留的不对称，勿顺手统一**」（`I-39` 约束的是**上报面**，与入口名不冲突）。
+- 同批：新增 **§21**（逐条处置 / 与评审不同 / 变异表 / 未闭环）+ 头部（**v0.15** / 日期 / 状态 / 交付物 ㉑）+ `docs/README.md` 索引行。⚠️ 需求 / 架构 / `plan-v2` **内容未变 ⇒ 不升版**（本轮无 FR / NFR / 风险条目变更 —— 两条实质意见分别是**实现口径**与**文档精度**）。
+
 ### 功能 · V2 Step 10 `PR10-5`：T7-03 token budget 裁剪（`TokenBudget` + `budget_units` + `EmptyReason` 变体）（2026-10-10）
 
 - 新模块 `crates/core/src/post/token_budget.rs`：`TokenCounter` trait（**provided 默认 = 字符数**）/ `CharCounter` / **`TokenBudget`**（`PostProcessor` 的**第三个**实现）。
@@ -22,7 +30,7 @@
 - 🔴 **计数口径不撒谎**（`D-S10-10` / 架构 `R63`）：上报面字段名用**单位中立**的 `budget_units`，**不用**设计举例里的 `token_total` / `token_count`（叫 `token_*` 而装字符数正是禁止①的形态，`I-39`）；三处（trait / 构造器 / builder）明写「**默认单位 = 字符，不是 token**」；注入通道 `token_budget_with` 让调用方给真值。
 - 🔴 **可观测面的结构性理由**（`I-38`）：编排层**不持有计数器** ⇒ 逐条 `explain.budget_units` 是聚合面拿到真值的**唯一**路径（聚合 = 对**输出**逐条求和；被截掉的条目**不可观测** —— 有意边界，`S10-T45` 钉住）。
 - 接通面：`SearchIndexBuilder::token_budget(budget)` / `token_budget_with(budget, counter)`（**单槽 `post` 糖**、**后设置者生效**；**不新增 `Config` 字段** —— 同 `I-18` 口径，`I-40`）。**默认关** ⇒ 零行为变化。
-- 其它定值（`I-42 ~ I-45`）：`chars()`（**不是字节**）计数 / **本实现不产生 `Err`**（`usize` 预算无非法值；`budget == 0` 合法）/ 用例编号走未分配号段 `S10_T33 ~` / 两处防回绕（`saturating_add` + `u32` 饱和）。
+- 其它定值（`I-42 ~ I-45`）：`chars()`（**不是字节**）计数 / **本实现不产生 `Err`**（`usize` 预算无非法值；`budget == 0` 合法）/ 用例编号走未分配号段 `S10_T33 ~` / 防回绕（**判据与累加由同一个 `checked_add` 闭合**，`I-45` + `S10_T46`；`u32` 饱和）。⚠️ **本行原写「两处防回绕（`saturating_add` + `u32` 饱和）」** —— 第 1 轮评审 **P3-1** 指出该形态在 `budget == usize::MAX` 下仍会**静默放行**超预算条目，已改（原措辞保留为引文，见下方评审响应条目）。
 - 同批：设计 **§20**（实现期定值与偏差）+ 头部（**v0.13 → v0.14**）+ `docs/README.md` 索引行。
 
 ### 文档 · V2 Step 10 `PR10-4` 第 2 轮（响应验证型）评审响应（设计 v0.12 → v0.13）（2026-10-10）
