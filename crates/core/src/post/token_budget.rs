@@ -11,8 +11,9 @@
 //! for h in 窗口内候选（保持传入序）:
 //!     if out.len() == k: break                    // ① `k` 仍是候选上界
 //!     c = counter.count(h.text)
-//!     if used + c > budget: break                 // ② 预算：放不下就**停**
-//!     used += c; h.explain.budget_units = Some(c); out.push(h)
+//!     next = checked_add(used, c)                 // ② 预算：溢出或放不下就**停**
+//!     if next 为 `None` 或 next > budget: break
+//!     used = next; h.explain.budget_units = Some(c); out.push(h)
 //! ```
 //!
 //! 🔴 **超预算时的行为 = 「顺序截断」，不是「换更小的条目」**（用户 **2026-10-10** 拍板，
@@ -142,12 +143,18 @@ impl PostProcessor for TokenBudget {
             }
             let units = self.counter.count(&h.text);
             // ② 预算：**放不下就停**（顺序截断 —— 不跳过后面的更小条目，见模块文档）。
-            //    ⚠️ 用 `saturating_add` 兜极端大数：`used + units` 在 release 下会**回绕**，
-            //    那会让本判据变成 **false** ⇒ 静默把超预算条目放行。
-            if used.saturating_add(units) > self.budget {
+            //    🔴 **判据与累加由同一个 `checked_add` 闭合**（`I-45`）：`used + units` 若在 `usize`
+            //    上溢出（`budget == usize::MAX` 时**可达**，见 `S10_T46`）⇒ `None` ⇒ 与超预算同样
+            //    **break**。⚠️ 只把累加换成 `saturating_add` **不够** —— 饱和和 `== budget` 时判据
+            //    照样通过 ⇒ 静默放行超预算条目；`checked_add` 的 `Some` 分支里 `next` 是**精确和**
+            //    ⇒ 判据严格，且 `budget < usize::MAX` 的既有行为逐位不变。
+            let Some(next) = used.checked_add(units) else {
+                break;
+            };
+            if next > self.budget {
                 break;
             }
-            used += units;
+            used = next;
             // 逐条信号（`D-S10-09` ①）：`is_some()` ⟺ 本阶段给它计过数。
             // ⚠️ `u32` **饱和**（不是回绕、也不上抛）：观测面字段，计数本身已经发生；
             //    单条正文超过 42 亿字符属实际不可达，饱和只是把「不可能」写清楚。
@@ -358,5 +365,48 @@ mod tests {
         let out = TokenBudget::new(3).process(hs, 10).unwrap();
         assert_eq!(ids(&out), vec![0]);
         assert_eq!(units(&out), vec![3], "`budget_units` = `count(text)`");
+    }
+
+    /// **S10-T46（`I-45` 绊线 / `PR10-5` 第 1 轮评审 P3-1）**：**哨兵计数器 + `budget == usize::MAX`**
+    /// 下 `used + units` 会在 `usize` 上**溢出** ⇒ 若判据与累加**不是同一个 `checked_add`** 闭合，
+    /// 第 2 条会被**静默放行**（release）/ **panic**（debug）。
+    ///
+    /// ⚠️ **为什么这是必要绊线**：`budget == usize::MAX` 是本 PR 自己的 `S10_T43` 就在用的
+    /// 「不设限」惯用法，而 `TokenCounter` 是**公开注入点**（`token_budget_with`）—— 自定义计数器
+    /// 对超长文本返回哨兵大数是合理用法 ⇒ 该路径**可达**，且正是 `I-45` 立项要防的
+    /// 「静默放行超预算条目」的精确形态。
+    /// ⚠️ 在 debug / release 下**都必须通过**：修好之后该路径**没有** panic 分支
+    /// （这也是「判据与累加闭合」与「只把累加换 `saturating_add`」的分野 —— 后者在本用例下
+    /// 判据仍会放行第 2 条）。
+    #[test]
+    fn S10_T46_哨兵计数器与不设限预算下溢出条目被拦() {
+        /// 哨兵计数器：恒返回 `usize::MAX`（模拟自定义计数器对超长文本返回大数）。
+        struct MaxCounter;
+        impl TokenCounter for MaxCounter {
+            fn count(&self, _text: &str) -> usize {
+                usize::MAX
+            }
+        }
+
+        let hs = vec![hit(0, "a", 1.0), hit(1, "b", 0.9)];
+        let out = TokenBudget::with_counter(usize::MAX, Arc::new(MaxCounter))
+            .process(hs, 10)
+            .unwrap();
+        println!(
+            "budget=MAX + 哨兵计数器 ⇒ {:?} {:?}",
+            ids(&out),
+            units(&out)
+        );
+        assert_eq!(
+            ids(&out),
+            vec![0],
+            "🔴 第 1 条：`MAX == budget` ⇒ 入选；第 2 条：`MAX + MAX` 溢出 ⇒ `checked_add` 得 `None` \
+             ⇒ **停**（不得静默放行 —— `I-45`）"
+        );
+        assert_eq!(
+            units(&out),
+            vec![u32::MAX],
+            "单条 `usize::MAX` 上报时按 `u32` **饱和**（不是回绕、也不上抛）"
+        );
     }
 }

@@ -628,8 +628,10 @@ pub fn search_parts(
             units_sum += u as usize;
         }
     }
-    // `Some(0)` 只在「后处理阶段把输出截到 0 条」时出现（合计确实是 0）——
-    // 与「本阶段压根没参与」的 `None` 区分开（不撒谎）。
+    // `Some(0)` 有两种来源（**不能**互换，`PR10-5` 第 1 轮评审 P4-1）：① 后处理阶段把输出
+    // **截到 0 条**（`post_emptied`）；② **输出非空、但每条都是 0 单位**（正文为空 + `budget == 0`，
+    // 即 `S10_T38` 如实登记的推论 —— 此时无 `PostEmptied`）。两者都与「本阶段压根没参与」的
+    // `None` 区分开（不撒谎）。⚠️ 「`Some(0)` ⟺ 截到 0 条」只有 `⇐` 成立。
     metrics.budget_units = if units_seen || post_emptied {
         Some(units_sum)
     } else {
