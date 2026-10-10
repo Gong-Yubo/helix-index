@@ -563,10 +563,15 @@ pub fn search_parts(
     // ⚠️ 后处理**变更 `hits` 的长度是允许的**（token budget 就是第二道截断，
     //    设计 §4.5）⇒ 这里**不**设「不得超 `k`」的安全网（那是 `Reranker` 的契约）。
     //    但实现**必须**把长度 / 排序依据的变化经 `Explain` / `Metrics` 暴露（D-S10-09 / NFR-07）。
+    // ⚠️ 「本阶段把候选清空」的判据要在**调用前**取入参长度（`S10-06` / 设计 §9.2 `Q10-6`）：
+    //    编排层只看得见「入参非空、出参为空」⇒ `EmptyReason::PostEmptied` 的名字**不指名机制**。
+    let pre_post_len = proto.len();
+    let post_ran = parts.post.is_some();
     let proto = match parts.post {
         None => proto,
         Some(p) => p.process(proto, k)?,
     };
+    let post_emptied = post_ran && pre_post_len > 0 && proto.is_empty();
 
     // 5. 精排（V2 Step 7）。入参是**候选窗口**（可能 > `k`），出参应 ≤ `k` 条。
     //
@@ -612,6 +617,25 @@ pub fn search_parts(
         h.explain.vector_rank = vector_rank.get(&h.chunk_id).map(|(r, _)| *r);
     }
 
+    // 后处理观测面（`S10-06` / D-S10-10）：编排层**不持有计数器** ⇒ 只能对后处理器逐条写在
+    // `explain.budget_units` 上的计数求和（设计 §20 `I-38`）。⚠️ 量的是**输出**的合计 ——
+    // 被截掉的条目**不可观测**，这是有意的覆盖边界。
+    let mut units_seen = false;
+    let mut units_sum = 0usize;
+    for h in &hits {
+        if let Some(u) = h.explain.budget_units {
+            units_seen = true;
+            units_sum += u as usize;
+        }
+    }
+    // `Some(0)` 只在「后处理阶段把输出截到 0 条」时出现（合计确实是 0）——
+    // 与「本阶段压根没参与」的 `None` 区分开（不撒谎）。
+    metrics.budget_units = if units_seen || post_emptied {
+        Some(units_sum)
+    } else {
+        None
+    };
+
     metrics.fused = hits.len();
     let took = started.elapsed();
     metrics.took = took;
@@ -620,7 +644,13 @@ pub fn search_parts(
     Ok(SearchResponse {
         hits,
         total_candidates: metrics.candidates,
-        empty_reason: None,
+        // `Q10-6` 的落地（`S10-06`）：**入参非空、出参为空** ⇒ 本阶段把候选清空了。
+        // ⚠️ 与三条早退的原因不冲突 —— 那三条在更早的出口返回，走不到这里。
+        empty_reason: if post_emptied {
+            Some(super::response::EmptyReason::PostEmptied)
+        } else {
+            None
+        },
         took,
         metrics,
     })

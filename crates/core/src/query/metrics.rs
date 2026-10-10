@@ -184,6 +184,27 @@ pub struct Metrics {
     /// `None` = 未走自适应通道，或信号在当前 ctx 下无定义（如 s1 需要
     /// exactly 两路候选）。填充路径与 [`Self::fusion_weights`] 相同。
     pub fusion_signal: Option<f32>,
+    /// **本次输出按注入计数器计的「预算单位」合计**（V2 Step 10 / `S10-06` / FR-25）。
+    ///
+    /// # 🔴 单位**不是** token（`D-S10-10`）
+    ///
+    /// 与 [`crate::query::response::Explain::budget_units`] **同一个单位**：由调用方注入的
+    /// 计数器定义。用 [`crate::post::TokenBudget::new`] 时单位是**字符数**，**不是**任何模型
+    /// 的 token 数（中文下两者不成固定比例，架构 `R63`）。字段名故意**单位中立**
+    /// —— 禁止把它读成 / 报成 token 数（设计 §20 `I-39`）。
+    ///
+    /// # 语义与填充路径
+    ///
+    /// - `Some(n)` ⟺ 后处理阶段报过数 ⇒ 编排层**对输出逐条 `explain.budget_units` 求和**；
+    /// - `Some(0)` ⟺ 后处理阶段把输出**截到 0 条**（合计确实是 `0`；此时响应带
+    ///   [`crate::query::response::EmptyReason::PostEmptied`]）；
+    /// - `None` ⟺ 本阶段**未参与**或**没报数**（默认 `post: None` / `TimeDecay` / `Mmr`）。
+    ///
+    /// 🔑 **为什么由编排层求和、而不是由后处理器直接写**：编排层**不持有计数器**
+    /// （计数器在 [`crate::post::TokenBudget`] 自己的字段里）⇒ 逐条信号是聚合面拿到真值的
+    /// **唯一**路径（设计 §20 `I-38`）。⚠️ 因此本字段量的是**输出**的合计，
+    /// **不含**被截掉的那些条目（它们的计数**不可观测** —— 这是有意的覆盖边界）。
+    pub budget_units: Option<usize>,
 }
 
 impl Metrics {
@@ -210,6 +231,7 @@ impl Metrics {
             tombstoned = self.tombstoned,
             fusion_weights = ?self.fusion_weights,
             fusion_signal = ?self.fusion_signal,
+            budget_units = ?self.budget_units,
             "search"
         );
     }
@@ -253,6 +275,11 @@ mod tests {
             "默认 = 未走自适应通道（S9-T10 关时不写）"
         );
         assert!(m.fusion_signal.is_none(), "默认 = 未走自适应通道");
+        // V2 Step 10 / S10-06：默认 = 后处理阶段未参与（不撒谎）
+        assert!(
+            m.budget_units.is_none(),
+            "默认 = 后处理未参与 / 未报数（S10-06 关时不写）"
+        );
     }
 
     /// `VectorRoute` **四态**齐全且 `Copy`（进 `Metrics` 后不该带来克隆成本）。
@@ -302,6 +329,7 @@ mod tests {
             tombstoned: 2,
             fusion_weights: Some(vec![0.0, 1.5]),
             fusion_signal: Some(0.5),
+            budget_units: Some(1234),
         };
         full.log("满指标");
     }

@@ -45,6 +45,9 @@ mod tests {
                 // V2 Step 10 / S10-05：`Explain` **再**新增一个字段（MMR 序位；同样破坏性）
                 // ⇒ 库内构造点继续同步。同上仍**显式列出**。
                 mmr_selected: None,
+                // V2 Step 10 / S10-06：`Explain` **第四次**新增字段（预算单位；同样破坏性）
+                // ⇒ 库内构造点继续同步。同上仍**显式列出**。
+                budget_units: None,
             },
         }
     }
