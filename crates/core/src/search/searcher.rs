@@ -827,4 +827,92 @@ mod tests {
             "后设的 `mmr` 必须覆盖先设的 `post`"
         );
     }
+    /// **V2 Step 10 / `S10-06`（门面段）**：`SearchIndexBuilder::token_budget` 必须真的流到编排层
+    /// （`parts.post` 生效 + **注入的计数器真的被调用** + 与 `post` 共用单槽 ⇒ **后设置者生效**）。
+    #[test]
+    fn S10_门面token_budget真的流到编排层() {
+        use crate::post::{PostProcessor, TokenCounter};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// 记录被调用次数的计数器（证明「**注入的那个**真的被用了」）。
+        struct SpyCounter(Arc<AtomicUsize>);
+        impl TokenCounter for SpyCounter {
+            fn count(&self, text: &str) -> usize {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                text.chars().count()
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::new(SpyCounter(Arc::clone(&calls)));
+
+        // ① builder → Config：`token_budget_with` 写进**已合并的单槽** `post`
+        let cfg = super::super::config::SearchIndexBuilder::default()
+            .embedder(Some(Arc::new(FakeEmbedder)))
+            .vector_backend(crate::search::VectorBackend::Brute)
+            .token_budget_with(2, counter)
+            .build_config();
+        assert_eq!(
+            cfg.post.as_ref().expect("① builder → Config 这一段").name(),
+            "token-budget",
+            "🔴 `token_budget_with(...)` 没有写进 `post` 槽（门面链路第一段就断了）"
+        );
+
+        // ② 端到端：预算 2 字符 ⇒ 一条都放不下 ⇒ 空结果 + `PostEmptied` + 计数器**真的被调用**
+        let mut idx =
+            SearchIndex::from_config(cfg, crate::search::VectorBackend::Brute, Default::default());
+        idx.add("BM25 是经典关键词检索算法").unwrap();
+        idx.add("向量检索把文本编码成向量").unwrap();
+        idx.commit().unwrap();
+        let resp = idx
+            .into_searcher()
+            .unwrap()
+            .search_with("检索")
+            .top_n(2)
+            .exec()
+            .unwrap();
+        assert!(resp.hits.is_empty(), "预算 2 字符 ⇒ 全被截掉");
+        assert_eq!(
+            resp.empty_reason,
+            Some(crate::query::EmptyReason::PostEmptied),
+            "🔴 门面链路走完仍无空原因 ⇒ 中间某段把 post 吞了（同 S8-08 的教训）"
+        );
+        assert!(
+            calls.load(Ordering::SeqCst) > 0,
+            "🔴 注入的计数器**一次都没被调用**（门面链路里断了：builder / Config / parts 任一段）"
+        );
+
+        // ③ 槽位规则（**后设置者生效**）：两个方向都钉住 —— 否则三处 rustdoc 的承诺无人守
+        struct AnyPost;
+        impl PostProcessor for AnyPost {
+            fn name(&self) -> &'static str {
+                "any-post"
+            }
+            fn process(
+                &self,
+                hits: Vec<crate::query::Hit>,
+                _k: usize,
+            ) -> crate::error::Result<Vec<crate::query::Hit>> {
+                Ok(hits)
+            }
+        }
+        let after = super::super::config::SearchIndexBuilder::default()
+            .token_budget(10)
+            .post(Arc::new(AnyPost))
+            .build_config();
+        assert_eq!(
+            after.post.as_ref().unwrap().name(),
+            "any-post",
+            "后设的 `post` 必须覆盖先设的 `token_budget`"
+        );
+        let after2 = super::super::config::SearchIndexBuilder::default()
+            .post(Arc::new(AnyPost))
+            .token_budget(10)
+            .build_config();
+        assert_eq!(
+            after2.post.as_ref().unwrap().name(),
+            "token-budget",
+            "后设的 `token_budget` 必须覆盖先设的 `post`"
+        );
+    }
 }
