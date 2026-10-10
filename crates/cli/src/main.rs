@@ -1274,6 +1274,7 @@ fn empty_reason_text(r: EmptyReason) -> &'static str {
         EmptyReason::NoDocuments => "索引为空",
         EmptyReason::AllTermsUnmatched => "查询词全部未命中（可能含幻觉词）",
         EmptyReason::FilteredOut => "候选被过滤条件全部排除",
+        EmptyReason::PostEmptied => "候选被后处理阶段全部丢弃（如 token budget 预算不足）",
     }
 }
 
