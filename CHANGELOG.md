@@ -9,6 +9,22 @@
 
 ## [Unreleased]
 
+### 功能 · V2 Step 10 `PR10-5`：T7-03 token budget 裁剪（`TokenBudget` + `budget_units` + `EmptyReason` 变体）（2026-10-10）
+
+- 新模块 `crates/core/src/post/token_budget.rs`：`TokenCounter` trait（**provided 默认 = 字符数**）/ `CharCounter` / **`TokenBudget`**（`PostProcessor` 的**第三个**实现）。
+- **超预算行为 = 顺序截断**（用户 **2026-10-10** 拍板；设计 §20 `I-36`）：放不下的那条**及其后全部丢弃**，**不**跳过去装更小的条目。
+- **`k` 仍是候选上界**、budget 是**第二道**截断；**不改窗口**（provided 默认 = `k` —— 与 `TimeDecay` 同族、与 `Mmr` **相反**，`I-41`）。
+- ⚠️ **破坏性 ①**：`Explain` 新增 **`budget_units: Option<u32>`**（**第四次**加字段）。
+  ⚠️ **破坏性 ②**：**`EmptyReason` 新增变体 `PostEmptied`** ⇒ 下游穷尽 `match` 会断（**本步首个「公开枚举加变体」**）；
+  库内（`query/searcher.rs`）与 `cli/src/main.rs` 的 `match` 已同步，CLI 文案 = 「候选被后处理阶段全部丢弃（如 token budget 预算不足）」。
+  ⚠️ 纯加法：`Metrics` 新增 `budget_units: Option<usize>`。
+- 🔴 **`Q10-6` 落实**（= `PR10-2` 第 1 轮评审 `P3-1` 的登记项 / 设计 §15 `I-17`）：预算把结果**截到 0 条**时，响应**不再静默空集** —— 报 `EmptyReason::PostEmptied`（变体名**不指名机制**：编排层分不清是哪个后处理器清空的，`I-37`）。
+- 🔴 **计数口径不撒谎**（`D-S10-10` / 架构 `R63`）：上报面字段名用**单位中立**的 `budget_units`，**不用**设计举例里的 `token_total` / `token_count`（叫 `token_*` 而装字符数正是禁止①的形态，`I-39`）；三处（trait / 构造器 / builder）明写「**默认单位 = 字符，不是 token**」；注入通道 `token_budget_with` 让调用方给真值。
+- 🔴 **可观测面的结构性理由**（`I-38`）：编排层**不持有计数器** ⇒ 逐条 `explain.budget_units` 是聚合面拿到真值的**唯一**路径（聚合 = 对**输出**逐条求和；被截掉的条目**不可观测** —— 有意边界，`S10-T45` 钉住）。
+- 接通面：`SearchIndexBuilder::token_budget(budget)` / `token_budget_with(budget, counter)`（**单槽 `post` 糖**、**后设置者生效**；**不新增 `Config` 字段** —— 同 `I-18` 口径，`I-40`）。**默认关** ⇒ 零行为变化。
+- 其它定值（`I-42 ~ I-45`）：`chars()`（**不是字节**）计数 / **本实现不产生 `Err`**（`usize` 预算无非法值；`budget == 0` 合法）/ 用例编号走未分配号段 `S10_T33 ~` / 两处防回绕（`saturating_add` + `u32` 饱和）。
+- 同批：设计 **§20**（实现期定值与偏差）+ 头部（**v0.13 → v0.14**）+ `docs/README.md` 索引行。
+
 ### 文档 · V2 Step 10 `PR10-4` 第 2 轮（响应验证型）评审响应（设计 v0.12 → v0.13）（2026-10-10）
 
 - 评审落点 = `issues/86/comments`（`6093473385`；`reviews` / 行内 / `reviewThreads` **均 0 ⇒ 无线程需回复**）。**结论：✅ 通过、0×P1/P2/P3；1×P4**（非阻塞）。
