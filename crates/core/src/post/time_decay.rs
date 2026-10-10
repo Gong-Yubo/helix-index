@@ -91,14 +91,17 @@ impl TimeDecay {
     }
 
     /// 「现在」的 unix 毫秒（= 时钟源的当前读数）。
-    pub fn now_ms(&self) -> i64 {
+    ///
+    /// ⚠️ `pub(crate)`（V2 Step 10 / 上游 `PR10-3` 评审 **P4-1**，本 PR 落地）：它是对
+    /// 时钟源的**薄封装**、只有本模块的 `process` 与单测在用 —— **没有外部消费者**
+    /// ⇒ 不进公开面（同族口径：设计 §15 `I-11`「不给没有消费者的公开 API」）。
+    pub(crate) fn now_ms(&self) -> i64 {
         (self.clock)()
     }
 
-    /// 时间字段名。
-    pub fn field(&self) -> &str {
-        &self.field
-    }
+    // ⚠️ 原先还有一个 `pub fn field(&self) -> &str`（返回时间字段名）—— 同一评审 **P4-1**
+    // 指出它**全仓只有本模块单测**在用 ⇒ 按本仓红线（**S8-05 先例：删掉而非 `#[allow]`**）
+    // **直接删除**。字段本身仍由调用方在构造时给出；「读回」不是任何已知需求。
 
     /// 从 `metadata` 读时间戳（整数毫秒）。
     ///
@@ -400,7 +403,6 @@ mod tests {
                 "🔴 时间衰减只重加权、不需要额外候选 ⇒ 不得覆盖 provided 默认（否则白付召回与回捞成本）"
             );
         }
-        assert_eq!(td.field(), "ts_ms");
         assert_eq!(td.now_ms(), NOW);
     }
 }
