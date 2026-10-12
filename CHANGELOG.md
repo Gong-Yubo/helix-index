@@ -9,6 +9,17 @@
 
 ## [Unreleased]
 
+### 功能 · V2 Step 10 `PR10-6`：T7-04 多 query 融合（`search_multi` + 设计 §23）（2026-10-12）
+
+- 新增 **`search_multi`** 的四个面（**全部纯加法**）：`query::searcher::search_multi_parts`（`search_parts` 变成它的**一层委托**）/ `QueryExecutor::search_multi` + `search_multi_filtered` / 门面 `Searcher::search_multi` + `search_multi_with` / `search::MultiSearchRequest`。
+- 🔴 **四项用户拍板（2026-10-12，`Q10-4` 收口）**：① **`k` 语义 = 全局 `k`**（`candidate_k` 算式**不变**，输出仍 ≤ `k`）；② **融合层次 = `N×2` 条 lane 一次融合**（lane 布局 = **每 query 两槽交织**、**缺路留空槽**）；③ **多 query 不接自适应融合** —— 同时开 `adaptive_fusion` ⇒ **显式 `Err(InvalidInput)`**（**不静默忽略**：`FusionCtx` 的 query 侧字段是单 query 语义，而它是公开导出结构体）；④ **`RrfFusion` 的权重按 lane 序号循环取**（`lane_idx % weights.len()`）。
+- ⚠️ **1 条表外发现（设计 §4.6 未覆盖）**：`RrfFusion` 的权重是**按 lane 序号**取的，而多 query 的 lane 数 = `2N` ⇒ 「超出即 1.0」的旧兜底会让**第 2 个 query 起丢掉本路权重**（**静默错加权**），且 `FusionStrategy` **无权重访问器** ⇒ 编排层**无法自检**。处置 = **循环取法 + 每 query 固定 2 槽**（`I-49` / §23.3）。
+  ⚠️ **语义变更**：`lanes.len() > weights.len()` 时由「超出即 1.0」改为「按序号循环」（**外部**直接调 `fuse` 的调用者会受影响）；⚠️ **编排层现有可达路径逐位不变**（Hybrid 恒 2 lane = 默认权重长度 ⇒ `%` 退化为「直接取」）。
+- ✅ **单 query 零回归（结构性）**：`search_parts` 委托到 `search_multi_parts`，`queries.len() == 1` 时每一项都退化为原语义 ⇒ `cargo test -p helix-core --lib` 的 **327 / 0 / 7 与改动前逐字一致**；另有 **`S10_T47`**（两模式逐位比 `hits` / `explain` 快照 / 5 个 `Metrics` 字段）**正面**钉住。
+- **其它定值（`I-50 ~ I-54`）**：多 query 下 `Explain` 的 lane 名次取**跨 query 最好名次**（`min`，**与 query 顺序无关**）；`Metrics.bm25` / `vector` / 两个 `elapsed` = **各 query 合计**、`vector_shortfall` = **各 query 最大缺口**（保守方向）；`matched_terms` = **各 query 命中词的并集**；`query_is_empty` 与空原因探针按 **any**；日志与精排用**空格拼接**的单串（⚠️ **已知边界**：精排**不**做「按 query 分别精排」（成本 ×N），须另立阶段）。
+- **用例**（走未分配号段 **`S10_T47 ~ S10_T54`** + 1 条门面用例）：映射与**变异表 `M1 ~ M7`** 见设计 §23.5，**7/7 全红**。⚠️ 其中 `M2`（名次取 `max`）**首轮未变红** —— 夹具退化（目标文档在两条 lane 上名次相同 ⇒ 判据对 min / max **无区分力**）⇒ 已**加前置断言**（夹具一退化即红）+ **换夹具**（q1 专属文档 tf 拉高，让名次可分辨：`rank_a=4 / rank_b=1`）。
+- 同批：设计 **§23**（实现期定值与偏差）+ 头部（**v0.16 → v0.17**，四件套）+ **§7.1** 号段说明（`S10-T47 ~`）+ **§8.4** 的 `PR10-6` 行（原判「触碰 `S9_T3` 白名单」⇒ 实际取形**未动**）+ **§6 影响面表** + `docs/README.md` 索引行。
+
 ### 文档 · V2 Step 10 `PR10-5` 第 2 轮（响应验证型）评审响应（设计 v0.15 → v0.16）（2026-10-10）
 
 - 评审落点 = `pulls/87/reviews`（`5478582994`，`COMMENTED`）+ **行内 1 条**（`docs/devel/v2-step10-design.md:6`）；`issues/87/comments` **无新增**。**结论：✅ 通过、0×P1/P2/P3；1×P4（文档，非阻塞）**；评审同时**独立复现**了第 1 轮三条处置（含**自造变异**验绊线牙齿），并 **resolve** 了那两条行内线程。
