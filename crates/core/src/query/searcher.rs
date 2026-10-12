@@ -201,7 +201,17 @@ pub fn search_multi_parts(
     //    取形 = **显式拒绝**，**不静默忽略** —— 否则「开关开了却走了别的通道」正是
     //    NFR-07 要防的静默降级（同 `S8-08` 的 `embed_sessions` 教训）。
     // ⚠️ 复用既有 `Error::InvalidInput`，**不新增公开枚举变体**（那会破坏下游穷尽 `match`）。
-    if queries.len() > 1 && parts.adaptive_fusion {
+    //
+    // 🔑 **判据是「自适应是否真的会生效」，不是「开关是否开着」**（第 1 轮评审 **P4-2**）：
+    //    自适应**结构上**只在 `mode == Hybrid` 被消费（见下方融合分支 ② / ③ 的注释），
+    //    `Bm25` / `Vector` 模式下 `adaptive_fusion = true` **连单 query 也是静默放行**的
+    //    （同一个开关、同一个模式）。若本守卫只看开关，`search_multi(Bm25)` +
+    //    `adaptive_fusion` 会**比单 query 更严** —— 拒绝一条自适应**根本不会被调用**的
+    //    路径，属**误拒**（把「单路模式下开关本来就无意义」的既有语义改掉了）。
+    //    ⇒ 条件里加上 `mode`，与「自适应只在 Hybrid 有语义」这一既有事实对齐。
+    //    ⚠️ `mode == Hybrid` 时仍是**显式拒绝**（不静默忽略）—— 那才是 NFR-07 防的
+    //    「开关开了却走了别的通道」。（`S10_T49` 的两条臂分别钉住这两半。）
+    if queries.len() > 1 && parts.adaptive_fusion && mode == SearchMode::Hybrid {
         return Err(Error::InvalidInput(
             "多 query 与 adaptive_fusion 不能同时使用：FusionCtx 的 query 侧字段是单 query 语义，\
              多 query 下的自适应需先扩展该公开面"
@@ -607,8 +617,15 @@ pub fn search_multi_parts(
     //
     // 🔑 为什么是 min 而不是「第一个 query」或「逐 query 覆盖」：`Explain.bm25_rank`
     //    自称的是「该 chunk **在该路**里的名次」；多 query 下若让每个 query 各写一次会
-    //    **谁最后写谁生效**（结果取决于 query 顺序，不可解释）。取最好名次是唯一
-    //    「对哪个 query 都说得通」且**与 query 顺序无关**的定义。
+    //    **谁最后写谁生效**（结果取决于 query 顺序，不可解释）。
+    //
+    // 🔴 **同名次必须再按分数取更好者**（第 1 轮评审 **P4-1**）：只比名次时，平名次保留
+    //    「**先遇到**的那条 lane」⇒ 配对的 `score` 仍随 **query 顺序**变（`bm25_score` /
+    //    `vector_score` 是 `Explain` 的**公开字段**，不能只在文档里含糊过去）。加上 score
+    //    tie-break 后，结果是「**最小名次、其上的最大分**」—— 名次与配对的 score
+    //    **都与 lane 顺序无关**（严格相等时两值相同 ⇒ 同样与顺序无关）。
+    //    ⚠️ 单 query 时 `bm25_lanes` / `vector_lanes` 各只有 1 条 ⇒ 同 chunk 至多出现一次
+    //    ⇒ tie-break 永不触发 ⇒ **既有行为逐位不变**（`S10_T47` 逐位钉住）。
     let lane_rank = |lanes: &[LaneResults]| -> HashMap<ChunkId, (u32, Score)> {
         let mut m: HashMap<ChunkId, (u32, Score)> = HashMap::new();
         for lane in lanes {
@@ -616,7 +633,8 @@ pub fn search_multi_parts(
                 let r = i as u32 + 1;
                 let better = match m.get(id) {
                     None => true,
-                    Some((cur, _)) => r < *cur,
+                    // 更好 = 名次更靠前；**同名次取分数更高者**（⇒ 与 lane / query 顺序无关）
+                    Some((cur, cur_s)) => r < *cur || (r == *cur && s > cur_s),
                 };
                 if better {
                     m.insert(*id, (r, *s));
@@ -3814,9 +3832,18 @@ mod tests {
             .unwrap();
         let got: std::collections::HashSet<ChunkId> = ids_of(&multi).into_iter().collect();
         println!("q1={s1:?} q2={s2:?} ⇒ multi={got:?}");
-        assert!(
-            got.len() <= 4,
-            "🔴 `k` 仍是**候选上界**（全局 `k` 语义）—— 多 query 不是「每 query 各取 k」"
+        // ⚠️ 原写 `got.len() <= 4` 并自称是「全局 `k` 语义」的判据 —— 第 1 轮评审 **P3-2** 实测
+        //    它**无牙齿**：融合最终被 `take(k)` 兜住，**任何**实现都会 ≤ `k`；且本夹具只有 4 篇、
+        //    每 query 2 篇命中，而 `candidate_k = max(3k, R, post_R, 10) ≥ 10` **从不 binding**
+        //    ⇒ 在这里「全局 `k`」与「每 query 各取 `k`」**不可分辨**（评审注入 M9 全绿为证；
+        //    我方独立复现：注入后全 lib **336 全绿、零命中**）。
+        //    ⇒ 换成**本夹具下确实有牙齿**的一条（漏召回任一 query / 过度截断都会红），
+        //    **「全局 `k` / `candidate_k`」的专属判据见 `S10_T55`**（其夹具放大到 `candidate_k` 会 binding）。
+        let want = s1.len() + s2.len();
+        assert_eq!(
+            got.len(),
+            want,
+            "🔴 两组共 {want} 篇、互不相交，且 `k = 4` 足以容纳 ⇒ 融合结果应**恰好**把两组都带回（实得 {got:?}）"
         );
         assert!(
             s1.is_subset(&got) && s2.is_subset(&got),
@@ -3847,14 +3874,24 @@ mod tests {
         );
     }
 
-    /// **S10-T49（用户 2026-10-12 拍板）**：**多 query 不得与自适应融合同用** ⇒ 显式 `Err`
-    /// （**不静默忽略** —— 否则「开关开了却走了别的通道」正是 NFR-07 要防的静默降级）。
+    /// **S10-T49（用户 2026-10-12 拍板；第 1 轮评审 P4-2 收窄）**：
+    /// **多 query 不得与自适应融合同用** ⇒ 显式 `Err`（**不静默忽略**）。
     ///
-    /// ⚠️ 对照臂：**单 query** 开着同一开关仍正常 ⇒ 证明「拒绝的是**组合**，不是开关本身」。
+    /// 🔑 **判据是「自适应会不会真的生效」，不是「开关开着没有」**（P4-2）：
+    /// ① **报错臂** = `Hybrid` —— 那才是「开关开了却走了别的通道」；
+    /// ② **对照臂 A** = **单 query + `Hybrid`** —— 开关本身没坏；
+    /// ③ **对照臂 B** = **多 query + `Bm25`** —— 单路模式下自适应**结构上不会被消费**
+    ///    （单 query 同模式也是静默放行）⇒ 必须**不**报错，否则是**误拒**。
     #[test]
     fn S10_T49_多query与自适应融合同用报Err() {
-        let (index, analyzer) = build_two_topic_fixture();
+        let (index, analyzer, vi) = build_hybrid_fixture(&[
+            "向量检索 使用 近似最近邻 计算 余弦相似度 甲",
+            "向量检索 使用 近似最近邻 计算 余弦相似度 乙",
+            "中文分词 与 倒排索引 的 工程 取舍 丙",
+        ]);
+        let emb = FakeEmbedder;
         let ex = QueryExecutor::new(&index, &analyzer)
+            .with_vector(&emb, &vi)
             .with_fusion(Box::new(RrfFusion::new_adaptive(
                 60.0,
                 vec![1.0, 1.5],
@@ -3862,17 +3899,32 @@ mod tests {
             )))
             .with_adaptive_fusion(true);
 
-        let e = ex
-            .search_multi(&["向量检索", "中文分词"], SearchMode::Bm25, 2)
+        // ① 报错臂：`Hybrid`（自适应真的会被消费）⇒ 必须显式报错
+        let err = ex
+            .search_multi(&["向量检索", "中文分词"], SearchMode::Hybrid, 2)
             .unwrap_err();
         assert!(
-            matches!(e, Error::InvalidInput(_)),
-            "🔴 多 query + adaptive_fusion 必须**显式报错**（实得 {e:?}）"
+            matches!(err, Error::InvalidInput(_)),
+            "🔴 多 query + Hybrid + adaptive_fusion 必须**显式报错**（实得 {err:?}）"
         );
 
-        // 对照臂：同一个装配、单 query ⇒ 正常（开关本身没坏）
-        let ok = ex.search_multi(&["向量检索"], SearchMode::Bm25, 2).unwrap();
-        assert!(!ok.hits.is_empty(), "对照臂：单 query + adaptive 仍可用");
+        // ② 对照臂 A：同一装配、单 query + Hybrid ⇒ 正常（开关本身没坏）
+        let ok = ex
+            .search_multi(&["向量检索"], SearchMode::Hybrid, 2)
+            .unwrap();
+        assert!(
+            !ok.hits.is_empty(),
+            "对照臂 A：单 query + Hybrid + adaptive 仍可用"
+        );
+
+        // ③ 对照臂 B：多 query + `Bm25` ⇒ 自适应结构上不会被调用 ⇒ **不得**报错（否则误拒）
+        let bm25 = ex
+            .search_multi(&["向量检索", "中文分词"], SearchMode::Bm25, 2)
+            .expect("🔴 单路模式（Bm25）下自适应不会被消费 ⇒ 不得拒绝多 query（那是误拒）");
+        assert!(
+            !bm25.hits.is_empty(),
+            "对照臂 B：多 query + Bm25 + adaptive 必须可用"
+        );
     }
 
     /// **S10-T50（退化输入）**：空 `queries` ⇒ `Err(InvalidInput)` —— **不**静默返回空响应
@@ -3899,15 +3951,17 @@ mod tests {
     /// —— 不硬编码期望值（夹具一改就假绿），而是「与单跑读数的最小值一致」。
     #[test]
     fn S10_T51_多query的名次取跨query最好名次() {
+        // 🔴 夹具需**同时**满足两件事（否则两条判据各自退化成恒真）：
+        //   ① 至少一个文档在两条 lane 上**名次不同**（钉住「取 min」有区分力）—— 这里是文档 0
+        //      （`rank_a = 3 / rank_b = 1`）；
+        //   ② **至少一个**文档在两条 lane 上**名次相同、而分数不同**（钉住「平名次取更好者」
+        //      —— 第 1 轮评审 **P4-1** 要的正是这一条）—— 这里是文档 2
+        //      （`rank_a = rank_b = 2`，`score_a = 0.3009… / score_b = 1.0591…`）。
+        //   ⚠️ 实测形状（探针打印、与断言交叉核对）：`a = [1, 2, 0]`、`b = [0, 2]`。
         let (index, analyzer) = build_index(&[
-            // 前三篇把 q1 词面的 tf 拉高 ⇒ 目标文档（第 4 篇）在 **q1 lane 里名次靠后**，
-            // 而在 **q2 lane 里是唯一的 rank 1** ⇒ 两条 lane 的名次**必然不同**
-            // （否则「取 min 还是取 max」观察不到 —— 上面有前置断言守着）。
-            "向量检索 向量检索 向量检索 向量检索 甲",
-            "向量检索 向量检索 向量检索 向量检索 乙",
-            "向量检索 向量检索 向量检索 向量检索 丙",
-            // 目标：两个 query 词面都含 ⇒ 同时出现在两条 lane 里
-            "向量检索 中文分词 丁",
+            "向量检索 中文分词 中文分词 中文分词",
+            "向量检索 向量检索 向量检索 甲",
+            "向量检索 中文分词 乙",
         ]);
         let ex = QueryExecutor::new(&index, &analyzer);
         let (q1, q2) = ("向量检索", "中文分词");
@@ -3935,7 +3989,7 @@ mod tests {
         //    「取 min 还是取 max」**观察不到**（等同）⇒ 本用例会退化成恒真。故显式要求
         //    **至少一个**名次不同的文档，并要求它命中「最好名次」。
         let mut differing = 0usize;
-        for id in both {
+        for &id in &both {
             let ra = rank_in(&a, id);
             let rb = rank_in(&b, id);
             let (Some(x), Some(y)) = (ra, rb) else {
@@ -3960,6 +4014,49 @@ mod tests {
         assert!(
             differing > 0,
             "🔴 夹具退化：没有任何文档在两条 lane 里名次不同 ⇒ 本判据对 min / max **无区分力**，必须换夹具"
+        );
+
+        // 🔴 **`Explain` 必须与 query 顺序无关**（第 1 轮评审 **P4-1**）：`I-50` 原写「与 query
+        //    顺序无关」，但只比名次时**平名次**保留「**先遇到**的那条 lane」⇒ 配对的 `score`
+        //    仍随 query 顺序变（`Explain.bm25_score` 是**公开字段**，不能只在文档里含糊过去）。
+        //    修法 = tie-break 再比 score ⇒ **逆序跑一遍**，`(rank, score)` 必须**逐位一致**。
+        //    ⚠️ 本判据的**牙齿**见下面的前置断言：夹具必须含「两条 lane 名次相同、分数不同」的文档，
+        //    否则「取更好者」与「取先遇到者」观察不到（文档 5 就是为此加的）。
+        let score_in = |r: &SearchResponse, id: ChunkId| -> Option<Score> {
+            r.hits
+                .iter()
+                .find(|h| h.chunk_id == id)
+                .and_then(|h| h.explain.bm25_score)
+        };
+        let flat: Vec<ChunkId> = both
+            .iter()
+            .copied()
+            .filter(|id| {
+                let (ra, rb) = (rank_in(&a, *id), rank_in(&b, *id));
+                ra.is_some()
+                    && ra == rb
+                    && score_in(&a, *id).is_some()
+                    && score_in(&a, *id) != score_in(&b, *id)
+            })
+            .collect();
+        assert!(
+            !flat.is_empty(),
+            "🔴 夹具退化：不存在「在两条 lane 上**名次相同、而分数不同**」的文档 ⇒ \
+             「平名次取更好者」与「取先遇到者」不可分辨，本判据会退化成恒真（实得 flat={flat:?}）"
+        );
+
+        let rev = ex.search_multi(&[q2, q1], SearchMode::Bm25, 8).unwrap();
+        let keyed = |r: &SearchResponse| -> std::collections::BTreeMap<ChunkId, (Option<u32>, Option<Score>)> {
+            r.hits
+                .iter()
+                .map(|h| (h.chunk_id, (h.explain.bm25_rank, h.explain.bm25_score)))
+                .collect()
+        };
+        assert_eq!(
+            keyed(&m),
+            keyed(&rev),
+            "🔴 多 query 的 `(bm25_rank, bm25_score)` 必须**与 query 顺序无关**\
+             （平名次时取分更高者 ⇒ 逆序跑必须逐位一致）"
         );
     }
 
@@ -4042,6 +4139,70 @@ mod tests {
             "🔴 两个 query 的 rank-1 文档必须**同权**（平局按 `chunk_id` 升序）；\
              若第 2 条 lane 吃到了 vector 的权重，这里会变成 2（实得 {:?}）",
             ids2
+        );
+    }
+
+    /// **S10-T55（第 1 轮评审 P3-2 ⇒ 拍板 `Q10-4①`「全局 `k`」的专属判据）**。
+    ///
+    /// 🔴 为什么需要它：`S10_T48` 原写的 `got.len() <= 4` 对「全局 `k` vs 每 query 各取 `k`」
+    /// **无区分力** —— 融合最终被 `take(k)` 兜住，任何实现都 ≤ `k`；且那个夹具只有 4 篇、
+    /// `candidate_k = max(3k, R, post_R, 10) ≥ 10` **从不 binding**。评审据此注入 **M9**
+    /// （多 query 各取 `k`、单 query 不动）⇒ **全 lib 336 全绿、零命中**（我方独立复现一致）。
+    ///
+    /// 判据取形 = **让 `candidate_k` 真的 binding**：夹具里每个 query 都有 **20 篇**命中，
+    /// 而 `k = 2` ⇒ `candidate_k = max(3k, R, post_R, 10) = 10`（默认精排 / 后处理窗口 = `k`）
+    /// ⇒ 每条 lane 的深度 = `min(candidate_k, 命中数) = 10`：
+    ///
+    /// - `Metrics.bm25`（= **各 query** 该路长度**之和**）= `2 × candidate_k`；
+    /// - `Metrics.candidates`（= 融合候选数，被 `candidate_k` 截）= `candidate_k`。
+    ///
+    /// 「每 query 各取 `k`」的实现让两处分别退化成 `2k = 4` 与 `4` ⇒ **两条断言同时变红**。
+    #[test]
+    fn S10_T55_多query的召回深度是全局candidate_k() {
+        // 每个 query 20 篇命中（远超 `candidate_k = 10`）⇒ 召回深度**可观测**
+        let mut texts: Vec<String> = Vec::new();
+        for i in 0..20 {
+            texts.push(format!("向量检索 使用 近似最近邻 计算 余弦相似度 甲{i}"));
+        }
+        for i in 0..20 {
+            texts.push(format!("中文分词 与 倒排索引 的 工程 取舍 乙{i}"));
+        }
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let (index, analyzer) = build_index(&refs);
+        let ex = QueryExecutor::new(&index, &analyzer);
+
+        let k = 2usize;
+        // 与本 PR 默认装配套路一致（默认精排 / 后处理窗口都 = `k`）：
+        // `candidate_k = max(3k, R, post_R, 10)`（三个窗口项在默认装配下都 = `k`）。
+        let candidate_k = (3 * k).max(k).max(k).max(10);
+        assert!(
+            candidate_k > k,
+            "前提：`candidate_k` 必须大于 `k`（否则本判据对两种语义无区分力）"
+        );
+
+        let m = ex
+            .search_multi(&["向量检索", "中文分词"], SearchMode::Bm25, k)
+            .unwrap();
+        println!(
+            "k={k} candidate_k={candidate_k} ⇒ metrics.bm25={} candidates={}",
+            m.metrics.bm25, m.metrics.candidates
+        );
+
+        assert_eq!(
+            m.metrics.bm25,
+            2 * candidate_k,
+            "🔴 每个 query 必须按**同一个 `candidate_k`** 召回 ⇒ `Metrics.bm25` = 2 × {candidate_k}；\
+             若实现是「每 query 各取 `k`」，这里会是 2 × {k} = {}（实得 {}）",
+            2 * k,
+            m.metrics.bm25
+        );
+        assert_eq!(
+            m.metrics.candidates,
+            candidate_k,
+            "🔴 融合候选数被 `candidate_k` 截 ⇒ 必须 = {candidate_k}；\
+             「每 query 各取 `k`」时为 {}（实得 {}）",
+            2 * k,
+            m.metrics.candidates
         );
     }
 }
