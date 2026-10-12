@@ -154,6 +154,69 @@ pub fn search_parts(
     k: usize,
     filter: Option<&crate::schema::Filter>,
 ) -> Result<SearchResponse> {
+    // ⚠️ 单 query 路径**逐位等价**于 V2 Step 10 `S10-07` 之前（验收 **S10-6 ②**）：
+    //    本函数只是一层委托，`queries.len() == 1` 时下面的实现对每一项都退化为原语义。
+    search_multi_parts(parts, std::slice::from_ref(&query), mode, k, filter)
+}
+
+/// **多 query 融合**的编排（V2 Step 10 / `S10-07` / `D-S10-11` / **FR-21**；用户 **2026-10-12** 拍板）。
+///
+/// # 四项拍板（设计 §23 的实现期定值节）
+///
+/// 1. **`k` 的语义 = 全局 `k`**：每个 query 的各路都按**同一个** `candidate_k` 召回，
+///    一次融合后取全局 top-`k` ⇒ `k` 的含义与单 query 一致，`candidate_k` 算式不变。
+/// 2. **融合层次 = `N×2` 条 lane 一次融合**（复用现成 [`FusionStrategy::fuse`]；RRF 原论文形态）。
+/// 3. **多 query 不接自适应融合**：同时开 `adaptive_fusion` ⇒ **显式 `Err`**（见下）。
+/// 4. **权重按 lane 序号循环取**（`RrfFusion`，见 `fusion::rrf`）⇒ 配合下面的
+///    「每 query 固定 2 槽、缺路留空槽」布局，**每条 lane 吃到其 route 的权重**。
+///
+/// # lane 布局（决定权重怎么落到 route 上）
+///
+/// ```text
+/// Hybrid：  [bm25@q1, vector@q1, bm25@q2, vector@q2, …]      // 2N 条，无空槽
+/// Bm25：    [bm25@q1, ∅,         bm25@q2, ∅, …]              // 空槽占位（N≥2 时）
+/// Vector：  [∅, vector@q1,       ∅, vector@q2, …]
+/// ```
+///
+/// ⚠️ **空槽不删**（`I9-2` 的同精神）：删掉它会让后续 lane 的序号左移、权重串到另一路。
+/// ⚠️ **`len == 1` 时不改变既有语义**：单路模式仍走「lane 直通」（`hits.score` = 原路分，
+/// 不引入 RRF 分），Hybrid 仍是两路融合 —— 那是「单 query 零回归」的硬验收。
+pub fn search_multi_parts(
+    parts: &SearchParts<'_>,
+    queries: &[&str],
+    mode: SearchMode,
+    k: usize,
+    filter: Option<&crate::schema::Filter>,
+) -> Result<SearchResponse> {
+    // ⚠️ 退化输入：一个 query 都没有 ⇒ 没有「检索什么」可言 ⇒ **显式 `Err`**
+    //    （不静默返回空响应——那会让调用方以为「检索过了、没结果」，NFR-07）。
+    if queries.is_empty() {
+        return Err(Error::InvalidInput(
+            "search_multi 至少需要一个 query（收到 0 个）".to_string(),
+        ));
+    }
+    // ⚠️ **多 query 不接自适应融合**（用户 2026-10-12 拍板）：`FusionCtx` 的
+    //    `query_terms` / `query_chars` / `has_ascii` / `query_df` **全是单 query 语义**，
+    //    而它是**公开导出**结构体（加字段属**破坏性**，且白名单由 `S9_T3` 钉死）⇒
+    //    取形 = **显式拒绝**，**不静默忽略** —— 否则「开关开了却走了别的通道」正是
+    //    NFR-07 要防的静默降级（同 `S8-08` 的 `embed_sessions` 教训）。
+    // ⚠️ 复用既有 `Error::InvalidInput`，**不新增公开枚举变体**（那会破坏下游穷尽 `match`）。
+    if queries.len() > 1 && parts.adaptive_fusion {
+        return Err(Error::InvalidInput(
+            "多 query 与 adaptive_fusion 不能同时使用：FusionCtx 的 query 侧字段是单 query 语义，\
+             多 query 下的自适应需先扩展该公开面"
+                .to_string(),
+        ));
+    }
+    // 「本次查询」的**单串形态**（多 query 用**空格**连接）：同时供
+    // ① `Metrics::log` 的 `query` 字段、② `Reranker::rerank(query, …)` 与
+    // ③ 空结果原因里的 query 侧判断使用。
+    //
+    // ⚠️ **1 个 query 时 == 该 query 本身** ⇒ 日志 / 精排 / 空原因**逐字不变**。
+    // ⚠️ **已知边界**（实现期定值，如实登记）：多 query 下精排器拿到的是**拼接后的串**，
+    //    内核**不**为每个 query 各跑一次精排再合并（那会让精排成本 ×N）；想要「按 query
+    //    分别精排」需要另立阶段，本步不做。
+    let query_label: String = queries.join(" ");
     let started = Instant::now();
     let mut metrics = Metrics::default();
 
@@ -183,8 +246,20 @@ pub fn search_parts(
         Some(set) => set.n == 0,
         None => parts.index.num_chunks() == 0,
     };
-    let query_tokens = parts.analyzer.analyze_query(query);
-    let query_is_empty = query_tokens.is_empty();
+    // `query_tokens`：按 query 顺序**拼接**（供 df 覆盖率探针；`df_coverage` 内部按词去重）
+    // —— 1 个 query 时与改动前**逐位相同**（同一个 `analyze_query` 的唯一结果）。
+    // `query_is_empty`：**所有** query 都无词项才算空（多 query 下「任一 query 有词」即非空，
+    // 与下方 `query_has_hits_any` 的 any 口径对齐）。
+    let mut query_tokens: Vec<crate::analyze::Token> = Vec::new();
+    let mut any_query_has_terms = false;
+    for q in queries {
+        let t = parts.analyzer.analyze_query(q);
+        if !t.is_empty() {
+            any_query_has_terms = true;
+        }
+        query_tokens.extend(t);
+    }
+    let query_is_empty = !any_query_has_terms;
 
     if index_is_empty {
         // D-S5-08：`metrics.took` 必须与响应的 `took` **同值**（旧代码保持
@@ -253,7 +328,11 @@ pub fn search_parts(
             // query 本身就无命中时，报"你的过滤太窄"是误导——Agent 会去调过滤条件，
             // 而真正的问题在 query。故此处也跑一次词典探针（O(query 词数)，
             // 相比省下的一次完整检索可忽略）。
-            let reason = if query_is_empty || !query_has_hits_any(parts, segmented, query) {
+            let reason = if query_is_empty
+                || !queries
+                    .iter()
+                    .any(|q| query_has_hits_any(parts, segmented, q))
+            {
                 determine_empty_reason(false, query_is_empty, 0)
             } else {
                 Some(super::response::EmptyReason::FilteredOut)
@@ -263,7 +342,7 @@ pub fn search_parts(
             // ⇒ 日志打印 `took_ms=0` 而响应的 `took` 是真值，「日志与响应各说一套」。
             let took = started.elapsed();
             metrics.took = took;
-            metrics.log(query);
+            metrics.log(&query_label);
             return Ok(empty_response(reason, took, metrics));
         }
     };
@@ -355,97 +434,139 @@ pub fn search_parts(
     // 有没有向量路是编排层的信息，不该由后端编码）。
     let vec_route = vec_lane.as_ref().map_or(VectorRoute::None, |l| l.route());
 
-    let (bm25_lane, vector_lane) = match mode {
-        SearchMode::Bm25 => {
-            let t = Instant::now();
-            let lane = to_lane(bm25_recall(parts, segmented, query, candidate_k, bm25_f)?);
-            metrics.bm25_elapsed = t.elapsed();
-            (Some(lane), None)
+    // 2'. 各 query 的召回：**逐 query 循环**（`queries.len() == 1` 时循环体只跑一次
+    //     ⇒ 与 `S10-07` 之前**逐位相同**）。
+    //
+    // ⚠️ `vec_route` / `vector_segments` 在上方**一次性**填：它们只取决于装配
+    //    （载具 / 后端），**与 query 无关**。
+    // ⚠️ 计时口径（多 query）：`bm25_elapsed` / `vector_elapsed` = **各 query 的耗时之和**
+    //    （「本次检索在这两路上一共花了多少」）；1 个 query 时就等于原值。
+    let mut bm25_lanes: Vec<LaneResults> = Vec::with_capacity(queries.len());
+    let mut vector_lanes: Vec<LaneResults> = Vec::with_capacity(queries.len());
+    let mut bm25_elapsed = Duration::ZERO;
+    let mut vector_elapsed = Duration::ZERO;
+    // `SearchMode::Bm25` 不走向量路 ⇒ `vector_route` 保持 `None`（同改动前）。
+    if mode != SearchMode::Bm25 {
+        metrics.vector_route = vec_route;
+    }
+    for q in queries {
+        match mode {
+            SearchMode::Bm25 => {
+                let t = Instant::now();
+                let lane = to_lane(bm25_recall(parts, segmented, q, candidate_k, bm25_f)?);
+                bm25_elapsed += t.elapsed();
+                bm25_lanes.push(lane);
+            }
+            SearchMode::Vector => {
+                // 上方已解析过一次，这里复用；用 `ok_or` 而非 `expect`
+                // ⇒ 检索主路径不留 panic 分支（不可达，但不可达不等于该 panic）。
+                let vec = vec_lane.as_ref().ok_or(Error::NoEmbedder)?;
+                let t = Instant::now();
+                let lane = to_lane(vec.run(q, candidate_k, vec_f)?);
+                vector_elapsed += t.elapsed();
+                vector_lanes.push(lane);
+            }
+            SearchMode::Hybrid => {
+                let vec = vec_lane.as_ref().ok_or(Error::NoEmbedder)?;
+                // 并行执行；谓词是 Send + Sync，可安全跨 rayon 线程共享。
+                // 每路各自计时：Hybrid 下单一 `took` 无法归因"是哪一路慢"
+                // （D-S5-06；架构 §8.3 的示例日志本就预期 bm25=/vector= 两列）。
+                let (r1, r2) = rayon::join(
+                    || {
+                        let t = Instant::now();
+                        let r = bm25_recall(parts, segmented, q, candidate_k, bm25_f);
+                        (r, t.elapsed())
+                    },
+                    || {
+                        let t = Instant::now();
+                        let r = vec.run(q, candidate_k, vec_f);
+                        (r, t.elapsed())
+                    },
+                );
+                bm25_elapsed += r1.1;
+                vector_elapsed += r2.1;
+                bm25_lanes.push(to_lane(r1.0?));
+                vector_lanes.push(to_lane(r2.0?));
+            }
         }
-        SearchMode::Vector => {
-            // 上方已解析过一次，这里复用；用 `ok_or` 而非 `expect`
-            // ⇒ 检索主路径不留 panic 分支（不可达，但不可达不等于该 panic）。
-            let vec = vec_lane.as_ref().ok_or(Error::NoEmbedder)?;
-            metrics.vector_route = vec_route;
-            let t = Instant::now();
-            let lane = to_lane(vec.run(query, candidate_k, vec_f)?);
-            metrics.vector_elapsed = t.elapsed();
-            (None, Some(lane))
-        }
-        SearchMode::Hybrid => {
-            let vec = vec_lane.as_ref().ok_or(Error::NoEmbedder)?;
-            metrics.vector_route = vec_route;
-            // 并行执行；谓词是 Send + Sync，可安全跨 rayon 线程共享。
-            // 每路各自计时：Hybrid 下单一 `took` 无法归因"是哪一路慢"
-            // （D-S5-06；架构 §8.3 的示例日志本就预期 bm25=/vector= 两列）。
-            let (r1, r2) = rayon::join(
-                || {
-                    let t = Instant::now();
-                    let r = bm25_recall(parts, segmented, query, candidate_k, bm25_f);
-                    (r, t.elapsed())
-                },
-                || {
-                    let t = Instant::now();
-                    let r = vec.run(query, candidate_k, vec_f);
-                    (r, t.elapsed())
-                },
-            );
-            metrics.bm25_elapsed = r1.1;
-            metrics.vector_elapsed = r2.1;
-            (Some(to_lane(r1.0?)), Some(to_lane(r2.0?)))
-        }
-    };
-
-    metrics.bm25 = bm25_lane.as_ref().map_or(0, |l| l.len());
-    metrics.vector = vector_lane.as_ref().map_or(0, |l| l.len());
+    }
+    metrics.bm25_elapsed = bm25_elapsed;
+    metrics.vector_elapsed = vector_elapsed;
+    metrics.bm25 = bm25_lanes.iter().map(|l| l.len()).sum();
+    metrics.vector = vector_lanes.iter().map(|l| l.len()).sum();
     // 缺口必须相对「本该拿到的条数」，而不是 `candidate_k`——候选池本身就不足
     // `candidate_k` 时（小语料 / 高选择度过滤）`candidate_k - len` 恒为正，指标会被
     // 噪声淹没，而它的用途是判断 filtered-ANN 是否**真的**降级了（V2.1 prefilter 判据）。
-    metrics.vector_shortfall = vector_lane.as_ref().map_or(0, |l| {
-        candidate_k.min(metrics.allowed).saturating_sub(l.len())
-    });
+    // ⚠️ 多 query：取**各 query 里的最大缺口**（任一 query 的向量路不足 ⇒ 该信号就该亮；
+    //    取 min 会把它藏起来）。1 个 query 时与原值相同。
+    metrics.vector_shortfall = vector_lanes
+        .iter()
+        .map(|l| candidate_k.min(metrics.allowed).saturating_sub(l.len()))
+        .max()
+        .unwrap_or(0);
 
-    // 3. 融合（或单路直通）。**过滤已在召回期下推**，这里不再做 retain（原 1.5 节已删）
-    let mut lanes: Vec<LaneResults> = Vec::new();
-    if let Some(l) = &bm25_lane {
-        lanes.push(l.clone());
-    }
-    if let Some(l) = &vector_lane {
-        lanes.push(l.clone());
-    }
-
-    // 单路模式：直接用该路结果作为"融合"输出（分数即单路分数）。
-    // V2 Step 9（D-S9-01 / D-S9-03）：自适应只在 Hybrid 下有语义（单路没有
-    // 「两路分歧」可言）⇒ 开关只在 Hybrid 分支被消费。
-    let fused: Vec<(ChunkId, Score)> = if mode == SearchMode::Hybrid {
-        if parts.adaptive_fusion {
-            // 规则 2：构造 FusionCtx（零拷贝借用 lanes；df 探针只查词典、不回捞正文）
-            // → 走自适应通道（决策与应用都在策略内部——编排层不消费 `w`）。
-            let lane_stats: Vec<LaneStats<'_>> =
-                lanes.iter().map(|l| LaneStats::new(l.as_slice())).collect();
-            let ctx = FusionCtx {
-                lanes: &lane_stats,
-                query_terms: query_tokens.len(),
-                query_chars: query.chars().count(),
-                has_ascii: query.chars().any(|c| c.is_ascii_alphanumeric()),
-                query_df: df_coverage(parts.index, segmented, &query_tokens),
-                top_k: k,
-            };
-            let fused = parts.fusion.fuse_adaptive(&lanes, candidate_k, &ctx);
-            // 规则 3（第 3 轮评审 P4-9）：`weights_override` / `fusion_signal` 都是
-            // `&self` 纯函数 ⇒ 对同一 ctx 再调一次必然得到与决策时相同的值。
-            // （为什么不让 `fuse_adaptive` 顺路带回：那会破坏它与 `fuse` 同形的
-            // 「默认转发」、也破坏 S9-T6 的等价性判据；共享可变状态则破坏
-            // `Send + Sync` 与并发逐位一致——排除法见设计 §4.1。）
-            metrics.fusion_weights = parts.fusion.weights_override(&ctx);
-            metrics.fusion_signal = parts.fusion.fusion_signal(&ctx);
-            fused
-        } else {
-            // 规则 1：开关关 ⇒ 不构造 ctx、不调 fuse_adaptive（S9-2 结构性逐位一致）
-            parts.fusion.fuse(&lanes, candidate_k)
+    // 3. lane 组装 + 融合。**过滤已在召回期下推**，这里不再做 retain（原 1.5 节已删）。
+    //
+    // ⚠️ 两条 lane 布局（**决定权重如何落到 route 上**，见 `search_multi_parts` 的文档）：
+    //    · **单 query**（`single`）：**逐字保持既有布局**（两路各自一个槽；缺失的路**没有槽**）
+    //      —— 这是「单 query 零回归」的硬验收（`S10-6` ②）。
+    //    · **多 query**：**每 query 固定 2 槽**（缺路留**空槽**，**不删** —— 删了会让后续
+    //      lane 序号左移、权重串到另一路），交织后一次融合。
+    let single = queries.len() == 1;
+    let lanes: Vec<LaneResults> = if single {
+        let mut v: Vec<LaneResults> = Vec::new();
+        if let Some(l) = bm25_lanes.first() {
+            v.push(l.clone());
         }
+        if let Some(l) = vector_lanes.first() {
+            v.push(l.clone());
+        }
+        v
     } else {
+        let mut v: Vec<LaneResults> = Vec::with_capacity(2 * queries.len());
+        for i in 0..queries.len() {
+            v.push(bm25_lanes.get(i).cloned().unwrap_or_default());
+            v.push(vector_lanes.get(i).cloned().unwrap_or_default());
+        }
+        v
+    };
+
+    // 融合三分支：
+    //   ① **单 query + 单路模式** ⇒ **直通**（分数即单路分数，**不**引入融合分 —— 与改动前
+    //      逐位一致；`SearchMode::Bm25` 下 `hits.score` 必须是原 BM25 分）；
+    //   ② **单 query + Hybrid + 自适应开关开** ⇒ 构造 `FusionCtx` 走自适应通道；
+    //   ③ 其余（单 query Hybrid 关开关 / **多 query**） ⇒ 一次 `fuse`。
+    // V2 Step 9（D-S9-01 / D-S9-03）：自适应只在 Hybrid 下有语义（单路没有「两路分歧」
+    // 可言）⇒ 开关只在分支 ② 被消费。
+    let fused: Vec<(ChunkId, Score)> = if single && mode != SearchMode::Hybrid {
         lanes.into_iter().flatten().collect()
+    } else if single && parts.adaptive_fusion {
+        // 规则 2：构造 FusionCtx（零拷贝借用 lanes；df 探针只查词典、不回捞正文）
+        // → 走自适应通道（决策与应用都在策略内部——编排层不消费 `w`）。
+        let q = queries[0];
+        let lane_stats: Vec<LaneStats<'_>> =
+            lanes.iter().map(|l| LaneStats::new(l.as_slice())).collect();
+        let ctx = FusionCtx {
+            lanes: &lane_stats,
+            query_terms: query_tokens.len(),
+            query_chars: q.chars().count(),
+            has_ascii: q.chars().any(|c| c.is_ascii_alphanumeric()),
+            query_df: df_coverage(parts.index, segmented, &query_tokens),
+            top_k: k,
+        };
+        let fused = parts.fusion.fuse_adaptive(&lanes, candidate_k, &ctx);
+        // 规则 3（第 3 轮评审 P4-9）：`weights_override` / `fusion_signal` 都是
+        // `&self` 纯函数 ⇒ 对同一 ctx 再调一次必然得到与决策时相同的值。
+        // （为什么不让 `fuse_adaptive` 顺路带回：那会破坏它与 `fuse` 同形的
+        // 「默认转发」、也破坏 S9-T6 的等价性判据；共享可变状态则破坏
+        // `Send + Sync` 与并发逐位一致——排除法见设计 §4.1。）
+        metrics.fusion_weights = parts.fusion.weights_override(&ctx);
+        metrics.fusion_signal = parts.fusion.fusion_signal(&ctx);
+        fused
+    } else {
+        // 规则 1：开关关 ⇒ 不构造 ctx、不调 `fuse_adaptive`（S9-2 结构性逐位一致）；
+        // 多 query ⇒ 也走这条（多 query **不接**自适应，已在入口显式拒绝）。
+        parts.fusion.fuse(&lanes, candidate_k)
     };
 
     metrics.candidates = fused.len();
@@ -456,7 +577,11 @@ pub fn search_parts(
         //
         // 下推后 lane 结果已是过滤后的，"本来有候选但被过滤光"这个信号丢失了，
         // 因此用 `query_has_hits` 词典探针还原它（O(query 词数)，成本可忽略）。
-        let reason = if query_is_empty || !query_has_hits_any(parts, segmented, query) {
+        let reason = if query_is_empty
+            || !queries
+                .iter()
+                .any(|q| query_has_hits_any(parts, segmented, q))
+        {
             determine_empty_reason(false, query_is_empty, 0)
         } else if filter.is_some() {
             Some(super::response::EmptyReason::FilteredOut)
@@ -465,7 +590,7 @@ pub fn search_parts(
         };
         let took = started.elapsed();
         metrics.took = took;
-        metrics.log(query);
+        metrics.log(&query_label);
         return Ok(empty_response(reason, took, metrics));
     }
 
@@ -477,18 +602,31 @@ pub fn search_parts(
     // **线性放大**（设计 §2.4 的设计期新发现 B），而窗口里被精排截掉的候选（最多
     // `R − k` 条）算了就白算 ⇒ 推迟到第 5 步、只对最终 ≤ `k` 条算。
     // 代价是精排器**看不到** `explain` 的这部分（读侧契约，见 `Reranker::rerank`）。
-    let lane_rank = |lane: &Option<LaneResults>| -> HashMap<ChunkId, (u32, Score)> {
-        lane.as_ref()
-            .map(|l| {
-                l.iter()
-                    .enumerate()
-                    .map(|(i, (id, s))| (*id, (i as u32 + 1, *s)))
-                    .collect()
-            })
-            .unwrap_or_default()
+    // 名次映射：**跨 query 取最好名次**（多 query 下 = 「该 chunk 在**任一** query 的该路里
+    // 取得的最好名次」；1 个 query 时就是原值，逐位一致）。
+    //
+    // 🔑 为什么是 min 而不是「第一个 query」或「逐 query 覆盖」：`Explain.bm25_rank`
+    //    自称的是「该 chunk **在该路**里的名次」；多 query 下若让每个 query 各写一次会
+    //    **谁最后写谁生效**（结果取决于 query 顺序，不可解释）。取最好名次是唯一
+    //    「对哪个 query 都说得通」且**与 query 顺序无关**的定义。
+    let lane_rank = |lanes: &[LaneResults]| -> HashMap<ChunkId, (u32, Score)> {
+        let mut m: HashMap<ChunkId, (u32, Score)> = HashMap::new();
+        for lane in lanes {
+            for (i, (id, s)) in lane.iter().enumerate() {
+                let r = i as u32 + 1;
+                let better = match m.get(id) {
+                    None => true,
+                    Some((cur, _)) => r < *cur,
+                };
+                if better {
+                    m.insert(*id, (r, *s));
+                }
+            }
+        }
+        m
     };
-    let bm25_rank = lane_rank(&bm25_lane);
-    let vector_rank = lane_rank(&vector_lane);
+    let bm25_rank = lane_rank(&bm25_lanes);
+    let vector_rank = lane_rank(&vector_lanes);
 
     // ⚠️ **`k == 0` 必须单独挡掉**（PR #53 评审 P3-1）：`window.max(k)` 会让
     // `take_n == window`（> 0）⇒ 把**整个窗口**交给精排、跑完模型再被安全网截回 0 条
@@ -585,7 +723,9 @@ pub fn search_parts(
     // （差 > 0 ⇒ 本次窗口里有已不可回捞的 chunk）。
     let handed = proto.len();
     let t_rerank = Instant::now();
-    let mut hits = parts.reranker.rerank(query, proto, k)?;
+    // ⚠️ 多 query 下精排器拿到的是**空格拼接的查询串**（见上方 `query_label` 的边界说明）；
+    //    1 个 query 时与改动前**逐位相同**。
+    let mut hits = parts.reranker.rerank(&query_label, proto, k)?;
     metrics.rerank_elapsed = t_rerank.elapsed();
     metrics.rerank_window = handed;
 
@@ -610,7 +750,20 @@ pub fn search_parts(
     // 「谁后写谁生效」会把 D-S7-05 的信号冲掉（`Reranker::rerank` 的出参契约）。
     // 本循环只写下面 5 个字段 ⇒ 天然不碰 `rerank_score`；`S7_T12` 有用例钉住这一点。
     for h in &mut hits {
-        h.explain.matched_terms = matched_terms(parts.analyzer, query, &h.text);
+        // 多 query：**各 query 的命中词取并集**（按 query 顺序拼接、去重）；
+        // 1 个 query 时 == 原值（同一个 `matched_terms` 调用的唯一结果，逐位一致）。
+        h.explain.matched_terms = {
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut out: Vec<String> = Vec::new();
+            for q in queries {
+                for t in matched_terms(parts.analyzer, q, &h.text) {
+                    if seen.insert(t.clone()) {
+                        out.push(t);
+                    }
+                }
+            }
+            out
+        };
         h.explain.bm25_score = bm25_rank.get(&h.chunk_id).map(|(_, s)| *s);
         h.explain.bm25_rank = bm25_rank.get(&h.chunk_id).map(|(r, _)| *r);
         h.explain.vector_score = vector_rank.get(&h.chunk_id).map(|(_, s)| *s);
@@ -641,7 +794,7 @@ pub fn search_parts(
     metrics.fused = hits.len();
     let took = started.elapsed();
     metrics.took = took;
-    metrics.log(query);
+    metrics.log(&query_label);
 
     Ok(SearchResponse {
         hits,
@@ -1030,6 +1183,34 @@ impl<'a> QueryExecutor<'a> {
     ) -> Result<SearchResponse> {
         let parts = self.parts();
         search_parts(&parts, query, mode, k, filter)
+    }
+
+    /// **多 query 融合检索**（V2 Step 10 / `S10-07` / **FR-21**）。
+    ///
+    /// 语义、四项拍板（全局 `k` / `N×2` 一次融合 / 不接自适应 / 权重按 lane 循环）
+    /// 与 lane 布局见 [`search_multi_parts`] 的文档。
+    ///
+    /// ⚠️ **`queries.len() == 1` 时与 [`Self::search`] 逐位一致**（那样才谈得上「单 query
+    /// 路径零回归」）；⚠️ 空切片、或「多 query + `adaptive_fusion`」⇒ `Err(InvalidInput)`。
+    pub fn search_multi(
+        &self,
+        queries: &[&str],
+        mode: SearchMode,
+        k: usize,
+    ) -> Result<SearchResponse> {
+        self.search_multi_filtered(queries, mode, k, None)
+    }
+
+    /// 带元数据过滤的多 query 检索（过滤语义同 [`Self::search_filtered`]）。
+    pub fn search_multi_filtered(
+        &self,
+        queries: &[&str],
+        mode: SearchMode,
+        k: usize,
+        filter: Option<&crate::schema::Filter>,
+    ) -> Result<SearchResponse> {
+        let parts = self.parts();
+        search_multi_parts(&parts, queries, mode, k, filter)
     }
 }
 

@@ -21,4 +21,4 @@ pub use index::{
     AddOutcome, CompactionReport, GraphStatus, MergeReport, SearchIndex, SizeBytes, TombstoneStats,
     VectorMergeStrategy,
 };
-pub use searcher::{SearchRequest, Searcher};
+pub use searcher::{MultiSearchRequest, SearchRequest, Searcher};
