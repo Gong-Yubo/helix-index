@@ -87,8 +87,21 @@ impl RrfFusion {
         // chunk_id → 累计分
         let mut acc: HashMap<ChunkId, f32> = HashMap::new();
 
+        // ⚠️ 权重**按 lane 序号循环取**（`lane_idx % weights.len()`），**不是**「超出即 1.0」
+        // （V2 Step 10 / `S10-07` / `D-S10-11` 的连带定值；用户 **2026-10-12** 拍板）。
+        //
+        // 🔑 为什么：多 query 融合的 lane 数 = `2N`（每 query 两个 route 槽位）⇒ 只靠
+        // 「序号直接取」会让**第 2 个 query 起丢掉本路权重**（落 `unwrap_or(1.0)`）——
+        // 那是**静默错加权**。循环取法配合编排层「每 query 固定 2 槽、缺路留空槽」的
+        // 布局（`query::searcher::search_multi_parts`），使**每条 lane 都吃到其 route
+        // 的权重**。⚠️ 空槽**不删**（I9-2 的同精神：删槽会让权重串到另一路）。
+        //
+        // ✅ **单 query 路径逐位不变**：编排层只在 `Hybrid` 下调 `fuse`、恒传 2 条 lane，
+        // 而 `weights` 默认 2 项 ⇒ `lane_idx % 2 == lane_idx`，与改动前**完全相同**。
+        // ⚠️ 边界：`weights` 为空时 `period = 1` ⇒ 一律 1.0（与改动前同）。
+        let period = weights.len().max(1);
         for (lane_idx, lane) in lanes.iter().enumerate() {
-            let w = weights.get(lane_idx).copied().unwrap_or(1.0);
+            let w = weights.get(lane_idx % period).copied().unwrap_or(1.0);
             for (rank, (chunk_id, _)) in lane.iter().enumerate() {
                 // rank 从 1 起
                 let contribution = w / (self.k + (rank as f32 + 1.0));
@@ -130,9 +143,12 @@ impl FusionStrategy for RrfFusion {
     /// （`Metrics.fusion_weights` 的可观测语义，S9-T7 ① 的判据面）。
     fn weights_override(&self, ctx: &FusionCtx<'_>) -> Option<Vec<f32>> {
         let rule = self.adaptive?;
-        // 与 lanes 一一对应（含空 lane 槽位；超出的 lane 沿用 fuse 的 1.0 兜底口径）
+        // 与 lanes 一一对应（含空 lane 槽位）。⚠️ 取法与 [`Self::fuse_weighted`] **同源**
+        // （按 lane 序号**循环**取，V2 Step 10 `S10-07` 的连带定值）—— 否则「报出去的权重」
+        // 与「实际生效的权重」会在 lane 数 > `weights.len()` 时**分叉**。
+        let period = self.weights.len().max(1);
         let mut w: Vec<f32> = (0..ctx.lanes.len())
-            .map(|i| self.weights.get(i).copied().unwrap_or(1.0))
+            .map(|i| self.weights.get(i % period).copied().unwrap_or(1.0))
             .collect();
         // tier 1：某 lane 为空 ⇒ 该路权重置 0（🔴 不删槽——权重按 lane 序号取）
         for (i, lane) in ctx.lanes.iter().enumerate() {
@@ -495,5 +511,55 @@ mod tests {
             .map(|(id, _)| *id)
             .collect();
         assert_eq!(zero_scored, vec![5, 9], "0 分条目按 chunk_id 升序");
+    }
+
+    /// **S10-T54（V2 Step 10 / `S10-07` 的连带定值；用户 2026-10-12 拍板）**：
+    /// 权重**按 lane 序号循环取**（`lane_idx % weights.len()`）—— 多 query 融合的
+    /// lane 数 = `2N` > `weights.len()`（默认 2）时，每条 lane 仍吃到**它那一路**的权重；
+    /// 旧的「超出即 1.0」兜底会让**第 2 个 query 起丢掉本路权重**（静默错加权）。
+    ///
+    /// 判据（可分辨）：3 条 lane 各含一个**不同**的 chunk、`weights = [0.5, 2.0]`、`k = 60`
+    /// ⇒ lane 2（序号 2）的贡献必须是 **0.5/61**（循环取 `weights[0]`）而**不是 1.0/61**。
+    #[test]
+    fn S10_T54_权重按lane序号循环取() {
+        let lanes: Vec<LaneResults> = vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(2, 1.0)]];
+        let out = RrfFusion::new(60.0, vec![0.5, 2.0]).fuse(&lanes, 10);
+        let score_of = |id: ChunkId| {
+            out.iter()
+                .find(|(i, _)| *i == id)
+                .map(|(_, s)| *s)
+                .unwrap_or_else(|| panic!("chunk {id} 必须在融合结果里"))
+        };
+        assert!(
+            (score_of(0) - 0.5 / 61.0).abs() < 1e-7,
+            "lane 0 ⇒ `weights[0]`"
+        );
+        assert!(
+            (score_of(1) - 2.0 / 61.0).abs() < 1e-7,
+            "lane 1 ⇒ `weights[1]`"
+        );
+        assert!(
+            (score_of(2) - 0.5 / 61.0).abs() < 1e-7,
+            "🔴 lane 2 ⇒ `weights[0]`（**循环**）；旧「超出即 1.0」会得 1.0/61 = {}",
+            1.0 / 61.0
+        );
+
+        // ✅ 单 query 路径不变：2 条 lane + 2 项权重 ⇒ `%` 退化为「直接取」，逐位相同
+        let two: Vec<LaneResults> = vec![vec![(0, 1.0)], vec![(1, 1.0)]];
+        let out2 = RrfFusion::new(60.0, vec![0.5, 2.0]).fuse(&two, 10);
+        let s2 = |id: ChunkId| {
+            out2.iter()
+                .find(|(i, _)| *i == id)
+                .map(|(_, s)| *s)
+                .unwrap()
+        };
+        assert!((s2(0) - 0.5 / 61.0).abs() < 1e-7 && (s2(1) - 2.0 / 61.0).abs() < 1e-7);
+
+        // ⚠️ 边界：空 `weights` ⇒ 一律 1.0（与改动前同；`period` 用 `max(1)` 兜住除零）
+        let out3 = RrfFusion::new(60.0, Vec::new()).fuse(&two, 10);
+        assert!(
+            out3.iter().all(|(_, s)| (*s - 1.0 / 61.0).abs() < 1e-7),
+            "空权重 ⇒ 全部 1.0（不得 panic / 不得 NaN）"
+        );
     }
 }

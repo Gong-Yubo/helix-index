@@ -11,7 +11,7 @@ use std::sync::Arc;
 use crate::error::{Error, Result};
 use crate::predicate::{CandidateFilter, FilterKind};
 use crate::query::filter::{doc_bits, BuiltPredicates, PredicateBuilder};
-use crate::query::searcher::{search_parts, SearchParts};
+use crate::query::searcher::{search_multi_parts, search_parts, SearchParts};
 use crate::query::{SearchMode, SearchResponse};
 use crate::schema::Filter;
 
@@ -137,6 +137,30 @@ impl Searcher {
         }
     }
 
+    /// **多 query 融合检索**（V2 Step 10 / `S10-07` / **FR-21**）。
+    ///
+    /// 与 [`Self::search`] 同族：`mode` **自动推断**（有向量侧 ⇒ `Hybrid`，否则 `Bm25`）、
+    /// `top_n` 默认 `10`。多个 query 由调用方给（内核**不做**改写 / 扩展 / HyDE —— FR-21 原话）。
+    ///
+    /// ⚠️ 三项前置（否则 `Err(InvalidInput)`）：① `queries` 非空；
+    /// ② `queries.len() == 1` 时与 [`Self::search`] **逐位一致**；
+    /// ③ **多 query 不得同时开 `Config::adaptive_fusion`**（该通道的 query 侧字段是
+    /// 单 query 语义，多 query 下须先扩展公开面）。
+    pub fn search_multi(&self, queries: &[&str]) -> Result<SearchResponse> {
+        self.search_multi_with(queries).exec()
+    }
+
+    /// 多 query 的 builder 形态：承载可选参数（`mode` / `top_n` / `filter`）。
+    pub fn search_multi_with<'a>(&'a self, queries: &'a [&'a str]) -> MultiSearchRequest<'a> {
+        MultiSearchRequest {
+            searcher: self,
+            queries,
+            mode: None,
+            top_n: 10,
+            filter: None,
+        }
+    }
+
     /// 把 `view` 投影成借用型 `SearchParts`（编排内核的输入）。
     ///
     /// ⚠️ `S8-02` 期 `deltas` 恒空 ⇒ 只用 `view.main`；跨段在 `S8-04` / `S8-05`。
@@ -226,6 +250,22 @@ impl Searcher {
     ) -> Result<SearchResponse> {
         let parts = self.parts(view);
         search_parts(&parts, query, mode, top_n, filter)
+    }
+
+    /// 执行**多 query** 检索（内部实现，供 [`MultiSearchRequest::exec`] 调用）。
+    ///
+    /// ⚠️ 与 [`Self::run`] 同一条 `I8-3` 纪律：`view` 由调用方**取一次**并传入
+    /// （一次检索只用一个 `View`——否则 BM25 与向量可能看到不同的段集合）。
+    pub(crate) fn run_multi(
+        &self,
+        view: &View,
+        queries: &[&str],
+        mode: SearchMode,
+        top_n: usize,
+        filter: Option<&Filter>,
+    ) -> Result<SearchResponse> {
+        let parts = self.parts(view);
+        search_multi_parts(&parts, queries, mode, top_n, filter)
     }
 
     /// 换回写端（用同一 `Arc<Shared>` 造一个新写端）。
@@ -335,6 +375,55 @@ impl From<&str> for ModeArg {
 impl From<String> for ModeArg {
     fn from(s: String) -> Self {
         ModeArg::Raw(s)
+    }
+}
+
+/// `search_multi_with(queries)` 的 builder：与 [`SearchRequest`] **同形**（同一套可选参数）。
+///
+/// ⚠️ 与 [`SearchRequest`] 的**唯一语义差别**：`queries` 是**切片**（多 query 融合），
+/// 且 `queries.len() > 1` 时**不得**同时开 `Config::adaptive_fusion`（⇒ `Err(InvalidInput)`）。
+pub struct MultiSearchRequest<'a> {
+    searcher: &'a Searcher,
+    queries: &'a [&'a str],
+    mode: Option<ModeArg>,
+    top_n: usize,
+    filter: Option<&'a Filter>,
+}
+
+impl<'a> MultiSearchRequest<'a> {
+    /// 检索模式：接受 `SearchMode`、`&str` 或 `String`。
+    ///
+    /// 字符串解析延迟到 [`Self::exec`]，失败统一返回 `Error::InvalidInput`
+    /// （同 `SearchRequest::mode`，builder 阶段无法 `?`）。
+    pub fn mode<M: Into<ModeArg>>(mut self, mode: M) -> Self {
+        self.mode = Some(mode.into());
+        self
+    }
+
+    /// 返回条数（默认 10）。
+    pub fn top_n(mut self, top_n: usize) -> Self {
+        self.top_n = top_n;
+        self
+    }
+
+    /// 元数据过滤（FR-14）。
+    pub fn filter(mut self, filter: &'a Filter) -> Self {
+        self.filter = Some(filter);
+        self
+    }
+
+    /// 收口执行检索。
+    pub fn exec(self) -> Result<SearchResponse> {
+        // ⚠️ I8-3：**一次检索只取一次视图快照**（同 `SearchRequest::exec`）——
+        //    否则可能出现「BM25 用 v1 的段、向量用 v2 的段」⇒ 跨 lane 语义不一致。
+        let view = self.searcher.shared.snapshot();
+        let mode = match self.mode {
+            None => self.searcher.infer_mode(&view),
+            Some(ModeArg::Resolved(m)) => m,
+            Some(ModeArg::Raw(s)) => SearchMode::parse(&s).map_err(Error::InvalidInput)?,
+        };
+        self.searcher
+            .run_multi(&view, self.queries, mode, self.top_n, self.filter)
     }
 }
 
@@ -913,6 +1002,48 @@ mod tests {
             after2.post.as_ref().unwrap().name(),
             "token-budget",
             "后设的 `token_budget` 必须覆盖先设的 `post`"
+        );
+    }
+
+    /// **V2 Step 10 / `S10-07`（门面段 / FR-21）**：`Searcher::search_multi` 端到端可用，
+    /// 且 `search_multi(&[q])` 与 `search(q)` **逐位一致** —— 门面链路上没有任何一段
+    /// 把 `queries` 吃掉或降级成单 query（同 `S8-08` / `S9-T1` / `S10-T2` 的「每段都有判据」纪律）。
+    #[test]
+    fn S10_门面search_multi真的流到编排层() {
+        let s = build_hybrid();
+
+        // ① 单 query：与 `search(q)` 逐位一致（`f32` 用 `to_bits`）
+        let a = s.search("检索").unwrap();
+        assert!(!a.hits.is_empty(), "前提：检索有结果");
+        let b = s.search_multi(&["检索"]).unwrap();
+        let bits = |r: &SearchResponse| {
+            r.hits
+                .iter()
+                .map(|h| (h.chunk_id, h.score.to_bits()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            bits(&a),
+            bits(&b),
+            "🔴 门面：`search_multi(&[q])` 必须与 `search(q)` 逐位一致"
+        );
+
+        // ② 多 query：可用 + builder 的 `top_n` 真的生效
+        let c = s
+            .search_multi_with(&["检索", "向量"])
+            .top_n(1)
+            .exec()
+            .unwrap();
+        assert_eq!(
+            c.hits.len(),
+            1,
+            "🔴 `top_n(1)` 必须生效（builder 链路没断）"
+        );
+
+        // ③ 多 query 默认装配（未开 adaptive）⇒ 正常返回
+        assert!(
+            !s.search_multi(&["检索", "向量"]).unwrap().hits.is_empty(),
+            "🔴 门面多 query 链路断了（query::search_multi_parts 没被调到）"
         );
     }
 }
