@@ -563,10 +563,15 @@ pub fn search_parts(
     // ⚠️ 后处理**变更 `hits` 的长度是允许的**（token budget 就是第二道截断，
     //    设计 §4.5）⇒ 这里**不**设「不得超 `k`」的安全网（那是 `Reranker` 的契约）。
     //    但实现**必须**把长度 / 排序依据的变化经 `Explain` / `Metrics` 暴露（D-S10-09 / NFR-07）。
+    // ⚠️ 「本阶段把候选清空」的判据要在**调用前**取入参长度（`S10-06` / 设计 §9.2 `Q10-6`）：
+    //    编排层只看得见「入参非空、出参为空」⇒ `EmptyReason::PostEmptied` 的名字**不指名机制**。
+    let pre_post_len = proto.len();
+    let post_ran = parts.post.is_some();
     let proto = match parts.post {
         None => proto,
         Some(p) => p.process(proto, k)?,
     };
+    let post_emptied = post_ran && pre_post_len > 0 && proto.is_empty();
 
     // 5. 精排（V2 Step 7）。入参是**候选窗口**（可能 > `k`），出参应 ≤ `k` 条。
     //
@@ -612,6 +617,27 @@ pub fn search_parts(
         h.explain.vector_rank = vector_rank.get(&h.chunk_id).map(|(r, _)| *r);
     }
 
+    // 后处理观测面（`S10-06` / D-S10-10）：编排层**不持有计数器** ⇒ 只能对后处理器逐条写在
+    // `explain.budget_units` 上的计数求和（设计 §20 `I-38`）。⚠️ 量的是**输出**的合计 ——
+    // 被截掉的条目**不可观测**，这是有意的覆盖边界。
+    let mut units_seen = false;
+    let mut units_sum = 0usize;
+    for h in &hits {
+        if let Some(u) = h.explain.budget_units {
+            units_seen = true;
+            units_sum += u as usize;
+        }
+    }
+    // `Some(0)` 有两种来源（**不能**互换，`PR10-5` 第 1 轮评审 P4-1）：① 后处理阶段把输出
+    // **截到 0 条**（`post_emptied`）；② **输出非空、但每条都是 0 单位**（正文为空 + `budget == 0`，
+    // 即 `S10_T38` 如实登记的推论 —— 此时无 `PostEmptied`）。两者都与「本阶段压根没参与」的
+    // `None` 区分开（不撒谎）。⚠️ 「`Some(0)` ⟺ 截到 0 条」只有 `⇐` 成立。
+    metrics.budget_units = if units_seen || post_emptied {
+        Some(units_sum)
+    } else {
+        None
+    };
+
     metrics.fused = hits.len();
     let took = started.elapsed();
     metrics.took = took;
@@ -620,7 +646,13 @@ pub fn search_parts(
     Ok(SearchResponse {
         hits,
         total_candidates: metrics.candidates,
-        empty_reason: None,
+        // `Q10-6` 的落地（`S10-06`）：**入参非空、出参为空** ⇒ 本阶段把候选清空了。
+        // ⚠️ 与三条早退的原因不冲突 —— 那三条在更早的出口返回，走不到这里。
+        empty_reason: if post_emptied {
+            Some(super::response::EmptyReason::PostEmptied)
+        } else {
+            None
+        },
         took,
         metrics,
     })
@@ -3393,5 +3425,116 @@ mod tests {
             vec![0, 1],
             "两条的序位集合仍是 {{0, 1}}（错开的只是**位置**）"
         );
+    }
+    /// **V2 Step 10 / `S10-06`（编排层）**：token budget **未装** ⇒ 零回归，
+    /// 且 `budget_units`（逐条与聚合）都是 `None`（不撒谎）。
+    #[test]
+    fn S10_T43_token_budget未装时零回归且两面均None() {
+        use crate::post::TokenBudget;
+
+        const Q: &str = "向量检索 余弦相似度";
+        let (index, analyzer) = build_redundant_index();
+        let a = QueryExecutor::new(&index, &analyzer)
+            .search(Q, SearchMode::Bm25, 2)
+            .unwrap();
+        assert!(!a.hits.is_empty(), "前提：该 query 本来有结果");
+        assert!(a.metrics.budget_units.is_none(), "没装 ⇒ 聚合面 None");
+        assert!(
+            a.hits.iter().all(|h| h.explain.budget_units.is_none()),
+            "没装 ⇒ 逐条也是 None"
+        );
+
+        // 装了但预算极大 ⇒ 内容与 A 逐位一致（`budget_units` 是**新增信号**，按定义不同）
+        let b = QueryExecutor::new(&index, &analyzer)
+            .with_post(Arc::new(TokenBudget::new(usize::MAX)))
+            .search(Q, SearchMode::Bm25, 2)
+            .unwrap();
+        assert_eq!(ids_of(&a), ids_of(&b), "预算足够 ⇒ 条数与次序都不变");
+        for (x, y) in a.hits.iter().zip(&b.hits) {
+            assert_eq!(x.score.to_bits(), y.score.to_bits(), "分数逐位一致");
+            assert_eq!(explain_snapshot(x), explain_snapshot(y));
+            assert_eq!(
+                y.explain.budget_units,
+                Some(y.text.chars().count() as u32),
+                "装了 ⇒ 每条都计过数（单位 = 字符）"
+            );
+        }
+        assert!(b.metrics.budget_units.is_some(), "装了 ⇒ 聚合面有值");
+    }
+
+    /// **S10-T44（`Q10-6` 的落地 / 用户 2026-10-10 拍板）**：预算把结果**截到 0 条**时，
+    /// 响应必须报 [`crate::query::response::EmptyReason::PostEmptied`]（**不再静默空集**），
+    /// 且聚合面 = `Some(0)`。
+    #[test]
+    fn S10_T44_预算截到零条时报PostEmptied() {
+        use crate::post::TokenBudget;
+        use crate::query::response::EmptyReason;
+
+        const Q: &str = "向量检索 余弦相似度";
+        let (index, analyzer) = build_redundant_index();
+        // 前提：不装时本来有结果（否则本用例是空转 —— 空集不是本阶段造成的）
+        let base = QueryExecutor::new(&index, &analyzer)
+            .search(Q, SearchMode::Bm25, 2)
+            .unwrap();
+        assert!(!base.hits.is_empty(), "前提：该 query 本来有结果");
+
+        // 预算 1 字符 ⇒ 语料正文都远长于 1 ⇒ 一条都放不下
+        let r = QueryExecutor::new(&index, &analyzer)
+            .with_post(Arc::new(TokenBudget::new(1)))
+            .search(Q, SearchMode::Bm25, 2)
+            .unwrap();
+        println!(
+            "budget=1 ⇒ hits={} reason={:?} units={:?}",
+            r.hits.len(),
+            r.empty_reason,
+            r.metrics.budget_units
+        );
+        assert!(r.hits.is_empty(), "预算 1 字符 ⇒ 全被截掉");
+        assert_eq!(
+            r.empty_reason,
+            Some(EmptyReason::PostEmptied),
+            "🔴 `Q10-6`：截到 0 条必须**报原因**（此前是静默 `None`）"
+        );
+        assert_eq!(r.metrics.budget_units, Some(0), "输出合计确实是 0");
+        assert_eq!(r.metrics.fused, 0);
+    }
+
+    /// **S10-T45（验收① 的编排层读数 / `I-38`）**：`Metrics.budget_units` = **输出**逐条计数之和，
+    /// 且**不含**被截掉的条目；保留的正是**序首**那条（= 顺序截断）。
+    #[test]
+    fn S10_T45_聚合面等于输出逐条计数之和() {
+        use crate::post::TokenBudget;
+
+        const Q: &str = "向量检索 余弦相似度";
+        let (index, analyzer) = build_redundant_index();
+        let base = QueryExecutor::new(&index, &analyzer)
+            .search(Q, SearchMode::Bm25, 4)
+            .unwrap();
+        assert!(base.hits.len() >= 2, "前提：至少 2 条候选");
+        let first = base.hits[0].text.chars().count();
+        assert!(first > 1, "前提：首条正文长度 > 1（好让预算恰好只容下它）");
+
+        // 预算 = 首条长度 ⇒ 只放得下首条（第 2 条计数 ≥ 1 ⇒ `used + n > budget`）
+        let r = QueryExecutor::new(&index, &analyzer)
+            .with_post(Arc::new(TokenBudget::new(first)))
+            .search(Q, SearchMode::Bm25, 4)
+            .unwrap();
+        println!(
+            "budget={first} ⇒ {:?}（合计 {:?}）",
+            ids_of(&r),
+            r.metrics.budget_units
+        );
+        assert_eq!(r.hits.len(), 1, "只放得下首条");
+        assert_eq!(
+            r.hits[0].chunk_id, base.hits[0].chunk_id,
+            "保留的正是**序首**那条（顺序截断）"
+        );
+        assert_eq!(r.hits[0].explain.budget_units, Some(first as u32));
+        assert_eq!(
+            r.metrics.budget_units,
+            Some(first),
+            "🔴 聚合面 = 输出逐条之和（**不含**被截掉的）"
+        );
+        assert_eq!(r.empty_reason, None, "非空 ⇒ 不得报空原因");
     }
 }

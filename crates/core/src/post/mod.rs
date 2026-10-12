@@ -36,12 +36,19 @@
 //!   否则多样性无从发生）⇒ 显式覆盖 [`PostProcessor::candidate_window`]。⚠️ 它还**改变
 //!   `hits` 的排序依据**（输出按 MMR 选择顺序，不再是 `score` 降序）⇒ 属 `D-S10-09` /
 //!   架构 `R62` 明文处置的一档。
+//! - [`TokenBudget`]（**预算裁剪**，`S10-06` / `FR-25`）—— 计数口径（注入计数器 / 默认字符数）、
+//!   超预算行为（**顺序截断**）与两条禁止见 [`token_budget`]。
+//!   ⚠️ 与 `TimeDecay` **同族**：**不改窗口**（预算只裁已有候选 ⇒ 用 provided 默认 = `k`）。
+//!   ⚠️ 与 `Mmr` 的**分野**：MMR 改**序**不改分；本阶段改**长度**、不动序也不动分
+//!   （第二道截断）⇒ 同样属 `D-S10-09` 的一档。
 
 pub mod mmr;
 pub mod time_decay;
+pub mod token_budget;
 
 pub use mmr::Mmr;
 pub use time_decay::TimeDecay;
+pub use token_budget::{CharCounter, TokenBudget, TokenCounter};
 
 use crate::error::Result;
 use crate::query::response::Hit;
@@ -79,10 +86,12 @@ use crate::query::response::Hit;
 /// `Hit::score` 的 rustdoc 声明「`hits` 恒按本字段降序、同分按 `chunk_id` 升序（NFR-06）」，
 /// 下游可能据此设阈值 / 跨配置比较 / 缓存排序结果 ⇒ 静默改变是**缺陷**（NFR-07）。
 ///
-/// ⚠️ **返回空是允许的**：编排层会照常产出响应 —— 此时 `hits` 为空、**`empty_reason` 仍为 `None`**
-/// （现状：三条早退各有原因，唯独本阶段清空这条出口没有）。
-/// 该口径**待定**（是否新增 `EmptyReason` 变体 / 由编排层补一句），见设计 §9.2 `Q10-6`
-/// 与 §15 `I-17` —— 在它落地前，**本条描述的是现行行为**，不是承诺。
+/// ⚠️ **返回空是允许的**：编排层会照常产出响应。自 `S10-06`（`PR10-5`）起，
+/// 「**入参非空、出参为空**」会被编排层记为
+/// [`crate::query::response::EmptyReason::PostEmptied`] —— 设计 §9.2 `Q10-6` 已按用户
+/// 2026-10-10 拍板**新增变体**收口（定值 → 设计 §20 `I-37`）。此前该出口**没有原因**
+/// （静默空集，来源 = `PR10-2` 第 1 轮评审 `P3-1` / §15 `I-17`）。
+/// ⚠️ 变体名**不指名机制**：编排层只看得见「入参非空、出参为空」，分不清是哪个实现清空的。
 ///
 /// ⚠️ **出参长度不设上界**：token budget **必然**会改变长度（它是「第二道截断」），
 /// 所以本 trait **不能**照抄 `Reranker::rerank` 的「调用方按 `top_n` 再截一次」安全网。

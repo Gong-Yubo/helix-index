@@ -18,7 +18,7 @@ use crate::chunk::Chunker;
 use crate::embed::Embedder;
 use crate::error::Result;
 use crate::fusion::{FusionStrategy, RrfFusion};
-use crate::post::{PostProcessor, TimeDecay};
+use crate::post::{PostProcessor, TimeDecay, TokenBudget, TokenCounter};
 use crate::rerank::{NoOpReranker, Reranker};
 use crate::retriever::Bm25Params;
 
@@ -303,6 +303,42 @@ impl SearchIndexBuilder {
             .clone()
             .unwrap_or_else(|| Arc::new(MixedAnalyzer::new()));
         self.post = Some(Arc::new(crate::post::Mmr::new(lambda, analyzer, pool)));
+        self
+    }
+
+    /// 装配 **token budget 裁剪**（`S10-06` / FR-25）—— 用**默认计数器（字符数）**。
+    ///
+    /// ⚠️ **`budget` 的单位是字符，不是 token**：内核没有目标模型的 tokenizer
+    /// （设计 §2.5 `N4`）⇒ 把它当 token 预算用会**静默失准**（中文下两者不成固定比例，`R63`）。
+    /// 想要真 token 预算请用 [`Self::token_budget_with`] 注入计数器。
+    ///
+    /// ⚠️ **不改窗口**（预算只裁已有候选 ⇒ `candidate_window` 走 provided 默认 = `k`）——
+    /// 与 [`Self::time_decay`] 同族、与 [`Self::mmr`] **相反**。
+    ///
+    /// ⚠️ **会改变 `hits` 的长度**（第二道截断）⇒ 属 `D-S10-09` 处置的一档：
+    /// ① 可观测 = [`crate::query::Explain::budget_units`] +
+    /// [`crate::query::Metrics::budget_units`] + `empty_reason`（截到 0 条时）；
+    /// ② **默认关**（不调用本方法即零行为变化）。
+    /// 细节（计数口径 / 两条禁止 / 超预算行为）见 [`crate::post::TokenBudget`]。
+    ///
+    /// ⚠️ **与 [`Self::post`] / [`Self::time_decay`] / [`Self::mmr`] 是同一个槽位**
+    /// （后处理只有一个位置）⇒ **后设置者生效**。需要串联多个后处理器时，请自己实现一个
+    /// [`crate::post::PostProcessor`] 来组合它们。
+    ///
+    /// ⚠️ **不新增 `Config` 字段**（同 `PR10-3` 的 `I-18` 口径：`Config.post` 是**单槽**，
+    /// 本方法只是构造 [`crate::post::TokenBudget`] 写进它）⇒ 见设计 §20 `I-40`。
+    pub fn token_budget(self, budget: usize) -> Self {
+        self.token_budget_with(budget, Arc::new(crate::post::CharCounter))
+    }
+
+    /// 装配 **token budget 裁剪**，并**注入计数器**（预算单位随 `counter` 定义）。
+    ///
+    /// 想要「按目标模型计的 token 预算」时用本入口：实现 [`crate::post::TokenCounter`]
+    /// 并传进来，则 `Metrics.budget_units` / `Explain.budget_units` 的单位随之**一致**。
+    ///
+    /// 其余语义（不改窗口 / 改长度 / 单槽后设覆盖 / 不新增 `Config` 字段）见 [`Self::token_budget`]。
+    pub fn token_budget_with(mut self, budget: usize, counter: Arc<dyn TokenCounter>) -> Self {
+        self.post = Some(Arc::new(TokenBudget::with_counter(budget, counter)));
         self
     }
 
