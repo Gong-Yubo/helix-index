@@ -3718,4 +3718,330 @@ mod tests {
         );
         assert_eq!(r.empty_reason, None, "非空 ⇒ 不得报空原因");
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // V2 Step 10 / `S10-07`（**多 query 融合** / FR-21 / `D-S10-11`）
+    // 用例走**未分配号段 `S10_T47 ~`**（同 `PR10-5` 的 `S10_T33 ~`；§7.1 唯一映射表）。
+    // 四项拍板（用户 2026-10-12）见 `search_multi_parts` 的文档。
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// 多 query 夹具：`q1 = "向量检索"` 与 `q2 = "中文分词"` **词面不相交** ⇒ 两个 query
+    /// 各有**专属命中**（「多 query 比单 query 覆盖更多文档」这条判据才有牙齿）。
+    fn build_two_topic_fixture() -> (Index, MixedAnalyzer) {
+        build_index(&[
+            "向量检索 使用 近似最近邻 计算 余弦相似度 甲",
+            "向量检索 使用 近似最近邻 计算 余弦相似度 乙",
+            "中文分词 与 倒排索引 的 工程 取舍 丙",
+            "中文分词 与 倒排索引 的 工程 取舍 丁",
+        ])
+    }
+
+    /// **S10-T47（验收 `S10-6` ②）**：`search_multi(&[q])` 与 `search(q)` **逐位一致**
+    /// —— 单 query 路径**零回归**的正面判据（`f32` 用 `to_bits`，同 `S9-T1` 口径）。
+    ///
+    /// ⚠️ **两个模式都要过**：`Bm25`（单路直通，`hits.score` = 原路分）与 `Hybrid`
+    /// （两路融合）。本 PR 把「lane 组装 / 指标聚合 / 名次映射 / 命中词并集 / 日志标签」
+    /// 全部**泛化成了多 query 形态**，任一处走偏都会在这里现形。
+    #[test]
+    fn S10_T47_单query的search与search_multi逐位一致() {
+        let (index, analyzer, vi) = build_hybrid_fixture(&[
+            "向量检索 使用 近似最近邻 计算 余弦相似度 甲",
+            "向量检索 使用 近似最近邻 计算 余弦相似度 乙",
+            "中文分词 与 倒排索引 的 工程 取舍 丙",
+        ]);
+        let e = FakeEmbedder;
+        let ex = QueryExecutor::new(&index, &analyzer).with_vector(&e, &vi);
+
+        for mode in [SearchMode::Bm25, SearchMode::Hybrid] {
+            let a = ex.search("向量检索", mode, 2).unwrap();
+            let b = ex.search_multi(&["向量检索"], mode, 2).unwrap();
+            assert!(!a.hits.is_empty(), "前提：该 query 有结果（{mode:?}）");
+            assert_eq!(
+                s9_hits_bits(&a),
+                s9_hits_bits(&b),
+                "🔴 {mode:?}：`search(q)` 与 `search_multi(&[q])` 必须逐位一致"
+            );
+            for (x, y) in a.hits.iter().zip(&b.hits) {
+                assert_eq!(
+                    explain_snapshot(x),
+                    explain_snapshot(y),
+                    "`explain` 快照必须一致（{mode:?}）"
+                );
+            }
+            assert_eq!(a.metrics.bm25, b.metrics.bm25, "{mode:?}：`Metrics.bm25`");
+            assert_eq!(
+                a.metrics.vector, b.metrics.vector,
+                "{mode:?}：`Metrics.vector`"
+            );
+            assert_eq!(
+                a.metrics.candidates, b.metrics.candidates,
+                "{mode:?}：`Metrics.candidates`"
+            );
+            assert_eq!(
+                a.metrics.vector_shortfall, b.metrics.vector_shortfall,
+                "{mode:?}：`Metrics.vector_shortfall`"
+            );
+            assert_eq!(
+                a.metrics.vector_route, b.metrics.vector_route,
+                "{mode:?}：`Metrics.vector_route`"
+            );
+            assert_eq!(a.empty_reason, b.empty_reason, "{mode:?}：空原因");
+        }
+    }
+
+    /// **S10-T48（`S10-6` ① / FR-21）**：多 query 融合可用，且**两个 query 的专属命中都在**
+    /// —— 单 query 只能出其中一组 ⇒ 「融合真的把两个 query 的信息合起来了」有牙齿。
+    ///
+    /// ⚠️ 用 `Bm25` 模式是**刻意的**：`q1` / `q2` 词面不相交 ⇒ 单 query 的 BM25 路**结构上**
+    /// 不可能召回另一组（用 `Hybrid` 时向量路可能顺带召回 ⇒ 断言退化成恒真）。
+    #[test]
+    fn S10_T48_多query融合把两个query的专属命中都带回() {
+        let (index, analyzer) = build_two_topic_fixture();
+        let ex = QueryExecutor::new(&index, &analyzer);
+
+        let only_q1 = ex.search("向量检索", SearchMode::Bm25, 4).unwrap();
+        let only_q2 = ex.search("中文分词", SearchMode::Bm25, 4).unwrap();
+        assert!(
+            !only_q1.hits.is_empty() && !only_q2.hits.is_empty(),
+            "前提：两个 query 各自有命中"
+        );
+        let s1: std::collections::HashSet<ChunkId> = ids_of(&only_q1).into_iter().collect();
+        let s2: std::collections::HashSet<ChunkId> = ids_of(&only_q2).into_iter().collect();
+        assert!(s1.is_disjoint(&s2), "前提：两组命中不相交（词面不同）");
+
+        let multi = ex
+            .search_multi(&["向量检索", "中文分词"], SearchMode::Bm25, 4)
+            .unwrap();
+        let got: std::collections::HashSet<ChunkId> = ids_of(&multi).into_iter().collect();
+        println!("q1={s1:?} q2={s2:?} ⇒ multi={got:?}");
+        assert!(
+            got.len() <= 4,
+            "🔴 `k` 仍是**候选上界**（全局 `k` 语义）—— 多 query 不是「每 query 各取 k」"
+        );
+        assert!(
+            s1.is_subset(&got) && s2.is_subset(&got),
+            "🔴 两个 query 的专属命中都必须进融合结果（实得 {got:?}）"
+        );
+
+        // `matched_terms` 是**各 query 的并集**：来自 q2 专属文档的命中，其 `matched_terms`
+        // 必须含 **q1 里没有的**词项 —— 若实现只取第一个 query（或 `add` 而非并集），
+        // 这些命中的 `matched_terms` 会是空 ⇒ 本断言变红。
+        let q1_terms: std::collections::HashSet<String> = analyzer
+            .analyze_query("向量检索")
+            .into_iter()
+            .map(|t| t.term.to_string())
+            .collect();
+        let from_q2: Vec<&Hit> = multi
+            .hits
+            .iter()
+            .filter(|h| s2.contains(&h.chunk_id))
+            .collect();
+        assert!(!from_q2.is_empty(), "前提：q2 专属文档进了结果");
+        assert!(
+            from_q2.iter().any(|h| h
+                .explain
+                .matched_terms
+                .iter()
+                .any(|t| !q1_terms.contains(t))),
+            "🔴 `matched_terms` 必须是**各 query 的并集**（只取第一个 query ⇒ 这里为空）"
+        );
+    }
+
+    /// **S10-T49（用户 2026-10-12 拍板）**：**多 query 不得与自适应融合同用** ⇒ 显式 `Err`
+    /// （**不静默忽略** —— 否则「开关开了却走了别的通道」正是 NFR-07 要防的静默降级）。
+    ///
+    /// ⚠️ 对照臂：**单 query** 开着同一开关仍正常 ⇒ 证明「拒绝的是**组合**，不是开关本身」。
+    #[test]
+    fn S10_T49_多query与自适应融合同用报Err() {
+        let (index, analyzer) = build_two_topic_fixture();
+        let ex = QueryExecutor::new(&index, &analyzer)
+            .with_fusion(Box::new(RrfFusion::new_adaptive(
+                60.0,
+                vec![1.0, 1.5],
+                armed_shape_rule(0.5),
+            )))
+            .with_adaptive_fusion(true);
+
+        let e = ex
+            .search_multi(&["向量检索", "中文分词"], SearchMode::Bm25, 2)
+            .unwrap_err();
+        assert!(
+            matches!(e, Error::InvalidInput(_)),
+            "🔴 多 query + adaptive_fusion 必须**显式报错**（实得 {e:?}）"
+        );
+
+        // 对照臂：同一个装配、单 query ⇒ 正常（开关本身没坏）
+        let ok = ex.search_multi(&["向量检索"], SearchMode::Bm25, 2).unwrap();
+        assert!(!ok.hits.is_empty(), "对照臂：单 query + adaptive 仍可用");
+    }
+
+    /// **S10-T50（退化输入）**：空 `queries` ⇒ `Err(InvalidInput)` —— **不**静默返回空响应
+    /// （那会让调用方以为「检索过了、没结果」）。对照臂：单元素切片 ⇒ `Ok`。
+    #[test]
+    fn S10_T50_空query列表报Err() {
+        let (index, analyzer) = build_two_topic_fixture();
+        let ex = QueryExecutor::new(&index, &analyzer);
+        let e = ex.search_multi(&[], SearchMode::Bm25, 2).unwrap_err();
+        assert!(
+            matches!(e, Error::InvalidInput(_)),
+            "空 query 列表必须报 InvalidInput（实得 {e:?}）"
+        );
+        assert!(
+            ex.search_multi(&["向量检索"], SearchMode::Bm25, 2).is_ok(),
+            "对照臂：单元素切片必须正常"
+        );
+    }
+
+    /// **S10-T51（`Explain` 名次口径）**：多 query 下 `bm25_rank` = **跨 query 的最好名次**
+    /// （`min`），且**与 query 顺序无关**。
+    ///
+    /// 判据：拿一篇**同时含两个 query 词面**的文档，用「各 query 单跑」的名次交叉核对
+    /// —— 不硬编码期望值（夹具一改就假绿），而是「与单跑读数的最小值一致」。
+    #[test]
+    fn S10_T51_多query的名次取跨query最好名次() {
+        let (index, analyzer) = build_index(&[
+            // 前三篇把 q1 词面的 tf 拉高 ⇒ 目标文档（第 4 篇）在 **q1 lane 里名次靠后**，
+            // 而在 **q2 lane 里是唯一的 rank 1** ⇒ 两条 lane 的名次**必然不同**
+            // （否则「取 min 还是取 max」观察不到 —— 上面有前置断言守着）。
+            "向量检索 向量检索 向量检索 向量检索 甲",
+            "向量检索 向量检索 向量检索 向量检索 乙",
+            "向量检索 向量检索 向量检索 向量检索 丙",
+            // 目标：两个 query 词面都含 ⇒ 同时出现在两条 lane 里
+            "向量检索 中文分词 丁",
+        ]);
+        let ex = QueryExecutor::new(&index, &analyzer);
+        let (q1, q2) = ("向量检索", "中文分词");
+
+        let a = ex.search(q1, SearchMode::Bm25, 8).unwrap();
+        let b = ex.search(q2, SearchMode::Bm25, 8).unwrap();
+        let rank_in = |r: &SearchResponse, id: ChunkId| -> Option<u32> {
+            ids_of(r)
+                .iter()
+                .position(|c| *c == id)
+                .map(|i| i as u32 + 1)
+        };
+
+        let m = ex.search_multi(&[q1, q2], SearchMode::Bm25, 8).unwrap();
+        // 取自两个单跑读数都能看到的文档（= 那条「同时出现在两条 lane 里」的）
+        let both: Vec<ChunkId> = ids_of(&a)
+            .into_iter()
+            .filter(|id| rank_in(&b, *id).is_some())
+            .collect();
+        assert!(
+            !both.is_empty(),
+            "前提：存在同时命中两个 query 的文档（夹具需要它）"
+        );
+        // ⚠️ **判据的牙齿**：若夹具里这些文档在两条 lane 上的名次**全都相同**，那么
+        //    「取 min 还是取 max」**观察不到**（等同）⇒ 本用例会退化成恒真。故显式要求
+        //    **至少一个**名次不同的文档，并要求它命中「最好名次」。
+        let mut differing = 0usize;
+        for id in both {
+            let ra = rank_in(&a, id);
+            let rb = rank_in(&b, id);
+            let (Some(x), Some(y)) = (ra, rb) else {
+                continue;
+            };
+            println!("chunk {id}: rank_a={x} rank_b={y}");
+            if x != y {
+                differing += 1;
+            }
+            let got = m
+                .hits
+                .iter()
+                .find(|h| h.chunk_id == id)
+                .and_then(|h| h.explain.bm25_rank);
+            assert_eq!(
+                got,
+                Some(x.min(y)),
+                "🔴 chunk {id} 的 `bm25_rank` 必须是两条 lane 里的**最好名次** {}",
+                x.min(y)
+            );
+        }
+        assert!(
+            differing > 0,
+            "🔴 夹具退化：没有任何文档在两条 lane 里名次不同 ⇒ 本判据对 min / max **无区分力**，必须换夹具"
+        );
+    }
+
+    /// **S10-T52（指标聚合口径）**：多 query 下 `Metrics.bm25` = **各 query 该路的合计**
+    /// （不是 max / 不是第一个 query 的）；`vector_shortfall` = **各 query 的最大缺口**。
+    ///
+    /// 判据同样用「各 query 单跑读数」交叉核对，不硬编码。
+    #[test]
+    fn S10_T52_多query的指标是各query的聚合() {
+        let (index, analyzer) = build_two_topic_fixture();
+        let ex = QueryExecutor::new(&index, &analyzer);
+        let (q1, q2) = ("向量检索", "中文分词");
+
+        let a = ex.search(q1, SearchMode::Bm25, 4).unwrap();
+        let b = ex.search(q2, SearchMode::Bm25, 4).unwrap();
+        assert!(
+            a.metrics.bm25 > 0 && b.metrics.bm25 > 0,
+            "前提：两路都有候选"
+        );
+        let m = ex.search_multi(&[q1, q2], SearchMode::Bm25, 4).unwrap();
+        println!(
+            "bm25: a={} b={} ⇒ multi={}",
+            a.metrics.bm25, b.metrics.bm25, m.metrics.bm25
+        );
+        assert_eq!(
+            m.metrics.bm25,
+            a.metrics.bm25 + b.metrics.bm25,
+            "🔴 `Metrics.bm25` 必须是**各 query 的合计**（不是 max、也不是第一个 query 的）"
+        );
+        // Bm25 模式不走向量路 ⇒ 三者的 `vector_shortfall` 都是 0（口径一致性的锚点）
+        assert_eq!(m.metrics.vector_shortfall, 0);
+        assert_eq!(
+            a.metrics.vector_shortfall.max(b.metrics.vector_shortfall),
+            0
+        );
+    }
+
+    /// **S10-T53（lane 布局 / mode 语义）**：`Bm25` 模式的多 query 仍走**融合**（不是把
+    /// N 条 lane 直接拼接），且**缺路留空槽**（`vector_rank` 恒 `None`，且 `k` 仍是上界）。
+    ///
+    /// ⚠️ 这条同时钉住「多 query 下**单路模式也走 fuse**」——若实现退化成
+    /// `lanes.into_iter().flatten()`（`super(single)` 分支），同一 chunk 会在两条 lane 里
+    /// 出现两次、且分数是原路分 ⇒ 下面的「条数 = 去重后的文档数」会变红。
+    #[test]
+    fn S10_T53_单路模式的多query仍走融合且缺路留空槽() {
+        let (index, analyzer) = build_two_topic_fixture();
+        let ex = QueryExecutor::new(&index, &analyzer);
+
+        // 两个 query **指向同一批文档**（同词面）⇒ 拼接会出现重复，融合不会
+        let m = ex
+            .search_multi(&["向量检索", "向量检索"], SearchMode::Bm25, 4)
+            .unwrap();
+        let ids = ids_of(&m);
+        let uniq: std::collections::HashSet<ChunkId> = ids.iter().copied().collect();
+        println!("同一 query 两次 ⇒ {ids:?}");
+        assert_eq!(
+            ids.len(),
+            uniq.len(),
+            "🔴 融合结果里不得出现重复 chunk（拼接式实现会让同一 chunk 出现两次）"
+        );
+        assert!(
+            m.hits.iter().all(|h| h.explain.vector_rank.is_none()),
+            "🔴 `Bm25` 模式不得走向量路 ⇒ `vector_rank` 必须是 `None`（缺路留空槽、不造假信号）"
+        );
+
+        // 🔴 **权重真的落到 route 上**（空槽布局的**后果**判据）：两个 query 的 **rank-1 文档
+        //    同权**（Bm25 lane 一律吃 `weights[0] = 1.0`）⇒ 平局按 `chunk_id` 升序 ⇒ 两组第一名里
+        //    **id 小的在前**。
+        //    ⚠️ 若丢掉空槽（lanes 退化成 `[b@q1, b@q2]`），第 2 条 lane 会吃到
+        //    `weights[1] = 1.5` ⇒ q2 的 rank-1 以 1.5 倍分**反超** ⇒ 断言期望的 0 变 2。
+        let (index2, analyzer2) = build_two_topic_fixture();
+        let ex2 = QueryExecutor::new(&index2, &analyzer2);
+        let m2 = ex2
+            .search_multi(&["向量检索", "中文分词"], SearchMode::Bm25, 4)
+            .unwrap();
+        let ids2 = ids_of(&m2);
+        println!("两 query 融合 ⇒ {ids2:?}");
+        assert_eq!(
+            ids2[0], 0,
+            "🔴 两个 query 的 rank-1 文档必须**同权**（平局按 `chunk_id` 升序）；\
+             若第 2 条 lane 吃到了 vector 的权重，这里会变成 2（实得 {:?}）",
+            ids2
+        );
+    }
 }

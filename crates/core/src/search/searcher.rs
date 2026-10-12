@@ -1004,4 +1004,46 @@ mod tests {
             "后设的 `token_budget` 必须覆盖先设的 `post`"
         );
     }
+
+    /// **V2 Step 10 / `S10-07`（门面段 / FR-21）**：`Searcher::search_multi` 端到端可用，
+    /// 且 `search_multi(&[q])` 与 `search(q)` **逐位一致** —— 门面链路上没有任何一段
+    /// 把 `queries` 吃掉或降级成单 query（同 `S8-08` / `S9-T1` / `S10-T2` 的「每段都有判据」纪律）。
+    #[test]
+    fn S10_门面search_multi真的流到编排层() {
+        let s = build_hybrid();
+
+        // ① 单 query：与 `search(q)` 逐位一致（`f32` 用 `to_bits`）
+        let a = s.search("检索").unwrap();
+        assert!(!a.hits.is_empty(), "前提：检索有结果");
+        let b = s.search_multi(&["检索"]).unwrap();
+        let bits = |r: &SearchResponse| {
+            r.hits
+                .iter()
+                .map(|h| (h.chunk_id, h.score.to_bits()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            bits(&a),
+            bits(&b),
+            "🔴 门面：`search_multi(&[q])` 必须与 `search(q)` 逐位一致"
+        );
+
+        // ② 多 query：可用 + builder 的 `top_n` 真的生效
+        let c = s
+            .search_multi_with(&["检索", "向量"])
+            .top_n(1)
+            .exec()
+            .unwrap();
+        assert_eq!(
+            c.hits.len(),
+            1,
+            "🔴 `top_n(1)` 必须生效（builder 链路没断）"
+        );
+
+        // ③ 多 query 默认装配（未开 adaptive）⇒ 正常返回
+        assert!(
+            !s.search_multi(&["检索", "向量"]).unwrap().hits.is_empty(),
+            "🔴 门面多 query 链路断了（query::search_multi_parts 没被调到）"
+        );
+    }
 }

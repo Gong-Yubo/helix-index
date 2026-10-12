@@ -512,4 +512,54 @@ mod tests {
             .collect();
         assert_eq!(zero_scored, vec![5, 9], "0 分条目按 chunk_id 升序");
     }
+
+    /// **S10-T54（V2 Step 10 / `S10-07` 的连带定值；用户 2026-10-12 拍板）**：
+    /// 权重**按 lane 序号循环取**（`lane_idx % weights.len()`）—— 多 query 融合的
+    /// lane 数 = `2N` > `weights.len()`（默认 2）时，每条 lane 仍吃到**它那一路**的权重；
+    /// 旧的「超出即 1.0」兜底会让**第 2 个 query 起丢掉本路权重**（静默错加权）。
+    ///
+    /// 判据（可分辨）：3 条 lane 各含一个**不同**的 chunk、`weights = [0.5, 2.0]`、`k = 60`
+    /// ⇒ lane 2（序号 2）的贡献必须是 **0.5/61**（循环取 `weights[0]`）而**不是 1.0/61**。
+    #[test]
+    fn S10_T54_权重按lane序号循环取() {
+        let lanes: Vec<LaneResults> = vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(2, 1.0)]];
+        let out = RrfFusion::new(60.0, vec![0.5, 2.0]).fuse(&lanes, 10);
+        let score_of = |id: ChunkId| {
+            out.iter()
+                .find(|(i, _)| *i == id)
+                .map(|(_, s)| *s)
+                .unwrap_or_else(|| panic!("chunk {id} 必须在融合结果里"))
+        };
+        assert!(
+            (score_of(0) - 0.5 / 61.0).abs() < 1e-7,
+            "lane 0 ⇒ `weights[0]`"
+        );
+        assert!(
+            (score_of(1) - 2.0 / 61.0).abs() < 1e-7,
+            "lane 1 ⇒ `weights[1]`"
+        );
+        assert!(
+            (score_of(2) - 0.5 / 61.0).abs() < 1e-7,
+            "🔴 lane 2 ⇒ `weights[0]`（**循环**）；旧「超出即 1.0」会得 1.0/61 = {}",
+            1.0 / 61.0
+        );
+
+        // ✅ 单 query 路径不变：2 条 lane + 2 项权重 ⇒ `%` 退化为「直接取」，逐位相同
+        let two: Vec<LaneResults> = vec![vec![(0, 1.0)], vec![(1, 1.0)]];
+        let out2 = RrfFusion::new(60.0, vec![0.5, 2.0]).fuse(&two, 10);
+        let s2 = |id: ChunkId| {
+            out2.iter()
+                .find(|(i, _)| *i == id)
+                .map(|(_, s)| *s)
+                .unwrap()
+        };
+        assert!((s2(0) - 0.5 / 61.0).abs() < 1e-7 && (s2(1) - 2.0 / 61.0).abs() < 1e-7);
+
+        // ⚠️ 边界：空 `weights` ⇒ 一律 1.0（与改动前同；`period` 用 `max(1)` 兜住除零）
+        let out3 = RrfFusion::new(60.0, Vec::new()).fuse(&two, 10);
+        assert!(
+            out3.iter().all(|(_, s)| (*s - 1.0 / 61.0).abs() < 1e-7),
+            "空权重 ⇒ 全部 1.0（不得 panic / 不得 NaN）"
+        );
+    }
 }
