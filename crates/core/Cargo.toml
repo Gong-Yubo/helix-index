@@ -101,3 +101,10 @@ required-features = ["local-embed"]
 [[example]]
 name = "spike_s8s2"
 required-features = ["local-embed"]
+
+# V2 Step 10 / S10-08（`S10-T18`）：场景机制端到端示例（命名空间 / MMR / token budget / 时间衰减）。
+# 需要本地模型 ⇒ 与 `search_basic` 同 gate（默认 feature 已含 `local-embed`；
+# `--no-default-features` 构建不会尝试编译它）。
+[[example]]
+name = "step10_scenarios"
+required-features = ["local-embed"]

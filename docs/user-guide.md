@@ -23,6 +23,8 @@
   - [2.2 六 trait 替换矩阵](#22-六-trait-替换矩阵)
   - [2.3 feature flags 选用](#23-feature-flags-选用)
   - [2.4 性能预期](#24-性能预期)
+  - [2.5 检索模式怎么选](#25-检索模式怎么选)
+  - [2.6 检索后处理与多 query（V2 Step 10）](#26-检索后处理与多-queryv2-step-10)
 
 ---
 
@@ -454,3 +456,89 @@ NFR-03 第二口径）两条路径。
 **Recall@10 = 0.6829** 均为三路最高——对 Agent 场景（无翻页、首条即决定）
 最关键的正是这两项。hybrid 的 NDCG 略低于 vector 单路（0.5183 vs 0.5249）
 但差异不显著（p=0.385）。
+
+## 2.6 检索后处理与多 query（V2 Step 10）
+
+> ⚠️ **本节全部是库侧能力**：`mmr` / `token_budget` / `time_decay` / `search_multi`
+> **尚未**出现在 CLI 参数里（CLI 走默认链路）⇒ 下面的示例都是 Rust 代码。
+> 可运行示例见 [`crates/core/examples/step10_scenarios.rs`](../crates/core/examples/step10_scenarios.rs)。
+
+四个机制，入口都在 `SearchIndexBuilder` / `Searcher` 上：
+
+| 机制 | 启用入口 | 它改什么 | 可观测信号 |
+| --- | --- | --- | --- |
+| MMR 去重（FR-24） | `builder.mmr(λ, pool)` | `hits` 的**排列次序** | `Explain.mmr_selected` |
+| token budget（FR-25） | `builder.token_budget(n)` / `token_budget_with(n, counter)` | `hits` 的**长度** | `Explain.budget_units` / `Metrics.budget_units`、`EmptyReason::PostEmptied` |
+| 时间衰减（FR-33） | `builder.time_decay(λ, field, clock)` | `score`（融合分 × 因子）**与名次** | `Explain.decay_factor` |
+| 多 query（FR-21） | `searcher.search_multi(&[q1, q2])` | 候选池与 `Metrics` 的**聚合口径** | `Metrics.bm25` / `Metrics.vector`（各 query 求和） |
+
+**四条共同约定（都是刻意的）**：
+
+1. **默认关** —— 不调用就**零行为变化**：未启用时全链路与引入前**逐位一致**（每个机制都有用例钉住）。
+2. 🔴 **三种后处理器共用同一个槽位，后设置者生效（不是叠加）**：`.mmr(..)` / `.token_budget(..)` /
+   `.time_decay(..)` / `.post(..)` 写的是**同一处** `post`。想要「先衰减再裁 token」这类组合，
+   需自己实现 `PostProcessor` 再用 `.post(..)` 传进去。
+3. **窗口自动放大** —— MMR 需要**比 `k` 多**的候选（否则退化为「只重排」）⇒ 它的 `post_window`
+   会参与 `candidate_k` **与**回捞两处，你**不需要**手调 `k`（架构 `R61` 的两个封顶点）。
+4. **次序固定** —— 后处理在**回捞之后、精排之前**（`D-S10-02`）。
+
+### MMR（结果去重）
+
+```rust
+let index = SearchIndex::builder()
+    .mmr(0.7, 100)      // λ = 0.7（相关度权重），pool = 100（候选池）
+    .build();
+```
+
+贪心式 `mmr(c) = λ · rel(c) − (1 − λ) · max sim(c, s)`，选到 `k` 条为止。
+`λ = 1` ⇒ 纯按分数（等于原样取前 k）；`λ = 0` ⇒ 纯按多样性。
+
+- 相似度**起步取文本侧**（分词后 term 集合的 Jaccard）⇒ ⚠️ **它是词面、不是语义**：
+  同义改写**不会**被判为冗余（`D-S10-08`；向量侧为条件项）。
+- 🔴 **`hits` 从此不再按 `score` 降序**（改按 MMR 选择序）。下游若用 `score` 设阈值 / 比较缓存，
+  请改看 `Explain.mmr_selected`，并读 `Hit::score` 的三档语义 rustdoc（架构 `R62`）。
+
+### token budget（按预算裁剪）
+
+```rust
+let index = SearchIndex::builder()
+    .token_budget(2000)     // 默认计数器数的是**字符数**
+    .build();
+```
+
+逐条累加到**不超过预算**为止；超预算的条目**及其后全部丢弃**（= **顺序截断**，
+不是「换一条更小的顶上来」）。
+
+- ⚠️ **「字符数」不是「token 数」**：内核没有目标模型的 tokenizer ⇒ 要真值就实现
+  `TokenCounter` 走 `.token_budget_with(n, counter)`；上报字段因此叫 **`budget_units`**（单位中立），
+  它读起来是多少，取决于你注入的计数器。
+- 截到 0 条时 `empty_reason = EmptyReason::PostEmptied`（**不再**静默给空集）。
+
+### 时间衰减
+
+```rust
+let clock = Arc::new(|| now_ms());            // 返回「现在」的 unix **毫秒**
+let index = SearchIndex::builder()
+    .time_decay(1e-3, "ts_ms", clock)         // λ（1/秒）、字段名、时钟源
+    .build();
+```
+
+`age = max(0, clock() − t) / 1000`、`factor = exp(−λ · age)`、`score *= factor`。
+
+- 作用于**融合分这一档**（不是精排分）；只在**真的改写**时重排 ⇒ 无事发生时逐位一致。
+- ⚠️ **字段缺失 / 非整数 ⇒ `Err(InvalidInput)`**（不静默跳过，NFR-07），错误消息带**字段名**与 `chunk_id`。
+- 测试注入「恒返回定值」的时钟即得**可复现**读数（本仓单测即如此）。
+
+### 多 query 融合
+
+```rust
+let searcher = index.into_searcher()?;
+let resp = searcher.search_multi(&["如何加快检索", "索引优化"])?;
+// 定制：searcher.search_multi_with(&qs).mode(...).top_n(3).filter(&f).exec()?
+```
+
+- 每个 query 各取 `[bm25, vector]` 两条 lane，**一次** RRF 融合（缺路留**空槽**、不删）；
+  `k` 是**全局** `k`（不是「每 query 各 `k`」）。
+- **单 query 走同一实现** ⇒ `search_multi(&[q])` 与 `search(q)` **逐位一致**。
+- ⚠️ 与自适应融合在 **`hybrid` 下互斥**：同时开 `adaptive_fusion` ⇒ `Err(InvalidInput)`；
+  单路模式（`bm25` / `vector`）下自适应本就不会被消费，故**不拒**。
