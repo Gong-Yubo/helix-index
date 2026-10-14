@@ -24,7 +24,7 @@ use helix_core::search::{SearchIndex, SearchIndexBuilder};
 const NS_FIELD: &str = "ns";
 /// 时间字段名同理（内核不猜 `ts_ms` / `created_at`）。
 const TS_FIELD: &str = "ts_ms";
-/// 「现在」= 2026-10-12T00:00:00Z（示例固定它 ⇒ 读数**可复现**）。
+/// 「现在」= 2026-10-01T12:00:00Z（示例固定它 ⇒ 读数**可复现**）。
 const NOW_MS: i64 = 1_790_856_000_000;
 const DAY_MS: i64 = 86_400_000;
 
@@ -130,7 +130,9 @@ fn main() -> anyhow::Result<()> {
 
     // ================== ② MMR（结果去重）==================
     // `λ = 0.5`、候选池 `pool = 10`（⚠️ 建议 `pool >= 4 * k`，否则退化为「只重排」）。
-    println!("\n=== ② MMR：A 组三篇冗余 → 只留代表性的那条 ===");
+    // ⚠️ 本段 `print_hits` 用 `top_n = 6` = 语料规模 ⇒ MMR **没有可丢的余量** ⇒ 演示的是
+    //    「**冗余项被压到末位**」而非「丢弃」；要演示丢弃，把 `top_n` 调到 < 语料规模（如 3）。
+    println!("\n=== ② MMR：A 组三篇冗余 → 冗余项被压到末位（top_n = 语料规模，故不丢条目）===");
     let index_b = build(SearchIndex::builder().mmr(0.5, 10))?;
     let searcher_b = index_b.searcher();
     print_hits("MMR 关闭（对照：按融合分取前 k）", &searcher_a, None);
@@ -150,10 +152,17 @@ fn main() -> anyhow::Result<()> {
     // 若被截到 0 条 ⇒ `empty_reason = Some(EmptyReason::PostEmptied)`。
 
     // ================== ④ 时间衰减（附赠：同一语料上的第三个机制）==================
-    // 作用分 = **融合分这一档**：`score *= exp(-λ · age)`，岁数越大的条目掉得越多。
-    println!("\n=== ④ 时间衰减 λ=1e-3（1/秒）：新条目上浮 ===");
+    // 作用分 = **融合分这一档**：`score *= exp(-λ · age)`；`age` 单位是**秒**，岁数越大的条目掉得越多。
+    // 🔴 **λ 必须与你的时间尺度配对**（λ 的量纲 = 1/秒 ⇒ 特征时间 = 1/λ）：
+    //    本示例的时间戳是**天级**（`NOW_MS − 400 / 300 / 1 / 200 / 100 / 2 天`）⇒ 取 **λ = 1e-7**
+    //    （400 天 ⇒ `exp(−3.46) ≈ 0.031`，六条的分级一眼可见）。
+    //    ⚠️ 反例：写 `λ = 1e-3`（特征时间 ≈ 17 分钟）会让**大于 1.2034 天**的条目在 **f32 下溢为 0**
+    //    —— 实测 6 条里 5 条 `score = 0.000000`，且最老的那条因同分后按 `chunk_id` 兜底**反而排第 2**，
+    //    与「新条目上浮」**相反**（该阈值 = `f32` 下 `exp(−λ·age)` 归零的临界年龄，实测算得 1.2034 天）。
+    //    分钟级时间戳才该用 `1e-3` 量级。
+    println!("\n=== ④ 时间衰减 λ=1e-7（1/秒，配天级时间戳）：新条目上浮 ===");
     let clock = Arc::new(|| NOW_MS);
-    let index_d = build(SearchIndex::builder().time_decay(1e-3, TS_FIELD, clock))?;
+    let index_d = build(SearchIndex::builder().time_decay(1e-7, TS_FIELD, clock))?;
     let searcher_d = index_d.searcher();
     print_hits("衰减关闭（对照）", &searcher_a, None);
     print_hits("衰减开启", &searcher_d, None);
