@@ -210,7 +210,7 @@ mod tests {
     /// 而 `weight == 0` 时输出**逐位保持输入顺序**（id=1 排最后 ⇒ 名次 = 2）。
     /// 若输入本身就按期望顺序排，这条断言会「看着过了其实什么都没验」。
     #[test]
-    fn S10_T7_权重增大时新条目名次不变差() {
+    fn S10_时间衰减_权重增大时新条目名次不变差() {
         let ages_ms = [86_400_000i64, 3_600_000, 0]; // 24h / 1h / 0
         let mut prev_rank: Option<usize> = None;
         for w in [0.0f64, 1e-5, 1e-3] {
@@ -244,7 +244,7 @@ mod tests {
 
     /// **缺字段 / 非整数 ⇒ `Err`**（NFR-07：不得静默降级）+ 消息必须**可定位**。
     #[test]
-    fn S10_T8_时间字段缺失或非整数上抛Err() {
+    fn S10_时间衰减_时间字段缺失或非整数上抛Err() {
         let td = TimeDecay::new(1e-3, "ts_ms", fixed_clock(NOW));
 
         // ① 缺字段
@@ -275,7 +275,7 @@ mod tests {
 
     /// **边界：没有真的改写时 ⇒ 信号 `None`、顺序逐位保持**（设计 §4.3 的 `is_some() ⟺ 被改写`）。
     #[test]
-    fn S10_T10_未改写时信号为None且顺序逐位保持() {
+    fn S10_时间衰减_未改写时信号为None且顺序逐位保持() {
         // arm A：`weight == 0`（开了但无事发生）
         let hits = vec![
             hit(3, 0.5, Some(NOW - 1000)),
@@ -314,7 +314,7 @@ mod tests {
     ///
     /// ⚠️ 刻意让**输入顺序 ≠ 期望顺序**（输入 `[9, 4, 1]`、期望 `[4, 9, 1]`）。
     #[test]
-    fn S10_T9_改写后按分数降序且同分按chunk_id升序() {
+    fn S10_时间衰减_改写后按分数降序且同分按chunk_id升序() {
         let hits = vec![
             hit(9, 1.0, Some(NOW - 1000)),
             hit(4, 1.0, Some(NOW - 1000)), // 与 9 同 age ⇒ 改写后**同分**
@@ -346,7 +346,7 @@ mod tests {
 
     /// **非有限权重 ⇒ `Err`**（而不是悄悄产出 NaN 分数污染排序）。
     #[test]
-    fn S10_T11_非有限权重上抛Err() {
+    fn S10_时间衰减_非有限权重上抛Err() {
         for w in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let td = TimeDecay::new(w, "ts_ms", fixed_clock(NOW));
             let e = td
@@ -358,7 +358,7 @@ mod tests {
 
     /// **负权重**（调用方自担）：越**新**的条目分越**高** ⇒ 信号可以 `> 1`。
     #[test]
-    fn S10_T13_负权重时越新越高且信号可大于一() {
+    fn S10_时间衰减_负权重时越新越高且信号可大于一() {
         let hits = vec![
             hit(1, 1.0, Some(NOW - 86_400_000)), // 老
             hit(2, 1.0, Some(NOW)),              // 新（age == 0 ⇒ 不改写）
@@ -379,7 +379,7 @@ mod tests {
     ///
     /// 若去掉 `.max(0)`，未来时间戳会得到 `factor > 1`（**凭空加分**）—— 这条就是那个钳位的牙齿。
     #[test]
-    fn S10_T14_未来时间戳被钳为零龄() {
+    fn S10_时间衰减_未来时间戳被钳为零龄() {
         let td = TimeDecay::new(1e-3, "ts_ms", fixed_clock(NOW));
         let out = td
             .process(vec![hit(1, 1.0, Some(NOW + 3_600_000))], 10)
@@ -393,7 +393,7 @@ mod tests {
 
     /// **名字与「默认窗口」**：衰减**不需要额外候选** ⇒ 必须走 provided 默认（`k`）。
     #[test]
-    fn S10_T12_名字与默认窗口() {
+    fn S10_时间衰减_名字与默认窗口() {
         let td = TimeDecay::new(1e-3, "ts_ms", fixed_clock(NOW));
         assert_eq!(td.name(), "time-decay");
         for k in [1usize, 10, 100] {

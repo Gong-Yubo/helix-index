@@ -2952,7 +2952,7 @@ mod tests {
     /// ⚠️ 本字段是**成本面**的信号、**不是**正确性面：臂 ② 的**结果必须与臂 ① 逐位一致**
     /// （降级只让求值慢 O(N)，不让它答错 —— 见 `field_index.rs` 的基数保护节）。
     #[test]
-    fn S10_T5_降级档观测面属实且未降级档为假() {
+    fn S10_命名空间_降级档观测面属实且未降级档为假() {
         use crate::schema::Filter;
 
         let f = Filter::namespace("ns", "ns-3");
@@ -3006,7 +3006,7 @@ mod tests {
     /// 只是没有任何文档通过 ⇒ 若把赋值放到早退之后，这条路径会报 `false` —— 那是**撒谎**，
     /// 而它恰恰是最需要看降级的路径（「我的过滤为什么这么慢」）。
     #[test]
-    fn S10_T5_早退路径的filter_degraded也是真值() {
+    fn S10_命名空间_早退路径的filter_degraded也是真值() {
         use crate::query::response::EmptyReason;
         use crate::schema::Filter;
 
@@ -3298,7 +3298,7 @@ mod tests {
     /// **S10-T1（编排层零回归）**：不装后处理器 ⇒ 后处理阶段**一次都不执行**，
     /// 且 `hits` 与「窗口 = k 的精排」路径**逐位一致**。
     #[test]
-    fn S10_T1_默认不装后处理器时零变化() {
+    fn S10_后处理_默认不装后处理器时零变化() {
         let (index, analyzer, vi) = build_window_fixture();
         let e = FakeEmbedder;
 
