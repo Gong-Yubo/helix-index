@@ -42,11 +42,23 @@ ignore = [
 # 🔴 **2026-10-15 复核（V2 结项收口）—— 「有升级路径的不进 ignore」的实例记录**：
 #    `main`（`56ab97f`）的 CI 在 2026-10-14 变红，唯一失败作业 = `cargo-deny`，原因是 RustSec 库
 #    **新增 4 条**对 **`rustls 0.23.45`** 的公告（`RUSTSEC-2026-0346` / `0347` / `0348` / `0349`；
-#    依赖链 `rustls ← ureq ← hf-hub ← fastembed`，另有 `ort-sys` 的 build-dep 路径）。
+#    依赖链 `rustls ← ureq ← hf-hub ← fastembed`；**同一 `ureq` 还有第二个使用者 `ort-sys`**
+#    （`(build) ort-sys ← ort ← helix-core`，`ort-sys` 的 `Cargo.lock` 依赖里含 `ureq`）。
+#    ⚠️ **出数依据 = `cargo deny` 的 advisories 输出**（`all-features = true` 的图），原文含
+#    `└── (build) ort-sys v2.0.0-rc.13` / `└── ort v2.0.0-rc.13`（见 `main` 的 run `38579412845`
+#    的 `cargo-deny` job 日志，`2026-10-14T14:19:20Z`）。
+#    ⚠️ **同一事实在 `cargo tree` 口径下看不到**：`cargo tree -i rustls --edges all [--target all]`
+#    （本机 55 行）里 `ort-sys` **0 命中** —— 因为 `ort-sys` 侧的 `ureq` 未启用 `rustls` feature
+#    （只开 `socks-proxy`）。⇒ 措辞以 **`cargo deny` 的口径**为准，工具差异如实登记（评审 `P4-5`）。
 #    ⇒ 处置 = **`cargo update -p rustls`（`0.23.45 → 0.23.46`，仅动 1 个包）**，**不是**补 `ignore`
 #    —— 上面两条 ignore 之所以存在，是因为它们**确实无升级路径**（`Solution: No safe upgrade`）；
 #    本条**四条都写 `Upgrade to >=0.23.46`** ⇒ 属**可修复**类，补 ignore 会掩盖真实可修项。
-#    ⚠️ 时间线可复核：同一 commit 在 13:04Z 的 run 仍是 **11 / 11 全绿**，`main` 的 run 在 74 分钟后
+#    ⚠️ 时间线可复核（**2026-10-15 订正：原文只写「同一 commit」，未给 SHA；且 PR 正文曾误引 `eb2f05d`**）：
+#    13:04:39Z 的 run **`38568813037`**（=`11 / 11 success`）属**分支 head `53f67fa`**
+#    —— 它与 `main` 的 `56ab97f`（squash 合并结果）**树内容一致**（`git diff 53f67fa 56ab97f` 为空）；
+#    `main` 的 run **`38579412845`** 在 **14:18:58Z** ⇒ 间隔 **74 分 19 秒**。
+#    ⚠️ **不是** `eb2f05d`（那是 `PR10-7` 第 2 轮响应的 head，其唯一 run `38511544761` 在
+#    `2026-10-14T04:28:16Z`、与 `main` 的 run 相隔 **9.845 小时**）。
 #    ⇒ **红因是数据库新增条目，不是代码变更**（这正是本节开头那句「每次 CI 变红都要重新判一次」的实例）。
 
 # ---------------------------------------------------------------------------
