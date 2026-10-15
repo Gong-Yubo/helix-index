@@ -39,6 +39,16 @@ ignore = [
     { id = "RUSTSEC-2025-0141", reason = "bincode 上游永久停更、无升级路径；两条路径各有 owner：① bincode 1.3.3 ← hnsw_rs 0.3.4 是传递依赖（owner = hnsw_rs 上游）；② bincode 2.0.1 是本项目直接依赖、用于快照序列化（owner = 本项目），触发点是既有决策钩子 ADR-005 §7.6 的 bincode vs rkyv A/B 取舍规则 + p4-design R-P4-4。" },
 ]
 
+# 🔴 **2026-10-15 复核（V2 结项收口）—— 「有升级路径的不进 ignore」的实例记录**：
+#    `main`（`56ab97f`）的 CI 在 2026-10-14 变红，唯一失败作业 = `cargo-deny`，原因是 RustSec 库
+#    **新增 4 条**对 **`rustls 0.23.45`** 的公告（`RUSTSEC-2026-0346` / `0347` / `0348` / `0349`；
+#    依赖链 `rustls ← ureq ← hf-hub ← fastembed`，另有 `ort-sys` 的 build-dep 路径）。
+#    ⇒ 处置 = **`cargo update -p rustls`（`0.23.45 → 0.23.46`，仅动 1 个包）**，**不是**补 `ignore`
+#    —— 上面两条 ignore 之所以存在，是因为它们**确实无升级路径**（`Solution: No safe upgrade`）；
+#    本条**四条都写 `Upgrade to >=0.23.46`** ⇒ 属**可修复**类，补 ignore 会掩盖真实可修项。
+#    ⚠️ 时间线可复核：同一 commit 在 13:04Z 的 run 仍是 **11 / 11 全绿**，`main` 的 run 在 74 分钟后
+#    ⇒ **红因是数据库新增条目，不是代码变更**（这正是本节开头那句「每次 CI 变红都要重新判一次」的实例）。
+
 # ---------------------------------------------------------------------------
 [licenses]
 version = 2
