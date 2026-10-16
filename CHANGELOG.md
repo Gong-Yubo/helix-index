@@ -9,6 +9,15 @@
 
 ## [Unreleased]
 
+### 文档 · V2 结项收口第 2 轮评审响应（`PR91`：`plan-v2` v0.34 → v0.35）（2026-10-16）
+
+- 评审落点 = `pulls/91/reviews`（**`5542069022`**，`COMMENTED`，**响应验证型**）+ **行内 3 条**（`docs/devel/plan-v2.md:754` / `README.md:132` / `deny.toml:45` 线程内回复 —— 末条为**评审自身的口径更正**）；`issues/91/comments` **无新增**；`reviewThreads` **7 个、均未 resolve**（不代 resolve）。基线 = `900917e`。
+- 🔴 **`P3-1`（本轮新引入，属实）：`plan-v2` §8 两条 bullet 错位** —— `:754` 的「V2 结项收口（v0.33）」条被**截断**为「四处定义面同步」，其**剩余整段正文被挂到 `:755` 的 v0.34 条尾部**，且收尾警告句在该行出现 **2 次**（⇒ v0.33 的回写记录内容丢失、且被记到 v0.34 名下）。根因 = 第 1 轮响应补丁的**行内拼接失误** ⇒ **复原为两条各自完整**（v0.33 条按基线 `140eb80d` 原文**逐字回填**、v0.34 条删去混入段与重复句）。
+- ✅ **`P4-1`（第 1 轮 `P4-3` 的残留半条，属实）：顶层 `README.md:132`** 仍写「多 query（`adaptive_fusion`）」—— `adaptive_fusion` 是 **Step 9 / `FR-35`** 的开关（`Config::adaptive_fusion`），而多 query 的入口是 **`Searcher::search_multi`**（Step 10 / `FR-21`），两者在 `Hybrid` 下**互斥**（同开即 `Err`）⇒ 改为 **（入口 `Searcher::search_multi`）**。
+- ✅ **`P4-2`（属实）：PR 正文小节号缺号** —— 第 1 轮删 §七 后成 **一 / 二 / 四 / 五 / 六 / 八** ⇒ **重排为连续 一~七**（评审处方是「把八改成七」，此处**取重排**以免再留缺号），并同步 **3 处交叉引用**。
+- 版本面：`plan-v2` **v0.34 → v0.35**（头部 版本 / 日期 / 状态 三行 + §8）；⚠️ 架构 / 需求**内容未变 ⇒ 不升版**（对偶检查：本轮未碰这两个文件）。
+- 本轮**零 `.rs`、不动 `Cargo.lock`、`deny.toml` 零改动** ⇒ 按 `LESSONS §4.24` 先例**不重跑 16 段守门链**；`mdcheck --vs origin/main` **新引入 = 0** + `cmarkgfm` 渲染复核（`<del>` Δ0 / 正文残留裸 `**` Δ0）复跑。
+
 ### 文档 · V2 结项收口第 1 轮评审响应（`PR91`：`plan-v2` v0.33 → v0.34 / 架构 v1.31 → v1.32）（2026-10-15）
 
 - 评审落点 = `pulls/91/reviews`（**`5530304364`**，`COMMENTED`，**发现型**）+ **行内 5 条**（`deny.toml:49` / `deny.toml:45` / `docs/devel/plan-v2.md:8` / `docs/devel/architecture-design.md:1770` / `README.md:131`）；`issues/91/comments` **无新增**；`reviewThreads` **5 个、均未 resolve**（不代 resolve）。基线 head = `140eb80d`。**结论：⚠️ 有条件通过 —— 无阻塞项（0×P1 / 0×P2）；1×P3 + 5×P4 ⇒ 六条全处置。**
