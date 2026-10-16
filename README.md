@@ -147,7 +147,7 @@ make report CHECK=--check                         # 报告数字逐格对账
 
 - 使用文档：[`docs/user-guide.md`](docs/user-guide.md)
 - 开发文档索引：[`docs/README.md`](docs/README.md)；开工前先读
-  [`docs/devel/plan-v2.md`](docs/devel/plan-v2.md)（V2 进行中，`plan.md` 已冻结为 V1 计划）
+  [`docs/devel/plan-v2.md`](docs/devel/plan-v2.md)（**V2 已交付**，`plan.md` 已冻结为 V1 计划）
 
 ## 评测语料（可选）
 

@@ -416,7 +416,7 @@ analyzer 没活到最后 → 分词器不一致）。现在这些全部由库保
 只用关键词检索（不需要向量）时：
 
 ```toml
-helix-core = { version = "0.1.0", default-features = false }
+helix-core = { version = "0.3.0", default-features = false }
 ```
 
 可省掉 fastembed / ort / ONNX Runtime 一整条重依赖链（CI 有对应 job 守着这个能力）。
