@@ -322,6 +322,11 @@ fn build_ghost_facade(backend: VectorBackend) -> (SearchIndex, Vec<(DocId, Vec<C
 /// | 返回集里**存活**候选数（= 判据的分母） | `10` 89.25% ／ `9` 9.25% ／ `8` 1.50% ⇒ **下界 8** |
 /// | 本用例的断言量 `hits.len()` | **`5` = 400/400** ⇒ **未复现** #42 报的 `4` |
 ///
+/// ⚠️ 表里的公式只列了三个主要项：`hnsw_rs_index.rs` 的实际链是
+/// `ceil(k/ratio).saturating_add(k).min(len).min(PHYSICAL_OVERSAMPLE_CAP).max(k.min(len))`
+/// —— 另两项在本夹具下**不 binding**（`CAP = 1024` ≫ 30、`max(k.min(len))` = 30），
+/// 所以换算结果仍是 **30**；照公式复算时别把它们漏掉。
+///
 /// 🔴 **缺口 100% 落在存活集上**（返回 28 条时存活恰 `8`、29 条时恰 `9`，与我指定的
 /// 「存活 = 文档 20~29」**同号**）⇒ 损失是**集中打击**存活候选，而不是按比例摊薄。
 /// ⇒ 有效余量 = `下界 8 − K 5` = **3 条**；要让判据变红需要缺口 ≥ **6** 条
@@ -341,7 +346,9 @@ fn T1_已删向量不霸占TopK名额() {
     for backend in [VectorBackend::Brute, VectorBackend::Hnsw] {
         let (idx, per_doc) = build_ghost_facade(backend);
         let keep = 5;
-        let survive = keep * 2; // 存活文档数刻意取 K 的 2 倍，理由见函数文档
+        // 存活 = 2×K 只是**夹具形态**（让幽灵占图里 2/3 的点），**不是**余量论证 ——
+        // 余量的真正来源见函数文档的「余量实测」一节（#42）。
+        let survive = keep * 2;
         let total = per_doc.len();
         assert!(total >= survive * 2, "语料需足够大才能制造名额压力");
 
@@ -452,11 +459,29 @@ fn T1_已删向量不霸占TopK名额() {
 /// ② 即便快照里仍有幽灵向量（旧快照 / 其他写入路径），存活位图也会在检索期挡掉。
 /// 本测试走 storage 层直接落盘，**刻意绕过防线 ①**，专门验证防线 ②。
 ///
-/// 断言口径同 T1：看 `hits.len() == k`（名额未被幽灵占用），而非"结果不含幽灵"。
+/// # 断言口径：与 T1 **同形**，但**后端不同**（`#42` 第 1 轮评审 `P3-1` 的处置）
+///
+/// 与 T1 一样看 `hits.len() == k`（名额未被幽灵占用）+「结果不含幽灵」，**不**做 T1 那种
+/// 「前提 / 主张」两段式 —— 因为两条用例的向量后端不同：
+///
+/// - T1 走 `VectorBackend::Hnsw`（`SearchIndex` ⇒ 路径 A：普通 `search`、按存活比例过采样、后置过滤），ANN 覆盖不足那一族红因**真实存在**，所以前提必须单列；
+/// - 本用例在下文直接构造 `BruteForceIndex::from_entries`（**精确**后端），而 `vector/brute.rs` 的 `search_filtered` 是**先过滤后截断**、零召回损失 ⇒ **不存在 ANN 覆盖不足**。
+///
+/// ⇒ 本用例的**前提**是另一件事，且已单列在下方装配段：「快照里必须带着幽灵向量，否则本测试失去鉴别力」。
+/// 把 T1 的 `cover >= k` 搬过来在精确后端下**恒真**（`cover` 恒 = 存活 10 条 ≥ `K`），是空转断言。
+///
+/// 判别依据（变异实测，注入已还原）：把路径 A 的 `knbn` 上限压到 **5**（= 让 T1 前提变红的那个注入）
+/// ⇒ **T1 前提红、本用例仍绿** ⇒ 本用例对该族机制**零暴露**。
+///
+/// ⚠️ **覆盖边界**：本用例的 `hits.len() == k` 对「**先截断后过滤**」这一形态在**当前夹具**下
+/// **无鉴别力** —— 向量 lane 索取 `candidate_k = max(3K, 10) = 15`，而这 15 条里恰好含 **5** 条存活
+/// ⇒ 先截断后过滤仍得 5 条。实测该注入下 T1 / T2 **全绿**，但 lib 层
+/// `brute::tests::精确路径满足谓词且条数为min_k_allowed` 等 **3** 条红 ⇒ 该形态由**单元层**覆盖，本用例不承担。
 #[test]
 fn T2_幽灵候选不跨快照永续() {
     let keep = 5;
-    let survive = keep * 2; // 同 T1：存活数取 K 的 2 倍，规避 HNSW 近似误差
+    // 夹具形态：让幽灵占 2/3（**不是**「规避 HNSW 近似误差」—— 本用例走 Brute 精确路径，见函数文档）。
+    let survive = keep * 2;
     let analyzer = MixedAnalyzer::new();
     let chunker = Chunker::default();
     let mut index = Index::new();
