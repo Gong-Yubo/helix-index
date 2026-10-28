@@ -5,8 +5,11 @@
 //! 喂两侧完全相同的 token 流：`MixedAnalyzer` 分出的 token 空格拼接喂 tantivy 的
 //! `WhitespaceTokenizer`——分词/停用词/归一化差异完全消除，只比 BM25 排序数学。
 //!
-//! **参数口径**：tantivy 0.26 的 K1=1.2 / B=0.75 是硬编码常量（`query/bm25.rs:8-9`，
+//! **参数口径**：tantivy 0.27 的 K1=1.2 / B=0.75 仍是硬编码常量（`query/bm25.rs:8-9`，
 //! 无公开 API 可改）→ 自研侧显式 `Bm25Params { k1: 1.2, b: 0.75 }` 对齐。
+//! ⚠️ 2026-10-28 dev-dep `tantivy` 0.26 → **0.27**（为消 `zstd`/`zstd-safe` 的三条 RUSTSEC）——
+//! 动手核过：**两个常量与所在行号（`:8-9`）逐字未变** ⇒ 本对照的口径不受这次升级影响；
+//! `docs/devel/eval-report.md:75-76` 的读数**仍是 0.26 时测的**，按历史读数保留不改。
 //! 已知差异来源：tantivy fieldnorm 8bit 量化（长文档 dl 压缩到量化格点）。
 //!
 //! # 断言（D6）
@@ -139,7 +142,7 @@ fn 自研bm25与tantivy真实语料对照() {
     let tsearcher = reader.searcher();
     let query_parser = QueryParser::for_index(&tindex, vec![body]);
 
-    // ---- 自研检索器：k1/b 与 tantivy 硬编码对齐（tantivy 0.26 无公开参数 API）----
+    // ---- 自研检索器：k1/b 与 tantivy 硬编码对齐（tantivy 0.27 亦无公开参数 API）----
     let retriever =
         Bm25Retriever::new(&ours, &analyzer).with_params(Bm25Params { k1: 1.2, b: 0.75 });
 
