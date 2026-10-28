@@ -183,6 +183,11 @@ jobs:
       # --all-targets：cargo check 默认不编 dev-deps/tests，
       # 不加会漏掉 criterion / proptest 等 dev 依赖的 MSRV 违规
       - run: cargo +1.90.0 check --workspace --all-targets
+      # ⚠️ 上面那条走**默认 feature**，覆盖不到非默认 feature 的生产链
+      # （`charabia` → `jieba-rs` → `include-flate` → `zstd` / `zstd-safe`）。
+      # 2026-10-28 PR #95（zstd 家族 4 条 RUSTSEC 的修复）暴露了这个盲区：
+      # 升级恰好落在这条链上，而 MSRV job 当时并不编它 ⇒ 补一条显式覆盖。
+      - run: cargo +1.90.0 check -p helix-core --features charabia --all-targets
 
   # ------------------------------------------------------------ feature 隔离
   features:
