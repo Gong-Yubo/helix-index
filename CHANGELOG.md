@@ -9,6 +9,18 @@
 
 ## [Unreleased]
 
+### 依赖 · 修 main 的 `cargo-deny` 红：zstd 家族 4 条 RUSTSEC（零 `ignore`）（2026-10-28）
+
+- **现象**：`main` 的 CI（`run 40478445797`，`78c8df7`，2026-10-27T09:07Z）唯一红 = **`cargo-deny`**；而**同一个 commit** 在 PR #94 的 CI（`39719562453`，03:56Z）里该 job 是 **success** ⇒ 又是**公告库在两次 CI 之间新收录**（与 #94 的三条 emSign 公告同一模式）。
+- **4 条公告与解法**：`RUSTSEC-2026-0410`（`zstd-sys` 2.0.16，wasm32 上 malloc 失败未处理的 shim）⇒ `>=2.1.2`；`RUSTSEC-2026-0391`（`zstd` 0.13.3，`with_context` 复用上下文会把上一流的残留数据带进下一流）⇒ `>=0.14.3`；`RUSTSEC-2026-0398` / `0403`（`zstd-safe`，`Seekable::decompress` 越界写长度 / 遗留帧失败时暴露未初始化内存）⇒ `>=8.2.0`。
+- **两条依赖链分别处置（不补 `ignore`，按 `deny.toml` 的「有升级路径就升」约定）**：
+  - ① **生产路径**（`charabia` → `jieba-rs` → `include-flate`，运行时解压内嵌词典）：`include-flate` `0.3.4 → 0.3.5`（连带 `include-flate-codegen` / `-compress`）⇒ 引入 `zstd 0.14.3` + `zstd-safe 8.2.0`；顺带 `syn 3.0.4 → 3.0.9`。
+  - ② **dev-only 路径**（ADR-007 的 BM25 对照基线）：`tantivy` `0.26.2 → 0.27.0` ⇒ `tantivy-sstable` / `-stacker` 同步到 0.27，**`zstd 0.13.3` 与 `zstd-safe 7.2.4` 整个从依赖图里消失**。
+  - ③ `zstd-sys` `2.0.16+zstd.1.5.7 → 2.1.2+zstd.1.5.7`。
+- ⚠️ **动手核过参照口径**：`tantivy 0.27.0` 的 BM25 常量仍是 `K1 = 1.2` / `B = 0.75`，且**所在行号（`src/query/bm25.rs:8-9`）与 0.26 逐字相同** ⇒ 本仓「自研侧显式对齐 `k1=1.2/b=0.75`」的对照口径**不受这次升级影响**（`cargo test --test bm25_vs_tantivy` 通过）。`docs/devel/eval-report.md:75-76` 的读数**是 0.26 时测的**，按**历史读数**保留不改（只在 `eval_tantivy.rs` 的注释里写清这次升级与口径不变的依据）。
+- **范围**：`Cargo.toml` 一行（`crates/core` 的 dev-dependencies `tantivy "0.26" → "0.27"`）+ `Cargo.lock` + `eval_tantivy.rs` 两处**注释**；**零生产逻辑改动**、**`deny.toml` 零改动**（没有新增任何 `ignore`）。
+- **验证**：`cargo deny check advisories licenses bans sources` = **四类全 `ok`**；`cargo test --test bm25_vs_tantivy` 通过；16 段守门链整链重跑（读数见 PR 正文）。
+
 ### 依赖 · 修 `cargo deny` 的环境性红：三包小版本升级（`RUSTSEC-2026-0381` / `0382` / `0383`，**非评审项**）（2026-10-22）
 
 - **现象**：本 PR 的守门链段 14 `cargo deny check advisories licenses bans sources` 变红（`advisories FAILED`、2 条 error），而**本 PR 一行依赖都没动**。
