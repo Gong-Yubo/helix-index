@@ -9,7 +9,7 @@
 | 版本    | **v1.1（已执行并回写）**                                                                          |
 | 日期    | 2026-09-02                                                                              |
 | 状态    | **已执行完成** —— RRF 手算值 + 确定性 + compare/explain 全部通过，见第 12 章执行记录                             |
-| 上游    | `docs/devel/plan.md` 第 8 章（P3，T3-01 ~ T3-11）、`architecture-design.md` 第 5.8 / 7.4 节 |
+| 上游    | `docs/devel/plan.md` 第 8 章（P3，T3-01 ～ T3-11）、`architecture-design.md` 第 5.8 / 7.4 节 |
 | 关联    | ADR-004（RRF k=60）、FR-10 / FR-11（融合）、FR-12（出处引用）、FR-13（空结果原因）、FR-20（query 缓存）、NFR-06（确定性）、NFR-07（可观测性） |
 | 环境    | Rust 1.90.0 / P0、P1、P2 已完成                                                       |
 
@@ -307,7 +307,7 @@ make fmt && make lint && make test && make deny   # 全绿
 | 批次 4 | T3-07 query 缓存（moka）+ T3-08 确定性 + T3-09 可观测 | 缓存 + 确定性 + tracing   |
 | 批次 5 | T3-10 CLI compare/explain + T3-11 边界复查       | 端到端 + 评审            |
 
-> 顺序设计：批次 1~2 **不依赖两路**（RRF 是纯数学，response/explain 是纯类型），先把融合与语义做对；批次 3 才把 BM25 与向量接进来。
+> 顺序设计：批次 1～2 **不依赖两路**（RRF 是纯数学，response/explain 是纯类型），先把融合与语义做对；批次 3 才把 BM25 与向量接进来。
 
 ---
 

@@ -9,7 +9,7 @@
 | 版本    | **v1.1（已执行并回写）**                                                                          |
 | 日期    | 2026-09-02                                                                                |
 | 状态    | **已执行完成** —— 全部单测 + tantivy 对照通过，见第 14 章执行记录                                 |
-| 上游    | `docs/devel/plan.md` 第 6 章（P1，T1-01 ~ T1-15）、`architecture-design.md` 第 5 / 6 / 7.1 / 7.2 节 |
+| 上游    | `docs/devel/plan.md` 第 6 章（P1，T1-01 ～ T1-15）、`architecture-design.md` 第 5 / 6 / 7.1 / 7.2 节 |
 | 关联    | ADR-001（手写 BM25）、ADR-006（TAAT）、ADR-007（tantivy 作 dev 基线）                                  |
 | 环境    | Rust 1.90.0 / Apple M5 / P0 已完成（`dd7589c`）                                                |
 
@@ -200,7 +200,7 @@ pub struct Bm25Retriever<'a> { index: &'a Index, analyzer: &'a dyn Analyzer, k1:
 - **偏移用 byte offset**：`&text[start..end]` 可 O(1) 切片；长度按 `char` 计数（符合" 512 字"的直觉）
 - 单测：① 重叠部分内容一致；② 拼接后不丢字；③ `&text[start..end] == chunk.text`（含中文与 emoji）
 
-### T1-04 ~ T1-07 分词链路
+### T1-04 ～ T1-07 分词链路
 
 - **T1-04 分段**：`unicode-segmentation` 切中英段（草稿已写，需验证）
 - **T1-05 过滤链**：NFKC 归一化 → 小写化 → 停用词 → 长度过滤（≥1 且 ≤ 32 字符）；**英文词干化不做**（架构 7.1）
@@ -208,7 +208,7 @@ pub struct Bm25Retriever<'a> { index: &'a Index, analyzer: &'a dyn Analyzer, k1:
 - **T1-07 `Analyzer` trait**：`analyze_query` 默认转发 `analyze_doc`
 - 单测：中英混排、全角符号、emoji、空串、纯符号；**两侧一致性**
 
-### T1-08 ~ T1-10 倒排 / 正排 / 统计量
+### T1-08 ～ T1-10 倒排 / 正排 / 统计量
 
 - **T1-08**：term dict + postings（`Vec<Vec<Posting>>`），`positions` 走 feature
 - **T1-09**：正排 + 墓碑
@@ -216,7 +216,7 @@ pub struct Bm25Retriever<'a> { index: &'a Index, analyzer: &'a dyn Analyzer, k1:
 - **D3：P1 就实现 `remove()`**（含统计量回滚）。理由见第 9 章
 - 单测：**删除后统计量与全量重建逐项相等**（防 R5 漂移，架构 12.1 标记为"最关键测试"）
 
-### T1-11 ~ T1-13 BM25 打分与检索
+### T1-11 ～ T1-13 BM25 打分与检索
 
 - **T1-11**：`idf` + `tf` 部分，OR 语义（未命中 term 贡献 0）
 - **T1-12**：TAAT 累加 + Top-K，**同分按 `chunk_id` 升序 tie-break**
@@ -232,8 +232,8 @@ idx search --index /tmp/index.idx --mode bm25 -k 5 "查询文本"
 
 - `build`：读 JSONL（`{"source","text","metadata"}`）→ Chunker → Analyzer → Index → **暂不落盘**（快照是 P4 的 T4-01，P1 阶段内存索引即可）
   - ⚠️ 这意味着 P1 的 `search` 必须与 `build` 同进程，否则索引丢了。方案：`idx search` 在 P1 **重新 build 再搜**（慢但可用），或加 `--rebuild` 语义。**P4 有快照后自然解决。**
-- 示例语料：手写 **~30 篇**中文短文档（Rust / 检索 / BM25 / 向量 / 分词主题），每篇 300~800 字
-  - ⚠️ 这是**冒烟语料不是评测语料**。P5 需要的 50~200 篇真实语料另需准备（T5-01）→ **已被 2026-09-03 决策取代**：评测数据改用开源 T2Ranking 转换（见 `p5-design.md` 第 3~5 章），30 篇冒烟语料定稿为 demo 语料
+- 示例语料：手写 **～30 篇**中文短文档（Rust / 检索 / BM25 / 向量 / 分词主题），每篇 300～800 字
+  - ⚠️ 这是**冒烟语料不是评测语料**。P5 需要的 50～200 篇真实语料另需准备（T5-01）→ **已被 2026-09-03 决策取代**：评测数据改用开源 T2Ranking 转换（见 `p5-design.md` 第 3～5 章），30 篇冒烟语料定稿为 demo 语料
 
 ### T1-15 与 tantivy 对照测试
 
@@ -315,7 +315,7 @@ idf: rust=0.538997, bm25=0.538997, vector=0.875469, index=0.538997
 | D3  | **`remove()` 是否提前到 P1**   | **提前**。P1 就实现删除 + 统计量回滚（原属 T4-05）                                                                                                        | ① 防漂移的关键单测能尽早跑起来；② 否则 P1 的索引长期"只增不删"，残缺 |
 | D4  | **P1 是否落盘**               | **不落盘**。快照是 P4（T4-01）；P1 的 `idx search` 先重新 build 再搜                                                                                     | 避免重复实现；代价是 P1 的 CLI 检索要重建索引（30 篇语料 <1s）  |
 | D5  | **对照测试的分词对齐**             | 加 dev 依赖 `tantivy-jieba`，并写自定义 TokenFilter 复用我们的停用词表                                                                                   | 多一个 dev 依赖（MIT）；换来差异可归因                  |
-| D6  | **示例语料规模**                | P1 手写 **~30 篇**短文档作为冒烟语料；P5 的评测语料（50~200 篇真实文档）另行准备 → **已被 2026-09-03 决策取代**：改用 T2Ranking 转换，见 `p5-design.md`                                              | 30 篇只够冒烟，不足以得出任何效果结论                     |
+| D6  | **示例语料规模**                | P1 手写 **～30 篇**短文档作为冒烟语料；P5 的评测语料（50～200 篇真实文档）另行准备 → **已被 2026-09-03 决策取代**：改用 T2Ranking 转换，见 `p5-design.md`                                              | 30 篇只够冒烟，不足以得出任何效果结论                     |
 | D7  | **对照阈值**                  | 首次实测后校准并写回本文档；硬指标是 **`unexplained` 差异 = 0**                                                                                             | 避免"数字不好看就放宽阈值"                           |
 
 ---
@@ -360,8 +360,8 @@ make fmt && make lint && make test && make deny   # 全绿
 | 批次 1 | 恢复 stash + 验证草稿（T1-04 分段 / T1-06 停用词）      | 先把已写的跑通              |
 | 批次 2 | T1-05 过滤链 + T1-07 Analyzer trait（P1-A 完成）  | 含两侧一致性单测             |
 | 批次 3 | T1-03 Chunker（P1-B）                        | 偏移单测                 |
-| 批次 4 | T1-08 ~ T1-10 倒排 / 正排 / 统计量 + `remove()`（P1-C） | 含删除后统计量单测       |
-| 批次 5 | T1-11 ~ T1-13 BM25 + Top-K + Retriever（P1-D） | **手算值单测**          |
+| 批次 4 | T1-08 ～ T1-10 倒排 / 正排 / 统计量 + `remove()`（P1-C） | 含删除后统计量单测       |
+| 批次 5 | T1-11 ～ T1-13 BM25 + Top-K + Retriever（P1-D） | **手算值单测**          |
 | 批次 6 | T1-14 CLI + 示例语料（P1-E）                     | 端到端跑通                |
 | 批次 7 | T1-15 tantivy 对照测试（P1-F）                   | 阈值校准 + 差异归因          |
 
@@ -410,7 +410,7 @@ make fmt && make lint && make test && make deny   # 全绿
 
 - `Token.byte_start` / `byte_end` 当前置 0（P1 不消费），P3 实现 FR-12 精确引用时补上"归一化文本 → 原文"的偏移映射
 - `Document.content_hash` 当前置 0，P4（T4-04）做幂等 upsert 时补
-- `data/corpus.jsonl` 是 30 篇**冒烟语料**，P5 需 50~200 篇真实语料（T5-01）→ **已被 2026-09-03 决策取代**：评测数据改用 T2Ranking 转换（`p5-design.md`），本语料定稿为 demo 语料
+- `data/corpus.jsonl` 是 30 篇**冒烟语料**，P5 需 50～200 篇真实语料（T5-01）→ **已被 2026-09-03 决策取代**：评测数据改用 T2Ranking 转换（`p5-design.md`），本语料定稿为 demo 语料
 
 ---
 
