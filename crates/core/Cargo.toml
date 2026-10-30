@@ -74,7 +74,7 @@ ort = { version = "=2.0.0-rc.13", default-features = false, optional = true }
 
 [dev-dependencies]
 # ADR-007：仅作为 BM25 正确性对照基线，不参与构建产物
-tantivy  = "0.26"
+tantivy  = "0.27"
 criterion = "0.8"
 proptest  = "1"
 tempfile  = "3"

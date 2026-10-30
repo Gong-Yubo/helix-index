@@ -9,6 +9,33 @@
 
 ## [Unreleased]
 
+### 依赖 · 修 main 的 `cargo-deny` 红：zstd 家族 4 条 RUSTSEC（零 `ignore`）（2026-10-28）
+
+**时间线（三段；取代原「同一 commit 在 5 小时内」的错述 —— 评审 `P3-1`）**：
+
+```text
+绿：run 39719562453（PR #94 head 68ad40b，树 = 78c8df7）         2026-10-22T03:56:11Z  cargo-deny = success
+库：rustsec/advisory-db a78282a（加入 0391 / 0398 / 0403 / 0410）  2026-10-26T13:45:01Z
+红：run 40478445797（main 78c8df7）                               2026-10-27T09:07:50Z  cargo-deny = failure
+```
+
+⇒ 绿与红相距 **5 天 5 小时 11 分**（**不是**「5 小时」），而公告库那次提交正好落在中间（距绿 **4 天 9:48**、距红 **19:22**）⇒ **「环境性红」的结论不变，且从库侧被钉死**（原表述只靠「同一个 commit 绿/红」这一条推理）。
+
+- **4 条公告与解法**：`RUSTSEC-2026-0410`（`zstd-sys` 2.0.16，wasm32 上 malloc 失败未处理的 shim）⇒ `>=2.1.2`；`RUSTSEC-2026-0391`（`zstd` 0.13.3，`with_context` 复用上下文会把上一流的残留数据带进下一流）⇒ `>=0.14.3`；`RUSTSEC-2026-0398` / `0403`（`zstd-safe`，`Seekable::decompress` 越界写长度 / 遗留帧失败时暴露未初始化内存）⇒ `>=8.2.0`。
+- **两条依赖链分别处置（不补 `ignore`，按 `deny.toml` 的「有升级路径就升」约定）**：
+  - ① **生产路径**（`charabia` → `jieba-rs` → `include-flate`，运行时解压内嵌词典）：`include-flate` `0.3.4 → 0.3.5`（连带 `include-flate-codegen` / `-compress`）⇒ 引入 `zstd 0.14.3` + `zstd-safe 8.2.0`。
+  - ② **dev-only 路径**（ADR-007 的 BM25 对照基线）：`tantivy` **`0.26.1` → `0.27.0`** ⇒ 6 个 `tantivy-*` 子 crate 同步到 `0.27.0`，**`zstd 0.13.3` 与 `zstd-safe 7.2.4` 整个从依赖图里消失**。
+- **完整依赖面清单（评审 `P4-2`：本 PR 的全部内容就是依赖面 ⇒ 清单应可对账）** —— 包级 `Cargo.lock` diff = **+3 / −1 / 18 个版本变化**：
+  - **新增**：`frostem`（tantivy 0.27 的 **stemmer 后端换供应商** —— `rust-stemmers` 被移除；BSD-3-Clause、`build = false`（无构建期执行）；本仓两个对照测试都显式注册 `WhitespaceTokenizer` ⇒ **stemming 不参与**，故对结果零影响）、`serde-tuple-vec-map`、`unwrap-infallible`；
+  - **移除**：`rust-stemmers`；
+  - **与本次公告直接相关**：`zstd` `0.13.3 → 0.14.3`、`zstd-safe` `7.2.4 → 8.2.0`、`zstd-sys` `2.0.16 → 2.1.2`、`include-flate`（+ `-codegen` / `-compress`）`0.3.4 → 0.3.5`；
+  - **随 `tantivy 0.27` 一起来的**：`datasketches` `0.2.0 → 0.5.0`、`lru` `0.16.4 → 0.18.5`、`lz4_flex` `0.13.1 → 0.14.0`、`murmurhash32` `0.3.1 → 0.4.0`，以及 `tantivy-bitpacker` / `-columnar` / `-common` / `-query-grammar` / `-sstable` / `-stacker` 统一到 `0.27.0`；
+  - **顺带**：`syn` `3.0.4 → 3.0.9`。
+- ⚠️ **口径核验（两层，评审 `P4-3` 补齐第二层）**：① `tantivy 0.27.0` 的 `src/query/bm25.rs:8-9` 仍是 `K1 = 1.2` / `B = 0.75`，**该文件与 0.26.1 逐字节相同**；② **真语料判据（ADR-007）本轮重跑**（`cargo test -p helix-core --release --test eval_tantivy -- --ignored`）：12000 段落 / 320 查询 ⇒ 自研 **`0.4429`** / tantivy **`0.4415`** / 相对差 **`0.0031`**（阈值 ≤ 5%）/ Top-10 平均重叠率 **`0.9700`** —— 与 `eval-report.md:75-76` 的 0.26 读数**逐位相同** ⇒ 「口径未变」在**真语料**上也成立。⚠️ `eval-report.md` 那两行是 0.26 时的**历史读数**，按纪律保留不改。
+- **范围**：`Cargo.toml` 一行（`crates/core` 的 dev-dependencies `tantivy "0.26" → "0.27"`）+ `Cargo.lock` + `eval_tantivy.rs` 两处**注释** + **`ci.yml` 的 MSRV job 多一步**；**零生产逻辑改动**、**`deny.toml` 零改动**（没有新增任何 `ignore`）。
+- 🆕 **顺带补一个 CI 盲区（评审 `P4-3` 第 1 条）**：`MSRV 1.90` job 原来只跑 `cargo +1.90.0 check --workspace --all-targets`（**默认 feature**）⇒ 本轮升级的**生产链**（`charabia` → `jieba-rs` → `include-flate` → `zstd` / `zstd-safe`）**不在这一门里**，「MSRV 绿」与所改链路不对位。已在**同一 job** 追加一步 `cargo +1.90.0 check -p helix-core --features charabia --all-targets`（本地实测 rc=0）。
+- **验证**：`cargo deny check advisories licenses bans sources` = **四类全 `ok`**；`bm25_vs_tantivy` 通过（6/6 query overlap = 1.00）；`eval_tantivy --ignored` 通过（读数见上）；16 段守门链整链重跑（读数见 PR 正文）。
+
 ### 依赖 · 修 `cargo deny` 的环境性红：三包小版本升级（`RUSTSEC-2026-0381` / `0382` / `0383`，**非评审项**）（2026-10-22）
 
 - **现象**：本 PR 的守门链段 14 `cargo deny check advisories licenses bans sources` 变红（`advisories FAILED`、2 条 error），而**本 PR 一行依赖都没动**。
