@@ -87,6 +87,11 @@ jobs:
       - run: python3 scripts/check_shell_expansion.py
       - run: python3 scripts/check_doc_shell.py --self-test
       - run: python3 scripts/check_doc_shell.py
+      # GFM 把一对 ASCII `~` 当删除线分隔符 ⇒ 文档里的区间写法（`P0~P5`）会把中间整段
+      # 渲染成 <del>（`#79`：2026-09-28 记 21 文件/177 处 → 2026-10-30 已长到 23/189）。
+      # 判据 = 代码之外不存在**长度为 1** 的 `~` run；刻意 `~~删除线~~` 保留。
+      - run: python3 scripts/check_doc_tilde.py --self-test
+      - run: python3 scripts/check_doc_tilde.py
 
   # ------------------------------------------------------------ 评测资产（**离线桩**）
   #

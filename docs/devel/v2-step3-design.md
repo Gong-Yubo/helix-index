@@ -6,11 +6,11 @@
 
 | 项 | 内容 |
 | --- | --- |
-| 版本 | **v0.3（拍板版：D-S3-01~07 全部按建议采纳，可开工实现）** |
+| 版本 | **v0.3（拍板版：D-S3-01～07 全部按建议采纳，可开工实现）** |
 | 日期 | 2026-09-07 |
-| 状态 | 评审闭环（v0.1 → 8 条意见全回应 → v0.2）+ **拍板完成（D-S3-01~07，2026-09-07）**；S3-01 完成，S3-02~09 待开工（单 PR） |
-| 修订记录 | v0.1 首版；v0.2 回应评审：checkpoint 计数校正（4→3）、D-S3-03 方案重构（B → C′，钩子不进公开面）、验收 3 按快照/manifest tmp 拆分口径、cp1/cp3 矩阵行按真实崩溃形态改写、代码草图笔误修正、Strict 残留行为如实声明（新增 D-S3-07）、panic=abort 约束降级为文档级（库 profile 对宿主无效）；v0.3 拍板：D-S3-01~07 全部按 §0 建议列原样采纳（含 D-S3-07「Strict 补 best-effort 清理」） |
-| 上游 | `plan-v2.md` v0.4（Step 3 / S3-a~e / Q-C3 定级「高（正确性）」）、`requirements-spec.md` v1.7（FR-31 **Must**）、`architecture-design.md` v1.7（§7.6.2 前提段 / ADR-A / R19）、`v2-step2-design.md` v0.3（ADR-A 方案 C，已实施） |
+| 状态 | 评审闭环（v0.1 → 8 条意见全回应 → v0.2）+ **拍板完成（D-S3-01～07，2026-09-07）**；S3-01 完成，S3-02～09 待开工（单 PR） |
+| 修订记录 | v0.1 首版；v0.2 回应评审：checkpoint 计数校正（4→3）、D-S3-03 方案重构（B → C′，钩子不进公开面）、验收 3 按快照/manifest tmp 拆分口径、cp1/cp3 矩阵行按真实崩溃形态改写、代码草图笔误修正、Strict 残留行为如实声明（新增 D-S3-07）、panic=abort 约束降级为文档级（库 profile 对宿主无效）；v0.3 拍板：D-S3-01～07 全部按 §0 建议列原样采纳（含 D-S3-07「Strict 补 best-effort 清理」） |
+| 上游 | `plan-v2.md` v0.4（Step 3 / S3-a～e / Q-C3 定级「高（正确性）」）、`requirements-spec.md` v1.7（FR-31 **Must**）、`architecture-design.md` v1.7（§7.6.2 前提段 / ADR-A / R19）、`v2-step2-design.md` v0.3（ADR-A 方案 C，已实施） |
 | 范围 | T7-13 原子快照（tmp + fsync + rename + fsync 父目录，D-J3）+ tmp 孤儿回收 + 故障注入测试 + **R19 写路径残余收敛**（S3-e） |
 | 非范围 | 图 sidecar 的校验/降级（Step 2 已交付，本文只引用）；compaction 与跨快照体积问题（**Step 4**）；低选择度兜底与 Metrics 可观测（**Step 5**）；`parallel_build` 默认翻转（横切 **T7-21**，独立 PR）；`.gitignore` 补非 tmp 的图 sidecar（横切 **T7-24** / issue #25，本文只补 tmp 模式） |
 
@@ -19,14 +19,14 @@
 ## 评审速读：7 个已拍板决策（✅ 2026-09-07，全部按建议列采纳）
 
 > 评审者时间有限时，先看这张表。每条在 §5 有完整取舍与证据。
-> **拍板结果**：D-S3-01~07 全部按「建议」列原样采纳——下表第三列即终局结论，
+> **拍板结果**：D-S3-01～07 全部按「建议」列原样采纳——下表第三列即终局结论，
 > 各节的备选/可否决讨论仅作存档。
 
 | # | 决策 | 建议（= 拍板结果 ✅） | 阻塞谁 |
 | --- | --- | --- | --- |
 | **D-S3-01** | tmp 命名规则：现状 manifest 的 tmp 用 `with_extension` 拼出**双后缀怪名**（实测 `foo.idx.hnsw.manifest` → `foo.idx.hnsw.hnsw.manifest.tmp`） | 统一改为**目标路径 + `.tmp` 追加**：`foo.idx.tmp` / `foo.idx.hnsw.manifest.tmp`。纯中间文件名变更，最终文件与格式零影响；且与 `.gitignore` 既有 `*.idx.tmp` 模式对齐 | 阻塞 S3-02/S3-03 |
-| **D-S3-02** | `atomic_write` 的落点与签名：放 `graph.rs` 还是新模块；收 `&[u8]` 还是写闭包 | 新模块 `storage/atomic.rs`（`snapshot.rs` 不得反向依赖 graph 语义）；签名收**写闭包** `FnOnce(&mut BufWriter<File>) -> io::Result<()>`——快照 52MB 若按 `&[u8]` 拼整包要多一次全量拷贝 | 阻塞 S3-02~04 |
-| **D-S3-03** | 故障注入钩子的形态：`test-util` feature / `#[cfg(test)]` / 常驻原子变量 / 环境变量 | **常驻 `pub(crate)` 钩子 + 注入测试内迁 crate 内 `#[cfg(test)]`（方案 C′，v0.2 修订）**。v0.1 的方案 B（`#[doc(hidden)]` 公开）有结构性矛盾：钩子藏在私有 `mod atomic` 里对 `tests/` 同样不可达，要可达就必须公开——「零新增公开项」随之破产。C′ 让公开面**真零新增**；代价只是注入测试不放集成层（T3~T5 本就要直接调 `pub(crate)` 的 `atomic_write`，集成层本来就放不下） | 阻塞 S3-05 |
+| **D-S3-02** | `atomic_write` 的落点与签名：放 `graph.rs` 还是新模块；收 `&[u8]` 还是写闭包 | 新模块 `storage/atomic.rs`（`snapshot.rs` 不得反向依赖 graph 语义）；签名收**写闭包** `FnOnce(&mut BufWriter<File>) -> io::Result<()>`——快照 52MB 若按 `&[u8]` 拼整包要多一次全量拷贝 | 阻塞 S3-02～04 |
+| **D-S3-03** | 故障注入钩子的形态：`test-util` feature / `#[cfg(test)]` / 常驻原子变量 / 环境变量 | **常驻 `pub(crate)` 钩子 + 注入测试内迁 crate 内 `#[cfg(test)]`（方案 C′，v0.2 修订）**。v0.1 的方案 B（`#[doc(hidden)]` 公开）有结构性矛盾：钩子藏在私有 `mod atomic` 里对 `tests/` 同样不可达，要可达就必须公开——「零新增公开项」随之破产。C′ 让公开面**真零新增**；代价只是注入测试不放集成层（T3～T5 本就要直接调 `pub(crate)` 的 `atomic_write`，集成层本来就放不下） | 阻塞 S3-05 |
 | **D-S3-04** | R19 写路径残余（`DumpInit` 的 `panic_any`，TOCTOU 窗口只能缩小不能归零）怎么收敛 | `catch_unwind(AssertUnwindSafe(dump_graph))`，panic payload 降级为 `Err(VectorGraph)`，**汇入 Step 2 既有的 P0-3 语义链**（Lenient 警告 + `PersistFailed` / Strict Err），不新增状态机。probe 探测保留（第一道防线） | 阻塞 S3-06 |
 | **D-S3-05** | tmp 孤儿回收时机：save 前 / save 后 / load 后 / 都做 | **load 成功后 best-effort 删除**（快照本体），**save 前 `File::create` 截断复用**（天然覆盖同名 tmp）；manifest tmp 由既有 `remove_sidecars` 清理（仅改名，**只在 save 路径触发**——load-only 部署会保留 manifest tmp 孤儿，无害）。依据：原子协议下 tmp 永不权威，且项目无「并发写同一快照」语义 | 阻塞 S3-04 |
 | **D-S3-06** | fsync 给 `save` 引入的额外耗时（52MB 级 fsync）是否接受、要不要「跳过 fsync」逃生舱 | **接受并实测入档**（save 是用户显式调用的低频操作，与 NFR-03 构建口径无关）；**不提供跳过开关**——正确性语义不做成选项 | 影响 S3-08 |
@@ -57,10 +57,10 @@ tmp → flush → `sync_all` → rename → fsync 父目录）。**真源（快�
 
 ### 1.3 验收标准（Step 3 完成的定义，可证伪）
 
-1. ⚠️ **崩溃不变式**：在 `save` 序列的**任一注入点**（§4.3 三个 checkpoint，cp1~cp3）崩溃后，
-   `load` 要么拿到**旧快照**、要么拿到**新快照**，**绝不 `SnapshotCorrupted`**（S3-T3~T6）。
+1. ⚠️ **崩溃不变式**：在 `save` 序列的**任一注入点**（§4.3 三个 checkpoint，cp1～cp3）崩溃后，
+   `load` 要么拿到**旧快照**、要么拿到**新快照**，**绝不 `SnapshotCorrupted`**（S3-T3～T6）。
    注：注入只覆盖**快照写窗口**（`save` 内首次 `atomic_write`）；图 dump 与 manifest 发布
-   窗口（§4.3 矩阵末两行 / W2~W4）是性能退化窗口，Step 2 语义已覆盖，不做端到端注入复验
+   窗口（§4.3 矩阵末两行 / W2～W4）是性能退化窗口，Step 2 语义已覆盖，不做端到端注入复验
    （`FAIL_AT` 单发命中，端到端注入必先落在快照那次调用上——见 §7 T6 注）。
 2. 快照重写后旧图自动失效（CRC 版本锚点）——Step 2 已有行为，本 Step 改造后**回归不破**（S3-T2）。
 3. 崩溃残留的 tmp 孤儿被回收，**按类型分口径**（v0.2 拆分）：**快照 tmp**（`*.idx.tmp`）——
@@ -121,7 +121,7 @@ pub fn save_with_crc(..) -> Result<u32> {
 | W3 | 图 dump 中（旧图已删） | 半截图 + 无新 manifest → 图降级重建 | 同左（不变） |
 | W4 | manifest 发布后 | 全新一致 | 同左（不变） |
 
-**W1 是本 Step 唯一的「正确性事故」窗口**；W2~W4 都是「性能退化」窗口，Step 2 的
+**W1 是本 Step 唯一的「正确性事故」窗口**；W2～W4 都是「性能退化」窗口，Step 2 的
 降级语义已覆盖（plan-v2 验收也明确「该行为已被 Step 2 覆盖，不重复验收」）。
 
 ### 2.3 与图 manifest 原子写的对照（抽取的基础）
@@ -310,12 +310,12 @@ pub(crate) mod fault {
 | --- | --- | --- | --- |
 | A. `test-util` feature | 生产二进制零代码 | CI 矩阵要加一档（`--features test-util`），守门清单膨胀；漏跑即测试静默消失 | 否 |
 | B′. `#[doc(hidden)]` **公开**常驻钩子 | `tests/` 集成层可直接设 `FAIL_AT`，CI 零改动；每次 `atomic_write` 3 次 relaxed 读可忽略 | **必须公开可达**（`storage` 子模块全私有 + 选择性 `pub use`，v0.2 核实 `storage/mod.rs:15-25`）⇒ 「零新增公开项」破产，且 doc(hidden) 只藏文档不藏可达性——外部依赖理论上能设 `FAIL_AT` 制造 panic | 否（存档：若未来需要 T6 进集成层再议） |
-| **C′. 常驻 `pub(crate)` 钩子 + 注入测试内迁** | 公开面**真零新增**；CI 零改动；钩子常驻 ⇒ 测试路径与发布路径**逐位一致**；3 次 relaxed 读代价同 B′ | 注入测试（T3~T6、T9）必须放 crate 内 `#[cfg(test)]`，不能进 `tests/`；全局 `FAIL_AT` 与同二进制内并行测试互扰，需串行化（见下） | **✅ 已拍板（2026-09-07）** |
+| **C′. 常驻 `pub(crate)` 钩子 + 注入测试内迁** | 公开面**真零新增**；CI 零改动；钩子常驻 ⇒ 测试路径与发布路径**逐位一致**；3 次 relaxed 读代价同 B′ | 注入测试（T3～T6、T9）必须放 crate 内 `#[cfg(test)]`，不能进 `tests/`；全局 `FAIL_AT` 与同二进制内并行测试互扰，需串行化（见下） | **✅ 已拍板（2026-09-07）** |
 | D. 环境变量 | 零签名变化 | 生产代码读 env 改行为 = 隐藏通道，比隐藏 API 更糟；还要处理 env 解析错误 | 否 |
 
 > v0.1 方案 B 的矛盾（评审指出）：钩子放进私有 `mod atomic` 后，即便内部写 `pub static
 > FAIL_AT`，`tests/`（独立 crate）也够不到它——`cfg(test)` 不可见的问题只是换了藏法，
-> 原样存在。要可达就必须公开暴露，B 实际上就是 B′。而 T3~T5、T9 本就要**直接调用**
+> 原样存在。要可达就必须公开暴露，B 实际上就是 B′。而 T3～T5、T9 本就要**直接调用**
 > `pub(crate)` 的 `atomic_write`（往裸文件写 `b"old"`/`b"new"` 那种粒度），集成层
 > 本来就放不下——真正受影响的只有端到端 T6，而它在 `search/index.rs` 的
 > `#[cfg(test)]` 里同样能走完整的公开 API（`SearchIndex::save` → reload）。
@@ -395,11 +395,11 @@ pub(crate) fn dump_graph_caught(
 
 ---
 
-## 5. 决策记录（D-S3-01 ~ D-S3-07）
+## 5. 决策记录（D-S3-01 ～ D-S3-07）
 
 > 编号沿用项目惯例（Step 2 用 D-S2-xx）。以下每条 = §0 速读表的展开。
 >
-> **✅ 拍板（2026-09-07）**：D-S3-01~07 **全部按各节建议采纳**——本节结论即为终局，
+> **✅ 拍板（2026-09-07）**：D-S3-01～07 **全部按各节建议采纳**——本节结论即为终局，
 > 各节内残留的「备选 / 可否决」讨论仅作决策过程存档，不再构成待办。
 
 ### D-S3-01 tmp 命名统一为「目标路径 + `.tmp` 追加」
@@ -428,13 +428,13 @@ pub(crate) fn dump_graph_caught(
 
 完整对比见 §4.5 表格（v0.2 重构：v0.1 推荐的方案 B 经评审指出存在结构性矛盾——
 私有模块里的 `#[doc(hidden)] pub static` 对 `tests/` 仍不可达，要可达就必须公开，
-「零新增公开项」随之不成立；且注入测试 T3~T5/T9 本就要直接调 `pub(crate)` 的
+「零新增公开项」随之不成立；且注入测试 T3～T5/T9 本就要直接调 `pub(crate)` 的
 `atomic_write`，集成层放不下）。C′ 要点：
 
 1. `fault` 为 `pub(crate) mod`（常驻生产路径，不进公开面，也不 cfg 剔除——
    保证测试路径与发布路径逐位一致）；
-2. 注入测试 T3~T6、T9 全部放 crate 内 `#[cfg(test)]`（`storage/atomic.rs` 单测承载
-   T3~T5/T9，`search/index.rs` 单测承载端到端 T6——同样走完整公开 API）；
+2. 注入测试 T3～T6、T9 全部放 crate 内 `#[cfg(test)]`（`storage/atomic.rs` 单测承载
+   T3～T5/T9，`search/index.rs` 单测承载端到端 T6——同样走完整公开 API）；
 3. `tests/atomic_snapshot.rs` 只放**无注入**的公开 API 集成测试（save 原子性外观 +
    tmp 不残留 + 旧快照兼容回归）；
 4. 并行互扰防护：注入测试共用测试内 `static Mutex` 串行 + guard 复位（§4.5 末）。
@@ -469,13 +469,13 @@ pub(crate) fn dump_graph_caught(
 
 ### D-S3-06 fsync 代价：接受、实测、不开逃生舱
 
-- 52MB 快照的 `sync_all` 在普通 SSD 上量级约 50~300ms，HDD 上可达秒级。save 是
+- 52MB 快照的 `sync_all` 在普通 SSD 上量级约 50～300ms，HDD 上可达秒级。save 是
   **用户显式调用的低频操作**（CLI `build` / 宿主落库），不触碰任何 NFR 限额
   （NFR-02 查询 / NFR-03 构建 / NFR-04 冷启动都不含 save）。
 - **不提供 `skip_fsync` 选项**：fsync 是正确性语义（§2.1 缺陷 2 的直接修复），
   做成开关等于把「要不要丢数据」交给调用方——与「不得静默读错」同一级别的
   非选项。`--no-graph-persist` 是性能逃生舱，管的是缓存；真源没有逃生舱。
-- S3-08 在 12K 语料实测改造前后 `save` 耗时，**给范围**（三次以上取 min~max），
+- S3-08 在 12K 语料实测改造前后 `save` 耗时，**给范围**（三次以上取 min～max），
   写入 `eval-report.md` 新小节（§8.x，编号顺延）。
 
 ### D-S3-07（v0.2 新增）Strict 失败路径是否补 sidecar 清理
@@ -514,8 +514,8 @@ pub(crate) fn dump_graph_caught(
 ## 7. 测试计划
 
 > 编号 S3-Tn。带 ⚠️ 的是**必测**（直接对应验收）。
-> **测试落点（v0.2，随 D-S3-03 方案 C′ 调整）**：注入类测试（T3~T6、T9）全部放
-> crate 内 `#[cfg(test)]`——`storage/atomic.rs` 单测承载 T3~T5/T9（直接调
+> **测试落点（v0.2，随 D-S3-03 方案 C′ 调整）**：注入类测试（T3～T6、T9）全部放
+> crate 内 `#[cfg(test)]`——`storage/atomic.rs` 单测承载 T3～T5/T9（直接调
 > `pub(crate)` 的 `atomic_write`），`search/index.rs` 单测承载端到端 T6（走完整公开
 > API）；`tests/atomic_snapshot.rs`（集成层）只放**无注入**的公开 API 测试：
 > save 原子性外观（写新→load 得新）、tmp 不残留、旧快照兼容回归。
@@ -527,11 +527,11 @@ pub(crate) fn dump_graph_caught(
 | **S3-T3** ⚠️ | **注入 cp2（sync 后、rename 前，plan-v2 钦定点）** | `catch_unwind(atomic_write)` 后：① `foo.idx` 内容 == 旧值；② tmp 存在且内容 == 新值（但**永不权威**）；③ 随后 `load_with_crc` 成功且得旧内容；④ load 触发回收，tmp 消失 |
 | **S3-T4** | 注入 cp1（写入后、flush 前） | 不变式与 T3 的 ①③④ 相同（cp1/cp2 同属 rename 前，真源均未动）；tmp **内容不定**（v0.2：注入 panic 的栈展开会令 `BufWriter::drop` 尽力刷缓冲，tmp 常反而完整；真实半截态无法进程内复现，见 §4.3 注 2）——只断言存在性与回收，**不断言内容** |
 | **S3-T5** | 注入 cp3（rename 后、目录 fsync 前） | ① `foo.idx` 内容 == 新值；② `load_with_crc` 成功得新内容；③ 残留 tmp（若有）被 load 回收 |
-| **S3-T6** ⚠️ | **端到端**（验收 1 的直接对应） | 真实 `SearchIndex`（小语料）：save 前注入各 checkpoint + `catch_unwind(save)` → 重新 `SearchIndex::load`：要么旧要么新，**绝不 `SnapshotCorrupted`**；且检索功能可用。**注入范围声明（v0.2）**：`FAIL_AT` 单发命中，端到端注入只覆盖**快照写窗口**（save 内首次 `atomic_write`）；图 dump / manifest 发布窗口（W2~W4）不重复注入——Step 2 语义已覆盖（性能退化窗口），manifest 侧 `atomic_write` 协议本身由 T3~T5 在同一实现上直接覆盖 |
+| **S3-T6** ⚠️ | **端到端**（验收 1 的直接对应） | 真实 `SearchIndex`（小语料）：save 前注入各 checkpoint + `catch_unwind(save)` → 重新 `SearchIndex::load`：要么旧要么新，**绝不 `SnapshotCorrupted`**；且检索功能可用。**注入范围声明（v0.2）**：`FAIL_AT` 单发命中，端到端注入只覆盖**快照写窗口**（save 内首次 `atomic_write`）；图 dump / manifest 发布窗口（W2～W4）不重复注入——Step 2 语义已覆盖（性能退化窗口），manifest 侧 `atomic_write` 协议本身由 T3～T5 在同一实现上直接覆盖 |
 | **S3-T7** ⚠️ | **R19：dump panic 不杀进程**（验收 4） | 单元层（`vector/persist.rs` `#[cfg(test)]`）：mock 一个 `dump_graph` 直接 panic 的 `VectorGraphPersist` 实现 → `dump_graph_caught` 返回 `Err(VectorGraph(含 panic 信息))`；接入门面层后 Lenient 语义 = 既有 S2-T19 断言（save Ok + `PersistFailed`） |
 | **S3-T8** | manifest tmp 改名一致性 | `write_manifest_atomic` 成功 / 失败（同名目录占据）后，`remove_sidecars` 均不留 `*.manifest.tmp`（写、清两边用的是同一 `tmp_path`） |
 | **S3-T9** | fault 钩子默认关闭 | `FAIL_AT == 0` 时 `atomic_write` 行为与 T1 完全一致（防钩子泄漏进生产语义） |
-| **S3-T10** | fsync 代价实测（非 CI，本地） | 12K 语料：改造前后 `save` 耗时各测 ≥3 次取 min~max，入 `eval-report.md`（S3-08 交付） |
+| **S3-T10** | fsync 代价实测（非 CI，本地） | 12K 语料：改造前后 `save` 耗时各测 ≥3 次取 min～max，入 `eval-report.md`（S3-08 交付） |
 
 > 测试技法备忘（沿 Step 2 教训）：所有 `catch_unwind` 后**立即复位** `FAIL_AT`——用
 > guard（`Drop` 里 store 回 0）而非裸 store，防断言失败路径泄漏到下一个测试；注入测试
@@ -540,25 +540,25 @@ pub(crate) fn dump_graph_caught(
 
 ---
 
-## 8. 实施任务拆分（S3-01 ~ S3-09）
+## 8. 实施任务拆分（S3-01 ～ S3-09）
 
-> 量级 S（plan-v2）。默认**单个实现 PR**（S3-02~S3-08 代码 + 测试 + 文档回写同 PR）：
+> 量级 S（plan-v2）。默认**单个实现 PR**（S3-02～S3-08 代码 + 测试 + 文档回写同 PR）：
 > Step 2 的教训是堆叠 PR 的坑（#13/#14 显示 MERGED 却未进 main），S 量级不值得拆。
 > 如评审认为单 PR 过大，拆分线在 S3-05（代码 PR / 测试+文档 PR）。
 
 | # | 任务 | 对应 | 依赖 | 量级 |
 | --- | --- | --- | --- | --- |
-| **S3-01** | 本文评审 + D-S3-01~07 拍板，回写本文状态（**✅ 已完成**：v0.1 → v0.2 评审回应 → v0.3 拍板，PR #26） | — | — | S |
+| **S3-01** | 本文评审 + D-S3-01～07 拍板，回写本文状态（**✅ 已完成**：v0.1 → v0.2 评审回应 → v0.3 拍板，PR #26） | — | — | S |
 | **S3-02** | `storage/atomic.rs`：`atomic_write`（写闭包签名）+ `tmp_path` + `fsync_dir` + `fault` 钩子 + 单测（T1 / T9） | S3-a | S3-01 | S |
 | **S3-03** | `write_manifest_atomic` 改走 `atomic_write`（含 D-S3-01 改名）；`remove_sidecars` 的 tmp 清理同步换 `tmp_path`（T8） | S3-a | S3-02 | S |
 | **S3-04** | `save_with_crc` 改走 `atomic_write`（S3-b）；`load_with_crc` 成功后孤儿回收（S3-c）；既有测试回归（T2） | S3-b/c | S3-02 | S |
-| **S3-05** | 故障注入测试 T3~T6、T9（crate 内 `#[cfg(test)]`：`storage/atomic.rs` 承载 T3~T5/T9、`search/index.rs` 承载 T6；见 §7 落点说明）+ `tests/atomic_snapshot.rs` 无注入集成测试（save 原子性外观 / tmp 不残留 / 兼容回归） | S3-d | S3-04 | S |
+| **S3-05** | 故障注入测试 T3～T6、T9（crate 内 `#[cfg(test)]`：`storage/atomic.rs` 承载 T3～T5/T9、`search/index.rs` 承载 T6；见 §7 落点说明）+ `tests/atomic_snapshot.rs` 无注入集成测试（save 原子性外观 / tmp 不残留 / 兼容回归） | S3-d | S3-04 | S |
 | **S3-06** | R19：`dump_graph_caught`（catch_unwind + payload 降级）接入 `write_graph_sidecar`；Cargo.toml 钉「不得 panic=abort」注释（**仅约束本 workspace**，宿主约束走文档，见 §4.6）；Strict 失败路径补 best-effort `remove_sidecars`（**D-S3-07 已拍板**）；单测 T7 | S3-e | S3-03 | S |
 | **S3-07** | `.gitignore` + `*.manifest.tmp`（S3-c 后半；非 tmp 的 sidecar ignore 归 T7-24，不越界） | S3-c | S3-03 | XS |
 | **S3-08** | fsync 代价实测（12K，范围值）入 `eval-report.md`（T10） | — | S3-04 | S |
-| **S3-09** | 文档回写：架构 v1.8（§7.6.2 前提段销账「快照本体至今非原子」/ R19 残余更新 / 变更记录）、需求（FR-31 验收注记落地）、`plan-v2`（Step 3 进度 ✅ + 验收对照）、`CHANGELOG`、`docs/README.md` 索引、本文「实施结果」段 | — | S3-05~08 | S |
+| **S3-09** | 文档回写：架构 v1.8（§7.6.2 前提段销账「快照本体至今非原子」/ R19 残余更新 / 变更记录）、需求（FR-31 验收注记落地）、`plan-v2`（Step 3 进度 ✅ + 验收对照）、`CHANGELOG`、`docs/README.md` 索引、本文「实施结果」段 | — | S3-05～08 | S |
 
-> 注：S3-01 即本 PR；S3-02~S3-08 为实现 PR 的内容；S3-09 在实现 PR 内完成
+> 注：S3-01 即本 PR；S3-02～S3-08 为实现 PR 的内容；S3-09 在实现 PR 内完成
 > （单 PR 方案下不单独拆）。
 
 ---
@@ -626,7 +626,7 @@ pub(crate) fn dump_graph_caught(
 ) -> Result<GraphStats>;                          // R19：catch_unwind → Err(VectorGraph)
 ```
 
-## 附录 B：checkpoint × 断言对照（S3-T3~T6 的执行脚本）
+## 附录 B：checkpoint × 断言对照（S3-T3～T6 的执行脚本）
 
 | checkpoint | T3/T4/T6 断言（rename 前） | T5/T6 断言（rename 后） |
 | --- | --- | --- |
@@ -651,13 +651,13 @@ pub(crate) fn dump_graph_caught(
 | Strict 分支失败不清理 sidecar | `crates/core/src/search/index.rs:503`（Lenient 清理在 `:504-512`；v0.2 评审核实） |
 | `remove_sidecars` 仅 save 路径调用 | `crates/core/src/search/index.rs:484,488,493,507`（load 路径零调用点，v0.2 评审核实） |
 | storage 子模块私有 + 选择性 `pub use` | `crates/core/src/storage/mod.rs:15-25`（v0.2 评审核实：私有 `mod atomic` 内的钩子对 `tests/` 不可达） |
-| S3-a~e 子任务定义 | `docs/devel/plan-v2.md` §4 Step 3 |
+| S3-a～e 子任务定义 | `docs/devel/plan-v2.md` §4 Step 3 |
 
 ---
 
-## 10. 实施结果（S3-02~09，2026-09-07 落地）
+## 10. 实施结果（S3-02～09，2026-09-07 落地）
 
-> 单实现 PR（S3-02~09 代码 + 测试 + 文档回写同 PR），分支 `feat/v2-step3-atomic-snapshot`。
+> 单实现 PR（S3-02～09 代码 + 测试 + 文档回写同 PR），分支 `feat/v2-step3-atomic-snapshot`。
 
 ### 10.1 落地清单与设计偏差
 
@@ -680,8 +680,8 @@ pub(crate) fn dump_graph_caught(
 
 ### 10.3 fsync 代价实测（详见 eval-report §8.7）
 
-12K 语料 54,476,915 字节（≈54.5MB）：改造前 0.034~0.040s → 改造后 0.067~0.075s
-（+0.027~0.035s，本机 NVMe，3 轮 min~max）。**两版产物 CRC 逐位一致**（`0x576e065f`）
+12K 语料 54,476,915 字节（≈54.5MB）：改造前 0.034～0.040s → 改造后 0.067～0.075s
+（+0.027～0.035s，本机 NVMe，3 轮 min～max）。**两版产物 CRC 逐位一致**（`0x576e065f`）
 ——「格式零变化」（C3）得到字节级实测印证。不触碰任何 NFR。
 
 ### 10.4 评审回应与集成测试补强（2026-09-08，`a474d86` + `dc31b3f`）
@@ -695,7 +695,7 @@ pub(crate) fn dump_graph_caught(
 双点），评审「通常 EINVAL」前提在实测机不成立，注释仍按平台分列补全、
 eval-report §8.7 补平台口径注记。
 
-**集成测试 S3-TI1~TI5**（`tests/atomic_snapshot.rs`，与 S3-T 单元层互补——
+**集成测试 S3-TI1～TI5**（`tests/atomic_snapshot.rs`，与 S3-T 单元层互补——
 注入类受 C′ 约束留在 crate 内，无注入可观测的终态在集成层钉死）：
 
 | # | 覆盖 |

@@ -6,10 +6,10 @@
 | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | 版本      | v1.6                                                                                                                                                                                                                                             |
 | 创建日期    | 2026-09-02                                                                                                                                                                                                                                       |
-| 状态      | **P0~P6 全部完成**（P6 接口重构 2026-09-04 落地，回归对账通过）；下一步 P7（v2）                                                                                                                                                                                                     |
+| 状态      | **P0～P6 全部完成**（P6 接口重构 2026-09-04 落地，回归对账通过）；下一步 P7（v2）                                                                                                                                                                                                     |
 | v1.6 变更 | **事实同步（2026-09-12，PR #41）**：`make deny` 与 CI 的 cargo-deny 从 `licenses bans sources` 扩为 **`advisories licenses bans sources`**，并把检查器版本 **pin 到 `0.20.2`**（`deny.toml` / `Makefile` / `ci.yml` 三处），T0-06 行与「每日开发循环」段的命令字面量同步。⚠️ `advisories` 需联网拉 RustSec 数据库 ⇒ **断网时 `make all` 会在此失败，且与代码无关**（离线复核用 `cargo deny --offline check advisories`）；新增的这道门**拟登记为 R42**（与 R41 同批，随 S6-10 定义面回写）。 |
-| v1.5 变更 | P6 完成：I-01~I-14 全部落地（门面层 SearchIndex/Searcher、写缓冲+批量 embed、配置指纹校验、CLI/示例/文档迁移、bench 回归对账 brute 逐位一致）。batch_size 实测 32~256 差异 <20% 维持 64；NFR 重测见 eval-report 8.x |
-| v1.4 变更 | 依据 issue #1 与 `p6-design.md`：**P6 重新定义为「融合索引接口重构」**（原 v2 顺延 P7）。新增任务 I-01~I-14；接口目标 `index.add(doc)` / `searcher.search(query)`（仅 query 必选）。详见 `p6-design.md` |
+| v1.5 变更 | P6 完成：I-01～I-14 全部落地（门面层 SearchIndex/Searcher、写缓冲+批量 embed、配置指纹校验、CLI/示例/文档迁移、bench 回归对账 brute 逐位一致）。batch_size 实测 32～256 差异 <20% 维持 64；NFR 重测见 eval-report 8.x |
+| v1.4 变更 | 依据 issue #1 与 `p6-design.md`：**P6 重新定义为「融合索引接口重构」**（原 v2 顺延 P7）。新增任务 I-01～I-14；接口目标 `index.add(doc)` / `searcher.search(query)`（仅 query 必选）。详见 `p6-design.md` |
 | v1.3 变更 | P5 完成：三路对照 + 参数定稿（BM25 k1=1.5/b=0.75、RRF weights 1:1.5）、tantivy 基线相对差 0.31%、charabia 保留自研链、NFR 实测（延迟达标/构建未达标）、README、D8 移除 instant-distance。详见 `eval-report.md` |
 | v1.2 变更 | 依据 `p5-design.md` v1.2（评测数据源切换为开源 T2Ranking）：T5-01/T5-02 由"人工撰写语料 + 自标注"改为**数据集转换管线**（`t2_prep.rs`，固定种子）；T5-03 指标改**分级 NDCG**（gain=2^g−1）；T5-04 补 tantivy 基线与 RRF k 敏感性；T5-06 规模口径对齐 12K 段落；现状表与并行工作流同步 |
 | v1.1 变更 | 依据 `docs/devel/thirdparty.md` 调研结论回写：新增 T1-15（tantivy 对照）、T4-06a（向量索引 A/B）、T5-09（分词对照）；T0-03/T0-06 增加 MSRV 1.90 与 `cargo-deny`；T1-04 引入 `unicode-segmentation`/`unicode-normalization`；T3-07 缓存改 `moka`；T4-01 改 `bincode 3.0.0`；附录 B 依赖清单同步至实测版本 |
@@ -270,16 +270,16 @@ cargo run -p helix -- search --index /tmp/index.helix --mode hybrid --explain ".
 
 **目标**：用数据证明"混合检索确实比单路好"，并把所有 NFR 从目标值变成实测值。
 
-**阶段门槛**：三路对照实验有数据；BM25 参数经网格搜索定稿；NFR-02~05 全部替换为实测值。
+**阶段门槛**：三路对照实验有数据；BM25 参数经网格搜索定稿；NFR-02～05 全部替换为实测值。
 
 | ID    | 任务             | 产出                                         | 要点                                                                                                                  | 验收                                       |
 | ----- | -------------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- | ---------------------------------------- |
-| T5-01 | 评测语料装配         | `data/t2-corpus.jsonl`（~12K 段落）           | **从开源 T2Ranking（Apache-2.0，SIGIR 2023）转换**：`t2_prep.rs`（固定种子）从 dev 集装配 qrels 段落全集 + 均匀负例；真实中文网页段落，词频自然分布（选型与管线详见 `p5-design.md` 第 3~5 章） | ~12K 段落，可被 CLI 构建；分布统计输出                     |
-| T5-02 | 评测集装配          | `data/t2-queries.jsonl`（~320 条）             | 同上转换器产出：**四类各 ~80 条**（精确术语 / 同义改写 / 中英混合 / 长句问句，启发式分桶，词汇重合度计算不依赖任何检索器输出）；相关性为 **4 级专业标注**（T2Ranking qrels，每对 ≥3 人多数票），**不再自标注**（标注者偏差整体消除） | 四类齐全，`t2_prep` 校验通过（qrels 缺失 pid 为 0）      |
-| T5-03 | `helix bench` 实现 | `crates/cli` + `core/bench`                | 输出 Recall@10 / MRR@10 / NDCG@10（**分级 gain=2^g−1**）/ P50 / P99 延迟；`--rel-threshold` 可调 Recall/MRR 阈值；含指标手算单测锚点（详见 `p5-design.md` 第 6~7 章）                                                                      | 三种模式各跑一遍有完整输出                            |
+| T5-01 | 评测语料装配         | `data/t2-corpus.jsonl`（～12K 段落）           | **从开源 T2Ranking（Apache-2.0，SIGIR 2023）转换**：`t2_prep.rs`（固定种子）从 dev 集装配 qrels 段落全集 + 均匀负例；真实中文网页段落，词频自然分布（选型与管线详见 `p5-design.md` 第 3～5 章） | ～12K 段落，可被 CLI 构建；分布统计输出                     |
+| T5-02 | 评测集装配          | `data/t2-queries.jsonl`（～320 条）             | 同上转换器产出：**四类各 ～80 条**（精确术语 / 同义改写 / 中英混合 / 长句问句，启发式分桶，词汇重合度计算不依赖任何检索器输出）；相关性为 **4 级专业标注**（T2Ranking qrels，每对 ≥3 人多数票），**不再自标注**（标注者偏差整体消除） | 四类齐全，`t2_prep` 校验通过（qrels 缺失 pid 为 0）      |
+| T5-03 | `helix bench` 实现 | `crates/cli` + `core/bench`                | 输出 Recall@10 / MRR@10 / NDCG@10（**分级 gain=2^g−1**）/ P50 / P99 延迟；`--rel-threshold` 可调 Recall/MRR 阈值；含指标手算单测锚点（详见 `p5-design.md` 第 6～7 章）                                                                      | 三种模式各跑一遍有完整输出                            |
 | T5-04 | **强制对照实验**     | `docs/devel/eval-report.md`                | BM25 only / Vector only / Hybrid(RRF) 三路对比，按查询类型分桶统计；**tantivy 作第三路基线**（ADR-007：NDCG@10 相对差 ≤5%）；RRF k ∈ {20,60,100} 敏感性（R7）。**用 T5-05 定稿参数跑终版**（执行顺序：T5-05 先于 T5-04，见 p5-design.md 8.1）                | 有表格与结论                                   |
 | T5-05 | BM25 参数网格搜索    | `docs/devel/eval-report.md`                | `k1 ∈ {1.0, 1.2, 1.5, 2.0}` × `b ∈ {0.3, 0.5, 0.75, 0.9}`，以 NDCG@10 选优（并列取近默认值）。**不盲信英文经验值**（R6）——真实中文网页语料 + 真实查询正是该风险的设计场景                             | 参数定稿并写入默认值                               |
-| T5-06 | NFR 实测校准       | 更新 `docs/devel/requirements-spec.md` 第 6 章 | 用 `t2-corpus.jsonl`（~12K chunk，对齐"1 万 chunk"目标规模）实测 NFR-02~05，替换目标值或标注"未达标 + 原因"                                                                                | 需求文档不再有"待实测"标注                           |
+| T5-06 | NFR 实测校准       | 更新 `docs/devel/requirements-spec.md` 第 6 章 | 用 `t2-corpus.jsonl`（～12K chunk，对齐"1 万 chunk"目标规模）实测 NFR-02～05，替换目标值或标注"未达标 + 原因"                                                                                | 需求文档不再有"待实测"标注                           |
 | T5-07 | README 与示例     | `README.md`、`examples/`                    | 快速上手（30 篇 demo 语料）、架构速览、评测结论摘要、**T2Ranking 数据来源与引用**；demo 语料补 metadata 支撑 `--filter` 演示                                                                              | 新人不看文档能跑通                                |
 | T5-08 | 数据诚信           | `docs/devel/eval-report.md`                | 若混合未优于最优单路，**如实记录并分析原因**（子集难度 / 模型域 / 人类查询代理偏差），**不得粉饰**；披露：随机负例潜在假负例、分桶启发式、与论文基线仅量级对照                                                                             | 结论与实际数据一致                                |
 | T5-09 | 分词方案对照实验       | `analyze/charabia.rs`（feature 隔离）          | 用裁剪版 `charabia`（`default-features=false, features=["chinese"]`，MIT）实现第二个 `Analyzer`，在 **T2Ranking 真实语料**上与 `jieba-rs + 自研过滤链` 对比 NDCG@10。**三步验证先行**（依赖树 / MSRV / License），失败则记录事实并跳过（见 p5-design.md 第 9 章） | 输出对比结论；若 charabia 明显更优则切换（切换成本 = 一个实现文件） |
@@ -288,7 +288,7 @@ cargo run -p helix -- search --index /tmp/index.helix --mode hybrid --explain ".
 
 ## 11. P6 融合索引接口重构
 
-> **详细设计见 `docs/devel/p6-design.md`**（含业界调研、目标 API、`search_parts` 共用内核、配置指纹、决策点 D-I1~D-I8）。本章只保留任务纲要。
+> **详细设计见 `docs/devel/p6-design.md`**（含业界调研、目标 API、`search_parts` 共用内核、配置指纹、决策点 D-I1～D-I8）。本章只保留任务纲要。
 
 **目标**：把「手接 8 对象 / 79 行 / 3 个静默陷阱」的最小闭环降到 `index.add(doc)` + `searcher.search(query)`，让库的对外接口成为默认路径。
 
@@ -305,13 +305,13 @@ cargo run -p helix -- search --index /tmp/index.helix --mode hybrid --explain ".
 | I-07  | `remove` / `save` / `load` 接入门面层                       | I-04 | 低 |
 | I-08  | `ConfigFingerprint` + `Analyzer::id`/`Embedder::id` + `ConfigMismatch{expected,actual}` | I-07 | 中（升 FORMAT_VERSION） |
 | I-09  | **实现** `effective_version()`（base2/positions3）+ 互拒测试    | I-08 | 中（把注释约定落成实现） |
-| I-10  | CLI 切新 API（build/search/compare）——参数与输出一字不改          | I-04~I-08 | 中 |
+| I-10  | CLI 切新 API（build/search/compare）——参数与输出一字不改          | I-04～I-08 | 中 |
 | I-11  | `examples/search_basic.rs` 重写（79→≤15）+ user-guide 库接入章节 | I-10 | 低 |
 | I-12  | **bench 迁移 + 回归对账**（最高风险）；删 `--analyzer` 警告回退        | I-10,I-05 | 高 |
 | I-13  | plan.md 阶段表更新 + p6-design 状态回写                        | I-12 | 低 |
 | I-14  | 旧 `QueryExecutor`/`Index::add` 是否 `#[deprecated]`（D-I6：本轮不加） | I-13 | 低 |
 
-**执行顺序**：I-01 → I-02（地基，行为零变化）→ I-03~I-06（新增门面，纯加法）→ I-07~I-09（持久化+指纹）→ I-10（CLI）→ I-11（示例）→ I-12（bench 放最后）→ I-13/I-14。
+**执行顺序**：I-01 → I-02（地基，行为零变化）→ I-03～I-06（新增门面，纯加法）→ I-07～I-09（持久化+指纹）→ I-10（CLI）→ I-11（示例）→ I-12（bench 放最后）→ I-13/I-14。
 
 ### P7（v2，仅列方向，不排期）
 
@@ -362,7 +362,7 @@ make fmt && make lint && make test
 | P2→P3 | 向量路能召回同义改写；相似度对齐误差 < 1e-5；两路无相互引用                              |
 | P3→P4 | `helix compare` 三路可对比；`--explain` 完整；**连续 100 次结果完全一致**；融合层不回捞正文 |
 | P4→P5 | save/load 结果完全一致；增量写入立即可查；删除后统计量与全量重建一致；集成测试全绿 ✅ |
-| P5→完结 | 三路对照实验有数据；BM25 参数定稿；NFR-02~05 全部为实测值；评测报告含诚信声明 ✅（`eval-report.md`） |
+| P5→完结 | 三路对照实验有数据；BM25 参数定稿；NFR-02～05 全部为实测值；评测报告含诚信声明 ✅（`eval-report.md`） |
 
 ---
 
@@ -450,7 +450,7 @@ make fmt && make lint && make test
 | P6 | I-13 plan.md 更新 + 状态回写                               | ✅  |
 | P6 | I-14 旧 API deprecated 评估                              | ✅（D-I6 决议：本轮不加 `#[deprecated]`，P7 后评估） |
 
-**当前阶段**：**P0~P6 全部完成**（2026-09-04）。P6 接口重构落地：门面层 `SearchIndex`/`Searcher`、写缓冲 + 批量 embed、配置指纹校验（修 B1/B2）、CLI/示例/文档全迁移，brute 后端新旧逐位一致（回归对账通过）。下一步 P7（v2：Rerank / MMR / delta 分段）。
+**当前阶段**：**P0～P6 全部完成**（2026-09-04）。P6 接口重构落地：门面层 `SearchIndex`/`Searcher`、写缓冲 + 批量 embed、配置指纹校验（修 B1/B2）、CLI/示例/文档全迁移，brute 后端新旧逐位一致（回归对账通过）。下一步 P7（v2：Rerank / MMR / delta 分段）。
 
 **P0 实测基线**：工具链 1.90.0 / lockfile 414 包 / 轻依赖编译 7.3s / fastembed+ort 42.5s / 全量含 tantivy 24.2s / 模型下载 49.0s / **单条推理 1.58ms（debug）** —— 详见 `p0-design.md` 附录 A。
 

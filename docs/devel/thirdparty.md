@@ -71,7 +71,7 @@
 | 停用词表        | `stop-words` 0.10.0                   | ❌             | 中文表需自维护，英文表抄一份即可，不值得一个依赖                  |
 | 英文词干化       | `rust-stemmers` 1.2.0                 | ⏳ v2 可选       | 架构 7.1 已定 v1 不做                          |
 | Embedding   | `fastembed` 6.0.2                     | ✅             | Apache-2.0；⚠️ 依赖 `ort =2.0.0-rc.13`（预发布），见 4.3 |
-| 推理兜底        | `ort` 1.16.3 + `tokenizers`           | ⏳ 兜底路径        | 若 RC 依赖不可接受，可自研 ~150 行 BGE 推理              |
+| 推理兜底        | `ort` 1.16.3 + `tokenizers`           | ⏳ 兜底路径        | 若 RC 依赖不可接受，可自研 ～150 行 BGE 推理              |
 | 向量索引（v1）    | `instant-distance` 0.6.1              | ✅             | 纯 Rust、MIT/Apache-2.0；缺点是无增量插入            |
 | 向量索引（升级项）   | **`hnsw_rs` 0.3.4**                   | ⏳ **P4 A/B**  | **纯 Rust + 支持增量 insert + 内建 DistDot（要求归一化，正好匹配我们的方案）+ 支持过滤。可能直接消掉 R1 风险** |
 | 向量索引（备选）    | `usearch` 2.26.2                      | ⏳ P6          | 功能最全（add/remove/filtered_search），但要 C++（cxx） |
@@ -83,7 +83,7 @@
 | 内存映射        | `memmap2` 0.9.11                      | ⏳ 与 rkyv 绑定    | 只有走上 rkyv 零拷贝路线才需要                         |
 | 过滤位图        | `roaring` 0.11.5                      | ⏳ P4          | MIT/Apache-2.0；MVP 用 `Vec<u32>`/bitset 足够，注意 MSRV 1.90 |
 | 嵌入式 KV      | `redb` 4.2.0                          | ❌             | 持久化路线是快照，不引入 KV                           |
-| 文本分块        | `text-splitter` 0.32.0                | ⏳ v2          | 自研只要 ~80 行，且要精确维护 char 偏移（溯源需求）            |
+| 文本分块        | `text-splitter` 0.32.0                | ⏳ v2          | 自研只要 ～80 行，且要精确维护 char 偏移（溯源需求）            |
 | 缓存          | `moka` 0.12.16 / `quick_cache` 0.7.0  | ✅ 二选一         | 推荐 `moka`：并发安全且带 TTL；`lru` 需自己套锁          |
 | Token 计数    | `tiktoken-rs` 0.12.0                  | ⏳ v2（FR-25）   | MIT；配合自研 `TokenCounter` trait              |
 | 工程基础        | serde / thiserror / anyhow / clap / tracing / rayon / crc32fast / smol_str | ✅ | 全部宽松许可，无争议                                |
@@ -253,7 +253,7 @@ unicode-normalization = "0.1"
 
 > **教训（值得写进团队规范）**：crates.io 的 `max_version` **不等于**"可用的最新版本"。`bincode 3.0.0` 在 crates.io 上正常显示版本、License、依赖关系，看起来与真发布无异，实际是 XKCD 2347（Dependency）的玩笑。调研依赖时必须至少确认一点：该版本能真正编译（P0 的编译验证就是在这一步兜住的）。
 | `rkyv` 0.8.18        | MIT             | 1.81  | ⏳ P4 A/B   | **零反序列化**：mmap 后直接访问，加载接近 O(1)，对 NFR-04（冷启动 <2s）是最强手段。代价：所有落盘结构需 `derive(Archive)`，且格式升级要处理版本兼容 |
-| `zstd` 0.13.3        | MIT             | 1.64  | ⏳ 可选 feature | 快照体积可降 3~5 倍，代价是加载时的解压耗时；属于"体积换时间"，P5 实测后决定                                          |
+| `zstd` 0.13.3        | MIT             | 1.64  | ⏳ 可选 feature | 快照体积可降 3～5 倍，代价是加载时的解压耗时；属于"体积换时间"，P5 实测后决定                                          |
 | `memmap2` 0.9.11     | MIT OR Apache-2.0 | 1.65 | ⏳ 与 rkyv 绑定 | 只有走上零拷贝路线才需要                                                                          |
 | `crc32fast` 1.5.1    | MIT OR Apache-2.0 | 1.63 | ✅          | 快照 CRC，已在计划中                                                                              |
 | `redb` 4.2.0         | MIT OR Apache-2.0 | 1.90 | ❌          | 持久化路线是快照，不引入嵌入式 KV                                                                        |
@@ -499,4 +499,4 @@ proptest = "1"
 tempfile = "3"
 ```
 
-（`fastembed`、`instant-distance`、`bincode`、`crc32fast`、`clap`、`moka` 在 P2~P4 按阶段加入。）
+（`fastembed`、`instant-distance`、`bincode`、`crc32fast`、`clap`、`moka` 在 P2～P4 按阶段加入。）

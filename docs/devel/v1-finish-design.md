@@ -4,8 +4,8 @@
 | ----- | --- |
 | 版本    | **v1.3（已实施完成）** |
 | 日期    | 2026-09-03 |
-| 状态    | ✅ **已完成**（2026-09-03）：V1-00 ~ V1-16 全部落地，远端 CI 9/9 全绿 |
-| 前提    | P0~P5 全部完成（提交 `9d5179a`）；**P6（v2：Rerank / MMR / 自研索引）不在本轮范围** |
+| 状态    | ✅ **已完成**（2026-09-03）：V1-00 ～ V1-16 全部落地，远端 CI 9/9 全绿 |
+| 前提    | P0～P5 全部完成（提交 `9d5179a`）；**P6（v2：Rerank / MMR / 自研索引）不在本轮范围** |
 | 上游    | `docs/devel/plan.md`、`docs/devel/eval-report.md`、`docs/devel/thirdparty.md` |
 | 定位    | 把"能跑通的研究原型"变成"别人能接手、能复现、能持续集成的工程制品"，并正式定名发布 |
 
@@ -62,7 +62,7 @@ P5 结束时项目在**技术验证**上已闭环，但在**工程可用性**上
 | 效果评测 | ⚠️ `idx bench` 能力齐备，靠手工拼命令 | V1-04 脚本化 |
 | 性能评测 | ⚠️ NFR 实测散落手工操作 | V1-05 脚本化 |
 | 报告生成 | ⚠️ 表格手工抄录（**逐桶 p 值更是全手工算**） | V1-06 由 JSON 生成 |
-| CI/CD | ❌ 完全空白 | V1-08~10 |
+| CI/CD | ❌ 完全空白 | V1-08～10 |
 | **git 远端** | ❌ `git remote -v` 为空，仅本地 `main` | **V1-16**（CI 前置） |
 | CHANGELOG / NOTICE | ❌ 无 | V1-12 / V1-13 |
 | **`bench` debug 态** | ❌ **任何调用（含 `--help`）直接 panic** | **V1-11 阻塞级，最先修** |
@@ -212,7 +212,7 @@ README 指向 `docs/user-guide.md`；`docs/README.md` 增设"使用文档"分区
 
 ### 评测不进 CI（保留 v1.0 判断）
 
-效果评测需 12K 段落 embed（~230s）；性能评测是毫秒级 P99 口径，
+效果评测需 12K 段落 embed（～230s）；性能评测是毫秒级 P99 口径，
 共享 runner 上的数字**不具备可引用性，反而会污染 `eval-report`**。
 CI 只保留 `build-release` + 冒烟（见 V1-08）。
 
@@ -279,7 +279,7 @@ V1-02 加 `#![deny(missing_docs)]` 时只验证了默认 feature；
 
 ### V1-12 `CHANGELOG.md`
 
-记录 P0~P5 各阶段产出与 v1.0 能力边界（逆向补写），此后每次变更追加。Keep a Changelog 风格。
+记录 P0～P5 各阶段产出与 v1.0 能力边界（逆向补写），此后每次变更追加。Keep a Changelog 风格。
 
 ### V1-13 `NOTICE`
 
@@ -384,11 +384,11 @@ V1-02 加 `#![deny(missing_docs)]` 时只验证了默认 feature；
 | D-B1 | 评测脚本语言：Bash+Python 还是 Rust xtask？ | **Bash+Python**（跨平台内存测量用 Python 更稳，xtask 对本项目过重） |
 | D-C1 | CI 平台 | **GitHub Actions** |
 | D-C2 | 评测是否进 CI？ | **否**（见第 5 节理由） |
-| D-D1 | CHANGELOG 是否逆向补写 P0~P5？ | **是** |
+| D-D1 | CHANGELOG 是否逆向补写 P0～P5？ | **是** |
 | **D-E1** | **crate 与二进制命名** | ✅ **已定：E1 —— 库 crate `helix-core`，CLI 二进制 `helix`**（命令形如 `helix build` / `helix search`；发布前再核 crates.io 占用） |
 | **D-E2** | **GitHub 仓可见性** | ✅ **已定：private**（个人仓，项目尚未正式发布；待 README/CHANGELOG 完备后再转 public） |
 | **D-E3** | **本地目录是否改名** | ✅ **已定：暂不改** —— 本地目录保持 `index-demo`，远端仓名用 `helix-index`；不打断当前工作区与会话状态 |
-| **D-E4** | **历史文档（p0~p5-design、archive）是否改写项目名？** | **加注不改写**（沿用 `p1-design.md` 既有先例，保留历史原貌） |
+| **D-E4** | **历史文档（p0～p5-design、archive）是否改写项目名？** | **加注不改写**（沿用 `p1-design.md` 既有先例，保留历史原貌） |
 
 ### 命名映射表（D-E1 已定，**V1-15 已实施完成**）
 
@@ -400,7 +400,7 @@ V1-02 加 `#![deny(missing_docs)]` 时只验证了默认 feature；
 | 版本号 | **0.1.0** | 原本即 `0.1.0`，确认无需改动 | ✅ |
 | GitHub 仓 | **`helix-index`**（private） | V1-16 | ⬜ |
 | 本地目录 | **保持 `index-demo`** | D-E3，不打断工作区 | ✅ |
-| 历史文档（p0~p5-design、archive） | 加注不改写 | D-E4，7 份均已在标题下加改名注记 | ✅ |
+| 历史文档（p0～p5-design、archive） | 加注不改写 | D-E4，7 份均已在标题下加改名注记 | ✅ |
 
 **实施附带项**：模型缓存目录 `~/.cache/index-demo/models` → `~/.cache/helix-index/models`
 （**已 mv 迁移 91MB，避免重新下载模型**；已用 `helix search --mode hybrid` 冒烟验证加载正常）。

@@ -9,7 +9,7 @@
 | 版本   | **v2.0（已执行并回写）**                                                                  |
 | 日期   | 2026-09-02                                                                        |
 | 状态   | **已执行完成** —— P0 全部通过，提交 `dd7589c`（骨架）+ `eb03ccc`（文档回写）。执行中的 4 处修正见**第 12 章**，实测基线见**附录 A** |
-| 上游   | `docs/devel/plan.md` 第 5 章（P0，T0-01 ~ T0-07）                                      |
+| 上游   | `docs/devel/plan.md` 第 5 章（P0，T0-01 ～ T0-07）                                      |
 | 关联   | `docs/devel/architecture-design.md` 第 4.1 节（目录结构）、第 9 章（选型）、ADR-008（MSRV/License） |
 | 环境实测 | 2026-09-02 在本机采集，见第 2 章                                                           |
 
@@ -24,7 +24,7 @@
 **判定标准（Gate）** —— 全部满足才算 P0 完成：
 
 1. `cargo build` 空工程通过，`cargo clippy` / `cargo fmt` 干净
-2. 计划在 P1~P4 使用的**全部依赖**可拉取、可编译（含最重的 `fastembed`）
+2. 计划在 P1～P4 使用的**全部依赖**可拉取、可编译（含最重的 `fastembed`）
 3. **ONNX 模型能下载、能推理**：一句中文文本 → 512 维向量，L2 范数 ≈ 1.0
 4. `make deny` 通过（依赖 License 白名单）
 5. 仓库有 git，首次提交包含 `Cargo.lock` 与双 License 文件
@@ -41,7 +41,7 @@
 | 机型 / CPU                     | Apple **M5**，arm64，10 核                 | ONNX Runtime 需 **aarch64-apple-darwin** 预编译包 |
 | 系统                           | macOS 26.5.1（Darwin 25.5.0）             | 需 Xcode Command Line Tools（**已安装**）          |
 | 内存                           | 32 GB                                   | 足够；`ort` 编译峰值无压力                             |
-| 磁盘可用                         | 683 GB                                  | 充足（工具链 ~2GB + target ~3GB + 模型 91MB）         |
+| 磁盘可用                         | 683 GB                                  | 充足（工具链 ～2GB + target ～3GB + 模型 91MB）         |
 | `cc` / `clang` / `make`      | ✅ 均在 `/usr/bin`                         | 基础构建工具齐全                                     |
 | Xcode CLT                    | ✅ `/Library/Developer/CommandLineTools` | 无需额外安装                                       |
 | `git`                        | ✅ `/opt/homebrew/bin/git`               | 可初始化仓库                                       |
@@ -147,7 +147,7 @@ rustc --version && cargo --version
 **副作用（需你知晓）**
 
 - 安装器会在 `~/.zshrc` 追加一行 `source "$HOME/.cargo/env"`（可通过 `CARGO_HOME`/`RUSTUP_HOME` 改路径）
-- 磁盘占用约 1.5~2 GB（`~/.rustup` + `~/.cargo`）
+- 磁盘占用约 1.5～2 GB（`~/.rustup` + `~/.cargo`）
 - 卸载方式：`rustup self uninstall`
 
 **验收**：`rustc --version` ≥ 1.90（stable 当前为 **1.98.0**）；`cargo --version` 可用。
@@ -343,7 +343,7 @@ cargo build --workspace --all-targets
 | ---------------------- | -------------------------------------------------- |
 | crate 下载慢/超时           | 启用 T0-02 的 rsproxy 镜像                              |
 | `ort` 报找不到预编译包         | 设置 `ORT_LIB_LOCATION`，或改用 `ort/load-dynamic` 链接系统库 |
-| `ort` 回退到源码编译并报缺 cmake | `brew install cmake`（约 1~2 分钟），重跑                  |
+| `ort` 回退到源码编译并报缺 cmake | `brew install cmake`（约 1～2 分钟），重跑                  |
 | C 依赖链接失败               | 确认 Xcode CLT 版本；`sudo xcode-select --reset`        |
 
 **产出记录**：把三批的**实际编译耗时**记入本文件附录，作为 NFR-03 与后续 CI 时长的基线。
@@ -404,7 +404,7 @@ cargo run -p index-core --example embed_smoke
 **验收**
 
 - 模型下载成功（`~/.cache/huggingface/hub/models--Qdrant--bge-small-zh-v1.5/`）
-- 输出 `dim = 512`、`l2 norm ≈ 1.0`、`cos(0,1)` 在合理区间（0.3~0.9）
+- 输出 `dim = 512`、`l2 norm ≈ 1.0`、`cos(0,1)` 在合理区间（0.3～0.9）
 - 记录**第二次运行**（模型已缓存）的单条推理耗时，作为 NFR-02 的基线数据
 
 **失败分支**
@@ -482,7 +482,7 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 
 **验收**：`make deny` 通过；故意 `cargo add` 一个 GPL crate 时 `make deny` **失败**（验证白名单真的生效）。
 
-**`cargo-deny` 安装方式（需你确认 D5）**：`cargo install cargo-deny --locked`（编译 2~5 分钟，无 brew 依赖）优于 homebrew（公式不一定存在）。
+**`cargo-deny` 安装方式（需你确认 D5）**：`cargo install cargo-deny --locked`（编译 2～5 分钟，无 brew 依赖）优于 homebrew（公式不一定存在）。
 
 ---
 
@@ -545,9 +545,9 @@ pub mod prelude {
 | ------ | --------------------------------------- | --- | -------------------- | ------------------------------------------------------------------------------------------------- |
 | R-P0-1 | rustup 安装失败 / 下载慢                       | 低   | 阻塞全部                 | `RUSTUP_DIST_SERVER=https://rsproxy.cn` 或 `brew install rustup-init`                              |
 | R-P0-2 | `ort` 预编译包下载失败（GitHub 4.45s 可达但可能限速）    | 中   | 阻塞 T0-04/05          | ① 重试；② `ORT_LIB_LOCATION` 指向本地 ONNX Runtime；③ `ort/load-dynamic` + `brew install onnxruntime`     |
-| R-P0-3 | `ort` 回退源码编译，缺 cmake                    | 中   | 阻塞 T0-04，多耗 20~40 分钟 | `brew install cmake` 后重跑（**不在 P0 预装**，避免无谓安装）                                                     |
+| R-P0-3 | `ort` 回退源码编译，缺 cmake                    | 中   | 阻塞 T0-04，多耗 20～40 分钟 | `brew install cmake` 后重跑（**不在 P0 预装**，避免无谓安装）                                                     |
 | R-P0-4 | HuggingFace 下载 91MB 模型失败                | 中   | 阻塞 T0-05             | `HF_ENDPOINT=https://hf-mirror.com`；或手工下载 + `.with_cache_dir()`；或转 `remote-embed`（需回 ADR-003 重决策） |
-| R-P0-5 | `ort 2.0.0-rc.13` 在 aarch64-darwin 上有缺陷 | 低~中 | 阻塞 P2                | 退到自研路径：`ort 1.16.3` + `tokenizers` 手写 BGE 推理（约 150 行，thirdparty.md 4.3 已备）                        |
+| R-P0-5 | `ort 2.0.0-rc.13` 在 aarch64-darwin 上有缺陷 | 低～中 | 阻塞 P2                | 退到自研路径：`ort 1.16.3` + `tokenizers` 手写 BGE 推理（约 150 行，thirdparty.md 4.3 已备）                        |
 | R-P0-6 | 工具链/依赖污染本机环境                            | 低   | 环境问题                 | 全部隔离在 `~/.rustup` `~/.cargo` `~/.cache/huggingface`；卸载 `rustup self uninstall`                    |
 
 **回滚方案**：P0 只**新增**文件，不修改任何已有文件（唯一例外是 `~/.zshrc` 追加一行 PATH）。最坏情况：`rustup self uninstall` + 删除工作区新增文件即可完全复原。
@@ -584,13 +584,13 @@ git check-ignore -v Cargo.lock       # 期望：无输出（即未被忽略）
 
 | 批次   | 任务                               | 预计耗时                     | 是否需要交互 |
 | ---- | -------------------------------- | ------------------------ | ------ |
-| 批次 1 | T0-01 安装 Rust 工具链                | 3~10 分钟（取决于网络）           | 需确认    |
-| 批次 2 | T0-02 镜像配置 + T0-03 骨架/git/许可     | 2~5 分钟                   | 需确认    |
-| 批次 3 | T0-04 依赖编译（三批）                   | 8~25 分钟（ort 是大头）         | 否      |
-| 批次 4 | **T0-05 模型下载 + 推理**              | 5~20 分钟（91MB 下载）         | 否      |
-| 批次 5 | T0-06 Makefile/deny + T0-07 模块骨架 | 5~10 分钟（含 cargo-deny 编译） | 否      |
+| 批次 1 | T0-01 安装 Rust 工具链                | 3～10 分钟（取决于网络）           | 需确认    |
+| 批次 2 | T0-02 镜像配置 + T0-03 骨架/git/许可     | 2～5 分钟                   | 需确认    |
+| 批次 3 | T0-04 依赖编译（三批）                   | 8～25 分钟（ort 是大头）         | 否      |
+| 批次 4 | **T0-05 模型下载 + 推理**              | 5～20 分钟（91MB 下载）         | 否      |
+| 批次 5 | T0-06 Makefile/deny + T0-07 模块骨架 | 5～10 分钟（含 cargo-deny 编译） | 否      |
 
-**合计：约 25~70 分钟**，其中大部分是等待编译，可后台执行。
+**合计：约 25～70 分钟**，其中大部分是等待编译，可后台执行。
 
 **关键路径上的卡点只有 T0-05**：只要模型能下载能推理，P1 就可以开工；其余任务失败都可绕过。
 
@@ -598,7 +598,7 @@ git check-ignore -v Cargo.lock       # 期望：无输出（即未被忽略）
 
 ## 10. 明确不做（P0 范围外）
 
-- 不写任何业务逻辑（BM25、分词、向量索引等）——那是 P1~P4
+- 不写任何业务逻辑（BM25、分词、向量索引等）——那是 P1～P4
 - 不实现 CLI 的 `build` / `search` 子命令——只有占位
 - 不准备示例语料（那是 T1-14 起的并行流）
 - 不接入 CI（本机 Makefile 已足够，CI 待有远端仓库再说）
@@ -616,8 +616,8 @@ git check-ignore -v Cargo.lock       # 期望：无输出（即未被忽略）
 | D2 | **cargo 镜像**              | **默认直连**（实测 0.37s），镜像配置写入但注释掉，慢时再启用                                 | 避免镜像同步延迟导致新版本拉不到                      |
 | D3 | **`rust-toolchain.toml`** | **pin `1.90.0`**（NFR-08 的 MSRV），保证所有人同一工具链                          | 若要"跟随 stable"，改为 `channel = "stable"` |
 | D4 | **git 初始化与首次提交**          | 是，`git init` + 首次提交（含 `Cargo.lock`、双 License）                       | 仓库当前无 git                             |
-| D5 | **`cargo-deny` 安装**       | `cargo install cargo-deny --locked`（首次编译 2~5 分钟）                    | 若你不想等，可推迟到 P1，`deny.toml` 先写好         |
-| D6 | **dev 依赖 `tantivy`**      | 就在 T0-04 批次 3 一起验证（约 5~15 分钟额外编译）                                   | 若想省时间，可推迟到 T1-15 前再验证                 |
+| D5 | **`cargo-deny` 安装**       | `cargo install cargo-deny --locked`（首次编译 2～5 分钟）                    | 若你不想等，可推迟到 P1，`deny.toml` 先写好         |
+| D6 | **dev 依赖 `tantivy`**      | 就在 T0-04 批次 3 一起验证（约 5～15 分钟额外编译）                                   | 若想省时间，可推迟到 T1-15 前再验证                 |
 | D7 | **`cmake`**               | 不预装；仅当 `ort` 回退源码编译报错时再 `brew install cmake`                        | 大概率不需要（默认走预编译二进制）                     |
 
 ---
@@ -734,8 +734,8 @@ fastembed = { version = "6.0.2", default-features = false, features = [
 | 批次 2 `fastembed` + `ort` 编译     | **42.5s**（未触发 cmake，走预编译二进制）           | NFR-03 基线               |
 | 批次 3 `--all-targets`（含 tantivy） | **24.2s**                              | CI 时长预估                 |
 | 模型下载（96 MB，含初始化）                | **49.0s**                              | R-P0-4 判断（未用镜像）         |
-| **单条推理耗时**（模型已缓存，debug 构建）      | **1.58 ~ 1.84 ms**                     | **NFR-02 第一批实测基线**      |
-| `embed` 两条文本                    | 2.83 ~ 2.86 ms                         | NFR-02 基线               |
+| **单条推理耗时**（模型已缓存，debug 构建）      | **1.58 ～ 1.84 ms**                     | **NFR-02 第一批实测基线**      |
+| `embed` 两条文本                    | 2.83 ～ 2.86 ms                         | NFR-02 基线               |
 | `ort` 是否触发源码编译                  | **否**（预编译二进制；cmake 缺失未造成影响）           | R-P0-3 已排除              |
 | `target/` 体积                    | **4.6 GB**（debug 全量）                   | 磁盘占用；`make clean` 可清    |
 | `.fastembed_cache/` 体积          | 96 MB                                  | 已加入 .gitignore（见 12.4）  |

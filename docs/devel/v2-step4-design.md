@@ -8,24 +8,24 @@
 | --- | --- |
 | 版本 | **v0.4（实现完成版）** |
 | 日期 | 2026-09-10 |
-| 状态 | **S4-01 与 S4-03~S4-10 全部完成并合并进 `main`（S4-02 `remove_many` 为可选、**未实施**）**；验收 1/2/3 实测 PASS（§10.2）；Q1~Q7 全部结案（§10.3）。实现结论已回写架构 §7.5.3 / §14.2（R26~R30）与需求 FR-30 |
-| 修订记录 | v0.1 首版：三条膨胀路径逐行盘点 + 重新物化方案 + 9 个待拍板决策。<br>**v0.2（PR #28 评审回应）**：新增 **D-S4-10 `compact()` 与写缓冲 `pending` 的交互**（评审 P0：不先 flush 会让 stale chunk_id 污染 `raw_vectors` 与新图，采纳「先 `commit()`」修法，见 §4.1.1 / I8 / T13）；验收 3 的 `nb_point` 口径改为「存活**且有向量**」（§1.3）；D-S4-04 理由重写 + `graph_status` 语义补齐（§4.6 / 附录 A）；§4.3 明确六步作用于**新 `Index` 实例**（对齐 I5）；§4.4 「≤/≥」两层比较分开写；D-S4-03 的确定性改称「**重建确定性**」（独立于 NFR-06）；`CompactionReport` 并入字节级三体积（§4.7）。<br>**v0.3（决策拍板）**：**D-S4-01 = 重编号（方案 B）**、**D-S4-10 = `compact()` 开头先 `self.commit()?`（修法 A）** 两项正式拍板 ⇒ 从「待拍板」移入「已定案」，§9.2 的 Q1 / Q7 结案。<br>**v0.4（实现完成，2026-09-10）**：新增 **§10 实施结果**——S4-01 / S4-03~S4-10 完成状态与对应 commit、10K churn 实测结论（含 2026-09-10 复跑 VERDICT PASS）、**Q2~Q6 结案**（Q1 / Q7 已于 v0.3 结案）、评审响应要点、集成测试补强记录（CLI-1~CLI-5 + T14~T16）与三条踩坑 |
+| 状态 | **S4-01 与 S4-03～S4-10 全部完成并合并进 `main`（S4-02 `remove_many` 为可选、**未实施**）**；验收 1/2/3 实测 PASS（§10.2）；Q1～Q7 全部结案（§10.3）。实现结论已回写架构 §7.5.3 / §14.2（R26～R30）与需求 FR-30 |
+| 修订记录 | v0.1 首版：三条膨胀路径逐行盘点 + 重新物化方案 + 9 个待拍板决策。<br>**v0.2（PR #28 评审回应）**：新增 **D-S4-10 `compact()` 与写缓冲 `pending` 的交互**（评审 P0：不先 flush 会让 stale chunk_id 污染 `raw_vectors` 与新图，采纳「先 `commit()`」修法，见 §4.1.1 / I8 / T13）；验收 3 的 `nb_point` 口径改为「存活**且有向量**」（§1.3）；D-S4-04 理由重写 + `graph_status` 语义补齐（§4.6 / 附录 A）；§4.3 明确六步作用于**新 `Index` 实例**（对齐 I5）；§4.4 「≤/≥」两层比较分开写；D-S4-03 的确定性改称「**重建确定性**」（独立于 NFR-06）；`CompactionReport` 并入字节级三体积（§4.7）。<br>**v0.3（决策拍板）**：**D-S4-01 = 重编号（方案 B）**、**D-S4-10 = `compact()` 开头先 `self.commit()?`（修法 A）** 两项正式拍板 ⇒ 从「待拍板」移入「已定案」，§9.2 的 Q1 / Q7 结案。<br>**v0.4（实现完成，2026-09-10）**：新增 **§10 实施结果**——S4-01 / S4-03～S4-10 完成状态与对应 commit、10K churn 实测结论（含 2026-09-10 复跑 VERDICT PASS）、**Q2～Q6 结案**（Q1 / Q7 已于 v0.3 结案）、评审响应要点、集成测试补强记录（CLI-1～CLI-5 + T14～T16）与三条踩坑 |
 | 上游 | `plan-v2.md` §4 Step 4（原 Step 5，D-J10 提前）/ issue #21 / `requirements-spec.md` v1.9（FR-30 Should）/ `architecture-design.md` §7.5、§14.1（R22、R25）/ `v2-step1-design.md`（D-S1-01 存活单一真源）/ `v2-step2-design.md`（ADR-A 方案 C）/ `v2-step3-design.md`（`atomic_write`） |
 | 范围 | T7-12 墓碑物理回收（重建向量图 + 回收 `raw_vectors` + 重写快照）+ 零散写入 workload 脚本 + CLI/bench 观测入口 |
 | 非范围 | 真·物理删除 API（`usearch`，架构 §7.5 已排除）；读写并发下在线 compaction（**Step 8**）；低选择度兜底与 `Metrics` 可观测（**Step 5**）；`parallel_build` 默认值翻转（横切 **T7-21**）；R22「图体积 1.6×」本身（本 Step 只回收墓碑，不压缩存活数据） |
 
 ---
 
-## 决策速览：D-S4-01 ~ D-S4-10
+## 决策速览：D-S4-01 ～ D-S4-10
 
 > 评审者时间有限时先看这张表。每条在 §5 有完整取舍与证据。
 > **v0.3 拍板结果**：**D-S4-01 = 重编号（方案 B）**、**D-S4-10 = `compact()` 开头先 `self.commit()?`**
-> ——两项已定案，从「待拍板」移出；其余 D-S4-02~09 评审无异议，按本文建议执行。
+> ——两项已定案，从「待拍板」移出；其余 D-S4-02～09 评审无异议，按本文建议执行。
 
 | # | 决策 | 结论 | 状态 | 阻塞谁 |
 | --- | --- | --- | --- | --- |
 | **D-S4-01** | 要不要**重编号** `ChunkId` / `DocId`（这是能否压掉快照正文墓碑槽位的分水岭） | **重编号（方案 B）**。不重编号则 `docs` / `chunks` / `chunk_lens` 的空洞无法消除，验收「快照正文不无界增长」**不可能**达成；替代方案「复用空槽（free list）」被否决——ID 复用会让外部旧引用**静默指向错误内容**，比 ID 变更更危险 | ✅ **已拍板**<br>2026-09-08 | ~~阻塞全 Step~~<br>已解除 |
-| **D-S4-02** | 触发方式：手动 / `save` 自动 / 混合 | **手动为主 + 阈值告警**。`helix compact` 显式调用；`save()` 在墓碑比例超阈值时只 **eprintln 告警**（NFR-07 风格可观测），自动 compaction **默认关**。理由：自动会把 10~100s 的重建塞进 `save()`，让写路径耗时不可预测，而 `save` 是 NFR-03/04 口径旁边的敏感点 | ⏳ 评审无异议 | 阻塞 S4-07 |
+| **D-S4-02** | 触发方式：手动 / `save` 自动 / 混合 | **手动为主 + 阈值告警**。`helix compact` 显式调用；`save()` 在墓碑比例超阈值时只 **eprintln 告警**（NFR-07 风格可观测），自动 compaction **默认关**。理由：自动会把 10～100s 的重建塞进 `save()`，让写路径耗时不可预测，而 `save` 是 NFR-03/04 口径旁边的敏感点 | ⏳ 评审无异议 | 阻塞 S4-07 |
 | **D-S4-03** | 词表里的**死词**（postings 已空但 term 仍在 `term_dict`）是否一并压实 | **压实并 remap TermId**。死词是纯浪费（词串 + 一条空链）；TermId 是**内部**编号（快照里 `term_dict` 与 `postings` 一起导出/导入），remap 不影响外部语义 | ⏳ 评审无异议 | 阻塞 S4-03 |
 | **D-S4-04** | compaction 与 `save` 的关系 | 提供 `compact()`（纯内存，不落盘）+ `compact_and_save(path)`（= compact + 既有 `save`）。**铁律由此自动满足**：manifest 重发是 `save()` 的既有步骤，compaction 不再另开一条落盘路径。`Index::compact` 取 `pub(crate)` 是**结构性**理由（它与 `raw_vectors` / 向量索引的替换必须原子发生），门面层 `SearchIndex::compact` 是**有意保留**的内存路径，**落盘入口唯一 = `compact_and_save`**（§4.6） | ⏳ 评审无异议 | 阻塞 S4-07 |
 | **D-S4-05** | `flush()` 侧幽灵向量（remove 早于 flush ⇒ 防线①失效，§2.3）是否本 Step 修 | **修**（S4-01，独立小 PR）。它是 Q-C2 同源，且补上后「不经 compaction 也不泄漏」 | ⏳ 评审无异议 | 阻塞 S4-05 验收 |
@@ -33,7 +33,7 @@
 | **D-S4-07** | 重建图时是否沿用装配的 `parallel_build` | **沿用**（默认串行）。与 `load` 降级重建走同一条 `add_batch`，行为一致；compaction 是低频操作，不值得为此引入非确定性拓扑 | ⏳ 评审无异议 | 阻塞 S4-06 |
 | **D-S4-08** | 顺带做 `remove_many(&[DocId])`（架构 §7.5.2 已预留） | **可选**（S4-02，timebox 内）。价值是把「批量删 N 篇 O(N·M)」降到 O(N+M)；与本 Step 主题相邻但非必需 | ⏳ 可选 | 无 |
 | **D-S4-09** | ID 变更如何对外声明 | **三处**：`CompactionReport` 字段 + `user-guide.md`「已知坑」一节 + `SearchIndex::compact` 的 rustdoc 显式写「跨 compaction 的持久引用请用 `source` / `content_hash`，不要用 `doc_id` / `chunk_id`」 | ⏳ 评审无异议 | 阻塞 S4-10 |
-| **D-S4-10** | `compact()` 与写缓冲 `pending` 的交互（**v0.2 新增，评审 P0**） | **`compact()` 开头先 `self.commit()?`**。否则 `pending` 里仍是旧 chunk_id，紧随的 `save()` → `flush()` 会把 stale id 灌进 `raw_vectors` 与新图。三种修法中它最干净：纯 BM25 下 `pending` 恒空 ⇒ flush 是 no-op；与 S4-01 的 liveness 过滤天然衔接；`save` 的隐式 commit 变 no-op | ✅ **已拍板**<br>2026-09-08 | ~~阻塞 S4-03~S4-07~~<br>已解除 |
+| **D-S4-10** | `compact()` 与写缓冲 `pending` 的交互（**v0.2 新增，评审 P0**） | **`compact()` 开头先 `self.commit()?`**。否则 `pending` 里仍是旧 chunk_id，紧随的 `save()` → `flush()` 会把 stale id 灌进 `raw_vectors` 与新图。三种修法中它最干净：纯 BM25 下 `pending` 恒空 ⇒ flush 是 no-op；与 S4-01 的 liveness 过滤天然衔接；`save` 的隐式 commit 变 no-op | ✅ **已拍板**<br>2026-09-08 | ~~阻塞 S4-03～S4-07~~<br>已解除 |
 
 ---
 
@@ -99,9 +99,9 @@ Step 1 补上了**正确性**（存活位图谓词挡掉幽灵候选，FR-26 达
 
 | 路径 | 落点 | 现状（源码级） | 单位成本（512 维） |
 | --- | --- | --- | --- |
-| **① 向量图（内存 `Hnsw` + sidecar 两文件）** | `vector/hnsw_rs_index.rs`、`vector/persist.rs` | `VectorIndex` trait 只有 `add` / `add_batch`，**无 remove**（`vector/mod.rs:31-83`）；`file_dump` 写全量点（`persist.rs:177`）⇒ 墓碑随每次 `save` 再写一遍；`load_graph` 原样读回 ⇒ **跨快照累积** | **≈2.6 KB/点**（Step 2 实测 12K：graph 7.9~8.1MB + data 23.7MB ⇒ 31.6MB / 12K） |
+| **① 向量图（内存 `Hnsw` + sidecar 两文件）** | `vector/hnsw_rs_index.rs`、`vector/persist.rs` | `VectorIndex` trait 只有 `add` / `add_batch`，**无 remove**（`vector/mod.rs:31-83`）；`file_dump` 写全量点（`persist.rs:177`）⇒ 墓碑随每次 `save` 再写一遍；`load_graph` 原样读回 ⇒ **跨快照累积** | **≈2.6 KB/点**（Step 2 实测 12K：graph 7.9～8.1MB + data 23.7MB ⇒ 31.6MB / 12K） |
 | **② `raw_vectors`** | `search/index.rs:143` | `SearchIndex::remove` 已 `raw_vectors.retain(is_live_chunk)`（`index.rs:419-424`）⇒ **内存已回收**；⚠️ 但 §2.3 的时序缺口会让已删 chunk 的向量重新进来 | 512×4 = **2 KB/条**（但已被回收） |
-| **③ 快照正文** | `storage/snapshot.rs:19-28`、`index/mod.rs:62-77` | `docs: Vec<Option<DocumentDto>>` / `chunks: Vec<Option<Chunk>>` 的 `None` 槽（bincode Option tag **1 B**）；`chunk_lens: Vec<u32>` **push-only、remove 不回收**（`index.rs:193` 只 push）⇒ **4 B/条**；`term_dict` 的死词（`InvertedIndex::remove` 只摘 posting 不摘 term，`inverted.rs:61-72`）⇒ 词串 + 空链 | **≈5~6 B/chunk** + 死词（视词汇） |
+| **③ 快照正文** | `storage/snapshot.rs:19-28`、`index/mod.rs:62-77` | `docs: Vec<Option<DocumentDto>>` / `chunks: Vec<Option<Chunk>>` 的 `None` 槽（bincode Option tag **1 B**）；`chunk_lens: Vec<u32>` **push-only、remove 不回收**（`index.rs:193` 只 push）⇒ **4 B/条**；`term_dict` 的死词（`InvertedIndex::remove` 只摘 posting 不摘 term，`inverted.rs:61-72`）⇒ 词串 + 空链 | **≈5～6 B/chunk** + 死词（视词汇） |
 | 倒排 postings | `index/mod.rs:236` | ✅ `Index::remove` 物理摘除 | 0 |
 | `content_hashes` | `index/mod.rs:213` | ✅ `Index::remove` 摘除 | 0 |
 | 字段索引 | `field_index` | ✅ 不入快照，每次 `import` 重建 | 0 |
@@ -162,7 +162,7 @@ CLI 逐条 `add` 后删除就是这条路径），已删 chunk 的向量会进 `
 | 项 | 1 万次删改的残留 | 占比 |
 | --- | --- | --- |
 | 图 sidecar | 1 万 × 2.6 KB ≈ **26 MB** | ≈ 99.8% |
-| 快照正文（槽位 + `chunk_lens`） | 1 万 × ~6 B ≈ **60 KB** | ≈ 0.2% |
+| 快照正文（槽位 + `chunk_lens`） | 1 万 × ～6 B ≈ **60 KB** | ≈ 0.2% |
 
 ⇒ **图是绝对大头（约 440:1）**。但验收明确写了「三者均不无界增长」，且正文的压实是
 **同一趟重写的边际成本**（都已经在重建索引了，顺手 remap 即可）⇒ 一起做。
@@ -212,7 +212,7 @@ SearchIndex::compact_and_save(path) = compact() + 既有 save()
 2. **不需要新格式**。`FORMAT_VERSION` 保持 2，compaction 产物与「从头建一个同样的库」
    在字节层面不同（chunk_id 不同），但与「普通快照」结构上完全一样 ⇒ 旧版本能读新快照。
 3. **不引入 `usearch`**。「物理删除」的需求由「重建图」满足，代价是 O(存活数) 的重建时间
-   （12K 实测建图 ≈10~11.5s ⇒ 约 0.85 ms/点；**100K 预估 60~100s，待实测**），
+   （12K 实测建图 ≈10～11.5s ⇒ 约 0.85 ms/点；**100K 预估 60～100s，待实测**），
    换来的是零新依赖、零格式变更。
 
 ### 4.1.1 【P0】`compact()` 必须先 `commit()`（D-S4-10）
@@ -491,7 +491,7 @@ cargo run --release -p helix-core --example churn_bench -- \
 
 ---
 
-## 5. 决策记录（D-S4-01 ~ D-S4-10）
+## 5. 决策记录（D-S4-01 ～ D-S4-10）
 
 > **图例**：✅ = 已拍板（按此实现）；⏳ = 评审无异议、按本文建议执行（实现中若发现问题再回评审）。
 > **2026-09-08 拍板**：**D-S4-01（重编号）**、**D-S4-10（`compact()` 先 `commit()`）**。
@@ -507,7 +507,7 @@ cargo run --release -p helix-core --example churn_bench -- \
 | --- | --- | --- | --- | --- |
 | A 只重建图，不重编号 | ✅ 回收 99.8% | ❌ 空洞 + `chunk_lens` 死条目 + 死词**仍在**，无界增长 | 不变 | 不满足验收 1 |
 | **B 重编号（建议）** | ✅ | ✅ 全压干净 | **变**：旧 `doc_id`/`chunk_id` 失效 | ✅ **采纳（已拍板）** |
-| C 保留 ID + sparse→dense 映射表进快照 | ✅ | 部分（把洞换成映射表，4 B/条，比 5~6 B/条省得有限） | 不变 | 复杂度高、收益低，否决 |
+| C 保留 ID + sparse→dense 映射表进快照 | ✅ | 部分（把洞换成映射表，4 B/条，比 5～6 B/条省得有限） | 不变 | 复杂度高、收益低，否决 |
 | D 复用空槽（free list） | ✅（删改平衡时） | ✅（同上） | **更危险**：旧引用静默指向新文档 | 否决（§4.2） |
 
 **代价与缓解**：ID 变更 ⇒ 需要 D-S4-09 的三处声明；`Hit` 里同时带 `source` / `text` / `metadata`
@@ -515,7 +515,7 @@ cargo run --release -p helix-core --example churn_bench -- \
 
 ### D-S4-02 触发方式
 
-- **自动（`save` 内触发）**：省事，但把 10~100s 的重建塞进 `save()`，
+- **自动（`save` 内触发）**：省事，但把 10～100s 的重建塞进 `save()`，
   使写路径耗时**不可预测**；且 `save` 是 NFR-03/04 口径旁边的敏感点，评审难以接受隐式重活。
 - **手动（建议）**：`helix compact` 显式调用，行为可预测；
   `save()` 只在超阈值时 `eprintln` 告警（NFR-07 风格：问题必须可见，但不自作主张）。
@@ -559,7 +559,7 @@ TermId 是内部编号（快照里 `term_dict` 与 `postings` 一起导出/导�
 ### D-S4-10 `compact()` 与写缓冲 `pending` 的交互 ✅ 已拍板（2026-09-08，v0.2 新增，评审 P0）
 
 > **✅ 决策：采纳修法 A——`compact()` 的第一条语句是 `self.commit()?`。**
-> S4-03~S4-07（核心实现）据此开工；不变式 **I8** 与测试 **T13** 转为强制项。
+> S4-03～S4-07（核心实现）据此开工；不变式 **I8** 与测试 **T13** 转为强制项。
 
 完整论证见 **§4.1.1**。一句话：`add()` 在入 `pending` 之前就分配了 `chunk_id`，
 不先 flush 就重编号 ⇒ 旧 id 会在紧随的 `save()` 里被灌进 `raw_vectors` 与新图（幽灵点）。
@@ -570,7 +570,7 @@ TermId 是内部编号（快照里 `term_dict` 与 `postings` 一起导出/导�
 | B `Index::compact()` 顺带 remap `pending` | 可行，但把门面层写缓冲概念下沉进 `Index`，破坏分层 ⇒ 否决 |
 | C `pending` 非空时返回 `Err` | 把状态管理推给调用方，库 API 易踩 ⇒ 否决 |
 
-**阻塞范围**：~~S4-03 ~ S4-07（核心实现）动工前必须定稿~~ ⇒ **已拍板，阻塞解除**。
+**阻塞范围**：~~S4-03 ～ S4-07（核心实现）动工前必须定稿~~ ⇒ **已拍板，阻塞解除**。
 不变式 I8、测试 T13 转为强制项，实现时必须落地。
 
 ### D-S4-05 flush 侧幽灵向量（§2.3）
@@ -620,7 +620,7 @@ TermId 是内部编号（快照里 `term_dict` 与 `postings` 一起导出/导�
 
 ---
 
-## 7. 测试计划（S4-T1 ~ S4-T13）
+## 7. 测试计划（S4-T1 ～ S4-T13）
 
 | # | 测试 | 层 | 断言要点 |
 | --- | --- | --- | --- |
@@ -644,12 +644,12 @@ TermId 是内部编号（快照里 `term_dict` 与 `postings` 一起导出/导�
 > `PARALLEL_INSERT_THRESHOLD` 教训：隐式耦合会让测试静默失效）。建议给
 > `SearchIndexBuilder` 加 `batch_size`，并在 T13 里**先断言 `pending` 非空**再 compact。
 
-> ⚠️ 沿 Step 2 教训：**所有体积断言除「<2s」类硬判定外一律给范围**（实测单次波动 ±10~15%）；
+> ⚠️ 沿 Step 2 教训：**所有体积断言除「<2s」类硬判定外一律给范围**（实测单次波动 ±10～15%）；
 > 体积判据统一写「±10%」而非定值。
 
 ---
 
-## 8. 实施任务拆分（S4-01 ~ S4-10）
+## 8. 实施任务拆分（S4-01 ～ S4-10）
 
 | # | 任务 | 交付 | 量级 |
 | --- | --- | --- | --- |
@@ -662,10 +662,10 @@ TermId 是内部编号（快照里 `term_dict` 与 `postings` 一起导出/导�
 | **S4-07** | 门面层：`compact`（**含步骤 0 `commit()`**，D-S4-10）/ `compact_and_save` / `tombstone_stats` + `TombstoneStats` / `CompactionReport`（含字节三体积）+ `save` 阈值告警（D-S4-02） | T7、T11、**T13** | M |
 | **S4-08** | CLI `helix compact`（`--dry-run` / `--output` / `--json`） | CLI + `user-guide.md` | S |
 | **S4-09** | workload：example `churn_bench` + `scripts/eval_churn.sh` + 实测入 `eval-report.md` §8.8 | T6、T8、T9、T10 | M |
-| **S4-10** | 文档回写：架构 §7.5.3（新增 compaction 小节）+ 风险 R26~R30、需求 FR-30 验收注记、plan-v2 进度、CHANGELOG、README 索引 | 文档 | S |
+| **S4-10** | 文档回写：架构 §7.5.3（新增 compaction 小节）+ 风险 R26～R30、需求 FR-30 验收注记、plan-v2 进度、CHANGELOG、README 索引 | 文档 | S |
 
 > **建议 PR 切分**（沿用 Step 3 教训：base 一律 `main`，一个 PR 一个主题）：
-> ① S4-01（小，先合）→ ② S4-03~S4-07（核心，单 PR，含 T1~T4/T7/T11/T12/**T13**）→
+> ① S4-01（小，先合）→ ② S4-03～S4-07（核心，单 PR，含 T1～T4/T7/T11/T12/**T13**）→
 > ③ S4-08 + S4-09（CLI + workload + 实测）→ ④ S4-10（文档回写）。
 >
 > **v0.3 开工状态**：D-S4-01 / D-S4-10 已拍板 ⇒ **① 与 ② 均可开工**（不再有阻塞项）。
@@ -675,13 +675,13 @@ TermId 是内部编号（快照里 `term_dict` 与 `postings` 一起导出/导�
 
 ## 9. 风险与未决问题
 
-### 9.1 新增风险（拟写入架构 §14.1，编号 R26~R30）
+### 9.1 新增风险（拟写入架构 §14.1，编号 R26～R30）
 
 | # | 风险 | 影响 | 对策 | 状态 |
 | --- | --- | --- | --- | --- |
 | **R26** | **compaction 期间内存峰值 ≈2×**（旧 Index/图 + 新 Index/图并存） | 100K 级可能 OOM | 先按正确性实现；缓解手段（正排原地重排、分步替换）待 S4-09 实测后决定 | 待实测 |
 | **R27** | **ID 重编号破坏外部持久引用** | 场景层引用的 `doc_id` 失效 | D-S4-09 三处声明；`source` / `content_hash` 作稳定键；`CompactionReport.remapped` 可观测 | 已缓解 |
-| **R28** | **compaction 耗时**（重建图 O(N)：12K ≈10~11.5s，100K 预估 60~100s，**待实测**） | 长时间独占 `SearchIndex` | 手动触发（D-S4-02）；CLI 打印耗时；100K 实测入 eval-report | 待实测 |
+| **R28** | **compaction 耗时**（重建图 O(N)：12K ≈10～11.5s，100K 预估 60～100s，**待实测**） | 长时间独占 `SearchIndex` | 手动触发（D-S4-02）；CLI 打印耗时；100K 实测入 eval-report | 待实测 |
 | **R29** | **重建图引入拓扑抖动**（NFR-06 口径不破，但与「增量建库」的历史评测基线不再逐位可比） | 评测可比性 | 文档说明 + oracle 重合率 ≥0.99 断言（T4） | 已接受 |
 | **R30** | compaction 期间**无法服务**（单写者语义，无并发读者） | 运维窗口 | V2.0 接受；在线 compaction 归 **Step 8** | 已接受 |
 
@@ -695,7 +695,7 @@ TermId 是内部编号（快照里 `term_dict` 与 `postings` 一起导出/导�
 - **Q6**：compaction 要不要顺带把 `content_hashes` 里指向墓碑 doc 的残留清掉？
   （现状 `Index::remove` 已摘 `content_hash`，理论上无残留 ⇒ 只需 T1 断言，不需要额外代码）
 - **~~Q7~~** ✅ **已拍板（2026-09-08）**：D-S4-10 采纳「`compact()` 开头先 `commit()`」（修法 A）；§4.1.1 的 B / C 不再考虑。
-  ⇒ Q1~Q7 的**全部结案结论**见 **§10.3**（v0.4 追加）。
+  ⇒ Q1～Q7 的**全部结案结论**见 **§10.3**（v0.4 追加）。
 
 ---
 
@@ -709,11 +709,11 @@ TermId 是内部编号（快照里 `term_dict` 与 `postings` 一起导出/导�
 | --- | --- | --- | --- |
 | **S4-01** | flush 侧幽灵向量防线 | ✅ 完成 | PR #29 → `1efc128` |
 | **S4-02** | `remove_many`（**可选**） | ⬜ **未实施** | 无需求驱动；`remove` 的 O(N·M) 代价保留（架构 §7.5.3 已记） |
-| **S4-03~06** | `Index::compact` 重编号 / 倒排 remap / `raw_vectors` / 图重建 | ✅ 完成 | PR #30 → `6f34ef2` |
+| **S4-03～06** | `Index::compact` 重编号 / 倒排 remap / `raw_vectors` / 图重建 | ✅ 完成 | PR #30 → `6f34ef2` |
 | **S4-07** | 门面层 `compact` / `compact_and_save` / `tombstone_stats` / `CompactionReport` + `save` 告警 | ✅ 完成 | PR #30 |
 | **S4-08** | CLI `helix compact` | ✅ 完成 | PR #31 → `ac9fcbe` |
 | **S4-09** | `churn_bench` + `eval_churn.sh` + 实测 | ✅ 完成 | PR #31 |
-| **S4-10** | 文档回写 | ✅ 完成 | 本 PR（架构 §7.5.3 / §14.2 R26~R30、需求 FR-30、plan-v2、CHANGELOG、README 索引） |
+| **S4-10** | 文档回写 | ✅ 完成 | 本 PR（架构 §7.5.3 / §14.2 R26～R30、需求 FR-30、plan-v2、CHANGELOG、README 索引） |
 
 ### 10.2 实测结论（10K churn，合成 embedder）
 
@@ -725,13 +725,13 @@ TermId 是内部编号（快照里 `term_dict` 与 `postings` 一起导出/导�
 | 判据 | 结果 |
 | --- | --- |
 | 验收 1 三体积不无界增长 | ✅ churn 0.3：graph+data **84.6 → 33.7MB**（-60%）；`nb_point` 25000 → 10000（== 存活且有向量的 chunk 数） |
-| 验收 2 `GraphStatus::Loaded` | ✅ 非 `Rebuilt`；冷启动 91~99ms |
+| 验收 2 `GraphStatus::Loaded` | ✅ 非 `Rebuilt`；冷启动 91～99ms |
 | 验收 3 不累积（J2） | ✅ compact 后 snapshot 与首轮差异 <1.2%（阈 15%）；`raw_vectors` 恒 10000 |
 
 ⚠️ **未量出 compaction 耗时**：`churn_bench` 的 CSV 只有 `coldstart_ms` 列、**无 `compact_ms`**，
 故 R28 维持「未实测」（架构 §14.2）。数字可用 `helix compact --json` 的 `compact_ms` 采集。
 
-### 10.3 未决问题结案（Q1 ~ Q7）
+### 10.3 未决问题结案（Q1 ～ Q7）
 
 - **Q1**（D-S4-01 是否重编号）✅ v0.3 已拍板 = 重编号。实现侧由 **T15** 验证「compact 后存活
   向量 id 连续 `0..alive`、无洞」。
@@ -753,13 +753,13 @@ TermId 是内部编号（快照里 `term_dict` 与 `postings` 一起导出/导�
 ### 10.4 评审响应要点（PR #30 / #31）
 
 - **无墓碑早退**：`compact()` 在 `chunks_total == chunks_alive` 时直接返回空 report
-  （`remapped=false`，**不重建图**）——按原设计会白跑 10~100s 的重建。
+  （`remapped=false`，**不重建图**）——按原设计会白跑 10～100s 的重建。
 - **`bytes_before` 的诚实语义**：目标文件不存在时为 `None`，而非 `Some(0,0,0)`。
 - **失败语义写进 rustdoc**：`save` 失败时返回 `Err`，但**内存已压实**（I5 无 undo 路径），
   调用方对同一 `path` 重试 `save()` 即可续写，不必重跑 `compact()`。
 - **CLI 机制的可测性边界**：CLI 真二进制测 compact 有两硬约束——① 无 `remove` 子命令 ⇒
   造不出墓碑，只能测 no-op；② `--index` 走默认装配会实例化 `LocalEmbedder`
-  （**构造即触发 bge 下载 ~49s**）。故改用**门面层等效复刻**（确定性 `TestEmbedder`），见 §10.5。
+  （**构造即触发 bge 下载 ～49s**）。故改用**门面层等效复刻**（确定性 `TestEmbedder`），见 §10.5。
 
 ### 10.5 集成测试补强（PR #31 追加 commit `aed8829`，+8 例 / 553 行）
 
@@ -865,5 +865,5 @@ cargo run --release -p helix-core --example churn_bench -- \
 | BM25 排序是全序（score 降序 + chunk_id 升序） | `retriever/bm25.rs:129-135` |
 | 铁律原文 | `architecture-design.md:728` |
 | Step 4 任务与验收原文 | `plan-v2.md:267-282`；issue #21 |
-| 12K 图体积实测（单位成本外推依据） | `plan-v2.md:205-217`（graph 7.9~8.1MB + data 23.7MB，dump 43.5ms） |
-| 降级重建耗时（12K ≈10~11.5s） | `plan-v2.md:212` |
+| 12K 图体积实测（单位成本外推依据） | `plan-v2.md:205-217`（graph 7.9～8.1MB + data 23.7MB，dump 43.5ms） |
+| 降级重建耗时（12K ≈10～11.5s） | `plan-v2.md:212` |

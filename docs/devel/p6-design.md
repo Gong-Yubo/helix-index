@@ -4,11 +4,11 @@
 | --- | --- |
 | 版本 | **v2.1（已实施完成）** |
 | 日期 | 2026-09-04 |
-| 状态 | ✅ **已实施**（决策点 D-I1~D-I8 定案，I-01~I-14 全部落地；详见第 9.1 节实施记录） |
+| 状态 | ✅ **已实施**（决策点 D-I1～D-I8 定案，I-01～I-14 全部落地；详见第 9.1 节实施记录） |
 | 来源 | [issue #1「融合索引接口重新设计」](https://github.com/Gong-Yubo/helix-index/issues/1) |
-| 评审 | [issue #1 评论（方案摘要 + 决策点待拍板）](https://github.com/Gong-Yubo/helix-index/issues/1#issuecomment-5526051968)、[回应评审 P1~P11](https://github.com/Gong-Yubo/helix-index/issues/1#issuecomment-5534925042) |
-| 前提 | P0~P5 + v1 收尾全部完成（`v1-finish-design.md` V1-00~V1-16 已落地，CI 9/9 绿） |
-| 上游 | `requirements-spec.md`（FR/NFR 定义源）、`architecture-design.md`（模块边界 4.2、ADR-001~008）、`plan.md` |
+| 评审 | [issue #1 评论（方案摘要 + 决策点待拍板）](https://github.com/Gong-Yubo/helix-index/issues/1#issuecomment-5526051968)、[回应评审 P1～P11](https://github.com/Gong-Yubo/helix-index/issues/1#issuecomment-5534925042) |
+| 前提 | P0～P5 + v1 收尾全部完成（`v1-finish-design.md` V1-00～V1-16 已落地，CI 9/9 绿） |
+| 上游 | `requirements-spec.md`（FR/NFR 定义源）、`architecture-design.md`（模块边界 4.2、ADR-001～008）、`plan.md` |
 | 定位 | **不改算法、不改评测口径、不改 CLI 参数**，只重构库的**对外接口层**，让 `index.add(doc)` / `searcher.search(query)` 成为默认路径 |
 
 > 命名说明：本文件按 `p0~p5-design.md` 的既有约定命名，编号 P6。
@@ -555,7 +555,7 @@ LanceDB 有 `EmbeddingRegistry` 可以按配置自动重建 embedding 函数。
 | **I-07** | `remove` / `save` / `load` 接入门面层 | I-04 | 低 |
 | **I-08** | `ConfigFingerprint` + `Analyzer::id` / `Embedder::id` + `Error::ConfigMismatch { expected, actual }` | I-07 | 中（升 FORMAT_VERSION） |
 | **I-09** | **实现** `effective_version()`（base 2 / positions 3）+ positions↔非positions 互拒测试 + 快照兼容性测试（把注释约定落成实现，修掉现存隐患） | I-08 | 中 |
-| **I-10** | CLI 切到新 API（`build` / `search` / `compare`）——**参数与输出一字不改** | I-04~I-08 | 中 |
+| **I-10** | CLI 切到新 API（`build` / `search` / `compare`）——**参数与输出一字不改** | I-04～I-08 | 中 |
 | **I-11** | `examples/search_basic.rs` 重写（79 → ≤15 行）+ `docs/user-guide.md` 库接入章节重写 | I-10 | 低 |
 | **I-12** | **bench 迁移到新 API + 回归对账**（最高风险项）；同步删除 `load_setup` 的 `--analyzer` 警告回退逻辑，改由指纹校验硬报 `ConfigMismatch`（评审 P11） | I-10, I-05 | **高** |
 | I-13 | `plan.md` 阶段表更新（P6 接口重构 / P7 顺延）+ 本文档状态回写 | I-12 | 低 |
@@ -575,7 +575,7 @@ LanceDB 有 `EmbeddingRegistry` 可以按配置自动重建 embedding 函数。
 > 且它用到了最多的逃生舱（brute 后端、BM25 网格、RRF 网格、--runs 重建图、裸 embedder）。
 > **在所有逃生舱都被验证过之前动 bench，等于拿评测数字冒险。**
 
-### 9.1 实施记录（2026-09-04，I-01~I-14 全部落地）
+### 9.1 实施记录（2026-09-04，I-01～I-14 全部落地）
 
 | # | 与设计的偏离 / 关键实测 | 结论 |
 | --- | --- | --- |
@@ -586,7 +586,7 @@ LanceDB 有 `EmbeddingRegistry` 可以按配置自动重建 embedding 函数。
 | **实测** | NFR-03 构建：embed 209.9s（口径修正为累计值，非 commit 计时）、总 225.5s | 仍不达标（<120s）；batch_size 略改善吞吐但未改结论。NFR-05 峰值 372MB，raw_vectors 翻倍被模型+ort 主导项稀释 |
 | **修复 bug** | build 命令原「embed 耗时」在 `commit()` 处计时，只测到最后一批（581ms），误导 | `SearchIndex::embed_elapsed()` 累计真实 embed 推理耗时（209.9s） |
 
-> 提交：I-01 `aeec34d`、I-02 `30af5d8`、I-03~I-06 `38e3bf6`、I-07 `79c1a71`、
+> 提交：I-01 `aeec34d`、I-02 `30af5d8`、I-03～I-06 `38e3bf6`、I-07 `79c1a71`、
 > I-08 `71ee890`、I-09 `617fdff`、I-10 `da96e38`、I-11 `e377bb4`、I-12 `2fc0677`、I-13 收尾。
 
 ---
@@ -640,7 +640,7 @@ LanceDB 有 `EmbeddingRegistry` 可以按配置自动重建 embedding 函数。
 
 | # | 风险 / 代价 | 影响 | 缓解 |
 | --- | --- | --- | --- |
-| R1 | **`raw_vectors` 内存翻倍**：向量索引 + 原始向量两份（12K×512 约 24.6MB → ~49MB） | NFR-05 | 快照策略 D1 要求存原始向量，无法回避。提供 `.keep_raw_vectors(false)` 逃生舱（省内存，代价是无法保存含向量快照）；**NFR-05 必须重新实测并记录** |
+| R1 | **`raw_vectors` 内存翻倍**：向量索引 + 原始向量两份（12K×512 约 24.6MB → ～49MB） | NFR-05 | 快照策略 D1 要求存原始向量，无法回避。提供 `.keep_raw_vectors(false)` 逃生舱（省内存，代价是无法保存含向量快照）；**NFR-05 必须重新实测并记录** |
 | R2 | **写缓冲让 `add` 延迟有长尾**（偶发一次 batch embed） | 写入端体验 | 文档明确写明；提供 `add_documents` 批量路径；`helix build` 走批量路径，不受影响 |
 | R3 | **"零拷贝"仅在无 `Searcher` clone 残留时成立**；`clone()` 后继续 `add` 会静默深拷贝整个 `Inner` | 性能语义 | 见 6.4「P3 修正」：`debug_assert!(Arc::strong_count == 1)` 提示；结构共享留 P7 |
 | R4 | **mode 字符串接受方式（`FromStr` 的 Err 延后到 `exec()`）可能编译/语义不成立** | I-06 | 有退化方案（`.mode()` 仅收 enum，字符串走 `SearchMode::parse`）；I-06 第一步就验证 |
@@ -655,7 +655,7 @@ LanceDB 有 `EmbeddingRegistry` 可以按配置自动重建 embedding 函数。
 
 - issue #1 原文：https://github.com/Gong-Yubo/helix-index/issues/1
 - 需求定义：`docs/devel/requirements-spec.md`（FR-12 / FR-13 / FR-14 / FR-15 / FR-17 / NFR-02 / NFR-03 / NFR-05）
-- 架构边界：`docs/devel/architecture-design.md` 4.2（模块职责）、ADR-001~008
+- 架构边界：`docs/devel/architecture-design.md` 4.2（模块职责）、ADR-001～008
 - 评测口径与抖动容差：`docs/devel/eval-report.md` 3.4（R-P5-13）、第 8 节（NFR 实测）
 - 收尾现状：`docs/devel/v1-finish-design.md`
 - 业界参照：tantivy 0.26 docs（IndexWriter / commit / TopDocs）、
