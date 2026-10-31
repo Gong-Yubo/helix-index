@@ -24,7 +24,7 @@
 
 | # | 决策 | 结论 | 状态 | 阻塞谁 |
 | --- | --- | --- | --- | --- |
-| **D-S4-01** | 要不要**重编号** `ChunkId` / `DocId`（这是能否压掉快照正文墓碑槽位的分水岭） | **重编号（方案 B）**。不重编号则 `docs` / `chunks` / `chunk_lens` 的空洞无法消除，验收「快照正文不无界增长」**不可能**达成；替代方案「复用空槽（free list）」被否决——ID 复用会让外部旧引用**静默指向错误内容**，比 ID 变更更危险 | ✅ **已拍板**<br>2026-09-08 | ～～阻塞全 Step～～<br>已解除 |
+| **D-S4-01** | 要不要**重编号** `ChunkId` / `DocId`（这是能否压掉快照正文墓碑槽位的分水岭） | **重编号（方案 B）**。不重编号则 `docs` / `chunks` / `chunk_lens` 的空洞无法消除，验收「快照正文不无界增长」**不可能**达成；替代方案「复用空槽（free list）」被否决——ID 复用会让外部旧引用**静默指向错误内容**，比 ID 变更更危险 | ✅ **已拍板**<br>2026-09-08 | ~~阻塞全 Step~~<br>已解除 |
 | **D-S4-02** | 触发方式：手动 / `save` 自动 / 混合 | **手动为主 + 阈值告警**。`helix compact` 显式调用；`save()` 在墓碑比例超阈值时只 **eprintln 告警**（NFR-07 风格可观测），自动 compaction **默认关**。理由：自动会把 10～100s 的重建塞进 `save()`，让写路径耗时不可预测，而 `save` 是 NFR-03/04 口径旁边的敏感点 | ⏳ 评审无异议 | 阻塞 S4-07 |
 | **D-S4-03** | 词表里的**死词**（postings 已空但 term 仍在 `term_dict`）是否一并压实 | **压实并 remap TermId**。死词是纯浪费（词串 + 一条空链）；TermId 是**内部**编号（快照里 `term_dict` 与 `postings` 一起导出/导入），remap 不影响外部语义 | ⏳ 评审无异议 | 阻塞 S4-03 |
 | **D-S4-04** | compaction 与 `save` 的关系 | 提供 `compact()`（纯内存，不落盘）+ `compact_and_save(path)`（= compact + 既有 `save`）。**铁律由此自动满足**：manifest 重发是 `save()` 的既有步骤，compaction 不再另开一条落盘路径。`Index::compact` 取 `pub(crate)` 是**结构性**理由（它与 `raw_vectors` / 向量索引的替换必须原子发生），门面层 `SearchIndex::compact` 是**有意保留**的内存路径，**落盘入口唯一 = `compact_and_save`**（§4.6） | ⏳ 评审无异议 | 阻塞 S4-07 |
@@ -33,7 +33,7 @@
 | **D-S4-07** | 重建图时是否沿用装配的 `parallel_build` | **沿用**（默认串行）。与 `load` 降级重建走同一条 `add_batch`，行为一致；compaction 是低频操作，不值得为此引入非确定性拓扑 | ⏳ 评审无异议 | 阻塞 S4-06 |
 | **D-S4-08** | 顺带做 `remove_many(&[DocId])`（架构 §7.5.2 已预留） | **可选**（S4-02，timebox 内）。价值是把「批量删 N 篇 O(N·M)」降到 O(N+M)；与本 Step 主题相邻但非必需 | ⏳ 可选 | 无 |
 | **D-S4-09** | ID 变更如何对外声明 | **三处**：`CompactionReport` 字段 + `user-guide.md`「已知坑」一节 + `SearchIndex::compact` 的 rustdoc 显式写「跨 compaction 的持久引用请用 `source` / `content_hash`，不要用 `doc_id` / `chunk_id`」 | ⏳ 评审无异议 | 阻塞 S4-10 |
-| **D-S4-10** | `compact()` 与写缓冲 `pending` 的交互（**v0.2 新增，评审 P0**） | **`compact()` 开头先 `self.commit()?`**。否则 `pending` 里仍是旧 chunk_id，紧随的 `save()` → `flush()` 会把 stale id 灌进 `raw_vectors` 与新图。三种修法中它最干净：纯 BM25 下 `pending` 恒空 ⇒ flush 是 no-op；与 S4-01 的 liveness 过滤天然衔接；`save` 的隐式 commit 变 no-op | ✅ **已拍板**<br>2026-09-08 | ～～阻塞 S4-03～S4-07～～<br>已解除 |
+| **D-S4-10** | `compact()` 与写缓冲 `pending` 的交互（**v0.2 新增，评审 P0**） | **`compact()` 开头先 `self.commit()?`**。否则 `pending` 里仍是旧 chunk_id，紧随的 `save()` → `flush()` 会把 stale id 灌进 `raw_vectors` 与新图。三种修法中它最干净：纯 BM25 下 `pending` 恒空 ⇒ flush 是 no-op；与 S4-01 的 liveness 过滤天然衔接；`save` 的隐式 commit 变 no-op | ✅ **已拍板**<br>2026-09-08 | ~~阻塞 S4-03～S4-07~~<br>已解除 |
 
 ---
 
@@ -570,7 +570,7 @@ TermId 是内部编号（快照里 `term_dict` 与 `postings` 一起导出/导�
 | B `Index::compact()` 顺带 remap `pending` | 可行，但把门面层写缓冲概念下沉进 `Index`，破坏分层 ⇒ 否决 |
 | C `pending` 非空时返回 `Err` | 把状态管理推给调用方，库 API 易踩 ⇒ 否决 |
 
-**阻塞范围**：～～S4-03 ～ S4-07（核心实现）动工前必须定稿～～ ⇒ **已拍板，阻塞解除**。
+**阻塞范围**：~~S4-03 ～ S4-07（核心实现）动工前必须定稿~~ ⇒ **已拍板，阻塞解除**。
 不变式 I8、测试 T13 转为强制项，实现时必须落地。
 
 ### D-S4-05 flush 侧幽灵向量（§2.3）
@@ -687,14 +687,14 @@ TermId 是内部编号（快照里 `term_dict` 与 `postings` 一起导出/导�
 
 ### 9.2 未决问题（需评审或实测回答）
 
-- **～～Q1～～** ✅ **已拍板（2026-09-08）**：D-S4-01 采纳**重编号（方案 B）**。
+- **~~Q1~~** ✅ **已拍板（2026-09-08）**：D-S4-01 采纳**重编号（方案 B）**。
 - **Q2**：`save()` 的告警阈值（建议 ratio ≥0.2 且 total ≥1024）是否合适？
 - **Q3**：`raw_vectors` 缺向量的存活 chunk（§4.4）在 CLI 上要不要告警？
 - **Q4**：100K 档用合成 embedder 还是真实 embedder？（时间 vs 真实性）
 - **Q5**：`flush` 能否**先过滤再 embed**（§2.3）？需先实测 `fastembed` 的 batch 组成无关性。
 - **Q6**：compaction 要不要顺带把 `content_hashes` 里指向墓碑 doc 的残留清掉？
   （现状 `Index::remove` 已摘 `content_hash`，理论上无残留 ⇒ 只需 T1 断言，不需要额外代码）
-- **～～Q7～～** ✅ **已拍板（2026-09-08）**：D-S4-10 采纳「`compact()` 开头先 `commit()`」（修法 A）；§4.1.1 的 B / C 不再考虑。
+- **~~Q7~~** ✅ **已拍板（2026-09-08）**：D-S4-10 采纳「`compact()` 开头先 `commit()`」（修法 A）；§4.1.1 的 B / C 不再考虑。
   ⇒ Q1～Q7 的**全部结案结论**见 **§10.3**（v0.4 追加）。
 
 ---

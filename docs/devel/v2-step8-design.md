@@ -465,7 +465,7 @@ fn publish(shared: &Shared, next: View) {
 
 | 文件 | 变更 |
 | --- | --- |
-| `crates/core/src/search/view.rs`（**新**） | `Segment` / `View` / `Shared` / `Tombstones` / `IdAllocator` / `SegmentSums` + `snapshot` / `with_main_mut` / **`commit_view`**（发布内联在此；～～`publish`～～ / ～～`advance`～～ 已在 PR #62 第 1 轮评审响应中**删除**） |
+| `crates/core/src/search/view.rs`（**新**） | `Segment` / `View` / `Shared` / `Tombstones` / `IdAllocator` / `SegmentSums` + `snapshot` / `with_main_mut` / **`commit_view`**（发布内联在此；~~`publish`~~ / ~~`advance`~~ 已在 PR #62 第 1 轮评审响应中**删除**） |
 | `crates/core/src/search/index.rs` | 删 `Inner`（内容容器上移为 `Segment`）；`SearchIndex` 改持 `Arc<Shared>`；新增 `seg()` / `searcher(&self)`；`into_searcher()` 转 `#[deprecated]` 薄封装；`commit()` = `flush()` + **发布** |
 | `crates/core/src/search/searcher.rs` | `Searcher` 改持 `Arc<Shared>`；`parts()` / `has_vector()` / `infer_mode()` / `run()` 接 `&View`；`SearchRequest::exec` 取一次快照（`I8-3`）；`into_index()` 转 `#[deprecated]` |
 | `crates/cli/src/main.rs`（3 处）/ `examples/search_basic.rs`（1 处） | **迁移**到 `commit()` + `searcher()`（示范新用法） |
@@ -1728,10 +1728,10 @@ R52 分列 谓词 **+1 us** / 多段 **+3 us**、CI head `04a668d` **10/10**。
 | **Q2** | **是否永远不做多段快照？** | D-S8-01 把多段快照推给了「将来」 | 登记为**条件项**：若出现「delta 大到 `save` 时合并成本不可接受」的真实场景，再开 **ADR-B** |
 | **Q3′** | （**改述自 Q3**）不同 `intra_threads`（及不同实例数）是否改变 `embed_query` 的向量**数值**？ | 若改变 ⇒ 池化破坏 NFR-10 ① 的「逐位一致」前置 ⇒ **必须判「不投」** | **spike S8-S2 必答**；⚠️ 不允许推断（R47 的教训） |
 | **Q4** | **默认 `embed_sessions` 取值** | 默认 1 = 零收益零风险；默认 > 1 = 在**没有实测支撑**的情况下付内存 | 默认 **1**；若 S8-S2 通过，再在 CLI / 用户文档给推荐值（**库侧默认不动**） |
-| **Q5** | ✅ **已结案（2026-09-17，评审代核 + 本文独立复核）**：**`VectorRoute` 定义于 `vector/mod.rs:37`，未标 `#[non_exhaustive]`**，三变体 `None` / `Ann` / `Exact`，经 `query/mod.rs:24` 再导出、在公开的 `Metrics.vector_route` 上暴露 ⇒ **新增 `Mixed` 变体对下游 exhaustive `match` 是破坏性变更**；**给枚举补 `#[non_exhaustive]` 同样会让下游 exhaustive `match` 编译失败**（须加通配臂）⇒ **两条路都属 breaking，没有「零破坏」选项**。⇒ 取形 = **新增 `Mixed` 变体 + PR5 的 CHANGELOG 记 `Breaking`**。～～**`VectorRoute` 混合取形**～～：新增 `Mixed` 变体（破坏性，取决于是否 `#[non_exhaustive]`）还是新增独立布尔字段？ | 影响公开面 | **实现期核实** `VectorRoute` 的定义后定；倾向**新增 `Mixed` 变体 + 给枚举补 `#[non_exhaustive]`** |
+| **Q5** | ✅ **已结案（2026-09-17，评审代核 + 本文独立复核）**：**`VectorRoute` 定义于 `vector/mod.rs:37`，未标 `#[non_exhaustive]`**，三变体 `None` / `Ann` / `Exact`，经 `query/mod.rs:24` 再导出、在公开的 `Metrics.vector_route` 上暴露 ⇒ **新增 `Mixed` 变体对下游 exhaustive `match` 是破坏性变更**；**给枚举补 `#[non_exhaustive]` 同样会让下游 exhaustive `match` 编译失败**（须加通配臂）⇒ **两条路都属 breaking，没有「零破坏」选项**。⇒ 取形 = **新增 `Mixed` 变体 + PR5 的 CHANGELOG 记 `Breaking`**。~~**`VectorRoute` 混合取形**~~：新增 `Mixed` 变体（破坏性，取决于是否 `#[non_exhaustive]`）还是新增独立布尔字段？ | 影响公开面 | **实现期核实** `VectorRoute` 的定义后定；倾向**新增 `Mixed` 变体 + 给枚举补 `#[non_exhaustive]`** |
 | **Q6** | **段数上限与「何时合并」的策略**（`deltas.len() > K` 才合并？） | 读路径成本随段数线性增长 | 库**不设**策略；CLI / 宿主按 `K = 4`（拟）触发；**D-S8-08 的「库只给原语」在此延续** |
 | **Q7** | **NFR-14 ② 的判据取形**：相对（比值）还是绝对（ms）？ | 决定报告怎么读 | **相对为主 + 绝对为护栏**（§4.13.1 已给理由：避免把「分段的基线变化」与「合并的干扰」混在一起） |
-| **Q8** | ✅ **已结案（2026-09-17，评审代核 + 本文独立复核）**：**`Config` 无 `impl Default` / 无 `Default` derive**（`search/config.rs:35` 的 `pub struct Config {` 上方只有文档注释），全仓**唯一**字面构造点是 `config.rs:301` 的 `build_config`（crate 内部）⇒ **仓内无下游破坏**。⇒ 取形 = **加在 `Config` 上（字段公开）+ 同步 `build_config`**；`ConfigBuilder` 不必需。～～`Config::embed_sessions` 加在 `Config` 还是 `ConfigBuilder`？～～ | 公开面（§6 的破坏性核实项） | **实现期核实** `Config` 是否有字面构造用法后定；若走 `ConfigBuilder` 则风险最小 |
+| **Q8** | ✅ **已结案（2026-09-17，评审代核 + 本文独立复核）**：**`Config` 无 `impl Default` / 无 `Default` derive**（`search/config.rs:35` 的 `pub struct Config {` 上方只有文档注释），全仓**唯一**字面构造点是 `config.rs:301` 的 `build_config`（crate 内部）⇒ **仓内无下游破坏**。⇒ 取形 = **加在 `Config` 上（字段公开）+ 同步 `build_config`**；`ConfigBuilder` 不必需。~~`Config::embed_sessions` 加在 `Config` 还是 `ConfigBuilder`？~~ | 公开面（§6 的破坏性核实项） | **实现期核实** `Config` 是否有字面构造用法后定；若走 `ConfigBuilder` 则风险最小 |
 
 ---
 
@@ -1923,7 +1923,7 @@ cargo run -p helix --release -- build --input data/t2-corpus.jsonl --index /tmp/
 | `fastembed v6.0.2` `src/text_embedding/impl.rs:453-456` | `embed(&mut self, …)` | §2.7 / §4.11.1（池化是唯一形态） |
 | `fastembed v6.0.2` `src/common.rs:262-290` | `init_session_builder(eps, intra_threads)`：`None` ⇒ `available_parallelism()`；`Session::builder().with_intra_threads(threads)` | §2.7 / §4.11 |
 
-⚠️ **本文未核实的项**（诚实标注，2026-09-17 更新）：① `LayerGenerator` 的层高生成实现细节 —— **仍未核实**（本文只依赖「每点恰在一层」这一条，已由 `generate_new_point` 的 push 语义直接给出）；② ～～`VectorRoute` 是否 `#[non_exhaustive]`（Q5）～～ ⇒ ✅ **已核实并结案**（`vector/mod.rs:37`，**无** `#[non_exhaustive]`；评审代核、本文独立复核，见 Q5）；③ ～～`Config` 是否有字面构造用法（Q8）～～ ⇒ ✅ **已核实并结案**（**无** `impl Default`；全仓唯一字面构造在 `config.rs:301` 的 `build_config`，属 crate 内部；评审代核、本文独立复核，见 Q8）。
+⚠️ **本文未核实的项**（诚实标注，2026-09-17 更新）：① `LayerGenerator` 的层高生成实现细节 —— **仍未核实**（本文只依赖「每点恰在一层」这一条，已由 `generate_new_point` 的 push 语义直接给出）；② ~~`VectorRoute` 是否 `#[non_exhaustive]`（Q5）~~ ⇒ ✅ **已核实并结案**（`vector/mod.rs:37`，**无** `#[non_exhaustive]`；评审代核、本文独立复核，见 Q5）；③ ~~`Config` 是否有字面构造用法（Q8）~~ ⇒ ✅ **已核实并结案**（**无** `impl Default`；全仓唯一字面构造在 `config.rs:301` 的 `build_config`，属 crate 内部；评审代核、本文独立复核，见 Q8）。
 
 ---
 

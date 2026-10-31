@@ -692,12 +692,12 @@ GraphStale { reason: String },
 | **R21** | **平台/端序绑定**（C4）：裸 f32 + native endian | 快照拷到别的平台 → 图不可用 | manifest 记 `platform` 并校验，不匹配即降级 | 图 sidecar **不可跨平台搬运**是既定事实，需在用户文档声明 |
 | **R22** | **磁盘体积增加约 60%**（12K 估算：快照 52.3MB → +～25MB 数据文件 + ～8MB 图文件 ≈ 85MB，待 S2-T14 实测） | 大语料（100 万级）下显著 | 先接受并实测；Step 5 compaction 重写图时可一并优化；`--no-graph-persist` 逃生舱 | 未解决，V2.0 接受 |
 | **R23** | **`Box::leak` 的 `HnswIo`**（C6） | 每次加载泄漏约 200B + 路径串；长生命周期服务反复加载会累积 | 量级极小且可控；**leak 后丢弃句柄、不存字段**（P1-2，避免与 `Hnsw` 内部指向 Mmap 的共享借用形成别名）；S2-T12 护栏 | 目前无回收路径；**依赖 `HnswIo: Send + Sync`**，S2-03 加编译期断言，`hnsw_rs` 升级时需复核 |
-| **R24** | **加载后增量插入的建图参数不同**（C8：`extend_candidates` 重载后为 `true`，`Hnsw::new` 为 `false`） | 长期增量写入后，图质量与纯内存建库存在偏差，可能影响召回 | S2-T10 覆盖；实测 oracle 重合率；文档记录 | ～～无法在外部改私有字段～～ **已修正（评审 #14 发现 2）**：`Hnsw::set_extend_candidates(&mut self, bool)` 是公开 API（`hnsw.rs:853`），可显式对齐；真正不可外部改的是 `datamap_opt`（只有 `pub(crate)` getter） |
+| **R24** | **加载后增量插入的建图参数不同**（C8：`extend_candidates` 重载后为 `true`，`Hnsw::new` 为 `false`） | 长期增量写入后，图质量与纯内存建库存在偏差，可能影响召回 | S2-T10 覆盖；实测 oracle 重合率；文档记录 | ~~无法在外部改私有字段~~ **已修正（评审 #14 发现 2）**：`Hnsw::set_extend_candidates(&mut self, bool)` 是公开 API（`hnsw.rs:853`），可显式对齐；真正不可外部改的是 `datamap_opt`（只有 `pub(crate)` getter） |
 | **R25** | **每次 `save` 全量重 dump 图** | 频繁 save 场景成本高（30MB 级写入 + CRC 扫两遍） | 先不做优化；预留 dirty 标记（`dumped_len == len()` 可跳过）的位置，实测后决定 | 未解决 |
 
 **未决问题（需评审补充意见）**
 
-1. ～～`parallel_insert` 的实测收益未知……是否值得为它引入「建图拓扑不可复现」这一永久性代价？～～
+1. ~~`parallel_insert` 的实测收益未知……是否值得为它引入「建图拓扑不可复现」这一永久性代价？~~
    **✅ 已出数据并收敛（2026-09-07，`eval-report.md` §8.6）**：12K 真实语料 11.676s → 2.182s
    （**5.35×**），50K 合成向量 171.8s → 32.7s（5.26×）——加速比稳定在 ≈5.3× 且与规模无关；
    真实语料上 oracle 重合率**无差异**（0.995 / 0.995）。
