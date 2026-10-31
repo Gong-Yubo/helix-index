@@ -33,6 +33,12 @@ GFM 把一对 ASCII `~` 当**删除线分隔符**（单波浪线即生效）⇒ 
 
 * **不判**「`~~` 是否配对完整」：孤立的 `~~` 不会渲染成删除线，属可读性问题、不是渲染事故；
 * **不判**围栏代码块与行内代码内的 `~`：那里是字面量（`~/.cargo` 之类必须写进反引号）；
+* ⚠️ **缩进式代码块（4 空格）与跨行行内代码跨度不在覆盖内**（第 2 轮评审 **P4-1** 指出）：
+  两者都要块级 / 跨行上下文才能判准，**粗判的代价是「假绿」——比假红糟得多**（会让真事故漏网）。
+  ⇒ 当前行为 = 按普通行扫描，因此这两种构造里的 `~` 会得到一条**假红**；真遇到就把它挪进
+  **行内代码**或改**全角**即可（两条路都让门与渲染同时成立）。
+  ⚠️ 我试过「跨行跨度状态机」，在 `docs/devel/v2-step8-design.md` 上**误吞 23 处真事故事件**
+  （把 23 个单 `~` 当成代码内 ⇒ 门变瞎）⇒ **已回退**，只保留「引用块内的围栏」这一条（它不产生假绿）；
 * 本门**只覆盖 `.md`**：`scripts/*.sh` 等由 `check_shell_expansion.py` 负责；
 * 判据比「渲染无事故」**更严**（连 `R1 ~ R65` 这种带空格、实际不会配对的也禁）——
   这是刻意的：**文档里的 ASCII `~` 只允许出现在代码里**，表区间一律用全角 `～`。
@@ -53,9 +59,12 @@ import re
 import subprocess
 import sys
 
+# 引用块前缀（可嵌套：`> > `）；剥掉它再判围栏 —— 否则 `> ``` ` 这类块会被当成正文
+QUOTE = re.compile(r"^[ \t]*(?:>[ \t]*)+")
 FENCE = re.compile(r"^(?P<indent>[ \t]*)(?P<marker>`{3,}|~{3,})(?P<info>.*)$")
 LINK_DST = re.compile(r"\]\([^)]*\)")
 LINK_REF = re.compile(r"^\s*\[[^\]]+\]:\s*\S+")
+# 行内代码跨度：**只认行内配对**。跨行跨度不认（见 docstring 边界段：认错会假绿）
 CODE_SPAN = re.compile(r"(`{1,3})(?!`).*?(?<!`)\1(?!`)")
 RUN = re.compile(r"~+")
 
@@ -70,25 +79,46 @@ def mask(pattern: re.Pattern[str], line: str) -> str:
     return pattern.sub(lambda m: " " * len(m.group(0)), line)
 
 
+def _quote_depth(line: str) -> int:
+    """引用块的嵌套层数（`> > x` ⇒ 2）。"""
+    d = 0
+    i = 0
+    n = len(line)
+    while i < n:
+        while i < n and line[i] in " \t":
+            i += 1
+        if i < n and line[i] == ">":
+            d += 1
+            i += 1
+            continue
+        break
+    return d
+
+
 def violations(text: str) -> list[tuple[int, int, str]]:
     """返回 (行号, 列号, 上下文)；行号/列号从 1 起。"""
     out: list[tuple[int, int, str]] = []
-    fence: tuple[str, int] | None = None
+    fence: tuple[str, int, int] | None = None  # (marker char, marker len, quote depth)
     for lineno, line in enumerate(text.split("\n"), 1):
-        m = FENCE.match(line)
-        if fence is None:
-            if m:
-                fence = (m.group("marker")[0], len(m.group("marker")))
-                continue
-        else:
-            if (
-                m
-                and m.group("marker")[0] == fence[0]
-                and len(m.group("marker")) >= fence[1]
-                and m.group("info").strip() == ""
-            ):
+        depth = _quote_depth(line)
+        body = QUOTE.sub("", line)
+        m = FENCE.match(body)
+
+        if fence is not None:
+            # 引用块结束（层数变浅）⇒ 该围栏随之结束，当前行按普通行继续判
+            if depth < fence[2]:
                 fence = None
+            elif m and m.group("marker")[0] == fence[0] and len(m.group("marker")) >= fence[1] \
+                    and m.group("info").strip() == "":
+                fence = None
+                continue
+            else:
+                continue
+
+        if m:
+            fence = (m.group("marker")[0], len(m.group("marker")), depth)
             continue
+
         masked = mask(LINK_REF, line)
         masked = mask(LINK_DST, masked)
         masked = mask(CODE_SPAN, masked)
@@ -119,6 +149,9 @@ def selftest() -> int:
         ("阳性对照：刻意 `~~删除线~~`", "~~已作废~~ 之后重写", 0),
         ("阴性对照：带空格的 `R1 ~ R65`（1 个 `~`，照样禁，见判据）", "R1 ~ R65", 1),
         ("阳性对照：围栏块内的 ~", "```text\nP0~P5\n```", 0),
+        ("阳性对照：**引用块内**的围栏（第 2 轮评审 P4-1 已修）", "> ```text\n> a~b\n> ```\n", 0),
+        ("阳性对照：嵌套引用块内的围栏", "> > ```text\n> > x~y\n> > ```\n", 0),
+        ("已知边界（**假红**，见 docstring）：跨行行内代码跨度", "`a~b\nc` 之后\n", 1),
         ("阳性对照：链接目标里的 ~", "[x](./a~b.md)", 0),
         ("阴性对照：混在刻意 `~~` 里的一处单 ~", "~~a~~ 与 `x` 和 b~c", 1),
     ]
