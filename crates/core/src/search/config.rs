@@ -410,8 +410,16 @@ impl SearchIndexBuilder {
     /// ⚠️ 代价：`parallel_insert_slice` 走 rayon ⇒ 插入顺序不确定 ⇒
     /// **建图拓扑不可复现**（C8）。图落盘后即被冻结，故「同快照两次加载」
     /// 仍逐位一致（**NFR-06 不受影响**）；但「同一批向量两次建库」不再逐位一致。
-    /// D-J11 已拍板接受该代价（NFR-06 的口径是「同快照两次**加载**」，不约束建库过程）；
-    /// 需要可复现拓扑时用 `.parallel_build(false)` 关掉。
+    /// D-J11 已拍板接受该代价（NFR-06 的口径是「同快照两次**加载**」，不约束建库过程）。
+    ///
+    /// 🔴 **`.parallel_build(false)` 拿不到「可复现拓扑」**（2026-11-01 源码级更正，原措辞
+    /// 「需要可复现拓扑时用它关掉」**是错的**，issue **#34** §五之二②）：它只固定**插入顺序**；
+    /// 而每个点的**层级分配**来自 `LayerGenerator` 的 `StdRng::from_os_rng()`
+    /// （`hnsw_rs-0.3.4/src/hnsw.rs:328` 的 `new` 与 `:343` 的 `new_with_scale` 都是
+    /// `StdRng::from_os_rng()`）⇒ **每次建库都取新的 OS 熵**，同一批向量两次建库的层级分配
+    /// 不同 ⇒ 拓扑仍不同，与串行 / 并行无关。
+    /// 要真正可复现得能注入 RNG，而该版本**没有注入口**（`rng` 字段私有、`LayerGenerator` 由
+    /// `PointIndexation::new` 内部自建）。⇒ 本文档**不承诺**任何「可复现拓扑」的能力。
     ///
     /// `HnswRsIndex::parallel_inserts()` 可观测后端实际分派（**门面不暴露该计数**，
     /// 覆盖边界见 `crates/core/tests/graph_persist.rs` 里 T22 的说明）。
