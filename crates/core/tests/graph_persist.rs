@@ -401,11 +401,28 @@ fn T5_截断图文件不panic() {
 /// 0..19，于是「重建只灌了前 30 篇」这类**内容缺失**（重合率已掉到 0.22）也能三查全绿。
 ///
 /// ⚠️ 曾考虑但**不采用**的第三条（评审建议的「全量检索 id 集合 == 全量 id 集合」）：
-/// **它本身会 flaky**。实测 `top_n(N)` 的返回值随建图拓扑在 198~200 之间跳（7 次里
-/// 4 次 200 条、2 次缺 1 个、1 次缺 2 个：缺 `{190}` / `{199}` / `{144,198}` / `{174,198}`）。
-/// 机理是 `level ≥ 1` 的点**不在 layer 0**（`hnsw.rs:500-511`：`generate_new_point` 只把新点
-/// 推进**它自己那一层**，不回填低层），只能靠上层下降时被访问到，而访问得没访问到取决于拓扑
-/// ⇒ 「取不回全部点」是**固有现象、不是缺陷**，不能当断言。
+/// **它确实会 flaky，但原先写在这里的机理是错的**（2026-11-01 更正，issue #34 §五之二）——
+///
+/// - **现象是真的**：`top_n(N)` 的返回条数确实在 `N-2 … N` 之间跳。本次实测 **30 次降级重建 ×
+///   200 条 query = 6000 条**查询，长度分布 `{198: 792, 199: 1746, 200: 3462}`
+///   （`T6_诊断_topN的返回条数` 用例可复跑；⚠️ 每次跑的分布会抖——拓扑随机，只看自匹配那一条判据）。
+/// - ❌ **但机理不是「`level ≥ 1` 的点不在 layer 0」**：`insert` 会给新点在 **`0..=level` 每一层**
+///   建双向连接（`hnsw_rs-0.3.4/src/hnsw.rs:1149` 的 `for l in (0..level + 1).rev()`），而
+///   `search_layer` 只沿 `neighbours` 遍历（`hnsw.rs:997`）、**不枚举** `points_by_layer`
+///   （`hnsw.rs:511` 那张**每层点表**只决定「点登记在哪层」，不决定链接图）⇒ level ≥ 1 的点
+///   在 layer 0 的链接图里**是存在的**，不是「只能靠上层下降时被访问到」。
+/// - ✅ **真机理是 `search_layer` 的 fast-return**（`hnsw.rs:983`：`if filter.is_none() { return
+///   return_points; }`）：一旦「最近的未访问候选」比「已收集的最远点」还远就**立即终止**，不等
+///   `return_points` 填满 ⇒ `k = N` 的返回条数**天然是近似值**，与「内容有没有丢」不是一回事。
+/// - ✅ **而且它与自匹配失败无关**：同一批 6000 条 query 里自匹配**全部排第一**（0 失败）；另外
+///   **720 次独立建图**（macOS 540 / Linux x86_64 180，扫过 `keep_pruned` 与插入顺序两个变量；
+///   合计 144,000 次自匹配）里
+///   「某点的自身 query 取不回自己」= **0 次**。
+///
+/// ⇒ 第三条不能当断言（它测的是 ANN 的终止行为，不是内容覆盖）；但**也不能**把它写成
+/// 「`level ≥ 1` 点的结构性不可达」—— 那句话已被源码与实测双双否掉。
+/// ⚠️ 因此 **#34 的 10-16 那次 18/200 自匹配失败至今仍未归因**：上面的 720 次建图 + 6000 条
+/// 门面查询都没能复现，说明它不是「建图拓扑随机」的常规范畴。
 #[test]
 fn T6_旧快照无图可加载() {
     const N: usize = 200;
@@ -453,6 +470,10 @@ fn T6_旧快照无图可加载() {
     struct Row {
         i: usize,
         got: Vec<(u32, f32)>,
+        /// `k = N` 的全量检索结果（**只取 id**）。用途 = 失败时把「走向不可达」与
+        /// 「排序 / 距离异常」分开：前者说明这一条 query 的贪心走法根本没走到该点，
+        /// 后者说明走到了却排错（#34 §四 要求「可归因」）。
+        all: Vec<u32>,
         oracle: Vec<u32>,
     }
     let rows: Vec<Row> = (0..N)
@@ -461,6 +482,10 @@ fn T6_旧快照无图可加载() {
             Row {
                 i,
                 got: topk_searcher(&s, &q, 10),
+                all: topk_searcher(&s, &q, N)
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect(),
                 oracle: oracle_topk(&oracle, &q, 10),
             }
         })
@@ -469,6 +494,8 @@ fn T6_旧快照无图可加载() {
     let mut overlap_sum = 0.0f64;
     let mut overlap_worst = 1.0f64;
     let mut self_fail = 0usize;
+    let mut fail_reachable = 0usize;
+    let mut fail_unreachable = 0usize;
     for row in &rows {
         let ids: Vec<u32> = row.got.iter().map(|(id, _)| *id).collect();
         // 1-based 排名；None = 未进 Top-10。
@@ -478,16 +505,24 @@ fn T6_旧快照无图可加载() {
         overlap_worst = overlap_worst.min(ov);
         if rank != Some(1) {
             self_fail += 1;
+            if row.all.contains(&(row.i as u32)) {
+                fail_reachable += 1;
+            } else {
+                fail_unreachable += 1;
+            }
         }
         eprintln!(
-            "[T6] query {}: 自身文档排名 {rank:?} / top1 相似度 {:.6} / 与 oracle 重合率 {ov:.3}",
+            "[T6] query {}: 自身文档排名 {rank:?} / top1 相似度 {:.6} / 与 oracle 重合率 {ov:.3} \
+             / k={N} 取回 {} 条",
             row.i,
-            row.got.first().map_or(f32::NAN, |(_, sc)| *sc)
+            row.got.first().map_or(f32::NAN, |(_, sc)| *sc),
+            row.all.len()
         );
     }
     eprintln!(
-        "[T6] 降级重建：{N} 篇自匹配失败 {self_fail} 篇；与 oracle 的 Top-10 重合率 \
-         均值 {:.3} / 最差 {:.3}（**仅诊断，不断言**）",
+        "[T6] 降级重建：{N} 篇自匹配失败 {self_fail} 篇（其中「k={N} 能取回」= {fail_reachable} \
+         ⇒ 排序 / 距离异常；「k={N} 取不回」= {fail_unreachable} ⇒ 这一条 query 的走法不可达）；\
+         与 oracle 的 Top-10 重合率 均值 {:.3} / 最差 {:.3}（**仅诊断，不断言**）",
         overlap_sum / N as f64,
         overlap_worst
     );
@@ -499,11 +534,16 @@ fn T6_旧快照无图可加载() {
         assert_eq!(
             row.got.first().map(|(id, _)| *id),
             Some(row.i as u32),
-            "query {} 的自身文档应排第一；实得 Top-10 = {:?}（若无 {}，说明降级重建后的图 \
-             不可导航，或灌入的向量 / ID 有误，issue #34）",
+            "query {} 的自身文档应排第一；实得 Top-10 = {:?}；k={N} 全量检索{}取回该篇\
+             （**不能**取回 = 这一条 query 的走法不可达；**能**取回 = 排序 / 距离异常。\
+             两种都属 issue #34，日志首行有分类计数）",
             row.i,
             row.got.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-            row.i
+            if row.all.contains(&(row.i as u32)) {
+                "**能**"
+            } else {
+                "**不能**"
+            }
         );
         // ② 且相似度≈1：`hits.score` 是**余弦相似度**而非距离——`hnsw_rs_index.rs:5-7` 约定
         //    实现统一输出 `d² = 2−2cos`，retriever 再换算 `score = 1 − d²/2 = cos`
@@ -523,6 +563,70 @@ fn T6_旧快照无图可加载() {
             "oracle 应把自身文档排第一（同时钉住「第 i 篇 chunk_id == i」这一前提）"
         );
     }
+}
+
+/// **诊断**（`#[ignore]`）：`top_n(N)` 的返回条数分布 + 自匹配计数（issue **#34**）。
+///
+/// 这条**不是门**，是把 T6 上方那段注释里的读数变成**可复跑**的东西：
+///
+/// ```bash
+/// PROBE_RUNS=30 cargo test -p helix-core --test graph_persist \
+///   T6_诊断_topN的返回条数 -- --ignored --nocapture
+/// ```
+///
+/// 判据 = **自匹配失败 0 条**（与 T6 的主门同口径）；返回条数只打印、不断言 ——
+/// 它是 `search_layer` fast-return（`hnsw.rs:983`）的**正常近似行为**，见上方注释。
+#[test]
+#[ignore = "诊断用（#34）：默认 30 轮降级重建，debug 约 2 min"]
+fn T6_诊断_topN的返回条数() {
+    const N: usize = 200;
+    let runs: usize = std::env::var("PROBE_RUNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+    let mut hist: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+    let mut runs_self_fail = 0usize;
+    let mut total_self_fail = 0usize;
+    for _ in 0..runs {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.idx");
+        {
+            let mut idx = builder().build();
+            for i in 0..N {
+                idx.add(format!("旧文档 {i}")).unwrap();
+            }
+            idx.save(&path).unwrap();
+        }
+        helix_core::storage::remove_sidecars(&path).unwrap();
+        let loaded = builder().load(&path).unwrap();
+        assert!(
+            matches!(loaded.graph_status(), GraphStatus::Rebuilt(_)),
+            "前提自检：本诊断只在降级重建路径上有意义"
+        );
+        let s = loaded.into_searcher().unwrap();
+        let mut sf = 0usize;
+        for i in 0..N {
+            let all = topk_searcher(&s, &format!("旧文档 {i}"), N);
+            *hist.entry(all.len()).or_insert(0) += 1;
+            if all.first().map(|(id, _)| *id) != Some(i as u32) {
+                sf += 1;
+            }
+        }
+        if sf > 0 {
+            runs_self_fail += 1;
+        }
+        total_self_fail += sf;
+    }
+    println!(
+        "[T6-诊断] runs={runs} top_n({N}) 长度分布={hist:?} \
+         有自匹配失败的 run={runs_self_fail} 自匹配失败总数={total_self_fail}/{}",
+        runs * N
+    );
+    assert_eq!(
+        total_self_fail, 0,
+        "[T6-诊断] 出现自匹配失败 {total_self_fail} 条（长度分布 {hist:?}）；\
+         若同时长度 < {N}，先看是否属 fast-return 正常近似 —— 自匹配失败与它无关"
+    );
 }
 
 /// **S2-T7** 逃生舱不破：Brute 后端加载含图快照 → 忽略图。
